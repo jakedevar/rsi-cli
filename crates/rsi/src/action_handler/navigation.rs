@@ -485,39 +485,29 @@ pub(super) fn dispatch(app: &mut App, action: LcAction) {
             let zone_info = if let Pane::SessionList {
                 active_zone,
                 selected_index,
-                taskrabbit_selected_index,
                 archive_selected_index,
                 jobs_selected_index,
                 ..
             } = app.session_list_pane_mut()
             {
                 let new_zone = match *active_zone {
-                    crate::types::SessionListZone::Archive => crate::types::SessionListZone::Main,
-                    crate::types::SessionListZone::Main => {
-                        crate::types::SessionListZone::TaskRabbit
-                    }
-                    crate::types::SessionListZone::TaskRabbit => {
-                        crate::types::SessionListZone::Jobs
-                    }
+                    crate::types::SessionListZone::Main => crate::types::SessionListZone::Jobs,
                     crate::types::SessionListZone::Jobs => crate::types::SessionListZone::Archive,
+                    crate::types::SessionListZone::Archive => crate::types::SessionListZone::Main,
                 };
                 Some((
                     new_zone,
                     *selected_index,
-                    *taskrabbit_selected_index,
                     *archive_selected_index,
                     *jobs_selected_index,
                 ))
             } else {
                 None
             };
-            if let Some((new_zone, sel, tr_sel, ar_sel, jobs_sel)) = zone_info {
+            if let Some((new_zone, sel, ar_sel, jobs_sel)) = zone_info {
                 let new_session = match new_zone {
                     crate::types::SessionListZone::Main => {
                         app.filtered_session_order.get(sel).copied()
-                    }
-                    crate::types::SessionListZone::TaskRabbit => {
-                        app.filtered_taskrabbit_order.get(tr_sel).copied()
                     }
                     crate::types::SessionListZone::Archive => {
                         app.filtered_archived_order.get(ar_sel).copied()
@@ -543,39 +533,29 @@ pub(super) fn dispatch(app: &mut App, action: LcAction) {
             let zone_info = if let Pane::SessionList {
                 active_zone,
                 selected_index,
-                taskrabbit_selected_index,
                 archive_selected_index,
                 jobs_selected_index,
                 ..
             } = app.session_list_pane_mut()
             {
                 let new_zone = match *active_zone {
-                    crate::types::SessionListZone::Archive => crate::types::SessionListZone::Jobs,
-                    crate::types::SessionListZone::Jobs => {
-                        crate::types::SessionListZone::TaskRabbit
-                    }
                     crate::types::SessionListZone::Main => crate::types::SessionListZone::Archive,
-                    crate::types::SessionListZone::TaskRabbit => {
-                        crate::types::SessionListZone::Main
-                    }
+                    crate::types::SessionListZone::Archive => crate::types::SessionListZone::Jobs,
+                    crate::types::SessionListZone::Jobs => crate::types::SessionListZone::Main,
                 };
                 Some((
                     new_zone,
                     *selected_index,
-                    *taskrabbit_selected_index,
                     *archive_selected_index,
                     *jobs_selected_index,
                 ))
             } else {
                 None
             };
-            if let Some((new_zone, sel, tr_sel, ar_sel, jobs_sel)) = zone_info {
+            if let Some((new_zone, sel, ar_sel, jobs_sel)) = zone_info {
                 let new_session = match new_zone {
                     crate::types::SessionListZone::Main => {
                         app.filtered_session_order.get(sel).copied()
-                    }
-                    crate::types::SessionListZone::TaskRabbit => {
-                        app.filtered_taskrabbit_order.get(tr_sel).copied()
                     }
                     crate::types::SessionListZone::Archive => {
                         app.filtered_archived_order.get(ar_sel).copied()

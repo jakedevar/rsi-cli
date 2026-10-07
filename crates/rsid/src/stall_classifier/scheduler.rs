@@ -315,6 +315,18 @@ fn strip_code_fence(s: &str) -> &str {
     inner.strip_suffix("```").unwrap_or(inner).trim()
 }
 
+/// Refresh before admission so the ledger and HTTP request use the same model.
+fn refresh_classifier_from_runtime(
+    llm: &mut StallClassifierLlmClient,
+    runtime: &RuntimeConfig,
+) -> bool {
+    if !runtime.stall_classifier_enabled.load(Ordering::Relaxed) {
+        return false;
+    }
+    llm.model = runtime.stall_classifier_model.read().clone();
+    true
+}
+
 /// Spawn the classifier sibling task. The returned `JoinHandle` is held by
 /// `main.rs` so the task is dropped (and the loop exits) when the daemon
 /// shuts down.
@@ -330,17 +342,9 @@ pub fn spawn_classifier(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         tracing::info!("Stall classifier scheduler spawned");
+        let mut llm = llm;
         while let Some(session_id) = rx.recv().await {
-            // Re-read on every receive so a runtime disable takes effect
-            // immediately.
-            let enabled = runtime_config
-                .stall_classifier_enabled
-                .load(Ordering::Relaxed);
-            if !enabled {
-                tracing::debug!(
-                    session_id = %session_id,
-                    "Stall classifier: disabled at receive time; dropping signal"
-                );
+            if !refresh_classifier_from_runtime(&mut llm, &runtime_config) {
                 continue;
             }
             let floor = *runtime_config.stall_classifier_confidence_floor.read();
@@ -394,6 +398,31 @@ mod tests {
         c.stall_classifier_max_per_session = 3;
         c.stall_classifier_cooldown_secs = 1800;
         c
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn classifier_enable_and_model_apply_to_existing_client() {
+        let runtime = RuntimeConfig::from_config(&cfg());
+        let mut llm = StallClassifierLlmClient::new(
+            "http://localhost:11434/v1".into(),
+            None,
+            "boot-model".into(),
+            std::time::Duration::from_secs(30),
+        );
+        assert!(!refresh_classifier_from_runtime(&mut llm, &runtime));
+        runtime
+            .update_field("stall_classifier_model", &serde_json::json!("live-model"))
+            .unwrap();
+        runtime
+            .update_field("stall_classifier_enabled", &serde_json::json!(true))
+            .unwrap();
+        assert!(refresh_classifier_from_runtime(&mut llm, &runtime));
+        assert_eq!(llm.invocation_target().model, "live-model");
+        runtime
+            .update_field("stall_classifier_enabled", &serde_json::json!(false))
+            .unwrap();
+        assert!(!refresh_classifier_from_runtime(&mut llm, &runtime));
     }
 
     fn classifier_cfg() -> ClassifierConfig {

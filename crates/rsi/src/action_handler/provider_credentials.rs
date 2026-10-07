@@ -79,6 +79,10 @@ pub async fn set_provider_credential(app: &mut App, slot: ProviderCredentialSlot
         Ok(meta) => {
             upsert_credential(app, meta);
             app.notify_success(format!("{slot}: credential set"));
+            // #1407: the `:aws-setup` flow verifies the stored Bedrock key.
+            if slot == ProviderCredentialSlot::Bedrock && app.aws_setup_verify_pending {
+                super::aws_setup::verify_bedrock_setup(app, None).await;
+            }
         }
         Err(e) => {
             tracing::warn!("Failed to set provider credential {}: {}", slot, e);

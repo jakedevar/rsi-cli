@@ -91,7 +91,8 @@ fn main() -> ExitCode {
     // failed or delayed by it).
     if raw_args.first().map(String::as_str) == Some(rsi_common::boundary_mail_hook::HOOK_SUBCOMMAND)
     {
-        let code = rsi_common::boundary_mail_hook::run_hook_stdin(
+        let code = rsi_common::boundary_mail_hook::run_hook_stdin_with_args(
+            &raw_args[1..],
             &mut std::io::stdout().lock(),
             rsi_common::agent_rpc_client::dispatch_with_timeout,
         );

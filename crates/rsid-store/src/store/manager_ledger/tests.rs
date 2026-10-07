@@ -102,6 +102,7 @@ fn fixture_using(store: Store) -> Fixture {
 }
 fn request(change: ManagerUpdateV2, key: &str) -> AgentManagerUpdateRequestV2 {
     AgentManagerUpdateRequestV2 {
+        project_id: None,
         fence: ManagerFenceV2 {
             scope_version: 1,
             policy_version: 1,
@@ -569,6 +570,7 @@ fn archive_restorable_fence_admits_restore_container() {
         .enqueue_manager_action(
             ManagerActionOriginV2::Agent { caller: f.manager },
             AgentManagerControlRequestV2 {
+                project_id: None,
                 fence: ManagerFenceV2 {
                     scope_version: config.row_version,
                     policy_version: policy.row_version,
@@ -677,6 +679,48 @@ fn inspect(f: &Fixture, section: ManagerInspectSectionV2) -> ManagerInspectionV2
             },
         )
         .unwrap()
+}
+
+/// #1333: the friction section is the project's rollup for its manager and
+/// the operator board; a worker (here the Epic lead) is refused.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn friction_inspect_section_is_the_project_rollup_for_managers_only() {
+    use rsi_common::friction::{FrictionKind, NewFrictionEventV1};
+    let f = fixture();
+    for session in [f.lead, f.manager, f.lead] {
+        f.store
+            .record_friction_event(
+                &NewFrictionEventV1::new(FrictionKind::DeployTimeout, &["worker_mid_turn"])
+                    .session(Some(session)),
+            )
+            .unwrap();
+    }
+    let query = AgentManagerInspectRequestV2 {
+        section: ManagerInspectSectionV2::Friction,
+        limit: 10,
+        ..Default::default()
+    };
+    for page in [
+        f.store.manager_v2_inspect(f.manager, &query).unwrap(),
+        f.store
+            .manager_v2_inspect_operator(f.project, &query)
+            .unwrap(),
+    ] {
+        assert_eq!(page.rows.len(), 1);
+        let row = &page.rows[0];
+        assert_eq!(row["type"], "friction");
+        assert_eq!(row["key"], "deploy_timeout:worker_mid_turn");
+        assert_eq!(row["occurrences"], 3);
+        assert_eq!(row["sessions"], 2);
+        assert_eq!(row["state"], "due");
+        assert!(page.complete);
+    }
+    let refused = f.store.manager_v2_inspect(f.lead, &query).unwrap_err();
+    assert!(
+        refused.to_string().contains("manager_v2_scope_denied"),
+        "{refused}"
+    );
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
@@ -1102,6 +1146,7 @@ fn inbox_retrieval_tracks_only_returned_ids_and_lead_transitions_are_distinct() 
                 after_sequence: 0,
                 limit: 1,
                 request_id: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1267,6 +1312,7 @@ fn settled_bookkeeping_history_does_not_exhaust_coordination_or_new_receipts() {
         after_sequence: 0,
         limit: 1,
         request_id: Some(sent.message_id),
+        ..Default::default()
     };
     let first = f.store.manager_inbox(f.lead, &request).unwrap();
     assert_eq!(first.messages[0].message_id, sent.message_id);
@@ -1810,6 +1856,8 @@ fn agent_decisions_cannot_replace_exact_operator_acceptance_gates() {
             question: "Replace acceptance?".into(),
             request_id: None,
             work_key: Some("a".into()),
+            gate: None,
+            options: vec![],
         };
         assert!(
             f.store
@@ -1834,6 +1882,8 @@ fn agent_decisions_cannot_replace_exact_operator_acceptance_gates() {
                     question: "Keep both visible identities?".into(),
                     request_id: None,
                     work_key: Some("a".into()),
+                    gate: None,
+                    options: vec![],
                 },
                 "question",
             ),

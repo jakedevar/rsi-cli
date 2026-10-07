@@ -4,13 +4,28 @@ use rsi_common::types::SessionStatus;
 use std::collections::{HashMap, HashSet};
 
 impl Store {
+    /// Update variants the global arm does not drive in S1 (#1235).
+    pub fn manager_update_global_withheld(change: &ManagerUpdateV2) -> bool {
+        matches!(
+            change,
+            ManagerUpdateV2::RequestReview { .. }
+                | ManagerUpdateV2::Migration { .. }
+                | ManagerUpdateV2::MigrationSeal { .. }
+                | ManagerUpdateV2::MigrationSealRelease { .. }
+                | ManagerUpdateV2::MigrationSealTransfer { .. }
+                | ManagerUpdateV2::MigrationTransfer { .. }
+                | ManagerUpdateV2::MigrationRelease { .. }
+        )
+    }
+
     pub fn manager_v2_prepare_update(
         &self,
         caller: Uuid,
         request: &AgentManagerUpdateRequestV2,
     ) -> Result<LedgerObservationContext> {
         text(&request.idempotency_key, 128).map_err(refused)?;
-        let authority = self.manager_v2_authorize(caller, &request.fence, None)?;
+        let authority =
+            self.manager_v2_authorize_in(caller, request.project_id, &request.fence, None)?;
         let capability = if matches!(request.change, ManagerUpdateV2::Integration { .. }) {
             ManagerCapabilityV2::Integration
         } else {
@@ -25,6 +40,16 @@ impl Store {
                 .policy
                 .capabilities
                 .contains(&ManagerCapabilityV2::SessionCreate)
+        {
+            return Err(refused("manager_v2_capability_denied"));
+        }
+        // #1235: review and migration allocation resolve through the project
+        // manager's appointment; the global seat records the other facts.
+        if Self::manager_update_global_withheld(&request.change)
+            && self.is_global_principal_anchor(
+                authority.config.project_id,
+                authority.config.manager_session_id,
+            )?
         {
             return Err(refused("manager_v2_capability_denied"));
         }
@@ -107,11 +132,14 @@ impl Store {
                 {
                     return Err(refused("manager_v2_reserved_decision_key"));
                 }
-                if self
-                    .manager_v2_record(&authority.config, "decision", key)?
-                    .is_some_and(|r| r.epic_id != Some(*epic_id))
-                {
-                    return Err(refused("manager_v2_decision_identity_changed"));
+                if let Some(prior) = self.manager_v2_record(&authority.config, "decision", key)? {
+                    if prior.epic_id != Some(*epic_id) {
+                        return Err(refused("manager_v2_decision_identity_changed"));
+                    }
+                    // #1415: an archived record stays archived history.
+                    if prior.archived {
+                        return Err(refused("manager_v2_decision_archived"));
+                    }
                 }
                 if let Some(id) = request_id {
                     if self.manager_v2_request_target(&authority, *id)? != *epic_id {
@@ -123,6 +151,11 @@ impl Store {
                         return Err(refused("manager_v2_work_out_of_scope"));
                     }
                 }
+                None
+            }
+            ManagerUpdateV2::DecisionRuling { .. } | ManagerUpdateV2::DecisionWithdraw { .. } => {
+                // #1415: the settlement checks its own ledger and authority.
+                self.manager_v2_check_decision_settlement(&authority, &request.change)?;
                 None
             }
             ManagerUpdateV2::Handoff { .. } => {
@@ -199,7 +232,13 @@ impl Store {
             let w = work
                 .as_ref()
                 .ok_or_else(|| refused("manager_v2_work_missing"))?;
-            if self.manager_v2_descendant_epic(&authority.config, id)? != w.epic_id {
+            // #1493: review evidence may come from any Epic of this manager
+            // scope (`descendant_epic` refuses out-of-scope sessions); other
+            // evidence stays bound to the Work's Epic.
+            let source_epic = self.manager_v2_descendant_epic(&authority.config, id)?;
+            if source_epic != w.epic_id
+                && !matches!(request.change, ManagerUpdateV2::RequestReview { .. })
+            {
                 return Err(refused("manager_v2_evidence_out_of_scope"));
             }
             let source = self
@@ -211,7 +250,7 @@ impl Store {
             if matches!(request.change, ManagerUpdateV2::RequestReview { .. }) {
                 // #599 S1: review observes the custody holder, which may be
                 // the author's rotation tip. Other evidence keeps its rules.
-                Some(self.manager_review_source_holder(&authority.config, w.epic_id, &source)?)
+                Some(self.manager_review_source_holder(&authority.config, &source)?)
             } else {
                 if source.status == SessionStatus::Deleted {
                     return Err(refused("manager_v2_evidence_source_unavailable"));
@@ -306,6 +345,12 @@ impl Store {
         ) {
             return self.manager_v2_commit_migration_settlement(caller, request, observed);
         }
+        if matches!(
+            request.change,
+            ManagerUpdateV2::DecisionRuling { .. } | ManagerUpdateV2::DecisionWithdraw { .. }
+        ) {
+            return self.manager_v2_commit_decision_settlement(caller, request);
+        }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let context = self.manager_v2_prepare_update(caller, request)?;
         let a = &context.authority;
@@ -316,6 +361,17 @@ impl Store {
             return Ok(serde_json::from_value(receipt)?);
         }
         for (session, id, generation) in &observed.custody {
+            if matches!(request.change, ManagerUpdateV2::RequestReview { .. }) {
+                let author = self
+                    .get_session(*session)?
+                    .ok_or_else(|| refused("manager_review_author_missing"))?;
+                if let Some(current) = self.manager_review_reclaimed_source(&author)? {
+                    if current.custody_id != *id || current.generation != *generation {
+                        return Err(refused("manager_v2_evidence_custody_changed"));
+                    }
+                    continue;
+                }
+            }
             let current = self.live_custody_for_session(*session)?;
             if current.custody_id != *id || current.generation != *generation {
                 return Err(refused("manager_v2_evidence_custody_changed"));
@@ -921,6 +977,8 @@ impl Store {
                 question,
                 request_id,
                 work_key,
+                gate,
+                options,
             } => {
                 text(key, 128).map_err(refused)?;
                 text(question, 4096).map_err(refused)?;
@@ -954,14 +1012,26 @@ impl Store {
                     status: "pending".into(),
                     answer: None,
                     delivery: None,
+                    gate: gate.map(|gate| gate.as_str().to_owned()),
+                    options: options.clone(),
+                    asked_by: None,
+                    answered_by: None,
+                    history: Vec::new(),
                 };
+                let prior = self.manager_v2_record(config, "decision", key)?;
+                let mut value = serde_json::to_value(d)?;
+                self.manager_v2_decision_ask_audit(a, prior.as_ref(), &mut value)?;
                 (
                     "decision",
                     key.clone(),
                     Some(*epic_id),
                     *expected_row_version,
-                    serde_json::to_value(d)?,
+                    value,
                 )
+            }
+            // Dispatched to `manager_v2_commit_decision_settlement` above.
+            ManagerUpdateV2::DecisionRuling { .. } | ManagerUpdateV2::DecisionWithdraw { .. } => {
+                return Err(refused("manager_v2_invalid_update"));
             }
             ManagerUpdateV2::Handoff {
                 summary,

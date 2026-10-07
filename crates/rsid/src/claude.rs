@@ -167,6 +167,12 @@ pub struct LaunchConfig {
 
 /// MCP server name for the agent-control gateway. Claude lists its tools as
 /// `mcp__rsi-agent__rsi_control_*`; Codex uses the same server name.
+/// #1549: Claude Code's native wake/cron tools never fire under headless
+/// `claude -p`; denying them leaves RSI's `schedule_wake` / `AgentSubmitJob`
+/// as the only way to wait.
+const CLAUDE_DISALLOWED_TOOLS_ARG: &str =
+    "--disallowedTools=ScheduleWakeup,CronCreate,CronDelete,CronList";
+
 pub(crate) const AGENT_MCP_SERVER_NAME: &str = "rsi-agent";
 
 /// The `rsi-agent-mcp` binary installed next to the running daemon.
@@ -260,32 +266,41 @@ pub(crate) fn apply_bedrock_launch_env(
     Ok(())
 }
 
-/// The shell command the boundary-mail hook runs: `rsi-rpc boundary-mail-hook`,
-/// preferring the `rsi-rpc` installed next to the running daemon and falling
-/// back to `PATH`.
-fn boundary_mail_hook_command() -> String {
-    let sibling = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("rsi-rpc")))
-        .filter(|path| path.is_file())
-        .and_then(|path| path.to_str().map(str::to_string))
-        .filter(|path| !path.contains('\'') && !path.contains('\n'));
-    let program = match sibling {
-        Some(path) => format!("'{path}'"),
-        None => "rsi-rpc".to_string(),
-    };
-    format!(
-        "{program} {}",
-        rsi_common::boundary_mail_hook::HOOK_SUBCOMMAND
-    )
+/// The `rsi-rpc` binary installed next to the running daemon: the only
+/// executable a boundary-mail hook may run (#1183 review). Never resolved from
+/// `PATH`, so a workspace-controlled binary cannot receive the session token.
+pub(crate) fn daemon_sibling_rsi_rpc_path() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()?
+        .parent()
+        .map(|directory| directory.join("rsi-rpc"))
 }
 
-/// `--settings <json>` installing the #1049 PostToolUse hook for one launch.
-pub(crate) fn boundary_mail_hook_args() -> [String; 2] {
-    [
-        "--settings".to_string(),
-        rsi_common::boundary_mail_hook::claude_settings_json(&boundary_mail_hook_command()),
-    ]
+/// The shell command a boundary-mail hook runs: `'<abs rsi-rpc>'
+/// boundary-mail-hook [args]`, or `None` (no hook, so mail waits for turn end)
+/// unless `rsi_rpc` is an existing absolute file whose UTF-8 path can be
+/// single-quoted safely. The Codex CLI launch installs the same command.
+pub(crate) fn boundary_mail_hook_command(rsi_rpc: Option<&Path>, args: &[&str]) -> Option<String> {
+    let Some(path) = rsi_rpc
+        .filter(|path| path.is_absolute() && path.is_file())
+        .and_then(Path::to_str)
+        .filter(|path| !path.contains('\'') && !path.contains('\n'))
+    else {
+        tracing::warn!(
+            path = ?rsi_rpc,
+            "trusted rsi-rpc sibling missing; no boundary-mail hook, mail waits for turn end"
+        );
+        return None;
+    };
+    let mut command = format!(
+        "'{path}' {}",
+        rsi_common::boundary_mail_hook::HOOK_SUBCOMMAND
+    );
+    for arg in args {
+        command.push(' ');
+        command.push_str(arg);
+    }
+    Some(command)
 }
 
 /// Maps a `SessionKind` to the `$CLAUDE_AGENT_ROLE` value expected by
@@ -413,6 +428,9 @@ pub struct ClaudeClient {
     /// `rsi_control_*` tools to a tokened session (see
     /// [`ClaudeClient::agent_mcp_config`]). `None` for discovery/test clients.
     agent_mcp_path: Option<PathBuf>,
+    /// Daemon-installed `rsi-rpc` sibling the #1049 boundary-mail hook runs.
+    /// `None` (discovery/test clients, or not installed) installs no hook.
+    boundary_mail_hook_path: Option<PathBuf>,
 }
 
 /// Validate `config.effort` before it reaches `--effort`.
@@ -452,6 +470,7 @@ impl ClaudeClient {
             binary_path,
             runtime_config: None,
             agent_mcp_path: None,
+            boundary_mail_hook_path: None,
         }
     }
 
@@ -465,6 +484,7 @@ impl ClaudeClient {
             binary_path,
             runtime_config: Some(runtime_config),
             agent_mcp_path: daemon_sibling_agent_mcp_path(),
+            boundary_mail_hook_path: daemon_sibling_rsi_rpc_path(),
         })
     }
 
@@ -483,6 +503,7 @@ impl ClaudeClient {
             binary_path,
             runtime_config: None,
             agent_mcp_path: None,
+            boundary_mail_hook_path: None,
         })
     }
 
@@ -616,6 +637,11 @@ impl ClaudeClient {
             "--verbose",
             "--permission-mode",
             "bypassPermissions",
+            // #1549: print-mode sessions are headless, so Claude Code's own
+            // wake/cron tools never fire and a worker that arms one ends its
+            // turn and is never resumed. Only RSI's `schedule_wake` and
+            // `AgentSubmitJob` are real. `=` form: the flag is variadic.
+            CLAUDE_DISALLOWED_TOOLS_ARG,
         ]);
 
         // RSI settles the entire CLI process group at each print-mode turn.
@@ -648,8 +674,14 @@ impl ClaudeClient {
         // #1049: deliver mail at tool boundaries. Only sessions rsid launches
         // with its own attribution token get the per-session `--settings`
         // PostToolUse hook; the operator's global settings are never touched.
-        if config.rsi_session_token.is_some() {
-            cmd.args(boundary_mail_hook_args());
+        if config.rsi_session_token.is_some()
+            && let Some(command) =
+                boundary_mail_hook_command(self.boundary_mail_hook_path.as_deref(), &[])
+        {
+            cmd.arg("--settings")
+                .arg(rsi_common::boundary_mail_hook::claude_settings_json(
+                    &command,
+                ));
         }
 
         // Set working directory
@@ -1127,6 +1159,7 @@ mod tests {
             binary_path,
             runtime_config: None,
             agent_mcp_path: None,
+            boundary_mail_hook_path: None,
         }
     }
 
@@ -1138,6 +1171,7 @@ mod tests {
             binary_path,
             runtime_config: Some(RuntimeConfig::from_config(&config)),
             agent_mcp_path: None,
+            boundary_mail_hook_path: None,
         }
     }
 
@@ -1181,15 +1215,14 @@ printf '{"type":"result","subtype":"turn_completed","usage":{"input_tokens":0,"o
         let output_path = dir.join("claude_prompt_output.txt");
         fs::write(
             &binary_path,
-            format!(
-                r#"#!/usr/bin/env bash
+            r#"#!/usr/bin/env bash
 set -euo pipefail
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --) shift; break ;;
     -p|--verbose) ;;
     --output-format|--permission-mode)
-      [[ "$#" -ge 2 ]] || {{ echo "missing option value" >&2; exit 2; }}
+      [[ "$#" -ge 2 ]] || { echo "missing option value" >&2; exit 2; }
       shift
       ;;
     --*=*) ;;
@@ -1197,13 +1230,23 @@ while [[ "$#" -gt 0 ]]; do
   esac
   shift
 done
-[[ "$#" -eq 1 ]] || {{ echo "expected exactly one prompt after --" >&2; exit 2; }}
-printf '%s\n' "$1" > {output}
-prompt_json=$(printf '%s' "$1" | sed ':a;N;$!ba;s/\n/\\n/g')
-printf '{{"type":"assistant","session_id":"prompt-parser","message":{{"role":"assistant","content":[{{"type":"text","text":"%s"}}]}}}}\n' "$prompt_json"
+[[ "$#" -eq 1 ]] || { echo "expected exactly one prompt after --" >&2; exit 2; }
+# Serialize the stream event rather than hand-escaping prompt text. Passing the
+# prompt as argv preserves leading dashes and trailing newlines on BSD and GNU.
+python3 - "$1" "$(dirname "$0")/claude_prompt_output.txt" <<'PYTHON'
+import json
+import pathlib
+import sys
+
+prompt = sys.argv[1]
+pathlib.Path(sys.argv[2]).write_bytes(prompt.encode("utf-8"))
+print(json.dumps({
+    "type": "assistant",
+    "session_id": "prompt-parser",
+    "message": {"role": "assistant", "content": [{"type": "text", "text": prompt}]},
+}))
+PYTHON
 "#,
-                output = output_path.display(),
-            ),
         )
         .expect("write prompt-parsing fake claude");
         let mut perms = fs::metadata(&binary_path).unwrap().permissions();
@@ -1323,7 +1366,16 @@ worker prompt body\n\
         let (binary_path, output_path) = install_prompt_parsing_claude(tmp.path());
         let client = test_client(binary_path);
 
-        for prompt in ["---\ndate: test\n---\n# Handoff", "-x", "--help"] {
+        for prompt in [
+            "---\ndate: test\n---\n# Handoff",
+            "-x",
+            "--help",
+            "--",
+            "--quoted \"text\" and \\path\\file\nnext line\n\n",
+            "-controls\twith CR\r\nand backspace\u{0008}\u{000c}",
+            "-Unicode: café, 日本語, 🦀\n",
+            "",
+        ] {
             let mut config = launch_config_for_provider_test(prompt);
             config.system_prompt = Some("-leading-dash-free-text".to_string());
             let (mut process, mut rx) = client
@@ -1343,8 +1395,9 @@ worker prompt body\n\
                 serde_json::Value::String(prompt.to_string())
             );
             assert_eq!(
-                fs::read_to_string(&output_path).expect("read echoed prompt"),
-                format!("{prompt}\n")
+                fs::read(&output_path).expect("read captured prompt"),
+                prompt.as_bytes(),
+                "prompt argv must survive byte-for-byte: {prompt:?}"
             );
         }
     }
@@ -1468,6 +1521,39 @@ worker prompt body\n\
         assert_prompt_is_final_verbatim(&args, "test query");
     }
 
+    /// #1549: headless sessions must not be offered Claude Code's native
+    /// wake/cron tools, which never fire under `claude -p`.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn launch_denies_native_wake_and_cron_tools() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (binary_path, args_path) = install_fake_claude(tmp.path());
+        let client = test_client(binary_path);
+        let mut config = launch_config_for_provider_test("test query");
+        config.resume_session_id = Some("previous-turn".to_string());
+        let (mut process, _rx) = client
+            .launch(
+                &config,
+                CliExecutionCapability::for_test(RuntimeExecutionRoute::ClaudeCli),
+            )
+            .expect("launch fake claude");
+        process.wait().await.expect("wait fake claude");
+
+        let args = read_nul_args(&args_path);
+        let denied = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("--disallowedTools="))
+            .unwrap_or_else(|| panic!("no --disallowedTools in {args:?}"));
+        for tool in ["ScheduleWakeup", "CronCreate", "CronDelete", "CronList"] {
+            assert!(
+                denied.split(',').any(|t| t == tool),
+                "{tool} not denied: {denied}"
+            );
+        }
+        assert_prompt_is_final_verbatim(&args, "test query");
+    }
+
     /// #1206: fresh and resumed print-mode turns must keep Claude tasks in the
     /// foreground so a stopped background task cannot abort the next prompt.
     #[cfg(unix)]
@@ -1512,7 +1598,10 @@ worker prompt body\n\
         async fn argv(token: Option<&str>) -> Vec<String> {
             let tmp = TempDir::new().expect("tempdir");
             let (binary_path, args_path) = install_fake_claude(tmp.path());
-            let client = test_client(binary_path);
+            let mut client = test_client(binary_path);
+            let rsi_rpc = tmp.path().join("rsi-rpc");
+            std::fs::write(&rsi_rpc, b"").expect("fake rsi-rpc");
+            client.boundary_mail_hook_path = Some(rsi_rpc);
             let mut config = launch_config_for_provider_test("q");
             config.rsi_session_token = token.map(str::to_string);
             let (mut process, _rx) = client
@@ -1540,13 +1629,10 @@ worker prompt body\n\
             serde_json::from_str(&with[position + 1]).expect("settings json");
         let hook = &settings["hooks"]["PostToolUse"][0]["hooks"][0];
         assert_eq!(hook["type"], "command");
-        assert!(
-            hook["command"]
-                .as_str()
-                .unwrap()
-                .ends_with("boundary-mail-hook"),
-            "{hook}"
-        );
+        let command = hook["command"].as_str().unwrap();
+        // #1183 review: the trusted absolute sibling, single-quoted.
+        assert!(command.starts_with("'/"), "{hook}");
+        assert!(command.ends_with("/rsi-rpc' boundary-mail-hook"), "{hook}");
         // #1097: the same hook also routes heavy Bash commands through the
         // spill wrapper at PreToolUse.
         let pre = &settings["hooks"]["PreToolUse"][0];
@@ -1563,6 +1649,40 @@ worker prompt body\n\
             "the session token must never be in argv"
         );
         assert_prompt_is_final_verbatim(&with, "q");
+    }
+
+    /// #1183 review: a tokened launch with no trusted absolute `rsi-rpc`
+    /// (not installed, relative, or missing) gets NO hook rather than a
+    /// `PATH`-resolved one; mail then waits for turn end.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn launch_without_a_trusted_rsi_rpc_installs_no_boundary_mail_hook() {
+        for path in [
+            None,
+            Some(PathBuf::from("rsi-rpc")),
+            Some(PathBuf::from("/nonexistent/rsi-rpc")),
+        ] {
+            let tmp = TempDir::new().expect("tempdir");
+            let (binary_path, args_path) = install_fake_claude(tmp.path());
+            let mut client = test_client(binary_path);
+            client.boundary_mail_hook_path = path.clone();
+            let mut config = launch_config_for_provider_test("q");
+            config.rsi_session_token = Some("tok".to_string());
+            let (mut process, _rx) = client
+                .launch(
+                    &config,
+                    CliExecutionCapability::for_test(RuntimeExecutionRoute::ClaudeCli),
+                )
+                .expect("launch fake claude");
+            process.wait().await.expect("wait fake claude");
+            let argv = read_nul_args(&args_path);
+            assert!(
+                !argv.iter().any(|arg| arg.contains("boundary-mail-hook")),
+                "{path:?}: {argv:?}"
+            );
+        }
+        assert_eq!(boundary_mail_hook_command(None, &[]), None);
     }
 
     /// Capture the argv `launch()` actually emits for `policy`.
@@ -1605,6 +1725,7 @@ worker prompt body\n\
             "--verbose".to_string(),
             "--permission-mode".to_string(),
             "bypassPermissions".to_string(),
+            "--disallowedTools=ScheduleWakeup,CronCreate,CronDelete,CronList".to_string(),
             "--".to_string(),
             "test query".to_string(),
         ];
@@ -1722,8 +1843,8 @@ worker prompt body\n\
         );
         assert_eq!(
             read_nul_args(&untokened_args).len(),
-            8,
-            "untokened argv must match the historical eight arguments"
+            9,
+            "untokened argv must be the historical eight arguments plus the #1549 tool denial"
         );
     }
 
@@ -1909,6 +2030,7 @@ mod model_discovery_tests {
             binary_path: PathBuf::from("/nonexistent/claude"),
             runtime_config: None,
             agent_mcp_path: None,
+            boundary_mail_hook_path: None,
         };
         let discovered = client
             .discover_models()

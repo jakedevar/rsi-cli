@@ -72,6 +72,11 @@ impl World {
             max_active_sessions,
             allow_create_groups: true,
             max_recovery_attempts: 0,
+            allowed_launches: vec![ManagerLaunchChoiceV2 {
+                provider: SessionProvider::Codex,
+                model: "gpt-6-astra".into(),
+                effort: Some("medium".into()),
+            }],
             ..Default::default()
         };
         store
@@ -125,6 +130,7 @@ impl World {
             .unwrap()
             .unwrap();
         AgentManagerControlRequestV2 {
+            project_id: None,
             fence: ManagerFenceV2 {
                 scope_version: config.row_version,
                 policy_version: grant.row_version,
@@ -199,6 +205,12 @@ impl World {
         claim
     }
     fn bound(&mut self, claim: &ManagerSuccessionClaim) -> ManagerSuccessionClaim {
+        let bound = self.bind_candidate(claim);
+        self.store
+            .claim_manager_succession_provider_effect(&bound)
+            .unwrap()
+    }
+    fn bind_candidate(&mut self, claim: &ManagerSuccessionClaim) -> ManagerSuccessionClaim {
         let root = &claim.reservation;
         let mut candidate = root.frozen.predecessor.clone();
         candidate.id = root.candidate_session_id;
@@ -215,12 +227,8 @@ impl World {
                 root.model_invocation_id,
             )
             .unwrap();
-        let bound = self
-            .store
-            .record_manager_succession_candidate_bound(claim)
-            .unwrap();
         self.store
-            .claim_manager_succession_provider_effect(&bound)
+            .record_manager_succession_candidate_bound(claim)
             .unwrap()
     }
     fn publication(claim: &ManagerSuccessionClaim) -> ManagerSuccessionPublicationWitness {
@@ -252,6 +260,40 @@ impl World {
             })
             .unwrap()
     }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn root_succession_empty_allowlist_refuses_before_reserving_a_candidate() {
+    let w = World::new(false);
+    let grant = w
+        .store
+        .get_harness_manager_policy(w.project)
+        .unwrap()
+        .unwrap();
+    let mut policy = grant.policy;
+    policy.allowed_launches.clear();
+    w.store
+        .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+            project_id: w.project,
+            expected_scope_version: grant.scope_version,
+            expected_policy_version: grant.row_version,
+            idempotency_key: "empty-launches".into(),
+            policy,
+        })
+        .unwrap();
+    let operations_before = w.count("harness_manager_v2_operations");
+    let error = w
+        .store
+        .enqueue_manager_succession(w.owner, &w.request("refused"), &w.proof())
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("manager_v2_launch_not_granted: allowed_launches=[]")
+    );
+    assert_eq!(w.count("manager_root_successions"), 0);
+    assert_eq!(w.count("harness_manager_v2_operations"), operations_before);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
@@ -837,13 +879,32 @@ fn root_succession_publication_failure_rolls_back_edge_archive_epoch_root_and_jo
     let claim = w.claim(&receipt);
     let claim = w.admit(&claim);
     let claim = w.bound(&claim);
+    // Hold an unrelated root in the same registry bucket throughout both
+    // publications. The old stripe mutex deterministically returned root_busy.
+    let custody_id = claim
+        .reservation
+        .frozen
+        .predecessor_custody
+        .as_ref()
+        .unwrap()
+        .custody_id;
+    let other = loop {
+        let id = Uuid::new_v4();
+        if id != custody_id
+            && crate::store::sandbox_custody::custody_root_lock_shard(id)
+                == crate::store::sandbox_custody::custody_root_lock_shard(custody_id)
+        {
+            break id;
+        }
+    };
+    let _unrelated = crate::store::sandbox_custody::lock_custody_root(other);
     let epoch = w.store.manager_authority_epoch(w.project).unwrap();
     w.store.conn.execute_batch("CREATE TEMP TRIGGER root_test_abort BEFORE INSERT ON harness_manager_v2_events WHEN NEW.kind='action_result' BEGIN SELECT RAISE(ABORT,'publication fault'); END;").unwrap();
-    assert!(
-        w.store
-            .commit_manager_succession(&claim, &World::publication(&claim))
-            .is_err()
-    );
+    let error = w
+        .store
+        .commit_manager_succession(&claim, &World::publication(&claim))
+        .unwrap_err();
+    assert!(error.to_string().contains("publication fault"), "{error}");
     assert_eq!(
         w.store.get_session(w.owner).unwrap().unwrap().status,
         SessionStatus::Completed
@@ -871,6 +932,52 @@ fn root_succession_publication_failure_rolls_back_edge_archive_epoch_root_and_jo
         .conn
         .execute_batch("DROP TRIGGER root_test_abort;")
         .unwrap();
+    assert_eq!(
+        w.store
+            .commit_manager_succession(&claim, &World::publication(&claim))
+            .unwrap()
+            .state,
+        ManagerActionStateV2::Succeeded
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn root_succession_busy_exact_root_releases_partial_locks_before_publication() {
+    let mut w = World::new(true);
+    let receipt = w.enqueue("busy-root");
+    let claim = w.claim(&receipt);
+    let claim = w.admit(&claim);
+    let claim = w.bound(&claim);
+    let mut ids = [
+        claim
+            .reservation
+            .frozen
+            .predecessor_custody
+            .as_ref()
+            .unwrap()
+            .custody_id,
+        claim
+            .reservation
+            .candidate_custody
+            .as_ref()
+            .unwrap()
+            .custody_id,
+    ];
+    ids.sort_unstable();
+    let held = crate::store::sandbox_custody::lock_custody_root(ids[1]);
+    let error = w
+        .store
+        .commit_manager_succession(&claim, &World::publication(&claim))
+        .unwrap_err();
+    assert!(
+        crate::store::custody_lock_order::is_lock_order_busy_error(&error),
+        "{error}"
+    );
+    let first = crate::store::sandbox_custody::try_lock_custody_root(ids[0])
+        .expect("partial acquisition released on refusal");
+    drop(first);
+    drop(held);
     assert_eq!(
         w.store
             .commit_manager_succession(&claim, &World::publication(&claim))
@@ -945,7 +1052,7 @@ fn root_succession_epoch_covers_normal_rotation_restore_retirement_foreign_proje
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
-fn root_succession_scope_change_blocks_effect_and_retains_creation_charge() {
+fn root_succession_scope_change_blocks_effect_and_releases_uncreated_charge() {
     let w = World::new(false);
     let receipt = w.enqueue("scope");
     let claim = w.claim(&receipt);
@@ -984,12 +1091,12 @@ fn root_succession_scope_change_blocks_effect_and_retains_creation_charge() {
             },
         })
         .unwrap();
-    assert!(
-        w.store
-            .enqueue_manager_succession(w.owner, &w.request("second"), &w.proof())
-            .is_err()
-    );
-    assert_eq!(w.count("manager_root_successions"), 1);
+    // #1390: the revoked occurrence never created its candidate, so it no
+    // longer holds the new scope's only creation slot.
+    assert_eq!(w.created_usage(), 0);
+    w.enqueue("second");
+    assert_eq!(w.count("manager_root_successions"), 2);
+    assert_eq!(w.created_usage(), 1);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
@@ -1106,17 +1213,10 @@ fn root_succession_invalid_metadata_and_early_publication_do_not_confer_authorit
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
-fn root_succession_new_event_policy_and_operator_pause_invalidate_settlement() {
+fn root_succession_new_event_policy_invalidates_settlement() {
     let w = World::new(false);
     let receipt = w.enqueue("pause");
     let claim = w.claim(&receipt);
-    w.store
-        .record_manager_operator_pause(w.owner, true)
-        .unwrap();
-    assert!(w.store.manager_succession_effect_gate(&claim).is_err());
-    w.store
-        .record_manager_operator_pause(w.owner, false)
-        .unwrap();
     assert!(w.store.manager_succession_effect_gate(&claim).is_ok());
     let mut row = w.store.get_session(w.owner).unwrap().unwrap();
     row.query = "new operator request".into();
@@ -1548,5 +1648,426 @@ fn root_succession_publishes_after_normal_result_telemetry_write() {
             .unwrap()
             .current_session_id,
         Some(candidate)
+    );
+}
+
+impl World {
+    /// Seed a running model invocation owned by the predecessor manager.
+    fn running_invocation(&self, purpose: &str, foreground: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        self.store
+            .conn
+            .execute(
+                "INSERT INTO model_invocations
+                 (id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,
+                  trigger_source,session_id,project_id,policy_snapshot_json,usage_confidence,created_at)
+                 VALUES (?1,?2,?3,?3,'paid_capable','admitted','running','issue-1390',?4,?5,'{}','unavailable',?6)",
+                params![
+                    id.to_string(),
+                    purpose,
+                    foreground,
+                    self.owner.to_string(),
+                    self.project.to_string(),
+                    now()
+                ],
+            )
+            .unwrap();
+        id
+    }
+    fn created_usage(&self) -> i64 {
+        let config = self
+            .store
+            .get_harness_manager(self.project)
+            .unwrap()
+            .unwrap();
+        self.store.manager_v2_created_usage(&config, false).unwrap()
+    }
+}
+
+/// #1390: the turn ends, the lifecycle starts a background `session.title`
+/// call on the untitled manager, then succeed_manager settles and moves the
+/// seat. The title call used to refuse settlement as a live predecessor.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn root_succession_settles_past_a_background_title_invocation_and_moves_the_seat() {
+    let mut w = World::new(true);
+    let receipt = w.enqueue("title-race");
+    assert!(
+        w.store
+            .session_has_unresolved_manager_succession(w.owner)
+            .unwrap()
+    );
+    let title = w.running_invocation("session.title", "background");
+    let claim = w.unsettled_claim(&receipt);
+    let row = w.store.get_session(w.owner).unwrap().unwrap();
+    let proof = ManagerPredecessorSettledWitness::after_checked_drain(
+        &row,
+        claim.reservation.frozen.predecessor_invocation_id,
+        claim.action.boot_id,
+    )
+    .unwrap();
+    let claim = w
+        .store
+        .record_manager_succession_predecessor_settled(&claim, &proof)
+        .unwrap();
+    w.store.manager_succession_effect_gate(&claim).unwrap();
+    // A late refinement result cannot write the pinned predecessor row.
+    assert!(
+        !w.store
+            .fill_session_title_if_absent(w.owner, "Late refinement")
+            .unwrap()
+    );
+    w.store.manager_succession_effect_gate(&claim).unwrap();
+    let claim = w.admit(&claim);
+    let claim = w.bound(&claim);
+    let candidate = claim.reservation.candidate_session_id;
+    let published = w
+        .store
+        .commit_manager_succession(&claim, &World::publication(&claim))
+        .unwrap();
+    assert_eq!(published.state, ManagerActionStateV2::Succeeded);
+    assert_eq!(
+        w.store
+            .get_harness_manager(w.project)
+            .unwrap()
+            .unwrap()
+            .current_session_id,
+        Some(candidate)
+    );
+    let status: String = w
+        .store
+        .conn
+        .query_row(
+            "SELECT status FROM model_invocations WHERE id=?1",
+            [title.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "running");
+}
+
+/// #1390 keeps the settlement guarantee: a predecessor mid-turn still blocks.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn root_succession_predecessor_mid_turn_still_refuses_settlement() {
+    let w = World::new(false);
+    let receipt = w.enqueue("mid-turn");
+    w.running_invocation("session.title", "background");
+    w.running_invocation("session.continue.resume", "foreground");
+    let claim = w.unsettled_claim(&receipt);
+    let row = w.store.get_session(w.owner).unwrap().unwrap();
+    let proof = ManagerPredecessorSettledWitness::after_checked_drain(
+        &row,
+        claim.reservation.frozen.predecessor_invocation_id,
+        claim.action.boot_id,
+    )
+    .unwrap();
+    assert!(
+        w.store
+            .record_manager_succession_predecessor_settled(&claim, &proof)
+            .unwrap_err()
+            .to_string()
+            .contains("manager_succession_predecessor_ledger_live")
+    );
+}
+
+/// #1390: a succession refused before its candidate existed releases its
+/// `max_created_sessions` charge, so a retry does not burn the budget.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn root_succession_blocked_before_candidate_releases_its_creation_charge() {
+    let w = World::new(false);
+    assert_eq!(w.created_usage(), 0);
+    let receipt = w.enqueue("blocked");
+    assert_eq!(w.created_usage(), 1);
+    let claim = w.unsettled_claim(&receipt);
+    w.store
+        .finish_manager_action(
+            &claim.action,
+            ManagerActionStateV2::Blocked,
+            "manager_succession_predecessor_ledger_live",
+        )
+        .unwrap();
+    let root = w
+        .store
+        .manager_succession(receipt.operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(root.state, ManagerRootState::Blocked);
+    assert!(
+        !w.store
+            .session_has_unresolved_manager_succession(w.owner)
+            .unwrap()
+    );
+    assert_eq!(w.created_usage(), 0);
+    w.enqueue("retry");
+    assert_eq!(w.created_usage(), 1);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn root_succession_operator_pause_holds_queue_until_operator_clear() {
+    use crate::store::manager_actions::OperatorPause;
+    for pause in [OperatorPause::Soft, OperatorPause::Hard] {
+        let mut w = World::new(false);
+        // Finish the fixture's legacy invocation repair before freezing identity.
+        w.store
+            .update_session_status(w.owner, SessionStatus::Completed)
+            .unwrap();
+        drop(Store::open(&w.dir.path().join("store.db")).unwrap());
+        w.store.set_operator_pause(w.owner, pause).unwrap();
+        let receipt = w.enqueue("paused-handoff");
+        w.store
+            .update_session_status(w.owner, SessionStatus::Completed)
+            .unwrap();
+        let root = w
+            .store
+            .manager_succession(receipt.operation_id)
+            .unwrap()
+            .unwrap();
+        // The reservation survives restart without allocating or starting a candidate.
+        let reopened = Store::open(&w.dir.path().join("store.db")).unwrap();
+        assert_eq!(
+            reopened
+                .recover_manager_actions_startup(Uuid::new_v4())
+                .unwrap(),
+            0
+        );
+        for _ in 0..2 {
+            assert!(
+                reopened
+                    .claim_manager_action(Uuid::new_v4())
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(reopened.get_operator_pause(w.owner).unwrap(), pause);
+            assert_eq!(
+                reopened
+                    .manager_action_operation(receipt.operation_id)
+                    .unwrap()
+                    .unwrap()
+                    .receipt
+                    .state,
+                ManagerActionStateV2::Queued
+            );
+            assert!(
+                reopened
+                    .get_session(root.candidate_session_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                !reopened
+                    .manager_succession(receipt.operation_id)
+                    .unwrap()
+                    .unwrap()
+                    .effect_claimed
+            );
+        }
+        reopened
+            .set_operator_pause(w.owner, OperatorPause::None)
+            .unwrap();
+        let claim = w.claim(&receipt);
+        let claim = w.admit(&claim);
+        let claim = w.bound(&claim);
+        assert_eq!(
+            w.store
+                .commit_manager_succession(&claim, &World::publication(&claim))
+                .unwrap()
+                .state,
+            ManagerActionStateV2::Succeeded
+        );
+        assert_eq!(
+            w.store
+                .get_operator_pause(root.candidate_session_id)
+                .unwrap(),
+            OperatorPause::None
+        );
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn root_succession_operator_pause_before_effect_refuses_provider_launch() {
+    use crate::store::manager_actions::OperatorPause;
+    for pause in [OperatorPause::Soft, OperatorPause::Hard] {
+        for pause_candidate in [false, true] {
+            let mut w = World::new(false);
+            let receipt = w.enqueue("late-pause");
+            let claim = w.claim(&receipt);
+            let claim = w.admit(&claim);
+            let claim = w.bind_candidate(&claim);
+            let target = if pause_candidate {
+                claim.reservation.candidate_session_id
+            } else {
+                w.owner
+            };
+            w.store.set_operator_pause(target, pause).unwrap();
+            assert!(
+                w.store
+                    .claim_manager_succession_provider_effect(&claim)
+                    .is_err()
+            );
+            assert!(
+                !w.store
+                    .manager_succession(receipt.operation_id)
+                    .unwrap()
+                    .unwrap()
+                    .effect_claimed
+            );
+            assert_eq!(w.store.get_operator_pause(target).unwrap(), pause);
+            w.store
+                .set_operator_pause(target, OperatorPause::None)
+                .unwrap();
+            assert!(
+                w.store
+                    .claim_manager_succession_provider_effect(&claim)
+                    .is_ok()
+            );
+        }
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn root_succession_operator_pause_blocks_publication_and_survives_recovery() {
+    use crate::store::manager_actions::OperatorPause;
+    for pause in [OperatorPause::Soft, OperatorPause::Hard] {
+        let mut w = World::new(false);
+        let receipt = w.enqueue("publication-pause");
+        let claim = w.claim(&receipt);
+        let claim = w.admit(&claim);
+        let claim = w.bound(&claim);
+        let candidate = claim.reservation.candidate_session_id;
+        w.store.set_operator_pause(w.owner, pause).unwrap();
+        // A separately hard-paused candidate must never be downgraded by a soft predecessor.
+        w.store
+            .set_operator_pause(candidate, OperatorPause::Hard)
+            .unwrap();
+        let epoch = w.store.manager_authority_epoch(w.project).unwrap();
+        for _ in 0..2 {
+            assert!(
+                w.store
+                    .commit_manager_succession(&claim, &World::publication(&claim))
+                    .is_err()
+            );
+            assert_eq!(w.store.get_operator_pause(w.owner).unwrap(), pause);
+            assert_eq!(
+                w.store.get_operator_pause(candidate).unwrap(),
+                OperatorPause::Hard
+            );
+            assert_eq!(w.store.manager_authority_epoch(w.project).unwrap(), epoch);
+            assert_eq!(
+                w.store
+                    .get_harness_manager(w.project)
+                    .unwrap()
+                    .unwrap()
+                    .current_session_id,
+                Some(w.owner)
+            );
+            assert_eq!(
+                w.store.get_session(w.owner).unwrap().unwrap().status,
+                SessionStatus::Completed
+            );
+        }
+        let reopened = Store::open(&w.dir.path().join("store.db")).unwrap();
+        assert_eq!(
+            reopened
+                .recover_manager_actions_startup(Uuid::new_v4())
+                .unwrap(),
+            1
+        );
+        let root = reopened
+            .manager_succession(receipt.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.state, ManagerRootState::CleanupRequired);
+        reopened
+            .update_session_status(candidate, SessionStatus::Failed)
+            .unwrap();
+        reopened
+            .conn
+            .execute(
+                "UPDATE model_invocations SET status='failed' WHERE id=?1",
+                [root.model_invocation_id.to_string()],
+            )
+            .unwrap();
+        reopened
+            .settle_manager_succession(
+                &root,
+                &ManagerSuccessionCleanupWitness::after_checked_settlement(&root),
+            )
+            .unwrap();
+        assert_eq!(reopened.get_operator_pause(w.owner).unwrap(), pause);
+        assert_eq!(
+            reopened.get_operator_pause(candidate).unwrap(),
+            OperatorPause::Hard
+        );
+        let retry = w.enqueue("publication-pause-retry");
+        assert!(
+            w.store
+                .claim_manager_action(Uuid::new_v4())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            w.store
+                .manager_action_operation(retry.operation_id)
+                .unwrap()
+                .unwrap()
+                .receipt
+                .state,
+            ManagerActionStateV2::Queued
+        );
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn operator_pause_detail_shows_age_and_held_succession_then_clears() {
+    use crate::store::manager_actions::OperatorPause;
+    // #1541: the operator can see a pause, how long ago it was written, and
+    // that a succession is queued behind it; clearing removes all of it.
+    let mut w = World::new(false);
+    assert_eq!(
+        w.store.get_operator_pause_detail(w.owner).unwrap().level,
+        OperatorPause::None
+    );
+    w.store
+        .set_operator_pause(w.owner, OperatorPause::Hard)
+        .unwrap();
+    let before = w.store.get_operator_pause_detail(w.owner).unwrap();
+    assert_eq!(before.level, OperatorPause::Hard);
+    assert!(before.since.is_some());
+    assert!(!before.held_succession);
+    w.enqueue("held-handoff");
+    let held = w.store.get_operator_pause_detail(w.owner).unwrap();
+    assert_eq!(held.level, OperatorPause::Hard);
+    assert!(held.held_succession);
+    w.store
+        .set_operator_pause(w.owner, OperatorPause::None)
+        .unwrap();
+    let cleared = w.store.get_operator_pause_detail(w.owner).unwrap();
+    assert_eq!(cleared.level, OperatorPause::None);
+    assert_eq!(cleared.since, None);
+    assert!(!cleared.held_succession);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn root_succession_without_operator_pause_leaves_successor_unpaused() {
+    use crate::store::manager_actions::OperatorPause;
+    let mut w = World::new(false);
+    let receipt = w.enqueue("unpaused-handoff");
+    let claim = w.claim(&receipt);
+    let claim = w.admit(&claim);
+    let claim = w.bound(&claim);
+    let candidate = claim.reservation.candidate_session_id;
+    w.store
+        .commit_manager_succession(&claim, &World::publication(&claim))
+        .unwrap();
+    assert_eq!(
+        w.store.get_operator_pause(candidate).unwrap(),
+        OperatorPause::None
     );
 }

@@ -1143,18 +1143,22 @@ impl PolicyState {
                             .insert((choice.provider, choice.model.clone()), label.clone());
                     }
                 }
-                picker.model_dropdown.models = models;
-                picker.model_dropdown.selected_index = picker
-                    .original
-                    .as_ref()
-                    .and_then(|c| {
-                        picker
-                            .model_dropdown
-                            .models
-                            .iter()
-                            .position(|(id, _)| *id == c.model)
-                    })
-                    .unwrap_or(0);
+                picker.model_dropdown.replace_models(models);
+                if !picker.model_dropdown.filter_editing
+                    && picker.model_dropdown.filter_query.is_empty()
+                {
+                    picker.model_dropdown.selected_index = picker
+                        .original
+                        .as_ref()
+                        .and_then(|c| {
+                            picker
+                                .model_dropdown
+                                .models
+                                .iter()
+                                .position(|(id, _)| *id == c.model)
+                        })
+                        .unwrap_or(0);
+                }
                 picker.status = CatalogStatus::Loaded;
             }
             Err(error) => picker.status = CatalogStatus::Failed(error),
@@ -1367,6 +1371,8 @@ pub(super) async fn open(
         previous: vec![],
         selected: 0,
         detail_scroll: 0,
+        option_cursor: None,
+        archive: None,
         error: None,
         notice: String::new(),
         answer: None,

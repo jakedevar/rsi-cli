@@ -12,6 +12,7 @@ fn fenced(
     operation: ManagerActionV2,
 ) -> AgentManagerControlRequestV2 {
     AgentManagerControlRequestV2 {
+        project_id: None,
         fence: ManagerFenceV2 {
             scope_version,
             policy_version,
@@ -281,6 +282,7 @@ async fn manager_recovery_settle_proven_absent_and_unobservable() {
                 kind: SessionKind::Feature,
                 query: "work".into(),
                 launch: p.policy.allowed_launches[0].clone(),
+                sandbox_source: None,
             },
             "execution_owner_lost_unconfirmed",
         )
@@ -402,6 +404,7 @@ async fn manager_recovery_settle_refuses_foreign_revoked_and_missing_capability(
                 kind: SessionKind::Feature,
                 query: "work".into(),
                 launch: p.policy.allowed_launches[0].clone(),
+                sandbox_source: None,
             },
             "execution_owner_lost_unconfirmed",
         )
@@ -601,6 +604,7 @@ async fn manager_recovery_390_retire_then_assign_live_worker_single_lead() {
                 kind: SessionKind::Feature,
                 query: "audit work".into(),
                 launch: p.policy.allowed_launches[0].clone(),
+                sandbox_source: None,
             },
         )
         .await;
@@ -765,6 +769,7 @@ async fn manager_recovery_retirement_admission_pauses_intent_until_explicit_resu
         .agent_manager_update(
             p.owner,
             AgentManagerUpdateRequestV2 {
+                project_id: None,
                 fence: ManagerFenceV2 {
                     scope_version: 1,
                     policy_version,
@@ -1065,6 +1070,7 @@ async fn manager_recovery_evidence_survives_reopen_and_replays() {
                 kind: SessionKind::Feature,
                 query: "work".into(),
                 launch: p.policy.allowed_launches[0].clone(),
+                sandbox_source: None,
             },
             "execution_owner_lost_unconfirmed",
         )
@@ -1248,6 +1254,7 @@ async fn manager_recovery_nested_settlement_is_scope_checked() {
                 kind: SessionKind::Feature,
                 query: "work".into(),
                 launch: p.policy.allowed_launches[0].clone(),
+                sandbox_source: None,
             },
             "execution_owner_lost_unconfirmed",
         )

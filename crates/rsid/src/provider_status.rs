@@ -247,6 +247,7 @@ impl ProviderStatusService {
             generated_at: now,
             cache_ttl_secs: self.ttl.as_secs(),
             providers,
+            provider_profile: rsi_common::provider_profile::ProviderProfile::All,
         }
     }
 
@@ -297,6 +298,14 @@ impl ProviderStatusService {
             },
             (None, _) => ("open", None),
         };
+        // A provider that rejected its credential at startup stays refused
+        // until a later launch gets past startup (#1610).
+        let (launch_admission, refusal_detail) =
+            if launch_admission == "open" && launch_stats.auth_episode_started_at.is_some() {
+                ("refused", Some("auth_invalid".to_string()))
+            } else {
+                (launch_admission, refusal_detail)
+            };
         let reachable = live.reachable.or_else(|| {
             check
                 .as_ref()
@@ -336,6 +345,7 @@ impl ProviderStatusService {
             }),
             last_402_at,
             last_429_at: launch_stats.last_rate_limit_at,
+            last_auth_failure_at: launch_stats.last_auth_failure_at,
             launches_24h: launch_stats.launches,
             failed_launches_24h: launch_stats.failed,
             failure_rate_24h,
@@ -458,6 +468,7 @@ mod tests {
                 failed: 1,
                 last_credit_error_at: Some(now - chrono::Duration::hours(3)),
                 last_rate_limit_at: Some(now - chrono::Duration::hours(1)),
+                ..ProviderLaunchStats::default()
             },
         );
         let result = service
@@ -480,6 +491,44 @@ mod tests {
             !json.contains(FAKE_KEY),
             "the response must never carry a key"
         );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn auth_rejection_refuses_codex_admission_until_the_episode_ends() {
+        let service = ProviderStatusService::new(
+            stub(http(200, "{}"), http(200, "{}")),
+            Duration::from_secs(60),
+        );
+        let now = Utc::now();
+        let failed_at = now - chrono::Duration::minutes(3);
+        let mut stats = HashMap::new();
+        stats.insert(
+            "Codex".to_string(),
+            ProviderLaunchStats {
+                launches: 2,
+                failed: 2,
+                last_auth_failure_at: Some(failed_at),
+                auth_episode_started_at: Some(failed_at),
+                ..ProviderLaunchStats::default()
+            },
+        );
+        let result = service
+            .report(&vault(true), &stats, Some("codex"), now)
+            .await;
+        let entry = &result.providers[0];
+        assert_eq!(entry.launch_admission, "refused");
+        assert_eq!(entry.refusal_detail.as_deref(), Some("auth_invalid"));
+        assert_eq!(entry.last_auth_failure_at, Some(failed_at));
+
+        stats.get_mut("Codex").unwrap().auth_episode_started_at = None;
+        let result = service
+            .report(&vault(true), &stats, Some("codex"), now)
+            .await;
+        let entry = &result.providers[0];
+        assert_eq!(entry.launch_admission, "open");
+        assert_eq!(entry.refusal_detail, None);
+        assert_eq!(entry.last_auth_failure_at, Some(failed_at));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]

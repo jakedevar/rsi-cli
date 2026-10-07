@@ -863,6 +863,19 @@ impl Store {
                 "manager_succession_origin_required",
             ));
         }
+        // #1314: a delegated appointment's seat launch is gated and reserved
+        // only through its origin; never admit it without one.
+        if request
+            .dedup_key
+            .as_deref()
+            .is_some_and(|k| k.starts_with("global.appoint:"))
+            && !origin
+                .is_some_and(super::manager_resources::ManagerResourceLaunchOrigin::is_appointment)
+        {
+            return Err(super::harness_manager_v2::refused(
+                "manager_appointment_origin_required",
+            ));
+        }
         let capacity_delivery = match channel {
             StoreAdmissionChannel::Generic => {
                 if request.trigger == "scheduled_capacity_resume"

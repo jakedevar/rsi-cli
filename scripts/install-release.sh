@@ -127,6 +127,22 @@ if [[ ! -x "$RSI_BIN" || ! -x "$RSID_BIN" || ! -x "$RSI_RPC_BIN" || ! -x "$RSI_A
     exit 1
 fi
 
+# #1592: carry the supervisor through the same manifest as the binaries.
+# Direct installs below copy it too; quiet installs leave the running path
+# alone until the daemon swaps the verified set.
+install_supervisor_script "$TARGET_DIR/release"
+
+# Daemon jobs execute this copy directly. Publish it before either install
+# path returns, keeping any running cargo-slot on its existing inode.
+(
+    mkdir -p "$RSI_HOME_DIR/bin"
+    cargo_slot_temp="$(mktemp "$RSI_HOME_DIR/bin/.cargo-slot.XXXXXX")"
+    trap 'rm -f "$cargo_slot_temp"' EXIT
+    cp "$ROOT/scripts/cargo-slot" "$cargo_slot_temp"
+    chmod 755 "$cargo_slot_temp"
+    mv -f "$cargo_slot_temp" "$RSI_HOME_DIR/bin/cargo-slot"
+)
+
 if [[ "$QUIET_RESTART" -eq 1 ]]; then
     # The daemon stages, verifies and swaps the new binaries in at a quiet point
     # (nothing is relinked here: the installed set stays the previous, working
@@ -302,7 +318,7 @@ restart_rsid() {
             --property="MemoryMax=${RSID_SCOPE_MEMORY_MAX_MIB}M" \
             --property="MemorySwapMax=${RSID_SCOPE_MEMORY_SWAP_MAX_MIB}M" \
             --property="CPUWeight=${RSID_SCOPE_CPU_WEIGHT}" \
-            -- "$ROOT/scripts/rsid-supervisor.sh" "$RSID_BIN" \
+            -- "$INSTALL_DIR/rsid-supervisor.sh" "$RSID_BIN" \
             </dev/null >>"$DAEMON_LOG" 2>&1 &
     else
         nohup "$RSID_BIN" </dev/null >>"$DAEMON_LOG" 2>&1 &

@@ -312,6 +312,7 @@ fn spawn_dreamer_with_clock_and_runtime(
         interval.tick().await;
 
         let mut llm = llm;
+        let mut config = config;
         let mut running_call: Option<RunningPhaseCall> = None;
         let mut manual_trigger_requested = false;
         let mut shutting_down = false;
@@ -375,6 +376,12 @@ fn spawn_dreamer_with_clock_and_runtime(
 
         let mut immediate_drive = true;
         loop {
+            // Update future-run policy; an active run keeps its persisted caps
+            // and an already scheduled cooldown keeps its deadline.
+            config.observation_threshold = runtime_config
+                .dream_observation_threshold
+                .load(Ordering::Relaxed);
+            config.cooldown_secs = runtime_config.dream_cooldown_secs.load(Ordering::Relaxed);
             refresh_llm_from_runtime(&mut llm, &store, &runtime_config).await;
             let control = match compute_control_state(
                 &store,
@@ -1899,6 +1906,8 @@ mod tests {
         let mut config = Config::default();
         config.dream_enabled = enabled;
         config.dream_idle_secs = 1;
+        config.dream_observation_threshold = 1;
+        config.dream_cooldown_secs = 2;
         config.dream_model = Some("qwen3:14b".to_string());
         config.dream_api_url = None;
         let runtime = RuntimeConfig::from_config(&config);
@@ -2235,6 +2244,53 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "current_thread")]
+    async fn live_threshold_and_cooldown_apply_without_respawning_dreamer() {
+        let store = store();
+        insert_explicit_observation(&store, "fact one").await;
+        let runtime = runtime_config(true);
+        runtime
+            .update_field("dream_observation_threshold", &serde_json::json!(100))
+            .unwrap();
+        let backend = FakeDreamBackend::with_steps([BackendStep::Return(Ok(String::new()))]);
+        let (clock, control) = DreamClock::manual(Utc::now());
+        let handle = spawn_dreamer_with_clock(
+            Arc::clone(&store),
+            Arc::new(EventBus::new(16)),
+            local_llm(&store, backend.clone()),
+            dream_config(),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::clone(&runtime),
+            clock,
+        );
+        drive_scheduler(&handle, &control, 1500).await;
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
+        runtime
+            .update_field("dream_observation_threshold", &serde_json::json!(1))
+            .unwrap();
+        runtime
+            .update_field("dream_cooldown_secs", &serde_json::json!(90))
+            .unwrap();
+        handle.notify_control_change().await.unwrap();
+        drive_until(&handle, &control, || {
+            let store = Arc::clone(&store);
+            async move {
+                load_state(&*store.lock().await)
+                    .unwrap()
+                    .last_success_at
+                    .is_some()
+            }
+        })
+        .await;
+        let state = load_state(&*store.lock().await).unwrap();
+        let finished = parse_timestamp(state.last_success_at.as_deref().unwrap()).unwrap();
+        let cooldown = parse_timestamp(state.cooldown_until.as_deref().unwrap()).unwrap();
+        assert_eq!((cooldown - finished).num_seconds(), 90);
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 1);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test(flavor = "current_thread")]
     async fn live_disable_pauses_active_dream_work() {
         let store = store();
         insert_explicit_observation(&store, "fact one").await;
@@ -2383,6 +2439,9 @@ mod tests {
         let backend = FakeDreamBackend::with_steps([BackendStep::Return(Ok(String::new()))]);
         let runtime = runtime_config(true);
         let config = dream_config_with_threshold(100);
+        runtime
+            .update_field("dream_observation_threshold", &serde_json::json!(100))
+            .unwrap();
         let (clock, control) = DreamClock::manual(Utc::now());
         let handle = spawn_dreamer_with_clock(
             Arc::clone(&store),
@@ -2414,6 +2473,10 @@ mod tests {
             insert_explicit_observation(&store, "fact one").await;
             let backend = FakeDreamBackend::with_steps([BackendStep::Return(Ok(String::new()))]);
             let config = dream_config_with_threshold(100);
+            let runtime = paid_runtime_config(true);
+            runtime
+                .update_field("dream_observation_threshold", &serde_json::json!(100))
+                .unwrap();
             let (clock, control) = DreamClock::manual(Utc::now());
             let handle = spawn_dreamer_with_clock(
                 Arc::clone(&store),
@@ -2421,7 +2484,7 @@ mod tests {
                 paid_llm(&store, backend.clone()),
                 config,
                 Arc::new(RwLock::new(HashMap::new())),
-                paid_runtime_config(true),
+                runtime,
                 clock,
             );
 

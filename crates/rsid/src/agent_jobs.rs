@@ -1,8 +1,8 @@
 //! Daemon-owned durable agent jobs (#1002 slice 1).
 //!
 //! `AgentSubmitJob` turns typed parameters into a fixed argv, records a
-//! `running` job row and starts the argv in a transient `systemd-run --user`
-//! unit. The unit is a sibling of every session scope and of rsid itself, so a
+//! `running` job row and starts the argv in a transient systemd unit (Linux)
+//! or launchd service (macOS). The service is outside every session scope, so a
 //! session's end or a daemon restart does not kill it. The unit's wrapper writes
 //! the exit status to a status file as its last act; the runner polls the
 //! `running` rows, settles each exactly once (CAS in the store, which also
@@ -15,15 +15,21 @@ use crate::store::Store;
 use crate::store::agent_jobs::{AgentJobRow, NewAgentJob};
 use chrono::{DateTime, Utc};
 use rsi_common::agent_jobs::{
-    AgentJobResultV1, AgentJobV1, BuildJobParams, CloudSweepResultV1, JOB_CANCELLED,
-    JOB_DIR_NOT_ALLOWED, JOB_LAUNCH_FAILED, JOB_NOT_FOUND, JobKind, JobParams, JobState, JobWake,
-    LandingJobParams, SWEEP_MAX_FAILURES, SweepVerdict, TestJobParams,
+    AgentJobResultV1, AgentJobV1, BuildJobParams, CloudSweepResultV1, JOB_ADMISSION_TIMED_OUT,
+    JOB_CANCELLED, JOB_DIR_NOT_ALLOWED, JOB_LAUNCH_FAILED, JOB_NOT_FOUND, JOB_TIMED_OUT, JobKind,
+    JobParams, JobState, JobWake, LandingJobParams, SWEEP_MAX_FAILURES, SweepVerdict,
+    TestJobParams,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+
+#[cfg(any(target_os = "macos", test))]
+mod launchd;
+
+mod recipe;
 
 const TICK: Duration = Duration::from_secs(5);
 /// A `running` row with no active unit and no status file is only declared
@@ -39,6 +45,54 @@ pub(crate) const JOB_SCRATCH_QUOTA_EXCEEDED: &str = "job_scratch_quota_exceeded"
 const LOG_TAIL_READ_BYTES: u64 = 256 * 1024;
 const MAX_FAILING_TESTS: usize = 32;
 const STRIP_NAMESPACE_ENV: &str = "RSI_PROCESS_OWNERSHIP_NAMESPACE";
+/// #1337: a timed test job's unit keeps running this long past its timeout
+/// before systemd/launchd stops it, so the daemon's poll (which settles it
+/// `job_timed_out`) acts first; the unit cap is only the backstop for a
+/// daemon that is down.
+const JOB_TIMEOUT_UNIT_GRACE_SECS: u64 = 5 * 60;
+
+/// #1611: how long past the deploy drain's hold cap a job may stay `queued`
+/// (unlaunched) before it is failed `job_admission_timed_out`. The drain
+/// releases a hold by its cap at the latest, so a job still queued past
+/// cap + margin is stuck, not waiting.
+const JOB_ADMISSION_MARGIN_SECS: i64 = 5 * 60;
+
+/// #1611: the longest a job may wait unlaunched, from the drain's hold cap
+/// (the default cap when the drain is uncapped) plus the margin.
+fn admission_cap_secs(drain: &crate::deploy_drain::DeployDrain) -> i64 {
+    let hold = drain.hold_cap().map_or(
+        i64::try_from(rsi_common::agent_deploy::DEPLOY_DRAIN_HOLD_DEFAULT_SECS).unwrap_or(600),
+        |cap| cap.num_seconds(),
+    );
+    hold.saturating_add(JOB_ADMISSION_MARGIN_SECS)
+}
+
+/// #1611: whether a queued job has waited unlaunched past `cap_secs`.
+fn admission_expired(job: &AgentJobV1, now: DateTime<Utc>, cap_secs: i64) -> bool {
+    DateTime::parse_from_rfc3339(&job.created_at)
+        .is_ok_and(|created| (now - created.with_timezone(&Utc)).num_seconds() > cap_secs)
+}
+
+/// The typed `job_admission_timed_out` settlement of a job that never launched.
+fn admission_timed_out_result(cap_secs: i64) -> AgentJobResultV1 {
+    AgentJobResultV1 {
+        refusal: Some(JOB_ADMISSION_TIMED_OUT.into()),
+        detail: Some(format!(
+            "the job was held for more than {} minutes before its unit launched (deploy drain hold cap plus margin) and was failed without running; its execution timeout never started. Resubmit it",
+            cap_secs / 60
+        )),
+        ..AgentJobResultV1::default()
+    }
+}
+
+/// #1337: the wall-clock timeout a test job carries (stamped at submit).
+#[must_use]
+pub(crate) fn job_timeout_secs(params: &JobParams) -> Option<u64> {
+    match params {
+        JobParams::Test(p) => p.timeout_minutes.map(|minutes| u64::from(minutes) * 60),
+        _ => None,
+    }
+}
 
 /// The fixed command a job runs, before the systemd wrapper.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,7 +128,15 @@ impl JobTools {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let cargo_slot = std::env::var_os("RSI_JOB_CARGO_SLOT")
             .map(PathBuf::from)
-            .or_else(|| home.as_ref().map(|h| h.join(".rsi/bin/cargo-slot")))
+            // The slot wrapper uses Linux tools. On Mac, env is the direct
+            // command prefix; launchd supplies the smaller Cargo limits.
+            .or_else(|| {
+                if cfg!(target_os = "macos") {
+                    Some(PathBuf::from("/usr/bin/env"))
+                } else {
+                    home.as_ref().map(|h| h.join(".rsi/bin/cargo-slot"))
+                }
+            })
             .unwrap_or_else(|| PathBuf::from("cargo-slot"));
         Self {
             cargo_slot,
@@ -131,10 +193,13 @@ fn test_command(tools: &JobTools, p: &TestJobParams) -> Vec<String> {
     }
     // #1106: one failing binary must not hide the others; every binary runs.
     args.push(s("--no-fail-fast"));
-    // No filters runs every test of the package (no `--` at all).
-    if !p.filters.is_empty() {
+    // No filters runs every test; exact matching is a libtest option.
+    if !p.filters.is_empty() || p.exact {
         args.push(s("--"));
         args.extend(p.filters.iter().cloned());
+        if p.exact {
+            args.push(s("--exact"));
+        }
     }
     slot_cargo(tools, args)
 }
@@ -179,8 +244,17 @@ pub(crate) fn job_command(
     cwd: &Path,
     gate_script: Option<&Path>,
 ) -> Result<JobCommand> {
+    if let JobParams::Test(test) = params
+        && test.recipe.is_some()
+    {
+        return recipe::command(tools, test, cwd);
+    }
     let (argv, runtime_max_secs, stop_timeout_secs) = match params {
-        JobParams::Test(p) => (test_command(tools, p), 3 * 3600, 60),
+        JobParams::Test(p) => (
+            test_command(tools, p),
+            job_timeout_secs(params).map_or(3 * 3600, |secs| secs + JOB_TIMEOUT_UNIT_GRACE_SECS),
+            60,
+        ),
         JobParams::Build(p) => (build_command(tools, p), 2 * 3600, 60),
         JobParams::Landing(p) => {
             let mut argv = vec![
@@ -396,7 +470,7 @@ pub struct LaunchSpec {
     pub build_environment: Option<BuildEnvironment>,
 }
 
-/// Only test/build jobs receive these explicit, non-secret environment values.
+/// Jobs that build locally receive these explicit, non-secret environment values.
 #[derive(Debug, Clone)]
 pub struct BuildEnvironment {
     pub tmp_dir: PathBuf,
@@ -418,7 +492,7 @@ fn job_tmp_dir(log_path: &Path) -> PathBuf {
     log_path.with_extension("tmp")
 }
 
-/// Resolve the target directory a test/build job builds in, without starting
+/// Resolve the target directory a job builds in, without starting
 /// Cargo under the store lock. A directory-scoped config (`<ancestor>/.cargo`,
 /// relative to its parent) that sets `build.target-dir` wins, so an operator can
 /// point a whole tree elsewhere. The daemon's own `CARGO_TARGET_DIR` is ignored
@@ -464,7 +538,10 @@ fn prepare_build_environment(
     cwd: &Path,
     log: &Path,
 ) -> std::io::Result<Option<BuildEnvironment>> {
-    if !matches!(params, JobParams::Test(_) | JobParams::Build(_)) {
+    if !matches!(
+        params,
+        JobParams::Test(_) | JobParams::Build(_) | JobParams::Landing(_) | JobParams::CloudGate(_)
+    ) {
         return Ok(None);
     }
     let cargo_home = std::env::var_os("CARGO_HOME")
@@ -516,8 +593,20 @@ fn cleanup_job_tmp(log: &Path) {
 }
 
 /// Starts units and reports whether one is still alive. The production
-/// implementation is [`SystemdJobRuntime`]; tests substitute a fake.
+/// implementations are systemd on Linux and launchd on macOS; tests substitute
+/// a fake. Backend handles are stable service labels, never bare process IDs.
 pub trait JobRuntime: Send + Sync {
+    /// Durable platform handle. Mac includes its bootstrap domain, so restart
+    /// discovery never confuses a GUI service with a user-domain service.
+    fn unit_name(&self, id: Uuid) -> String {
+        format!("rsi-job-{id}")
+    }
+    /// Refuse workflows that the platform cannot run before inserting a row.
+    /// # Errors
+    /// A stable platform refusal.
+    fn validate(&self, _params: &JobParams) -> std::result::Result<(), &'static str> {
+        Ok(())
+    }
     /// # Errors
     /// A message when the unit could not be started.
     fn launch(&self, spec: &LaunchSpec) -> std::result::Result<(), String>;
@@ -533,8 +622,41 @@ pub trait JobRuntime: Send + Sync {
     }
 }
 
-/// The wrapper that runs inside the unit: redirect output to the log, run the
-/// fixed argv and record its exit status atomically as the very last act.
+/// Use the same backend for submission, cancellation and restart polling.
+#[must_use]
+pub fn platform_job_runtime() -> Arc<dyn JobRuntime> {
+    #[cfg(target_os = "linux")]
+    {
+        Arc::new(SystemdJobRuntime::default())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(launchd::LaunchdJobRuntime::default())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Arc::new(UnsupportedJobRuntime)
+    }
+}
+
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
+struct UnsupportedJobRuntime;
+
+#[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
+impl JobRuntime for UnsupportedJobRuntime {
+    fn validate(&self, _params: &JobParams) -> std::result::Result<(), &'static str> {
+        Err(rsi_common::agent_jobs::JOB_PLATFORM_UNSUPPORTED)
+    }
+    fn launch(&self, _spec: &LaunchSpec) -> std::result::Result<(), String> {
+        Err(rsi_common::agent_jobs::JOB_PLATFORM_UNSUPPORTED.into())
+    }
+    fn unit_active(&self, _unit_name: &str) -> bool {
+        false
+    }
+}
+
+/// The wrapper that runs inside the unit: append output to the log (the daemon
+/// pre-writes its `queue-wait`/`unit-launch` phases, #1608), run the fixed argv and record its exit status atomically as the very last act.
 ///
 /// The log is a bounded writer: `head -c` keeps at most `cap` bytes, so a
 /// runaway job cannot fill the disk. When the cap is reached the job's pipe
@@ -542,7 +664,7 @@ pub trait JobRuntime: Send + Sync {
 /// recorded status is 153 (128 + SIGXFSZ) even if the job later exits 0, so an
 /// oversized log fails visibly instead of being silently truncated.
 const WRAPPER: &str = r#"log=$1; status=$2; cap=$3; shift 3
-( "$@" 2>&1 </dev/null; printf '%s\n' "$?" >"$status.code" ) | head -c "$cap" >"$log"
+( PYTHONUNBUFFERED=1; export PYTHONUNBUFFERED; printf 'rsi-phase %s job-start\n' "$(date +%s)"; "$@" 2>&1 </dev/null; printf '%s\n' "$?" >"$status.code" ) | head -c "$cap" >>"$log"
 code=$(cat "$status.code" 2>/dev/null || echo 1)
 rm -f "$status.code"
 size=$(wc -c <"$log")
@@ -551,6 +673,24 @@ if [ "$size" -ge "$cap" ]; then
   code=153
 fi
 printf '%s\n' "$code" >"$status.tmp" && mv "$status.tmp" "$status""#;
+
+/// #1591: take the shard runner's artifact lock shared, saying so in the job
+/// log when it is contended (who holds it, how long this unit waited) instead of
+/// blocking silently. `$1` is the lock file, the rest is the job's own argv.
+/// Phase lines are `rsi-phase <epoch> <name>[: detail]`, read back by
+/// [`last_phase`].
+const LOCK_WAIT: &str = r#"lock=$1; shift
+t0=$(date +%s)
+if ! flock --shared --nonblock "$lock" true 2>/dev/null; then
+  holder=
+  ino=$(stat -c %i "$lock" 2>/dev/null)
+  if [ -n "$ino" ] && [ -r /proc/locks ]; then
+    pid=$(awk -v i="$ino" '$6 ~ (":" i "$") && $4 == "WRITE" { print $5; exit }' /proc/locks)
+    [ -n "$pid" ] && holder=" held by pid $pid ($(tr '\0' ' ' </proc/$pid/cmdline 2>/dev/null | cut -c1-120))"
+  fi
+  printf 'rsi-phase %s artifact-lock-wait: %s%s\n' "$t0" "$lock" "$holder"
+fi
+exec flock --shared "$lock" /bin/sh -c 'printf "rsi-phase %s artifact-lock-held: waited %ss\n" "$(date +%s)" "$(( $(date +%s) - $1 ))"; shift; exec "$@"' sh "$t0" "$@""#;
 
 /// `systemd-run --user` transient services.
 #[derive(Debug, Clone)]
@@ -566,6 +706,18 @@ impl Default for SystemdJobRuntime {
             systemctl: PathBuf::from("/usr/bin/systemctl"),
         }
     }
+}
+
+/// #1227: every agent job unit the daemon stops is logged with why, on the
+/// same `rsid::signal` target as the daemon's process signals.
+fn log_unit_stop(unit_name: &str, reason: &str) {
+    tracing::info!(
+        target: "rsid::signal",
+        unit = %format!("{unit_name}.service"),
+        signal = "systemctl stop",
+        reason,
+        "daemon stopping an agent job unit"
+    );
 }
 
 /// The `systemd-run` command line for one unit. Separate from `launch` so the
@@ -613,7 +765,13 @@ pub(crate) fn systemd_run_args(spec: &LaunchSpec, path_env: Option<&str>) -> Vec
         .as_ref()
         .and_then(|env| env.artifact_lock.as_ref())
     {
-        args.extend([s("flock"), s("--shared"), lock.display().to_string()]);
+        args.extend([
+            s("/bin/sh"),
+            s("-c"),
+            s(LOCK_WAIT),
+            s("rsi-lock"),
+            lock.display().to_string(),
+        ]);
     }
     args.extend(spec.command.argv.iter().cloned());
     args
@@ -739,7 +897,9 @@ pub(crate) struct SubmitContext {
 }
 
 /// Record and launch one job. A launch failure settles the row `failed`
-/// without a wake (the caller gets the error synchronously).
+/// without a wake (the caller gets the error synchronously). With `hold`
+/// (a deploy drain, #1566) the row is recorded `queued` and no unit is
+/// launched; [`start_queued_jobs`] launches it when the drain ends.
 pub(crate) fn submit(
     store: &Store,
     runtime: &dyn JobRuntime,
@@ -748,6 +908,23 @@ pub(crate) fn submit(
     ctx: SubmitContext,
     now: DateTime<Utc>,
 ) -> Result<(AgentJobRow, bool)> {
+    submit_with_hold(store, runtime, tools, jobs_dir, ctx, false, now)
+}
+
+/// [`submit`] with the deploy-drain `hold` choice made by the caller.
+pub(crate) fn submit_with_hold(
+    store: &Store,
+    runtime: &dyn JobRuntime,
+    tools: &JobTools,
+    jobs_dir: &Path,
+    mut ctx: SubmitContext,
+    hold: bool,
+    now: DateTime<Utc>,
+) -> Result<(AgentJobRow, bool)> {
+    recipe::fit_timeout(&mut ctx.params, &ctx.cwd)?;
+    runtime
+        .validate(&ctx.params)
+        .map_err(|code| DaemonError::InvalidParam(code.into()))?;
     let gate_script = matches!(
         ctx.params,
         JobParams::CloudGate(_) | JobParams::CloudSweep(_)
@@ -764,23 +941,73 @@ pub(crate) fn submit(
         name: ctx.name,
         params: ctx.params,
         cwd: ctx.cwd.display().to_string(),
-        unit_name: format!("rsi-job-{id}"),
+        unit_name: runtime.unit_name(id),
         log_path: jobs_dir.join(format!("{id}.log")).display().to_string(),
         status_path: jobs_dir.join(format!("{id}.status")).display().to_string(),
         idempotency_key: ctx.idempotency_key,
         wake: ctx.wake,
     };
-    let (row, replayed) = store.insert_agent_job(&new, now)?;
+    let state = if hold {
+        JobState::Queued
+    } else {
+        JobState::Running
+    };
+    let (row, replayed) = store.insert_agent_job_in_state(&new, now, state)?;
     if replayed {
-        return Ok((row, true));
+        return Ok((row, replayed));
     }
+    if hold {
+        append_phase(
+            &new.log_path,
+            now,
+            "queue-wait: held by the deploy drain; the unit has not been launched",
+        );
+        return Ok((row, false));
+    }
+    launch_recorded(store, runtime, &new, command, false)?;
+    Ok((row, false))
+}
+
+/// #1608: append one `rsi-phase <epoch> <text>` line to a job's log from the
+/// daemon, before the unit's wrapper exists, so a job that never starts (held
+/// by a deploy drain, or stuck launching) still shows where it waited. Best
+/// effort: evidence must never fail a submit. The wrapper appends after it.
+fn append_phase(log_path: &str, now: DateTime<Utc>, text: &str) {
+    use std::io::Write;
+    let line = format!("rsi-phase {} {text}\n", now.timestamp());
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .and_then(|mut file| file.write_all(line.as_bytes()));
+    if let Err(error) = result {
+        tracing::warn!(%error, log_path, "could not write the job phase line");
+    }
+}
+
+/// Launch the unit of a recorded `running` job. A failure settles the row
+/// `failed` (with the owner wake when `wake_on_failure`) and returns the error.
+fn launch_recorded(
+    store: &Store,
+    runtime: &dyn JobRuntime,
+    new: &NewAgentJob,
+    command: JobCommand,
+    wake_on_failure: bool,
+) -> Result<()> {
+    let id = new.id;
+    append_phase(
+        &new.log_path,
+        Utc::now(),
+        &format!("unit-launch: requesting service {}", new.unit_name),
+    );
     let launch = (|| {
+        let cwd = PathBuf::from(&new.cwd);
         let build_environment =
-            prepare_build_environment(&new.params, &ctx.cwd, Path::new(&new.log_path))
-                .map_err(|error| format!("cannot prepare test/build job environment: {error}"))?;
+            prepare_build_environment(&new.params, &cwd, Path::new(&new.log_path))
+                .map_err(|error| format!("cannot prepare job build environment: {error}"))?;
         let spec = LaunchSpec {
             unit_name: new.unit_name.clone(),
-            cwd: ctx.cwd,
+            cwd,
             log_path: PathBuf::from(&new.log_path),
             status_path: PathBuf::from(&new.status_path),
             command,
@@ -789,21 +1016,126 @@ pub(crate) fn submit(
         runtime.launch(&spec)
     })();
     if let Err(message) = launch {
+        // A controller error after dispatch can leave real work alive. Keep
+        // its row and scratch recoverable unless service stop is confirmed.
+        if runtime.unit_active(&new.unit_name) {
+            log_unit_stop(&new.unit_name, "launch failed after dispatch");
+            let stopped = runtime.stop_unit(&new.unit_name);
+            if stopped.is_err() || runtime.unit_active(&new.unit_name) {
+                return Err(DaemonError::Process(format!(
+                    "{JOB_LAUNCH_FAILED}: {message}; job {id} remains running because service stop could not be confirmed"
+                )));
+            }
+        }
         let result = AgentJobResultV1 {
             detail: Some(tail(&message)),
             refusal: Some(JOB_LAUNCH_FAILED.into()),
             ..AgentJobResultV1::default()
         };
-        store.settle_agent_job(id, JobState::Failed, &result, false, Utc::now())?;
-        if matches!(new.params, JobParams::Test(_) | JobParams::Build(_)) {
-            cleanup_job_tmp(Path::new(&new.log_path));
-        }
+        store.settle_agent_job(id, JobState::Failed, &result, wake_on_failure, Utc::now())?;
+        cleanup_job_tmp(Path::new(&new.log_path));
         tracing::warn!(%id, %message, "agent job launch failed");
         return Err(DaemonError::Process(format!(
             "{JOB_LAUNCH_FAILED}: {message}"
         )));
     }
-    Ok((row, false))
+    Ok(())
+}
+
+/// #1566: launch every `queued` job whose owner the deploy drain no longer
+/// holds, oldest first. The start CASes `queued -> running` before the unit is
+/// launched, so a concurrent cancel or a second poll never double-launches.
+/// A launch failure settles the job `failed` and wakes its owner as usual.
+/// Returns the number of jobs launched.
+pub(crate) async fn start_queued_jobs(
+    store: &Arc<tokio::sync::Mutex<Store>>,
+    runtime: &Arc<dyn JobRuntime>,
+    tools: &JobTools,
+    drain: &crate::deploy_drain::DeployDrain,
+) -> Result<usize> {
+    let queued = {
+        let store = Arc::clone(store);
+        tokio::task::spawn_blocking(move || store.blocking_lock().list_queued_agent_jobs())
+            .await
+            .map_err(|error| DaemonError::Process(format!("queued job list join: {error}")))??
+    };
+    let mut started = 0;
+    let admission_cap = admission_cap_secs(drain);
+    for row in queued {
+        if admission_expired(&row.job, Utc::now(), admission_cap) {
+            let store = store.lock().await;
+            let settled = store.settle_agent_job_outcome(
+                row.job.id,
+                JobState::Failed,
+                &admission_timed_out_result(admission_cap),
+                row.job.wake == JobWake::Owner,
+                Utc::now(),
+            )?;
+            if settled.is_some() {
+                cleanup_job_tmp(Path::new(&row.job.log_path));
+            }
+            continue;
+        }
+        let owner = row.job.owner_session_id;
+        let has_parent = {
+            let store = store.lock().await;
+            store
+                .get_session(owner)?
+                .is_none_or(|session| session.parent_id.is_some())
+        };
+        if drain.holds(Some(owner), has_parent) {
+            continue;
+        }
+        let runtime = Arc::clone(runtime);
+        let store = Arc::clone(store);
+        let tools = tools.clone();
+        let launched = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let job = &row.job;
+            let new = NewAgentJob {
+                id: job.id,
+                owner_session_id: job.owner_session_id,
+                project_id: None,
+                name: job.name.clone(),
+                params: job.params.clone(),
+                cwd: job.cwd.clone(),
+                unit_name: job.unit_name.clone(),
+                log_path: job.log_path.clone(),
+                status_path: row.status_path.clone(),
+                idempotency_key: None,
+                wake: job.wake,
+            };
+            let store = store.blocking_lock();
+            let command = match job_command(&tools, &new.params, Path::new(&new.cwd), None) {
+                Ok(command) => command,
+                Err(error) => {
+                    let result = AgentJobResultV1 {
+                        detail: Some(tail(&error.to_string())),
+                        refusal: Some(JOB_LAUNCH_FAILED.into()),
+                        ..AgentJobResultV1::default()
+                    };
+                    store.settle_agent_job(
+                        job.id,
+                        JobState::Failed,
+                        &result,
+                        job.wake == JobWake::Owner,
+                        Utc::now(),
+                    )?;
+                    return Ok(false);
+                }
+            };
+            if !store.start_queued_agent_job(job.id, Utc::now())? {
+                return Ok(false);
+            }
+            Ok(
+                launch_recorded(&store, &*runtime, &new, command, job.wake == JobWake::Owner)
+                    .is_ok(),
+            )
+        })
+        .await
+        .map_err(|error| DaemonError::Process(format!("queued job start join: {error}")))??;
+        started += usize::from(launched);
+    }
+    Ok(started)
 }
 
 /// The exit status the wrapper recorded, if it finished.
@@ -1270,9 +1602,10 @@ pub(crate) fn classify_cloud_sweep_timed(
     (state, result)
 }
 
-/// Seconds from the job's creation to `now`.
+/// Seconds from the job's launch (its creation when never held) to `now`.
 fn job_wall_secs(job: &AgentJobV1, now: DateTime<Utc>) -> Option<i64> {
-    let created = DateTime::parse_from_rfc3339(&job.created_at).ok()?;
+    let created =
+        DateTime::parse_from_rfc3339(job.started_at.as_deref().unwrap_or(&job.created_at)).ok()?;
     Some((now - created.with_timezone(&Utc)).num_seconds().max(0))
 }
 
@@ -1402,8 +1735,8 @@ fn scratch_exceeds(dir: &Path, cap: u64) -> bool {
 }
 
 /// A running test/build job whose scratch is over `quota`: stop its unit and
-/// return the failed settlement. `None` when the job has no scratch or is
-/// within the quota.
+/// return the failed settlement only after confirming it is inactive. `None`
+/// when within quota or stopping is uncertain, preserving custody for retry.
 fn scratch_quota_breach(
     job: &rsi_common::agent_jobs::AgentJobV1,
     runtime: &dyn JobRuntime,
@@ -1415,8 +1748,14 @@ fn scratch_quota_breach(
     if !scratch_exceeds(&job_tmp_dir(Path::new(&job.log_path)), quota) {
         return None;
     }
+    log_unit_stop(&job.unit_name, "job scratch over its disk quota");
     if let Err(error) = runtime.stop_unit(&job.unit_name) {
         tracing::warn!(unit = %job.unit_name, %error, "cannot stop over-quota agent job unit");
+        return None;
+    }
+    if runtime.unit_active(&job.unit_name) {
+        tracing::warn!(unit = %job.unit_name, "over-quota agent job unit is still active after stop");
+        return None;
     }
     let result = AgentJobResultV1 {
         refusal: Some(JOB_SCRATCH_QUOTA_EXCEEDED.into()),
@@ -1427,6 +1766,130 @@ fn scratch_quota_breach(
         ..AgentJobResultV1::default()
     };
     Some((JobState::Failed, result))
+}
+
+/// #1337: whether a job is past its wall-clock timeout at `now`.
+fn timed_out(job: &AgentJobV1, now: DateTime<Utc>) -> bool {
+    job_timeout_secs(&job.params).is_some_and(|limit| {
+        job_wall_secs(job, now).is_some_and(|wall| u64::try_from(wall).unwrap_or(0) > limit)
+    })
+}
+
+/// One `rsi-phase <epoch> <name>[: detail]` line from a job log (#1591).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogPhase {
+    at: i64,
+    text: String,
+}
+
+/// The last few phase lines of a job log, oldest first. Streams the whole log
+/// (bounded by the job's log cap) because the phases may precede the tail.
+fn read_log_phases(path: &str) -> Vec<LogPhase> {
+    use std::io::BufRead;
+    const KEEP: usize = 6;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut phases: std::collections::VecDeque<LogPhase> = std::collections::VecDeque::new();
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+        if let Some(phase) = parse_phase(&String::from_utf8_lossy(&line)) {
+            if phases.len() == KEEP {
+                phases.pop_front();
+            }
+            phases.push_back(phase);
+        }
+        line.clear();
+    }
+    phases.into()
+}
+
+fn parse_phase(line: &str) -> Option<LogPhase> {
+    let rest = line.trim_end().strip_prefix("rsi-phase ")?;
+    let (at, text) = rest.split_once(' ')?;
+    Some(LogPhase {
+        at: at.parse().ok()?,
+        text: text.chars().take(300).collect(),
+    })
+}
+
+/// Where the run was when it timed out: the last phases with their age, so
+/// "20 minutes in a lock or slot wait" is visible without a log (#1591).
+fn phase_summary(phases: &[LogPhase], now: DateTime<Utc>) -> String {
+    let Some(last) = phases.last() else {
+        return "no phase was logged: the unit's wrapper never wrote its job-start line, so the run stalled before it started (or the log predates phase logging)".into();
+    };
+    let age = |at: i64| (now.timestamp() - at).max(0);
+    let waiting = last.text.contains("wait") && !last.text.contains("waited");
+    let mut out = format!(
+        "last phase `{}` began {}s before the timeout{}\nphases:",
+        last.text,
+        age(last.at),
+        if waiting {
+            " and the job was still waiting there"
+        } else {
+            ""
+        }
+    );
+    for phase in phases {
+        out.push_str(&format!("\n  -{}s {}", age(phase.at), phase.text));
+    }
+    out
+}
+
+/// The typed `job_timed_out` settlement: failing tests, the last phase and the
+/// log tail ride along so the owner sees how far the run got.
+fn timed_out_result(job: &AgentJobV1, now: DateTime<Utc>) -> AgentJobResultV1 {
+    let log = read_log_tail(&job.log_path);
+    let minutes = job_timeout_secs(&job.params).unwrap_or(0) / 60;
+    let note = format!(
+        "the test job ran past its {minutes}-minute timeout and its unit was stopped; narrow the filters (scripts/check-touched-shards) or ask your manager to raise timeout_minutes\n{}",
+        phase_summary(&read_log_phases(&job.log_path), now)
+    );
+    AgentJobResultV1 {
+        refusal: Some(JOB_TIMED_OUT.into()),
+        failing_tests: failing_test_names(&log),
+        detail: Some(if log.is_empty() {
+            note
+        } else {
+            format!("{note}\n{}", tail(&log))
+        }),
+        ..AgentJobResultV1::default()
+    }
+}
+
+/// #1337: a running job past its timeout: stop its unit and return the
+/// failed settlement only after confirming it is inactive. `None` when within
+/// its timeout or stopping is uncertain (the next poll retries).
+fn timeout_breach(
+    job: &AgentJobV1,
+    runtime: &dyn JobRuntime,
+    now: DateTime<Utc>,
+) -> Option<(JobState, AgentJobResultV1)> {
+    if !timed_out(job, now) {
+        return None;
+    }
+    log_unit_stop(&job.unit_name, "test job past its wall-clock timeout");
+    if let Err(error) = runtime.stop_unit(&job.unit_name) {
+        tracing::warn!(unit = %job.unit_name, %error, "cannot stop timed-out agent job unit");
+        return None;
+    }
+    if runtime.unit_active(&job.unit_name) {
+        tracing::warn!(unit = %job.unit_name, "timed-out agent job unit is still active after stop");
+        return None;
+    }
+    Some((JobState::Failed, timed_out_result(job, now)))
+}
+
+/// #1337: the andon event for a test job stopped at its timeout.
+fn timed_out_friction(job: &AgentJobV1) -> rsi_common::friction::NewFrictionEventV1 {
+    rsi_common::friction::NewFrictionEventV1::new(
+        rsi_common::friction::FrictionKind::RunawayProcess,
+        &[&format!("job_{}", job.kind.as_str()), "timeout"],
+    )
+    .session(Some(job.owner_session_id))
+    .evidence("job", job.id)
 }
 
 /// One poll over every `running` job: settle each whose unit finished (or
@@ -1465,18 +1928,29 @@ async fn poll_with_scratch_quota(
             let active = runtime.unit_active(&job.unit_name);
             let code = read_status(&row.status_path);
             let (state, result) = match code {
+                // A status file is the wrapper's final write, but the service
+                // may still be tearing down its children. Keep scratch until
+                // the backend confirms that group has stopped.
+                Some(_) if active => return Ok(false),
                 Some(code) => {
                     let log = read_log_tail(&job.log_path);
                     classify(job, Some(code), &log)
                 }
-                None if active => match scratch_quota_breach(job, &*runtime, scratch_quota) {
+                None if active => match timeout_breach(job, &*runtime, now)
+                    .or_else(|| scratch_quota_breach(job, &*runtime, scratch_quota))
+                {
                     Some(settlement) => settlement,
                     None => return Ok(false),
                 },
+                // #1337: the unit cap (timeout plus grace) stopped it while the
+                // daemon could not: still a timeout, not a lost job.
+                None if timed_out(job, now) => (JobState::Failed, timed_out_result(job, now)),
                 None => {
-                    let created = DateTime::parse_from_rfc3339(&job.created_at)
-                        .map(|t| t.with_timezone(&Utc))
-                        .unwrap_or(now);
+                    let created = DateTime::parse_from_rfc3339(
+                        job.started_at.as_deref().unwrap_or(&job.created_at),
+                    )
+                    .map(|t| t.with_timezone(&Utc))
+                    .unwrap_or(now);
                     if (now - created).num_seconds() < LAUNCH_GRACE_SECS {
                         return Ok(false);
                     }
@@ -1517,13 +1991,20 @@ async fn poll_with_scratch_quota(
                 }
             };
             // #1006: a `wake: none` job settles without its per-job owner wake.
-            let settled = store.blocking_lock().settle_agent_job_outcome(
-                job.id,
-                state,
-                &result,
-                job.wake == JobWake::Owner,
-                Utc::now(),
-            )?;
+            let settled = {
+                let store = store.blocking_lock();
+                let settled = store.settle_agent_job_outcome(
+                    job.id,
+                    state,
+                    &result,
+                    job.wake == JobWake::Owner,
+                    Utc::now(),
+                )?;
+                if settled.is_some() && result.refusal.as_deref() == Some(JOB_TIMED_OUT) {
+                    crate::friction::note_locked(&store, &timed_out_friction(job));
+                }
+                settled
+            };
             if matches!(
                 job.kind,
                 rsi_common::agent_jobs::JobKind::Test | rsi_common::agent_jobs::JobKind::Build
@@ -1557,6 +2038,18 @@ pub(crate) fn cancel_job(
 ) -> Result<(AgentJobV1, bool)> {
     let not_found = || DaemonError::InvalidParam(JOB_NOT_FOUND.into());
     let row = store.get_agent_job(job_id)?.ok_or_else(not_found)?;
+    if row.job.state == JobState::Queued {
+        // #1566: held behind a deploy drain, never launched: nothing to stop.
+        let result = AgentJobResultV1 {
+            refusal: Some(JOB_CANCELLED.into()),
+            detail: Some("cancelled by the owner before the held job started".into()),
+            ..AgentJobResultV1::default()
+        };
+        let settled =
+            store.settle_agent_job_outcome(job_id, JobState::Failed, &result, false, now)?;
+        let current = store.get_agent_job(job_id)?.ok_or_else(not_found)?;
+        return Ok((current.job, settled.is_some()));
+    }
     if row.job.state != JobState::Running {
         return Ok((row.job, false));
     }
@@ -1568,6 +2061,7 @@ pub(crate) fn cancel_job(
             row.job.unit_name
         ))
     };
+    log_unit_stop(&row.job.unit_name, "job cancelled");
     runtime.stop_unit(&row.job.unit_name).map_err(unstopped)?;
     if runtime.unit_active(&row.job.unit_name) {
         return Err(unstopped("the unit is still active".into()));
@@ -1626,7 +2120,7 @@ pub(crate) async fn sweep_terminal_scratch(
             }
             let row = store.blocking_lock().get_agent_job(id)?;
             let Some(row) = row else { continue };
-            if row.job.state == JobState::Running {
+            if !row.job.state.is_terminal() {
                 continue;
             }
             cleanup_job_tmp(Path::new(&row.job.log_path));
@@ -1643,7 +2137,9 @@ pub(crate) async fn sweep_terminal_scratch(
 pub async fn run_agent_jobs_loop(
     store: Arc<tokio::sync::Mutex<Store>>,
     runtime: Arc<dyn JobRuntime>,
+    drain: Arc<crate::deploy_drain::DeployDrain>,
 ) {
+    let tools = JobTools::discover();
     let mut interval = tokio::time::interval(TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut first = true;
@@ -1655,6 +2151,13 @@ pub async fn run_agent_jobs_loop(
             }
             Ok(_) => {}
             Err(error) => tracing::warn!(%error, "agent job poll deferred"),
+        }
+        match start_queued_jobs(&store, &runtime, &tools, &drain).await {
+            Ok(started) if started > 0 => {
+                tracing::info!(started, "held agent jobs started after the deploy drain");
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "held agent job start deferred"),
         }
         match jobs_dir() {
             Ok(dir) => match sweep_terminal_scratch(&store, &dir).await {
@@ -1685,6 +2188,8 @@ mod tests {
 
     fn params(kind: JobKind, value: serde_json::Value) -> JobParams {
         AgentSubmitJobRequestV1 {
+            project_id: None,
+            sandbox_session_id: None,
             kind,
             params: value,
             name: None,
@@ -1760,6 +2265,268 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
+    fn unsupported_job_platforms_refuse_before_persisting_or_launching() {
+        let (store, dir) = open();
+        let request = ctx(Uuid::new_v4(), dir.path(), None);
+        let error = submit(
+            &*store.blocking_lock(),
+            &UnsupportedJobRuntime,
+            &tools(),
+            dir.path(),
+            request,
+            Utc::now(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(rsi_common::agent_jobs::JOB_PLATFORM_UNSUPPORTED)
+        );
+        assert!(
+            store
+                .blocking_lock()
+                .list_running_agent_jobs()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn launchd_accepts_package_build_tests_and_names_linux_workflow_refusals() {
+        let runtime = launchd::LaunchdJobRuntime::default();
+        for p in [
+            params(
+                JobKind::Build,
+                serde_json::json!({"command":"check","workspace":true}),
+            ),
+            params(
+                JobKind::Test,
+                serde_json::json!({"package":"rsid","lib_only":true}),
+            ),
+        ] {
+            assert_eq!(runtime.validate(&p), Ok(()));
+        }
+        for p in [
+            params(JobKind::Test, serde_json::json!({"shard":"other-01"})),
+            params(
+                JobKind::Test,
+                serde_json::json!({"candidate_receipt":"rsi/example"}),
+            ),
+            params(
+                JobKind::Landing,
+                serde_json::json!({"accepted":"a".repeat(40)}),
+            ),
+        ] {
+            assert_eq!(
+                runtime.validate(&p),
+                Err(rsi_common::agent_jobs::JOB_PLATFORM_UNSUPPORTED)
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn an_uncertain_launch_keeps_its_running_row_and_scratch_for_recovery() {
+        struct Uncertain;
+        impl JobRuntime for Uncertain {
+            fn launch(&self, _: &LaunchSpec) -> std::result::Result<(), String> {
+                Err("controller unavailable after dispatch".into())
+            }
+            fn unit_active(&self, _: &str) -> bool {
+                true
+            }
+            fn stop_unit(&self, _: &str) -> std::result::Result<(), String> {
+                Err("controller unavailable".into())
+            }
+        }
+        let (store, dir) = open();
+        let store = store.blocking_lock();
+        let owner = Uuid::new_v4();
+        let error = submit(
+            &store,
+            &Uncertain,
+            &tools(),
+            dir.path(),
+            ctx(owner, dir.path(), None),
+            Utc::now(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("remains running"));
+        let jobs = store.list_running_agent_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(job_tmp_dir(Path::new(&jobs[0].job.log_path)).is_dir());
+        assert!(wakes_for(&store, owner).is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_completed_wrapper_keeps_scratch_until_its_service_stops() {
+        let (store, dir) = open();
+        let runtime = Arc::new(FakeRuntime::default());
+        let dynamic: Arc<dyn JobRuntime> = runtime.clone();
+        let owner = Uuid::new_v4();
+        let (row, _) = submit(
+            &*store.lock().await,
+            &*runtime,
+            &tools(),
+            dir.path(),
+            ctx(owner, dir.path(), None),
+            Utc::now(),
+        )
+        .unwrap();
+        std::fs::write(&row.status_path, "0\n").unwrap();
+        let scratch = job_tmp_dir(Path::new(&row.job.log_path));
+        assert_eq!(poll_once(&store, &dynamic, Utc::now()).await.unwrap(), 0);
+        assert!(scratch.is_dir());
+        assert!(wakes_for(&*store.lock().await, owner).is_empty());
+        *runtime.active.lock().unwrap() = false;
+        assert_eq!(poll_once(&store, &dynamic, Utc::now()).await.unwrap(), 1);
+        assert_eq!(wakes_for(&*store.lock().await, owner).len(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn wait_for_launchd_completion(runtime: &dyn JobRuntime, row: &AgentJobRow) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while runtime.unit_active(&row.job.unit_name) || read_status(&row.status_path).is_none() {
+            if std::time::Instant::now() > deadline {
+                let _ = runtime.stop_unit(&row.job.unit_name);
+                panic!(
+                    "launchd completion timed out: {}",
+                    read_log_tail(&row.job.log_path)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn macos_build_job_persists_status_logs_and_one_wake_across_restart() {
+        let dir = disk_fixture();
+        let cwd = dir.path().join("fixture");
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::write(
+            cwd.join("Cargo.toml"),
+            "[package]\nname = 'rsi-job-smoke'\nversion = '0.1.0'\nedition = '2024'\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(cwd.join("src/lib.rs"), "pub fn smoke() -> u8 { 42 }\n").unwrap();
+        let db = dir.path().join("jobs.db");
+        let owner = Uuid::new_v4();
+        let store = Store::open(&db).unwrap();
+        let runtime = platform_job_runtime();
+        let tools = JobTools {
+            cargo_slot: PathBuf::from("/usr/bin/env"),
+            ..tools()
+        };
+        let (row, _) = submit(
+            &store,
+            &*runtime,
+            &tools,
+            dir.path(),
+            ctx(owner, &cwd, Some("mac-build")),
+            Utc::now(),
+        )
+        .unwrap();
+        // Destroy every in-memory object before completion: the reopened store
+        // and a fresh runtime recover solely from durable row/service/status.
+        drop(store);
+        drop(runtime);
+        let runtime = platform_job_runtime();
+        wait_for_launchd_completion(&*runtime, &row).await;
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open(&db).unwrap()));
+        assert_eq!(poll_once(&store, &runtime, Utc::now()).await.unwrap(), 1);
+        assert_eq!(poll_once(&store, &runtime, Utc::now()).await.unwrap(), 0);
+        let guard = store.lock().await;
+        let job = guard.get_agent_job(row.job.id).unwrap().unwrap().job;
+        assert_eq!(job.state, JobState::Succeeded);
+        assert_eq!(job.exit_code, Some(0));
+        assert!(read_log_tail(&job.log_path).contains("rsi-job-smoke"));
+        let wakes = wakes_for(&guard, owner);
+        assert_eq!(wakes.len(), 1);
+        assert!(wakes[0].message.contains(&job.id.to_string()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn macos_cancel_stops_only_its_service_and_timeout_stops_its_group() {
+        let dir = disk_fixture();
+        let runtime = platform_job_runtime();
+        let make_spec = |timeout| LaunchSpec {
+            unit_name: runtime.unit_name(Uuid::new_v4()),
+            cwd: dir.path().to_path_buf(),
+            log_path: dir.path().join(format!("{}.log", Uuid::new_v4())),
+            status_path: dir.path().join(format!("{}.status", Uuid::new_v4())),
+            command: JobCommand {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "echo running; while :; do echo tick >> \"$1\"; sleep 0.1; done".into(),
+                    "rsi-job".into(),
+                    dir.path()
+                        .join(format!("{}.heartbeat", Uuid::new_v4()))
+                        .display()
+                        .to_string(),
+                ],
+                runtime_max_secs: timeout,
+                stop_timeout_secs: 1,
+                log_max_bytes: 4096,
+                memory_max_gib: 1,
+                cpu_quota_percent: 100,
+            },
+            build_environment: None,
+        };
+        let cancelled = make_spec(30);
+        let other = make_spec(5);
+        runtime.launch(&cancelled).unwrap();
+        if let Err(error) = runtime.launch(&other) {
+            runtime.stop_unit(&cancelled.unit_name).unwrap();
+            panic!("second launch failed: {error}");
+        }
+        let started = std::time::Instant::now() + Duration::from_secs(3);
+        while [&cancelled, &other]
+            .iter()
+            .any(|spec| !Path::new(spec.command.argv.last().unwrap()).is_file())
+        {
+            if std::time::Instant::now() > started {
+                runtime.stop_unit(&cancelled.unit_name).unwrap();
+                runtime.stop_unit(&other.unit_name).unwrap();
+                panic!("job descendants did not start");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        runtime.stop_unit(&cancelled.unit_name).unwrap();
+        assert!(!runtime.unit_active(&cancelled.unit_name));
+        assert!(
+            runtime.unit_active(&other.unit_name),
+            "cancellation leaves the other job running"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while runtime.unit_active(&other.unit_name) {
+            if std::time::Instant::now() > deadline {
+                runtime.stop_unit(&other.unit_name).unwrap();
+                panic!("job watchdog did not stop its service");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(read_status(other.status_path.to_str().unwrap()), None);
+        for spec in [&cancelled, &other] {
+            let path = Path::new(spec.command.argv.last().unwrap());
+            let stopped = std::fs::read(path).unwrap_or_default();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            assert_eq!(
+                std::fs::read(path).unwrap_or_default(),
+                stopped,
+                "launchd stopped the job's descendant group"
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
     fn package_test_and_build_units_hold_the_shard_runner_artifact_lock_shared() {
         let jobs = disk_fixture();
         let store = Store::open_in_memory().unwrap();
@@ -1794,20 +2561,22 @@ mod tests {
                 environment.artifact_lock.as_deref(),
                 holds_lock.then_some(lock.as_path())
             );
-            let flock = args.iter().position(|a| a == "flock");
-            assert_eq!(flock.is_some(), holds_lock);
-            let Some(flock) = flock else { continue };
-            // The lock wraps the job's own argv: `flock --shared <lock> <cargo-slot ...>`.
+            let waiter = args.iter().position(|a| a == "rsi-lock");
+            assert_eq!(waiter.is_some(), holds_lock);
+            let Some(waiter) = waiter else { continue };
+            // The lock wraps the job's own argv: the waiter script takes the
+            // lock shared (logging a contended wait) and then runs it.
+            assert_eq!(args[waiter - 1], LOCK_WAIT);
             assert_eq!(
-                args[flock..flock + 4],
-                ["flock", "--shared", lock.to_str().unwrap(), "/x/cargo-slot"]
+                args[waiter + 1..waiter + 3],
+                [lock.to_str().unwrap(), "/x/cargo-slot"]
             );
         }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
-    fn test_and_build_units_receive_only_the_required_build_environment() {
+    fn build_and_gate_units_receive_only_the_required_build_environment() {
         let jobs = disk_fixture();
         let store = Store::open_in_memory().unwrap();
         let runtime = FakeRuntime::default();
@@ -1823,15 +2592,17 @@ mod tests {
                 serde_json::json!({"command":"check","workspace":true}),
                 true,
             ),
-            (JobKind::Landing, serde_json::json!({"accepted":oid}), false),
+            (JobKind::Landing, serde_json::json!({"accepted":oid}), true),
             (
                 JobKind::CloudGate,
                 serde_json::json!({"accepted":oid}),
-                false,
+                true,
             ),
             (JobKind::CloudSweep, serde_json::json!({"sha":oid}), false),
         ] {
-            let mut context = ctx(Uuid::new_v4(), jobs.path(), None);
+            let cwd = jobs.path().join(format!("{kind:?}"));
+            std::fs::create_dir(&cwd).unwrap();
+            let mut context = ctx(Uuid::new_v4(), &cwd, None);
             context.params = params(kind, value);
             let (row, _) =
                 submit(&store, &runtime, &tools(), jobs.path(), context, Utc::now()).unwrap();
@@ -1860,6 +2631,11 @@ mod tests {
                     job_tmp_dir(Path::new(&row.job.log_path))
                 );
                 assert!(environment.target_dir.is_absolute());
+                // The lander validates that the target already exists and is
+                // outside its TMPDIR before it starts any gates.
+                assert_eq!(environment.target_dir, cwd.join("target"));
+                assert!(environment.target_dir.is_dir());
+                assert!(!environment.target_dir.starts_with(&environment.tmp_dir));
                 assert!(args.contains(&format!(
                     "--setenv=TMPDIR={}",
                     environment.tmp_dir.display()
@@ -2015,6 +2791,208 @@ mod tests {
             .into_iter()
             .filter(|job| job.wake_session_id == Some(owner))
             .collect()
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn recipe_jobs_persist_replay_reconcile_and_timeout_with_existing_wake_policy() {
+        let (store, dir) = open();
+        std::fs::create_dir(dir.path().join(".rsi")).unwrap();
+        std::fs::write(dir.path().join(".rsi/jobs.toml"),
+            "version = 1\n[recipes.gate]\nrunner = 'make'\ntarget = 'check-cpu'\ntimeout_minutes = 20\ncpu_quota_percent = 200\n").unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let dynamic: Arc<dyn JobRuntime> = runtime.clone();
+        let owner = Uuid::new_v4();
+        let now = Utc::now();
+        let recipe_ctx = |key, wake| SubmitContext {
+            params: params(
+                JobKind::Test,
+                serde_json::json!({"recipe":"gate","timeout_minutes":10}),
+            ),
+            wake,
+            ..ctx(owner, dir.path(), Some(key))
+        };
+        let (finished, replayed) = submit(
+            &*store.lock().await,
+            &*runtime,
+            &tools(),
+            dir.path(),
+            recipe_ctx("finished", JobWake::Owner),
+            now,
+        )
+        .unwrap();
+        assert!(!replayed);
+        let (again, replayed) = submit(
+            &*store.lock().await,
+            &*runtime,
+            &tools(),
+            dir.path(),
+            recipe_ctx("finished", JobWake::Owner),
+            now,
+        )
+        .unwrap();
+        assert!(replayed);
+        assert_eq!(again.job.id, finished.job.id);
+        assert_eq!(runtime.launched.lock().unwrap().len(), 1);
+        // Reconciliation needs only the durable row and status, not the
+        // submitting turn or a recipe manifest that may since have changed.
+        std::fs::remove_file(dir.path().join(".rsi/jobs.toml")).unwrap();
+        std::fs::write(&finished.status_path, "0\n").unwrap();
+        *runtime.active.lock().unwrap() = false;
+        assert_eq!(poll_once(&store, &dynamic, now).await.unwrap(), 1);
+        assert_eq!(poll_once(&store, &dynamic, now).await.unwrap(), 0);
+        {
+            let guard = store.lock().await;
+            let row = guard.get_agent_job(finished.job.id).unwrap().unwrap();
+            assert_eq!(row.job.params, finished.job.params);
+            assert_eq!(row.job.state, JobState::Succeeded);
+            assert_eq!(row.job.result.unwrap().exit_code, Some(0));
+            assert_eq!(wakes_for(&guard, owner).len(), 1);
+        }
+        std::fs::write(dir.path().join(".rsi/jobs.toml"),
+            "version = 1\n[recipes.gate]\nrunner = 'make'\ntarget = 'check-cpu'\ntimeout_minutes = 20\ncpu_quota_percent = 200\n").unwrap();
+        let (timed, _) = submit(
+            &*store.lock().await,
+            &*runtime,
+            &tools(),
+            dir.path(),
+            recipe_ctx("timed", JobWake::None),
+            now,
+        )
+        .unwrap();
+        let later = now + chrono::Duration::minutes(11);
+        assert_eq!(poll_once(&store, &dynamic, later).await.unwrap(), 1);
+        let guard = store.lock().await;
+        let row = guard.get_agent_job(timed.job.id).unwrap().unwrap();
+        assert_eq!(row.job.state, JobState::Failed);
+        assert_eq!(
+            row.job.result.unwrap().refusal.as_deref(),
+            Some(JOB_TIMED_OUT)
+        );
+        assert_eq!(
+            wakes_for(&guard, owner).len(),
+            1,
+            "wake none remains silent for a batch predicate"
+        );
+        assert_eq!(*runtime.stopped.lock().unwrap(), vec![timed.job.unit_name]);
+        assert!(!job_tmp_dir(Path::new(&timed.job.log_path)).exists());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_recipe_declaring_less_than_the_stamped_default_timeout_runs_at_its_declaration() {
+        let store = Store::open_in_memory().unwrap();
+        let dir = disk_fixture();
+        std::fs::create_dir(dir.path().join(".rsi")).unwrap();
+        std::fs::write(dir.path().join(".rsi/jobs.toml"),
+            "version = 1\n[recipes.gate]\nrunner = 'make'\ntarget = 'gate'\ntimeout_minutes = 10\ncpu_quota_percent = 200\n").unwrap();
+        let runtime = FakeRuntime::default();
+        let owner = Uuid::new_v4();
+        // The verb stamps the operator default (20) on a request naming none.
+        let (row, _) = submit(
+            &store,
+            &runtime,
+            &tools(),
+            dir.path(),
+            SubmitContext {
+                params: params(
+                    JobKind::Test,
+                    serde_json::json!({"recipe":"gate","timeout_minutes":20}),
+                ),
+                ..ctx(owner, dir.path(), None)
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(job_timeout_secs(&row.job.params), Some(600));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn recipe_refusals_do_not_record_or_launch_a_job() {
+        let store = Store::open_in_memory().unwrap();
+        let dir = disk_fixture();
+        let runtime = FakeRuntime::default();
+        let owner = Uuid::new_v4();
+        let request = || SubmitContext {
+            params: params(
+                JobKind::Test,
+                serde_json::json!({"recipe":"gate","timeout_minutes":20}),
+            ),
+            ..ctx(owner, dir.path(), None)
+        };
+        assert!(
+            submit(
+                &store,
+                &runtime,
+                &tools(),
+                dir.path(),
+                request(),
+                Utc::now()
+            )
+            .is_err()
+        );
+        std::fs::create_dir(dir.path().join(".rsi")).unwrap();
+        for manifest in [
+            "version = 1\n[recipes]",
+            "version = 2\n[recipes]",
+            "version = 1\n[recipes.other]\nrunner = 'make'\ntarget = 'gate'\ntimeout_minutes = 20\ncpu_quota_percent = 200\n",
+        ] {
+            std::fs::write(dir.path().join(".rsi/jobs.toml"), manifest).unwrap();
+            assert!(
+                submit(
+                    &store,
+                    &runtime,
+                    &tools(),
+                    dir.path(),
+                    request(),
+                    Utc::now()
+                )
+                .is_err()
+            );
+        }
+        assert!(store.list_agent_jobs(owner, 10).unwrap().is_empty());
+        assert!(runtime.launched.lock().unwrap().is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn package_test_exact_matching_is_a_libtest_flag_and_preserves_default_argv() {
+        let command = |value| {
+            job_command(
+                &tools(),
+                &params(JobKind::Test, value),
+                Path::new("/w/sandbox"),
+                None,
+            )
+            .unwrap()
+            .argv
+        };
+        for filters in [
+            serde_json::json!([]),
+            serde_json::json!(["module::tests::one", "module::tests::two"]),
+        ] {
+            for lib_only in [false, true] {
+                let mut value =
+                    serde_json::json!({"package":"rsi","filters":filters,"lib_only":lib_only});
+                let default = command(value.clone());
+                value["exact"] = serde_json::json!(false);
+                assert_eq!(command(value.clone()), default);
+                value["exact"] = serde_json::json!(true);
+                let exact = command(value);
+                let mut expected = default;
+                if filters.as_array().unwrap().is_empty() {
+                    expected.push("--".into());
+                }
+                expected.push("--exact".into());
+                assert_eq!(exact, expected);
+                let separator = exact.iter().position(|arg| arg == "--").unwrap();
+                let mut libtest_args: Vec<String> =
+                    serde_json::from_value(filters.clone()).unwrap();
+                libtest_args.push("--exact".into());
+                assert_eq!(exact[separator + 1..], libtest_args);
+            }
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -2487,7 +3465,9 @@ mod tests {
                 exit_code: result.exit_code,
                 result: None,
                 created_at: Utc::now().to_rfc3339(),
+                started_at: None,
                 finished_at: None,
+                held: None,
                 wake: JobWake::Owner,
             };
             crate::store::agent_jobs::wake_message(&job, JobState::Failed, result)
@@ -3467,7 +4447,9 @@ mod tests {
         let text = std::fs::read_to_string(&log).unwrap();
         assert!(text.len() < 300, "log stayed bounded: {}", text.len());
         assert!(text.contains("log reached the 100-byte cap"));
-        // Under the cap a zero exit stays zero and the log is untouched.
+        // Under the cap a zero exit stays zero and the log is untouched. Each
+        // job has a fresh log (the wrapper appends), so start from none.
+        std::fs::remove_file(&log).unwrap();
         let out = Command::new("/bin/sh")
             .args(["-c", WRAPPER, "rsi-job"])
             .arg(&log)
@@ -3478,7 +4460,10 @@ mod tests {
             .unwrap();
         assert!(out.status.success());
         assert_eq!(read_status(status.to_str().unwrap()), Some(0));
-        assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "fine");
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.starts_with("rsi-phase "), "{text}");
+        assert!(text.contains(" job-start\n"), "{text}");
+        assert_eq!(text.lines().last(), Some("fine"));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -3521,6 +4506,8 @@ mod tests {
     fn the_wrapper_records_the_exit_status_and_log_and_keeps_arguments_inert() {
         let dir = tempfile::tempdir().unwrap();
         let (log, status) = (dir.path().join("j.log"), dir.path().join("j.status"));
+        // #1608: the daemon's pre-launch phase line survives the wrapper.
+        std::fs::write(&log, "rsi-phase 1 unit-launch: requesting service x\n").unwrap();
         let out = Command::new("/bin/sh")
             .args(["-c", WRAPPER, "rsi-job"])
             .arg(&log)
@@ -3531,7 +4518,10 @@ mod tests {
             .unwrap();
         assert!(out.status.success());
         assert_eq!(read_status(status.to_str().unwrap()), Some(7));
-        assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "hello");
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.starts_with("rsi-phase 1 unit-launch:"), "{text}");
+        assert!(text.contains(" job-start\n"), "{text}");
+        assert_eq!(text.lines().last(), Some("hello"));
         // A hostile argument is data, not shell text.
         let canary = dir.path().join("pwned");
         let hostile = format!("x; touch {}", canary.display());
@@ -3544,6 +4534,53 @@ mod tests {
             .output()
             .unwrap();
         assert!(!canary.exists());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn an_empty_log_timeout_says_no_phase_was_logged() {
+        let summary = phase_summary(&[], Utc::now());
+        assert!(summary.contains("no phase was logged"), "{summary}");
+    }
+
+    /// #1591: a contended artifact lock is logged before the unit blocks, and
+    /// the held line says how long it waited; the job then runs normally.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_contended_artifact_lock_wait_is_logged_with_its_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("lock");
+        std::fs::write(&lock, "").unwrap();
+        let mut holder = Command::new("flock")
+            .args(["--exclusive", lock.to_str().unwrap(), "sleep", "2"])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let out = Command::new("/bin/sh")
+            .args(["-c", LOCK_WAIT, "rsi-lock"])
+            .arg(&lock)
+            .args(["echo", "ran"])
+            .output()
+            .unwrap();
+        holder.wait().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{text}");
+        assert!(text.contains(" artifact-lock-wait: "), "{text}");
+        assert!(text.contains(" artifact-lock-held: waited "), "{text}");
+        assert_eq!(text.lines().last(), Some("ran"));
+        let phases: Vec<LogPhase> = text.lines().filter_map(parse_phase).collect();
+        assert_eq!(phases.len(), 2, "{text}");
+        assert!(phases[1].at >= phases[0].at);
+        // Uncontended: only the held line, waited 0s.
+        let out = Command::new("/bin/sh")
+            .args(["-c", LOCK_WAIT, "rsi-lock"])
+            .arg(&lock)
+            .args(["echo", "ran"])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(!text.contains("artifact-lock-wait"), "{text}");
+        assert!(text.contains("waited 0s"), "{text}");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -3675,6 +4712,113 @@ mod tests {
             settled.job.result.unwrap().refusal.as_deref(),
             Some(JOB_SCRATCH_QUOTA_EXCEEDED)
         );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    async fn assert_quota_stop_preserves_custody_until_retry(fail_stop: bool, kind: JobKind) {
+        struct Stubborn {
+            inner: FakeRuntime,
+            uncertain: Mutex<bool>,
+            fail_stop: bool,
+        }
+        impl JobRuntime for Stubborn {
+            fn launch(&self, spec: &LaunchSpec) -> std::result::Result<(), String> {
+                self.inner.launch(spec)
+            }
+            fn unit_active(&self, unit: &str) -> bool {
+                self.inner.unit_active(unit)
+            }
+            fn stop_unit(&self, unit: &str) -> std::result::Result<(), String> {
+                if *self.uncertain.lock().unwrap() {
+                    if self.fail_stop {
+                        return Err("service controller stop failed".into());
+                    }
+                    return Ok(());
+                }
+                self.inner.stop_unit(unit)
+            }
+        }
+        let (store, dir) = open();
+        let runtime = Arc::new(Stubborn {
+            inner: FakeRuntime::default(),
+            uncertain: Mutex::new(true),
+            fail_stop,
+        });
+        let dynamic: Arc<dyn JobRuntime> = runtime.clone();
+        let owner = Uuid::new_v4();
+        let mut context = ctx(owner, dir.path(), None);
+        if kind == JobKind::Test {
+            context.params = params(kind, serde_json::json!({"package":"rsid","filters":[]}));
+        }
+        let (row, _) = submit(
+            &*store.lock().await,
+            &*runtime,
+            &tools(),
+            dir.path(),
+            context,
+            Utc::now(),
+        )
+        .unwrap();
+        let scratch = job_tmp_dir(Path::new(&row.job.log_path));
+        let artifact = scratch.join("blob");
+        let contents = vec![7u8; 256 * 1024];
+        std::fs::write(&artifact, &contents).unwrap();
+
+        // An error or a successful stop that leaves the service active must
+        // keep the running row, artifacts and wake queue unchanged on retry.
+        for _ in 0..2 {
+            assert_eq!(
+                poll_with_scratch_quota(&store, &dynamic, Utc::now(), 64 * 1024)
+                    .await
+                    .unwrap(),
+                0
+            );
+            let guard = store.lock().await;
+            assert_eq!(
+                guard.get_agent_job(row.job.id).unwrap().unwrap().job,
+                row.job
+            );
+            assert_eq!(guard.list_running_agent_jobs().unwrap().len(), 1);
+            assert!(wakes_for(&guard, owner).is_empty());
+            assert_eq!(std::fs::read(&artifact).unwrap(), contents);
+            assert!(runtime.unit_active(&row.job.unit_name));
+        }
+
+        // Reconciliation retries the stop, then settles and wakes once.
+        *runtime.uncertain.lock().unwrap() = false;
+        assert_eq!(
+            poll_with_scratch_quota(&store, &dynamic, Utc::now(), 64 * 1024)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!runtime.unit_active(&row.job.unit_name));
+        assert!(!scratch.exists());
+        assert_eq!(poll_once(&store, &dynamic, Utc::now()).await.unwrap(), 0);
+        let guard = store.lock().await;
+        let job = guard.get_agent_job(row.job.id).unwrap().unwrap().job;
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(
+            job.result.unwrap().refusal.as_deref(),
+            Some(JOB_SCRATCH_QUOTA_EXCEEDED)
+        );
+        assert_eq!(wakes_for(&guard, owner).len(), 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn oversized_scratch_failed_stop_preserves_custody_until_successful_retry() {
+        for kind in [JobKind::Build, JobKind::Test] {
+            assert_quota_stop_preserves_custody_until_retry(true, kind).await;
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn oversized_scratch_lingering_service_preserves_custody_until_successful_retry() {
+        for kind in [JobKind::Build, JobKind::Test] {
+            assert_quota_stop_preserves_custody_until_retry(false, kind).await;
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -3945,6 +5089,360 @@ mod tests {
         assert!(!tmp.exists());
     }
 
+    fn engage_drain(drain: &crate::deploy_drain::DeployDrain) {
+        let row = crate::store::agent_deploys::DeployRow {
+            id: Uuid::new_v4(),
+            owner_session_id: Some(Uuid::new_v4()),
+            sha: "0".repeat(40),
+            manifest: Vec::new(),
+            state: rsi_common::agent_deploy::DeployState::Staged,
+            reason: None,
+            deadline_at: Utc::now() + chrono::Duration::seconds(600),
+            operator: false,
+            forced: false,
+        };
+        drain.sync(Some(&row), true, Utc::now());
+        assert!(drain.is_draining());
+    }
+
+    fn held_test_job(
+        store: &Store,
+        runtime: &dyn JobRuntime,
+        dir: &Path,
+        owner: Uuid,
+    ) -> AgentJobRow {
+        let mut c = ctx(owner, dir, None);
+        c.params = params(
+            JobKind::Test,
+            serde_json::json!({"package":"rsid","filters":[]}),
+        );
+        let (row, replayed) =
+            submit_with_hold(store, runtime, &tools(), dir, c, true, Utc::now()).unwrap();
+        assert!(!replayed);
+        row
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_held_job_survives_store_reopen_and_starts_once_across_restarts() {
+        let dir = disk_fixture();
+        let path = dir.path().join("held-job.db");
+        let runtime = Arc::new(FakeRuntime::default());
+        let job_runtime: Arc<dyn JobRuntime> = runtime.clone();
+        let store = Store::open(&path).unwrap();
+        let row = held_test_job(&store, &*runtime, dir.path(), Uuid::new_v4());
+        drop(store);
+
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open(&path).unwrap()));
+        let drain = crate::deploy_drain::DeployDrain::new();
+        engage_drain(&drain);
+        let restored = store
+            .lock()
+            .await
+            .get_agent_job(row.job.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.job.state, JobState::Queued);
+        assert_eq!(restored.job.held.as_deref(), Some("deploy_draining"));
+        assert_eq!(restored.job.started_at, None);
+        assert_eq!(
+            start_queued_jobs(&store, &job_runtime, &tools(), &drain)
+                .await
+                .unwrap(),
+            0
+        );
+        drain.sync(None, true, Utc::now());
+        assert_eq!(
+            start_queued_jobs(&store, &job_runtime, &tools(), &drain)
+                .await
+                .unwrap(),
+            1
+        );
+        drop(store);
+
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open(&path).unwrap()));
+        assert_eq!(
+            start_queued_jobs(&store, &job_runtime, &tools(), &drain)
+                .await
+                .unwrap(),
+            0
+        );
+        let restored = store
+            .lock()
+            .await
+            .get_agent_job(row.job.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.job.state, JobState::Running);
+        assert!(restored.job.started_at.is_some());
+        let launched = runtime.launched.lock().unwrap();
+        assert_eq!(launched.len(), 1);
+        assert_eq!(launched[0].unit_name, row.job.unit_name);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_held_job_is_queued_without_a_unit_and_starts_when_the_drain_ends() {
+        let (store, dir) = open();
+        let runtime = Arc::new(FakeRuntime::default());
+        let job_runtime: Arc<dyn JobRuntime> = runtime.clone();
+        let drain = crate::deploy_drain::DeployDrain::new();
+        engage_drain(&drain);
+        let owner = Uuid::new_v4();
+        let row = held_test_job(&*store.lock().await, &*runtime, dir.path(), owner);
+        assert_eq!(row.job.state, JobState::Queued);
+        assert_eq!(row.job.held.as_deref(), Some("deploy_draining"));
+        assert!(runtime.launched.lock().unwrap().is_empty());
+        // #1608: the held job's log already says where it waits.
+        let held_phases = read_log_phases(&row.job.log_path);
+        assert_eq!(held_phases.len(), 1, "{held_phases:?}");
+        assert!(
+            held_phases[0]
+                .text
+                .starts_with("queue-wait: held by the deploy drain"),
+            "{held_phases:?}"
+        );
+        // A queued job is neither polled as running nor swept as terminal.
+        assert!(
+            store
+                .lock()
+                .await
+                .list_running_agent_jobs()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            poll_once(&store, &job_runtime, Utc::now()).await.unwrap(),
+            0
+        );
+
+        // Still draining: nothing starts.
+        assert_eq!(
+            start_queued_jobs(&store, &job_runtime, &tools(), &drain)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(runtime.launched.lock().unwrap().is_empty());
+
+        // The hold ends: the job starts once, stamped, with the same unit.
+        drain.sync(None, true, Utc::now());
+        assert_eq!(
+            start_queued_jobs(&store, &job_runtime, &tools(), &drain)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            start_queued_jobs(&store, &job_runtime, &tools(), &drain)
+                .await
+                .unwrap(),
+            0,
+            "a second poll never double-launches"
+        );
+        let launched = runtime.launched.lock().unwrap().clone();
+        assert_eq!(launched.len(), 1);
+        assert_eq!(launched[0].unit_name, row.job.unit_name);
+        let stored = store
+            .lock()
+            .await
+            .get_agent_job(row.job.id)
+            .unwrap()
+            .unwrap()
+            .job;
+        assert_eq!(stored.state, JobState::Running);
+        assert_eq!(stored.held, None);
+        assert!(stored.started_at.is_some());
+        // The launch phase follows the hold phase, before any wrapper output.
+        let phases = read_log_phases(&row.job.log_path);
+        assert_eq!(phases.len(), 2, "{phases:?}");
+        assert!(phases[0].text.starts_with("queue-wait:"), "{phases:?}");
+        assert!(
+            phases[1]
+                .text
+                .starts_with("unit-launch: requesting service"),
+            "{phases:?}"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_submitted_job_logs_its_launch_phase_before_the_unit_exists() {
+        let store = Store::open_in_memory().expect("store");
+        let dir = disk_fixture();
+        let runtime = FakeRuntime::default();
+        let mut c = ctx(Uuid::new_v4(), dir.path(), None);
+        c.params = params(
+            JobKind::Test,
+            serde_json::json!({"package":"rsid","filters":[]}),
+        );
+        let (row, _) = submit(&store, &runtime, &tools(), dir.path(), c, Utc::now()).unwrap();
+        // The fake runtime never runs the wrapper, so the daemon's line is the
+        // only evidence, and the summary names it as the last phase.
+        let phases = read_log_phases(&row.job.log_path);
+        assert_eq!(phases.len(), 1, "{phases:?}");
+        assert_eq!(
+            phases[0].text,
+            format!("unit-launch: requesting service {}", row.job.unit_name)
+        );
+        assert!(phase_summary(&phases, Utc::now()).contains("last phase `unit-launch"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_held_job_cancels_without_a_unit_and_never_starts() {
+        let (store, dir) = open();
+        let runtime = Arc::new(FakeRuntime::default());
+        let job_runtime: Arc<dyn JobRuntime> = runtime.clone();
+        let drain = crate::deploy_drain::DeployDrain::new();
+        engage_drain(&drain);
+        let row = held_test_job(&*store.lock().await, &*runtime, dir.path(), Uuid::new_v4());
+        let (job, cancelled) =
+            cancel_job(&*store.lock().await, &*runtime, row.job.id, Utc::now()).unwrap();
+        assert!(cancelled);
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.result.unwrap().refusal.as_deref(), Some(JOB_CANCELLED));
+        assert!(runtime.stopped.lock().unwrap().is_empty());
+        drain.sync(None, true, Utc::now());
+        assert_eq!(
+            start_queued_jobs(&store, &job_runtime, &tools(), &drain)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(runtime.launched.lock().unwrap().is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_held_job_whose_launch_fails_settles_failed_and_wakes_its_owner() {
+        let (store, dir) = open();
+        let runtime = Arc::new(FakeRuntime::default());
+        let job_runtime: Arc<dyn JobRuntime> = runtime.clone();
+        let drain = crate::deploy_drain::DeployDrain::new();
+        let owner = Uuid::new_v4();
+        engage_drain(&drain);
+        let row = held_test_job(&*store.lock().await, &*runtime, dir.path(), owner);
+        *runtime.fail_launch.lock().unwrap() = true;
+        drain.sync(None, true, Utc::now());
+        assert_eq!(
+            start_queued_jobs(&store, &job_runtime, &tools(), &drain)
+                .await
+                .unwrap(),
+            0
+        );
+        let guard = store.lock().await;
+        let stored = guard.get_agent_job(row.job.id).unwrap().unwrap().job;
+        assert_eq!(stored.state, JobState::Failed);
+        assert_eq!(
+            stored.result.unwrap().refusal.as_deref(),
+            Some(JOB_LAUNCH_FAILED)
+        );
+        assert_eq!(wakes_for(&guard, owner).len(), 1, "the owner is told");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_wall_clock_limit_counts_from_the_launch_not_from_the_hold() {
+        let (store, dir) = open();
+        let runtime = FakeRuntime::default();
+        let row = held_test_job(&store.blocking_lock(), &runtime, dir.path(), Uuid::new_v4());
+        let mut job = row.job;
+        let JobParams::Test(test) = &mut job.params else {
+            unreachable!("a test job");
+        };
+        test.timeout_minutes = Some(30);
+        job.created_at = "2020-01-01T00:00:00.000000000Z".into();
+        let now = Utc::now();
+        assert!(timed_out(&job, now), "never started: counts from creation");
+        job.started_at = Some(now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true));
+        assert!(
+            !timed_out(&job, now),
+            "a job held for hours has its whole limit once it starts"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_job_held_past_the_admission_cap_fails_job_admission_timed_out() {
+        let (store, dir) = open();
+        let runtime = Arc::new(FakeRuntime::default());
+        let job_runtime: Arc<dyn JobRuntime> = runtime.clone();
+        let drain = crate::deploy_drain::DeployDrain::new();
+        engage_drain(&drain);
+        drain.set_hold_cap_secs(600);
+        assert_eq!(admission_cap_secs(&drain), 600 + JOB_ADMISSION_MARGIN_SECS);
+        let owner = Uuid::new_v4();
+        let mut c = ctx(owner, dir.path(), None);
+        c.params = params(
+            JobKind::Test,
+            serde_json::json!({"package":"rsid","filters":[],"timeout_minutes":20}),
+        );
+        // Submitted an hour ago and never launched: past 10 min + margin.
+        let old = Utc::now() - chrono::Duration::hours(1);
+        let (row, _) = submit_with_hold(
+            &*store.lock().await,
+            &*runtime,
+            &tools(),
+            dir.path(),
+            c,
+            true,
+            old,
+        )
+        .unwrap();
+        assert_eq!(row.job.state, JobState::Queued);
+        // A fresh held job beside it keeps waiting.
+        let fresh = held_test_job(&*store.lock().await, &*runtime, dir.path(), owner);
+
+        assert_eq!(
+            start_queued_jobs(&store, &job_runtime, &tools(), &drain)
+                .await
+                .unwrap(),
+            0,
+            "an expired job is failed, not launched"
+        );
+        let guard = store.lock().await;
+        let stored = guard.get_agent_job(row.job.id).unwrap().unwrap().job;
+        assert_eq!(stored.state, JobState::Failed);
+        let result = stored.result.unwrap();
+        assert_eq!(result.refusal.as_deref(), Some(JOB_ADMISSION_TIMED_OUT));
+        assert_ne!(result.refusal.as_deref(), Some(JOB_TIMED_OUT));
+        assert!(
+            result
+                .detail
+                .unwrap()
+                .contains("execution timeout never started")
+        );
+        assert_eq!(wakes_for(&guard, owner).len(), 1, "the owner is told once");
+        assert_eq!(
+            guard
+                .get_agent_job(fresh.job.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .state,
+            JobState::Queued
+        );
+        assert!(runtime.launched.lock().unwrap().is_empty());
+        drop(guard);
+        // A second pass settles nothing more and wakes nobody again.
+        start_queued_jobs(&store, &job_runtime, &tools(), &drain)
+            .await
+            .unwrap();
+        assert_eq!(wakes_for(&*store.lock().await, owner).len(), 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_admission_cap_defaults_when_the_drain_is_uncapped() {
+        let drain = crate::deploy_drain::DeployDrain::new();
+        assert_eq!(
+            admission_cap_secs(&drain),
+            i64::try_from(rsi_common::agent_deploy::DEPLOY_DRAIN_HOLD_DEFAULT_SECS).unwrap()
+                + JOB_ADMISSION_MARGIN_SECS
+        );
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn cancelling_an_unknown_job_is_job_not_found() {
@@ -4054,6 +5552,150 @@ mod tests {
         assert_eq!(wakes_for(&guard, owner).len(), 1);
     }
 
+    fn timed_test_ctx(owner: Uuid, cwd: &Path, timeout: Option<u32>) -> SubmitContext {
+        let mut value =
+            serde_json::json!({"package":"rsid","filters":["agent_jobs"],"lib_only":true});
+        if let Some(minutes) = timeout {
+            value["timeout_minutes"] = minutes.into();
+        }
+        SubmitContext {
+            params: params(JobKind::Test, value),
+            ..ctx(owner, cwd, None)
+        }
+    }
+
+    /// #1337: a test job's unit cap follows its timeout (plus the grace that
+    /// lets the daemon settle it first); an untimed job keeps the 3 h cap.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_timed_test_job_caps_its_unit_at_the_timeout_plus_grace() {
+        let cwd = Path::new("/w");
+        let timed = params(
+            JobKind::Test,
+            serde_json::json!({"package":"rsid","timeout_minutes":20}),
+        );
+        assert_eq!(job_timeout_secs(&timed), Some(1200));
+        let command = job_command(&tools(), &timed, cwd, None).unwrap();
+        assert_eq!(command.runtime_max_secs, 1200 + JOB_TIMEOUT_UNIT_GRACE_SECS);
+        // The timeout is a daemon field, never a cargo argument.
+        assert!(!command.argv.iter().any(|arg| arg.contains("timeout")));
+        let untimed = params(JobKind::Test, serde_json::json!({"package":"rsid"}));
+        assert_eq!(job_timeout_secs(&untimed), None);
+        assert_eq!(
+            job_command(&tools(), &untimed, cwd, None)
+                .unwrap()
+                .runtime_max_secs,
+            3 * 3600
+        );
+    }
+
+    /// #1337: past its timeout a running test job's unit is stopped and the
+    /// job settles `failed` with `job_timed_out`, once, waking its owner and
+    /// recording a `runaway_process` andon event; within it nothing happens.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_test_job_past_its_timeout_is_stopped_and_fails_job_timed_out() {
+        let (store, dir) = open();
+        let runtime = Arc::new(FakeRuntime::default());
+        let dynamic: Arc<dyn JobRuntime> = runtime.clone();
+        let owner = Uuid::new_v4();
+        let (row, _) = submit(
+            &*store.lock().await,
+            &*runtime,
+            &tools(),
+            dir.path(),
+            timed_test_ctx(owner, dir.path(), Some(20)),
+            Utc::now(),
+        )
+        .unwrap();
+        let started = Utc::now().timestamp();
+        std::fs::write(
+            &row.job.log_path,
+            format!(
+                "rsi-phase {started} job-start\nrsi-phase {started} slot-wait: queued (build position 0): all 4 build slots busy (4 in use); held by pid 7 (make scoped-test)\ntest store::slow_one ... FAILED\n"
+            ),
+        )
+        .unwrap();
+        let within = Utc::now() + chrono::Duration::minutes(19);
+        assert_eq!(poll_once(&store, &dynamic, within).await.unwrap(), 0);
+        assert!(runtime.stopped.lock().unwrap().is_empty());
+        let past = Utc::now() + chrono::Duration::minutes(21);
+        assert_eq!(poll_once(&store, &dynamic, past).await.unwrap(), 1);
+        assert_eq!(
+            *runtime.stopped.lock().unwrap(),
+            vec![row.job.unit_name.clone()]
+        );
+        assert_eq!(poll_once(&store, &dynamic, past).await.unwrap(), 0);
+        let guard = store.lock().await;
+        let job = guard.get_agent_job(row.job.id).unwrap().unwrap().job;
+        assert_eq!(job.state, JobState::Failed);
+        let result = job.result.unwrap();
+        assert_eq!(result.refusal.as_deref(), Some(JOB_TIMED_OUT));
+        assert!(
+            result
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("20-minute timeout")),
+            "{result:?}"
+        );
+        // The last phase and how long the job sat in it ride in the result.
+        let detail = result.detail.as_deref().unwrap();
+        assert!(
+            detail.contains("last phase `slot-wait: queued (build position 0)")
+                && detail.contains("held by pid 7 (make scoped-test)")
+                && detail.contains("still waiting there"),
+            "{detail}"
+        );
+        assert!(detail.contains("began 126"), "{detail}");
+        assert_eq!(wakes_for(&guard, owner).len(), 1);
+        let rollup = guard
+            .friction_rollup(
+                &rsi_common::friction::ListFrictionRollupRequestV1::default(),
+                Utc::now() + chrono::Duration::minutes(30),
+            )
+            .unwrap();
+        assert!(
+            rollup
+                .rows
+                .iter()
+                .any(|r| r.signature == "runaway_process:job_test:timeout"),
+            "{rollup:?}"
+        );
+    }
+
+    /// #1337: a timed job whose unit cap stopped it while the daemon was down
+    /// is a timeout, not a lost job.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_timed_job_stopped_by_its_unit_cap_settles_timed_out_not_lost() {
+        let (store, dir) = open();
+        let runtime = Arc::new(FakeRuntime::default());
+        let dynamic: Arc<dyn JobRuntime> = runtime.clone();
+        let owner = Uuid::new_v4();
+        let (row, _) = submit(
+            &*store.lock().await,
+            &*runtime,
+            &tools(),
+            dir.path(),
+            timed_test_ctx(owner, dir.path(), Some(5)),
+            Utc::now(),
+        )
+        .unwrap();
+        *runtime.active.lock().unwrap() = false;
+        let past = Utc::now() + chrono::Duration::minutes(11);
+        assert_eq!(poll_once(&store, &dynamic, past).await.unwrap(), 1);
+        assert!(runtime.stopped.lock().unwrap().is_empty());
+        let job = store
+            .lock()
+            .await
+            .get_agent_job(row.job.id)
+            .unwrap()
+            .unwrap()
+            .job;
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.result.unwrap().refusal.as_deref(), Some(JOB_TIMED_OUT));
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn a_job_outlives_the_session_that_submitted_it() {
@@ -4100,22 +5742,28 @@ mod tests {
         let dir = disk_fixture();
         let runtime = FakeRuntime::default();
         *runtime.fail_launch.lock().unwrap() = true;
-        let owner = Uuid::new_v4();
-        let error = submit(
-            &store,
-            &runtime,
-            &tools(),
-            dir.path(),
-            ctx(owner, dir.path(), None),
-            Utc::now(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains(JOB_LAUNCH_FAILED));
-        assert!(store.list_running_agent_jobs().unwrap().is_empty());
-        let jobs = store.list_agent_jobs(owner, 10).unwrap();
-        assert_eq!(jobs[0].job.state, JobState::Failed);
-        assert!(!job_tmp_dir(Path::new(&jobs[0].job.log_path)).exists());
-        assert!(wakes_for(&store, owner).is_empty());
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        for (kind, value) in [
+            (JobKind::Test, serde_json::json!({"package":"rsid"})),
+            (
+                JobKind::Build,
+                serde_json::json!({"command":"check","workspace":true}),
+            ),
+            (JobKind::Landing, serde_json::json!({"accepted":oid})),
+            (JobKind::CloudGate, serde_json::json!({"accepted":oid})),
+        ] {
+            let owner = Uuid::new_v4();
+            let mut context = ctx(owner, dir.path(), None);
+            context.params = params(kind, value);
+            let error =
+                submit(&store, &runtime, &tools(), dir.path(), context, Utc::now()).unwrap_err();
+            assert!(error.to_string().contains(JOB_LAUNCH_FAILED));
+            assert!(store.list_running_agent_jobs().unwrap().is_empty());
+            let jobs = store.list_agent_jobs(owner, 10).unwrap();
+            assert_eq!(jobs[0].job.state, JobState::Failed);
+            assert!(!job_tmp_dir(Path::new(&jobs[0].job.log_path)).exists());
+            assert!(wakes_for(&store, owner).is_empty());
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -4197,7 +5845,9 @@ mod tests {
             exit_code: None,
             result: None,
             created_at: Utc::now().to_rfc3339(),
+            started_at: None,
             finished_at: None,
+            held: None,
             wake: JobWake::Owner,
         };
         let (state, result) = classify(&job, Some(0), &log);

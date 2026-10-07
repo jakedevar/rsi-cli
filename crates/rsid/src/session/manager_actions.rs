@@ -158,6 +158,75 @@ impl AgentControlHandle {
             .manager_action_receipt_for_caller(caller, request)
     }
 
+    /// `AgentManagerGetAction` (#1311, #1417): the receipt plus, while the
+    /// action is queued behind a hold, the reason. A draining deploy holds
+    /// every worker start and reports when the hold releases; the host-load
+    /// admission holds `create_session` while the host is busy and reports the
+    /// load and the threshold. The claim loop holds exactly these actions
+    /// (`claim_manager_action_with_create_admission`).
+    pub async fn agent_manager_get_action_view(
+        &self,
+        caller: Uuid,
+        request: AgentManagerGetActionRequestV2,
+    ) -> Result<ManagerActionViewV2> {
+        let receipt = self.agent_manager_get_action(caller, request).await?;
+        let mut held = None;
+        let deploy_hold = self
+            .deploy_drain
+            .as_ref()
+            .and_then(|drain| drain.release_by());
+        let load_hold = self
+            .host_load
+            .as_ref()
+            .and_then(|gate| gate.hold_for_create(receipt.operation_id));
+        if receipt.state == ManagerActionStateV2::Queued
+            && (deploy_hold.is_some() || load_hold.is_some())
+            && let Some((action, new_worker)) = self
+                .store
+                .lock()
+                .await
+                .manager_action_operation(receipt.operation_id)?
+                .map(|operation| {
+                    let new_worker = operation.is_new_worker_create();
+                    (operation.context.request.operation, new_worker)
+                })
+        {
+            let starts_worker = matches!(
+                action,
+                ManagerActionV2::CreateSession { .. }
+                    | ManagerActionV2::ReplaceLead { .. }
+                    | ManagerActionV2::RetryLead { .. }
+                    | ManagerActionV2::ResumeLead { .. }
+            );
+            if let Some((deploy_id, release_by)) = deploy_hold
+                && starts_worker
+            {
+                held = Some(ManagerActionHeldV1 {
+                    reason: crate::deploy_drain::DEPLOY_DRAINING.to_string(),
+                    deploy_id: Some(deploy_id),
+                    release_by: Some(
+                        release_by.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                    ),
+                    load: None,
+                    threshold: None,
+                    recent_admissions: None,
+                });
+            } else if let Some(hold) = load_hold
+                && new_worker
+            {
+                held = Some(ManagerActionHeldV1 {
+                    reason: rsi_common::agent_daemon_info::HOST_LOAD.to_string(),
+                    deploy_id: None,
+                    release_by: None,
+                    load: Some(hold.load),
+                    threshold: Some(hold.threshold),
+                    recent_admissions: Some(hold.recent_admissions),
+                });
+            }
+        }
+        Ok(ManagerActionViewV2 { receipt, held })
+    }
+
     pub async fn agent_manager_control(
         &self,
         caller: Uuid,
@@ -239,24 +308,36 @@ impl SessionManager {
                 // together. With launches in flight, take the Store only if it
                 // is free and otherwise retry after the refill interval.
                 crate::launch_breadcrumbs::note_phase(Uuid::nil(), "manager_actions:claim");
+                // Admit the oldest eligible create through the shared queue.
+                // The synchronous callback never accesses the Store; a held
+                // create leaves recovery and continuations claimable.
+                let admit =
+                    |key, since, target| self.host_load.admit_manager_create(key, since, target);
                 let claim = if inflight.is_empty() {
-                    self.store.lock().await.claim_manager_action_holding(
-                        self.program_run_boot_id,
-                        self.deploy_drain.is_draining(),
-                    )?
+                    self.store
+                        .lock()
+                        .await
+                        .claim_manager_action_with_create_admission(
+                            self.program_run_boot_id,
+                            self.deploy_drain.is_draining(),
+                            &admit,
+                        )?
                 } else {
                     let Ok(store) = self.store.try_lock() else {
                         drained = true;
                         break;
                     };
-                    store.claim_manager_action_holding(
+                    store.claim_manager_action_with_create_admission(
                         self.program_run_boot_id,
                         self.deploy_drain.is_draining(),
+                        &admit,
                     )?
                 };
                 match claim {
                     None => drained = true,
-                    Some(claim) => inflight.push(Box::pin(self.run_claimed_manager_action(claim))),
+                    Some(claim) => {
+                        inflight.push(Box::pin(self.run_claimed_manager_action(claim)));
+                    }
                 }
             }
             if inflight.is_empty() {
@@ -367,6 +448,9 @@ impl SessionManager {
                         } else if matches!(
                             code,
                             "manager_v2_scope_changed"
+                                // #1335: the queuing seat retired with no
+                                // successor to inherit the action.
+                                | "manager_v2_actor_seat_retired"
                                 | "manager_review_assignment_terminal"
                                 | "manager_v2_policy_changed"
                                 | "manager_v2_capability_denied"
@@ -619,7 +703,13 @@ impl SessionManager {
                     .ok_or_else(|| refused("manager_v2_source_unavailable"))?;
                 note_launch_step("prepare_fork");
                 let runtime = self.custody_execution_runtime();
+                // #1195: an explicit or default create source names its
+                // commit; only legacy pinned sources follow the source HEAD.
                 let fork = if frozen.historical_commit {
+                    runtime
+                        .prepare_manager_review_fork_at(&source, &frozen.commit)
+                        .await?
+                } else if frozen.forks_at_frozen_commit() {
                     runtime
                         .prepare_manager_action_fork_at(&source, &frozen.commit)
                         .await?
@@ -639,7 +729,32 @@ impl SessionManager {
                     return Err(refused("manager_v2_source_changed"));
                 }
                 note_launch_step("launch_candidate");
-                let config = manager_launch_config(claim, &source)?;
+                // #1254: a `continue_from` Issue launch continues its
+                // predecessor's lineage and display identity.
+                let continued = match claim
+                    .operation
+                    .context
+                    .issue_binding
+                    .as_ref()
+                    .and_then(|binding| binding.continue_from)
+                {
+                    Some(id) => Some(
+                        self.store
+                            .lock()
+                            .await
+                            .get_session(id)?
+                            .ok_or_else(|| refused("manager_v2_source_unavailable"))?,
+                    ),
+                    None => None,
+                };
+                let config = manager_launch_config(claim, &source, continued.as_ref())?;
+                if let Some(model) = config.model.as_deref() {
+                    self.preflight_manager_action_model(
+                        config.provider.unwrap_or(SessionProvider::Claude),
+                        model,
+                    )
+                    .await?;
+                }
                 let target = claim
                     .operation
                     .context
@@ -1801,6 +1916,10 @@ pub(super) async fn manager_action_source_gate(
         .ok_or_else(|| refused("manager_v2_source_unavailable"))?;
     let fork = if frozen.historical_commit {
         runtime
+            .prepare_manager_review_fork_at(&source, &frozen.commit)
+            .await?
+    } else if frozen.forks_at_frozen_commit() {
+        runtime
             .prepare_manager_action_fork_at(&source, &frozen.commit)
             .await?
     } else {
@@ -1815,13 +1934,19 @@ pub(super) async fn manager_action_source_gate(
         return Err(refused("manager_v2_source_changed"));
     }
     if let Some(generation) = frozen.custody_generation {
-        if store
-            .lock()
-            .await
-            .live_custody_for_session(source.id)?
-            .generation
-            != generation as u64
-        {
+        let store = store.lock().await;
+        let current = if frozen.historical_commit {
+            store
+                .manager_review_reclaimed_source(&source)?
+                .map(|proof| proof.generation)
+        } else {
+            None
+        };
+        let current = match current {
+            Some(generation) => generation,
+            None => store.live_custody_for_session(source.id)?.generation,
+        };
+        if current != generation as u64 {
             return Err(refused("manager_v2_source_changed"));
         }
     }
@@ -1896,6 +2021,8 @@ const MANAGER_ACTION_ERROR_CODES: &[&str] = &[
     "manager_succession_unresolved",
     "manager_succession_unsettled_predecessor",
     "manager_review_assignment_terminal",
+    "manager_review_reclaimed_source_unavailable",
+    "manager_v2_actor_seat_retired",
     "manager_v2_scope_changed",
     "manager_v2_policy_changed",
     "manager_v2_capability_denied",
@@ -2033,7 +2160,11 @@ async fn git_ref(repo: &std::path::Path, ref_name: &str) -> Option<String> {
     crate::integration::resolve_ref(&config, repo, ref_name).await
 }
 
-fn manager_launch_config(claim: &ManagerActionClaimV2, source: &Session) -> Result<LaunchConfig> {
+fn manager_launch_config(
+    claim: &ManagerActionClaimV2,
+    source: &Session,
+    continued: Option<&Session>,
+) -> Result<LaunchConfig> {
     let choice = claim
         .operation
         .context
@@ -2071,8 +2202,14 @@ fn manager_launch_config(claim: &ManagerActionClaimV2, source: &Session) -> Resu
         completion_gates: None,
         query,
         title: None,
-        agent_role: predecessor.and_then(|_| source.agent_role.clone()),
-        epic_spawn_ordinal: predecessor.and(source.epic_spawn_ordinal),
+        agent_role: match continued {
+            Some(previous) => previous.agent_role.clone(),
+            None => predecessor.and_then(|_| source.agent_role.clone()),
+        },
+        epic_spawn_ordinal: match continued {
+            Some(previous) => previous.epic_spawn_ordinal,
+            None => predecessor.and(source.epic_spawn_ordinal),
+        },
         working_dir: Some(source.working_dir.clone()),
         provider: Some(choice.provider),
         model: Some(choice.model.clone()),
@@ -2085,7 +2222,7 @@ fn manager_launch_config(claim: &ManagerActionClaimV2, source: &Session) -> Resu
         rsi_session_id: claim.operation.context.target_session_id,
         rsi_socket: None,
         rsi_session_token: None,
-        continued_from: predecessor,
+        continued_from: predecessor.or_else(|| continued.map(|previous| previous.id)),
         openai_base_url: None,
         openai_api_key: None,
         conversation_history: None,

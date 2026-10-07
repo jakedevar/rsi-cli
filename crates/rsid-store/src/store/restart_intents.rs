@@ -428,6 +428,10 @@ impl Store {
             |r| r.get(0),
         ).optional()?.flatten();
         if let Some(reason) = reason {
+            // Refusals must be visible even when the intent stays pending
+            // (operator pause, question or changed custody). Never annotate a
+            // newer turn, and emit once per changed outcome across boots.
+            record_restart_refusal(&tx, intent.id, &reason)?;
             let state = if reason == "review_owned"
                 || reason == "pending_archive"
                 || reason == "newer_turn"
@@ -480,9 +484,53 @@ impl Store {
         if !matches!(outcome, "not_resumable" | "dispatch_failed") {
             return Err(DaemonError::Store("invalid restart intent outcome".into()));
         }
-        self.conn.execute("UPDATE daemon_restart_intents SET state='failed',outcome=?2,updated_at=?3 WHERE id=?1 AND state IN ('claimed','delivered')", params![intent_id.to_string(),outcome,now()])?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        record_restart_refusal(&tx, intent_id, outcome)?;
+        tx.execute("UPDATE daemon_restart_intents SET state='failed',outcome=?2,updated_at=?3 WHERE id=?1 AND state IN ('claimed','delivered')", params![intent_id.to_string(),outcome,now()])?;
+        tx.commit()?;
         Ok(())
     }
+}
+
+/// The journal and the owner-visible terminal reason commit together. Retain
+/// Interrupted for explicit holds; the ordinary terminal watch can report why
+/// this turn did not resume. No prompt or error prose enters telemetry.
+fn record_restart_refusal(conn: &Connection, intent: Uuid, reason: &str) -> Result<()> {
+    let session: Option<String> = conn
+        .query_row(
+            "SELECT session_id FROM daemon_restart_intents WHERE id=?1
+           AND state IN ('pending','claimed','delivered') AND outcome IS NOT ?2",
+            params![intent.to_string(), reason],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(session) = session else {
+        return Ok(());
+    };
+    conn.execute(
+        "UPDATE sessions SET stop_reason=?2,updated_at=?3 WHERE id=?1 AND status='Interrupted'
+           AND EXISTS(SELECT 1 FROM daemon_restart_intents i WHERE i.id=?4
+             AND (i.invocation_id=sessions.model_invocation_id
+               OR i.continuation_invocation_id=sessions.model_invocation_id))",
+        params![
+            session,
+            format!("daemon_restart_resume:{reason}"),
+            now(),
+            intent.to_string()
+        ],
+    )?;
+    let session = Uuid::parse_str(&session).map_err(|e| DaemonError::Store(e.to_string()))?;
+    super::friction::record_friction_in(
+        conn,
+        &rsi_common::friction::NewFrictionEventV1::new(
+            rsi_common::friction::FrictionKind::Terminal,
+            &["daemon_restart_resume", reason],
+        )
+        .session(Some(session))
+        .evidence("restart_intent", intent),
+        Utc::now(),
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

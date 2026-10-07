@@ -237,6 +237,7 @@ mod tests {
                         fingerprint: deploy_fingerprint(SHA, "x", 60),
                         manifest: &[],
                         max_wait_secs: 60,
+                        interrupt_workers: false,
                     },
                     now,
                 )

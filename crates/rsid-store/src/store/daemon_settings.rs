@@ -1145,7 +1145,7 @@ pub fn apply_persisted_runtime_config(
         }
     }
     let mut routes = store.conn.prepare(
-        "SELECT key, value FROM daemon_settings WHERE key LIKE 'api_route.openrouter.%' OR key LIKE 'api_route.bedrock.%' OR key LIKE 'coordinator_context_cap.%'",
+        "SELECT key, value FROM daemon_settings WHERE key LIKE 'api_route.openrouter.%' OR key LIKE 'api_route.bedrock.%' OR key LIKE 'coordinator_context_cap.%' OR key LIKE 'worker_context_cap.%'",
     )?;
     let rows = routes.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))

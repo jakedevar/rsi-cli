@@ -5,6 +5,7 @@ use crate::error::{DaemonError, Result};
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
+use std::path::Path;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -704,6 +705,66 @@ pub fn target_reclaim_slot_name(custody_id: Uuid, generation: u64) -> String {
 }
 
 impl Store {
+    /// Record each newly staged cache and queue a durable owning-manager notice.
+    /// No paths or process command lines enter friction telemetry.
+    pub fn record_target_reclaim_notice(
+        &self,
+        session_id: Uuid,
+        custody_id: Uuid,
+        generation: u64,
+        bytes: u64,
+        pending: bool,
+    ) -> Result<Option<Uuid>> {
+        use rsi_common::friction::{FrictionKind, NewFrictionEventV1};
+        let session = self.get_session(session_id)?;
+        let project = session.and_then(|session| session.project_id);
+        let outcome = if pending { "pending" } else { "removed" };
+        self.record_friction_event(
+            &NewFrictionEventV1::new(FrictionKind::SandboxTargetReclaim, &[outcome])
+                .session(Some(session_id))
+                .evidence("custody", custody_id),
+        )?;
+        let Some(project) = project else {
+            return Ok(None);
+        };
+        let Some(config) = self.get_harness_manager_notice_config(project)? else {
+            return Ok(None);
+        };
+        if config.current_session_id.is_none() || config.is_revoked() {
+            return Ok(None);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let version = super::harness_manager_v2::now();
+        let subject = format!("sandbox_target_reclaim:{custody_id}");
+        let (job_id, _, _) = self.manager_action_watch_identity(&config);
+        self.ensure_manager_action_watch(&config, &version)?; // sql-dynamic-ok: watch identity, not SQL
+        self.conn.execute(
+            "INSERT INTO harness_manager_notices
+             (id,job_id,project_id,manager_session_id,scope_version,epic_id,direction,
+              source_session_id,recipient_session_id,kind,subject_id,subject_version,
+              state_json,recorded_at,queued_at)
+             VALUES(?1,?2,?3,?4,?5,NULL,'to_manager',?6,?4,'ledger_change',?7,?8,?9,?8,?8)",
+            params![
+                Uuid::new_v4().to_string(),
+                job_id.to_string(),
+                project.to_string(),
+                config.manager_session_id.to_string(),
+                config.row_version,
+                session_id.to_string(),
+                subject,
+                version,
+                serde_json::to_string(&serde_json::json!({
+                    "record_kind": "sandbox_target_reclaim", "session_id": session_id,
+                    "custody_id": custody_id, "generation": generation,
+                    "bytes": bytes, "outcome": outcome,
+                }))?
+            ],
+        )?;
+        self.refresh_manager_notice_job(job_id)?;
+        tx.commit()?;
+        Ok(Some(job_id))
+    }
+
     pub fn target_reclaim_intent(
         &self,
         custody_id: Uuid,
@@ -776,6 +837,11 @@ impl Store {
         )? {
             tx.commit()?;
             return Ok(PrepareTargetReclaimIntentResult::Terminal(event));
+        }
+        if self.target_reclaim_has_live_consumer(custody_id, generation)? {
+            return Err(DaemonError::Store(
+                "target reclaim prepare has a live consumer".into(),
+            ));
         }
         let allocation_id = tx
             .query_row(
@@ -1514,7 +1580,7 @@ fn intent_page_digest(intents: &[TargetReclaimIntent]) -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TerminalReclaimSweepKey {
     pub updated_at: String,
     pub session_id: Uuid,
@@ -1546,8 +1612,24 @@ pub struct TerminalReclaimSweepEvidence {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminalReclaimSweepPage {
     pub candidates: Vec<TerminalCustodyReclaimCandidate>,
+    /// Rows the page inspected but withheld because a live consumer (an
+    /// enabled wake, a restart intent, a manager seat, a running job) still
+    /// needs the owner's `target/` (#1564). They spent page budget like any
+    /// other row, so the report names them instead of dropping them silently.
+    pub fenced: Vec<TerminalFencedCandidate>,
+    /// Rows whose `target/` is already gone, passed over without spending page
+    /// budget (#1607). Zero unless the page was selected with
+    /// `skip_absent_targets`; counted as `TargetAbsent` in the report.
+    pub absent_skipped: u32,
     pub has_more: bool,
     pub evidence: TerminalReclaimSweepEvidence,
+}
+
+/// A candidate withheld by [`TerminalReclaimSweepPage::fenced`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalFencedCandidate {
+    pub candidate: TerminalCustodyReclaimCandidate,
+    pub consumer: &'static str,
 }
 
 #[derive(Clone, Debug)]
@@ -1555,6 +1637,18 @@ struct SweepState {
     cycle: u64,
     after: Option<TerminalReclaimSweepKey>,
     upper: Option<TerminalReclaimSweepKey>,
+}
+
+// One internal runtime record, independent of the fair walk. Reserving recent
+// keys advances it even when the filesystem later refuses them (TargetAbsent,
+// for example). A new fair cycle retries the newest rows, including rebuilt
+// targets; no per-custody history or unbounded refusal set is needed.
+const RECENT_SWEEP_STATE_KEY: &str = "target_reclaim_recent_cursor";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RecentSweepState {
+    cycle: u64,
+    after: TerminalReclaimSweepKey,
 }
 
 impl Store {
@@ -1567,20 +1661,47 @@ impl Store {
     }
 
     /// Like [`Self::reserve_terminal_reclaim_page`]. With `recent_first` (a
-    /// pressure pass), the newest terminal rows outside the frozen cycle
-    /// window are placed ahead of the walk's candidates so a session that
-    /// went terminal after the cycle began is not starved until the cycle
-    /// wraps. The walk cursor, cycle and upper bound are unaffected.
+    /// pressure pass), the newest terminal rows with unreclaimed custody are
+    /// placed ahead of the walk's candidates, including rows inside the
+    /// frozen cycle window. The walk cursor, cycle and upper bound are
+    /// unaffected. Reserved recent keys yield their pressure slots until the
+    /// next fair cycle, regardless of reclaim outcome. Live consumers are
+    /// excluded from both lanes.
     pub fn reserve_terminal_reclaim_page_with(
         &self,
         limit: u32,
         recent_first: bool,
     ) -> Result<TerminalReclaimSweepPage> {
+        self.reserve_terminal_reclaim_page_filtered(limit, recent_first, false)
+    }
+
+    /// Like [`Self::reserve_terminal_reclaim_page_with`]. With
+    /// `skip_absent_targets` (a pressure pass, #1607) a row whose
+    /// `<sandbox_root>/target` no longer exists is walked past without spending
+    /// any of the `limit` budget: a finished sandbox whose target was already
+    /// reclaimed has nothing to free, and ~1,500 of them ahead of the real
+    /// targets used every pass's budget. Present targets keep their order
+    /// (newest first in the recent lane, then the fair walk). Absent rows still
+    /// advance both cursors and are counted in `absent_skipped`.
+    pub fn reserve_terminal_reclaim_page_filtered(
+        &self,
+        limit: u32,
+        recent_first: bool,
+        skip_absent_targets: bool,
+    ) -> Result<TerminalReclaimSweepPage> {
         validate_limit(limit)?;
         with_sweep_busy_timeout(&self.conn, || {
             let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
             let state = load_state(&tx)?;
-            let selected = select_page(&tx, &state, limit, true, recent_first)?;
+            let selected = select_page(
+                &tx,
+                self,
+                &state,
+                limit,
+                true,
+                recent_first,
+                skip_absent_targets,
+            )?;
             persist_selection(&tx, &selected)?;
             tx.commit()?;
             Ok(selected.page)
@@ -1599,11 +1720,29 @@ impl Store {
         limit: u32,
         recent_first: bool,
     ) -> Result<TerminalReclaimSweepPage> {
+        self.preview_terminal_reclaim_page_filtered(limit, recent_first, false)
+    }
+
+    pub fn preview_terminal_reclaim_page_filtered(
+        &self,
+        limit: u32,
+        recent_first: bool,
+        skip_absent_targets: bool,
+    ) -> Result<TerminalReclaimSweepPage> {
         validate_limit(limit)?;
         with_sweep_busy_timeout(&self.conn, || {
             let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
             let state = load_state(&tx)?;
-            let page = select_page(&tx, &state, limit, false, recent_first)?.page;
+            let page = select_page(
+                &tx,
+                self,
+                &state,
+                limit,
+                false,
+                recent_first,
+                skip_absent_targets,
+            )?
+            .page;
             tx.commit()?;
             Ok(page)
         })
@@ -1687,14 +1826,17 @@ struct SelectedPage {
     persisted_cycle: u64,
     persisted_after: Option<TerminalReclaimSweepKey>,
     persisted_upper: Option<TerminalReclaimSweepKey>,
+    recent_state: Option<RecentSweepState>,
 }
 
 fn select_page(
     connection: &Connection,
+    store: &Store,
     state: &SweepState,
     limit: u32,
     reserved: bool,
     recent_first: bool,
+    skip_absent: bool,
 ) -> Result<SelectedPage> {
     let (cycle_after, upper) = match &state.upper {
         Some(upper) => (state.cycle, Some(upper.clone())),
@@ -1707,36 +1849,88 @@ fn select_page(
         ),
     };
 
-    // Newest terminal rows above the cycle's frozen upper bound: the walk will
-    // not reach them until it wraps. They spend part of the page budget, so a
-    // pass never inspects more than `limit` rows.
-    let recent_keys = match (&state.upper, recent_first) {
-        (Some(upper), true) => {
-            select_recent_terminal_keys(connection, upper, (limit / 2).min(RECENT_FIRST_LIMIT))?
+    // Pressure pass: the newest terminal rows that still own an unreclaimed
+    // live custody go ahead of the fair walk, wherever the walk cursor is.
+    // They spend part of the page budget, so a pass never inspects more than
+    // `limit` rows, and they never move the fair cursor, cycle or upper bound.
+    // Their own durable descending cursor prevents refused keys from spending
+    // the same slots on every pass. It resets with the next fair cycle.
+    let mut absent_sessions = std::collections::HashSet::new();
+    let (recent_keys, recent_last, recent_scanned) = if recent_first {
+        let recent_state = store
+            .get_daemon_setting(RECENT_SWEEP_STATE_KEY)?
+            .map(|raw| serde_json::from_str::<RecentSweepState>(&raw))
+            .transpose()
+            .map_err(|error| DaemonError::Store(error.to_string()))?;
+        let after = recent_state
+            .as_ref()
+            .filter(|recent| recent.cycle == cycle_after)
+            .map(|recent| &recent.after);
+        let want = (limit / 2).min(RECENT_FIRST_LIMIT);
+        if skip_absent {
+            let scan = select_recent_present_keys(connection, after, want)?;
+            absent_sessions.extend(scan.absent.iter().copied());
+            (scan.accepted, scan.last_scanned, scan.scanned)
+        } else {
+            let keys = select_recent_terminal_keys(connection, after, want)?;
+            let last = keys.last().cloned();
+            let scanned = keys.len() as u32;
+            (keys, last, scanned)
         }
-        _ => Vec::new(),
+    } else {
+        (Vec::new(), None, 0)
     };
     let walk_limit = limit - recent_keys.len() as u32;
-    let terminal_keys = match &upper {
-        Some(upper) => select_terminal_keys(connection, state.after.as_ref(), upper, walk_limit)?,
-        None => Vec::new(),
+    let (terminal_keys, walk_last, walk_scanned) = match &upper {
+        Some(upper) if skip_absent => {
+            let scan =
+                select_present_terminal_keys(connection, state.after.as_ref(), upper, walk_limit)?;
+            absent_sessions.extend(scan.absent.iter().copied());
+            (scan.accepted, scan.last_scanned, scan.scanned)
+        }
+        Some(upper) => {
+            let keys = select_terminal_keys(connection, state.after.as_ref(), upper, walk_limit)?;
+            let last = keys.last().cloned();
+            let scanned = keys.len() as u32;
+            (keys, last, scanned)
+        }
+        None => (Vec::new(), None, 0),
     };
-    let candidates = recent_keys
+    let mut seen = std::collections::HashSet::new();
+    let selected = recent_keys
         .iter()
         .chain(terminal_keys.iter())
+        .filter(|key| seen.insert(key.session_id))
         .map(|key| select_candidate_for_key(connection, key))
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .flatten()
-        .collect::<Vec<_>>();
-    let has_more = terminal_keys
-        .last()
+        .map(|candidate| {
+            // Use the same store snapshot and consumer fence as preparation.
+            // Every raw key still consumes its fair-walk position, so a wake
+            // or detached job cannot stall the cursor. Preparation checks
+            // again if a consumer arrives after this page was reserved.
+            store
+                .target_reclaim_live_consumer(candidate.custody_id, candidate.generation)
+                .map(|consumer| (candidate, consumer))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut candidates = Vec::with_capacity(selected.len());
+    let mut fenced = Vec::new();
+    for (candidate, consumer) in selected {
+        match consumer {
+            None => candidates.push(candidate),
+            Some(consumer) => fenced.push(TerminalFencedCandidate {
+                candidate,
+                consumer,
+            }),
+        }
+    }
+    let has_more = walk_last
+        .as_ref()
         .is_some_and(|last| key_less(last, upper.as_ref().unwrap()));
-    let cursor_after = terminal_keys
-        .last()
-        .cloned()
-        .or_else(|| state.after.clone());
-    let completing_active_cycle = state.upper.is_some() && terminal_keys.is_empty();
+    let cursor_after = walk_last.clone().or_else(|| state.after.clone());
+    let completing_active_cycle = state.upper.is_some() && walk_scanned == 0;
     let persisted_after = if completing_active_cycle {
         None
     } else {
@@ -1768,17 +1962,23 @@ fn select_page(
                         .cloned()
                         .collect::<Vec<_>>(),
                 ),
-                inspected_terminal_rows: (terminal_keys.len() + recent_keys.len()) as u32,
-                custody_lookups: (terminal_keys.len() + recent_keys.len()) as u32,
+                inspected_terminal_rows: walk_scanned + recent_scanned,
+                custody_lookups: walk_scanned + recent_scanned,
                 reserved,
                 wrapped: reserved && wrapped,
             },
             candidates,
+            fenced,
+            absent_skipped: absent_sessions.len() as u32,
             has_more,
         },
         persisted_cycle: cycle_after,
         persisted_after,
         persisted_upper,
+        recent_state: recent_last.map(|after| RecentSweepState {
+            cycle: cycle_after,
+            after,
+        }),
     })
 }
 
@@ -1846,32 +2046,165 @@ fn select_terminal_keys(
         .map_err(Into::into)
 }
 
-/// Newest-first rows above the frozen upper bound a pressure pass examines
-/// ahead of the fair walk.
-const RECENT_FIRST_LIMIT: u32 = 64;
+/// Newest-first rows a pressure pass examines ahead of the fair walk.
+const RECENT_FIRST_LIMIT: u32 = 256;
 
-const SELECT_RECENT_TERMINAL_KEYS_ABOVE_SQL: &str = "SELECT updated_at,id FROM sessions
-     WHERE status IN ('Completed','Failed','Interrupted','Archived','Deleted')
-       AND (updated_at,id)>(?1,?2)
-     ORDER BY updated_at DESC,id DESC LIMIT ?3";
+/// Terminal sessions whose live, verified custody has no recorded target
+/// reclaim yet, newest first. A finished worker's `target/` is the capacity
+/// that matters under pressure, and the walk (oldest first) reaches it last.
+/// Recorded reclaims drop out through the events table. The descending cursor
+/// rotates past reserved rows without events, too; the fair walk still visits
+/// them and the next cycle retries them in the recent lane.
+const SELECT_RECENT_TERMINAL_KEYS_SQL: &str =
+    "SELECT s.updated_at,s.id,r.sandbox_root FROM sessions s
+     JOIN sandbox_custody_roots r
+       ON r.owner_session_id=s.id AND s.sandbox_custody_id=r.custody_id
+     WHERE s.status IN ('Completed','Failed','Interrupted','Archived','Deleted')
+       AND r.state='live' AND r.validation_state='verified'
+       AND r.validated_generation=r.generation
+       AND r.reserved_effects=0 AND r.active_effects=0
+       AND NOT EXISTS(SELECT 1 FROM sandbox_target_reclaim_intent_events e
+                      WHERE e.custody_id=r.custody_id AND e.generation=r.generation)
+       AND (?2 IS NULL OR (s.updated_at,s.id)<(?2,?3))
+     ORDER BY s.updated_at DESC,s.id DESC LIMIT ?1";
 
 fn select_recent_terminal_keys(
     connection: &Connection,
-    above: &TerminalReclaimSweepKey,
+    after: Option<&TerminalReclaimSweepKey>,
     limit: u32,
 ) -> Result<Vec<TerminalReclaimSweepKey>> {
     connection
-        .prepare(SELECT_RECENT_TERMINAL_KEYS_ABOVE_SQL)?
+        .prepare(SELECT_RECENT_TERMINAL_KEYS_SQL)?
         .query_map(
             params![
-                above.updated_at,
-                above.session_id.to_string(),
-                i64::from(limit)
+                i64::from(limit),
+                after.map(|key| key.updated_at.as_str()),
+                after.map(|key| key.session_id.to_string()),
             ],
             |row| parse_key(Some(row.get(0)?), Some(row.get(1)?), 1).map(Option::unwrap),
         )?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+/// Rows examined per statement and per lane while skipping absent targets.
+const ABSENT_SCAN_CHUNK: u32 = 256;
+const ABSENT_SCAN_CAP: u32 = 4096;
+
+struct PresentScan {
+    accepted: Vec<TerminalReclaimSweepKey>,
+    /// The last row examined, accepted or not: the cursor moves past it.
+    last_scanned: Option<TerminalReclaimSweepKey>,
+    scanned: u32,
+    /// Sessions whose target was absent; a row both lanes see counts once.
+    absent: Vec<Uuid>,
+}
+
+/// `<sandbox_root>/target` for the live custody row owned by `key`'s session;
+/// `None` when the row has no such custody (it was never a candidate).
+fn sandbox_root_of(connection: &Connection, key: &TerminalReclaimSweepKey) -> Option<String> {
+    connection
+        .query_row(
+            "SELECT r.sandbox_root FROM sessions s
+             JOIN sandbox_custody_roots r
+               ON r.owner_session_id=s.id AND s.sandbox_custody_id=r.custody_id
+             WHERE s.id=?1 AND s.updated_at=?2 AND r.state='live'",
+            params![key.session_id.to_string(), key.updated_at],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+}
+
+fn target_present(sandbox_root: &str) -> bool {
+    std::fs::symlink_metadata(Path::new(sandbox_root).join("target")).is_ok()
+}
+
+/// Oldest-first walk keys, skipping rows whose target is gone, until `want`
+/// present rows were found or [`ABSENT_SCAN_CAP`] rows were examined.
+fn select_present_terminal_keys(
+    connection: &Connection,
+    after: Option<&TerminalReclaimSweepKey>,
+    upper: &TerminalReclaimSweepKey,
+    want: u32,
+) -> Result<PresentScan> {
+    let mut scan = PresentScan {
+        accepted: Vec::new(),
+        last_scanned: None,
+        scanned: 0,
+        absent: Vec::new(),
+    };
+    let mut cursor = after.cloned();
+    'chunks: while scan.scanned < ABSENT_SCAN_CAP && (scan.accepted.len() as u32) < want {
+        let chunk = select_terminal_keys(connection, cursor.as_ref(), upper, ABSENT_SCAN_CHUNK)?;
+        if chunk.is_empty() {
+            break;
+        }
+        for key in chunk {
+            scan.scanned += 1;
+            scan.last_scanned = Some(key.clone());
+            cursor = Some(key.clone());
+            match sandbox_root_of(connection, &key) {
+                Some(root) if target_present(&root) => scan.accepted.push(key),
+                Some(_) => scan.absent.push(key.session_id),
+                None => {}
+            }
+            if scan.accepted.len() as u32 >= want {
+                break 'chunks;
+            }
+        }
+    }
+    Ok(scan)
+}
+
+/// Newest-first recent lane, skipping rows whose target is gone.
+fn select_recent_present_keys(
+    connection: &Connection,
+    after: Option<&TerminalReclaimSweepKey>,
+    want: u32,
+) -> Result<PresentScan> {
+    let mut scan = PresentScan {
+        accepted: Vec::new(),
+        last_scanned: None,
+        scanned: 0,
+        absent: Vec::new(),
+    };
+    let mut cursor = after.cloned();
+    'chunks: while scan.scanned < ABSENT_SCAN_CAP && (scan.accepted.len() as u32) < want {
+        let chunk = connection
+            .prepare(SELECT_RECENT_TERMINAL_KEYS_SQL)?
+            .query_map(
+                params![
+                    i64::from(ABSENT_SCAN_CHUNK),
+                    cursor.as_ref().map(|key| key.updated_at.as_str()),
+                    cursor.as_ref().map(|key| key.session_id.to_string()),
+                ],
+                |row| {
+                    let key =
+                        parse_key(Some(row.get(0)?), Some(row.get(1)?), 1).map(Option::unwrap)?;
+                    Ok((key, row.get::<_, String>(2)?))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if chunk.is_empty() {
+            break;
+        }
+        for (key, root) in chunk {
+            scan.scanned += 1;
+            scan.last_scanned = Some(key.clone());
+            cursor = Some(key.clone());
+            if target_present(&root) {
+                scan.accepted.push(key);
+            } else {
+                scan.absent.push(key.session_id);
+            }
+            if scan.accepted.len() as u32 >= want {
+                break 'chunks;
+            }
+        }
+    }
+    Ok(scan)
 }
 
 const SELECT_CANDIDATE_FOR_KEY_SQL: &str = "SELECT r.custody_id,r.generation,s.id,s.updated_at
@@ -1961,6 +2294,19 @@ fn persist_selection(tx: &Transaction<'_>, selected: &SelectedPage) -> Result<()
         return Err(DaemonError::Store(
             "V119 target reclaim sweep reservation lost singleton row".into(),
         ));
+    }
+    if let Some(recent) = &selected.recent_state {
+        let value =
+            serde_json::to_string(recent).map_err(|error| DaemonError::Store(error.to_string()))?;
+        tx.execute(
+            "INSERT INTO daemon_settings(key,value,updated_at) VALUES(?1,?2,?3)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+            params![
+                RECENT_SWEEP_STATE_KEY,
+                value,
+                Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
+            ],
+        )?;
     }
     Ok(())
 }
@@ -2238,6 +2584,195 @@ mod tests {
         );
     }
 
+    /// #1607: ~1,500 finished sandboxes whose `target/` was already reclaimed
+    /// sat ahead of the real targets and used every pass's whole budget.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn pressure_page_skips_absent_targets_without_spending_budget() {
+        let fixture = FixtureDirectory::create("target-reclaim-sweep-absent-skip");
+        let mut store = Store::open_in_memory().unwrap();
+        let ids = (0..40)
+            .map(|ordinal| seed_candidate(&mut store, fixture.path(), ordinal))
+            .collect::<Vec<_>>();
+        // Only the oldest and one middle row still own a target.
+        let present = [0usize, 20];
+        for ordinal in present {
+            std::fs::create_dir_all(fixture.path().join(format!("sandbox-{ordinal}/target")))
+                .unwrap();
+        }
+
+        // Unfiltered: the page of 4 is spent on absent rows (the defect).
+        let preview = store.preview_terminal_reclaim_page_with(4, true).unwrap();
+        assert_eq!(preview.absent_skipped, 0);
+
+        let page = store
+            .reserve_terminal_reclaim_page_filtered(4, true, true)
+            .unwrap();
+        let reached = page
+            .candidates
+            .iter()
+            .map(|candidate| candidate.session_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reached,
+            vec![ids[20], ids[0]],
+            "present targets are tried, newest first, in the first pass"
+        );
+        assert_eq!(page.absent_skipped, 38);
+        // Every row was walked past, so the next pass does not revisit them.
+        let again = store
+            .reserve_terminal_reclaim_page_filtered(4, true, true)
+            .unwrap();
+        assert!(again.candidates.is_empty(), "{again:?}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn unfiltered_pages_are_unchanged_by_absent_targets() {
+        let fixture = FixtureDirectory::create("target-reclaim-sweep-absent-unfiltered");
+        let mut store = Store::open_in_memory().unwrap();
+        let ids = (0..6)
+            .map(|ordinal| seed_candidate(&mut store, fixture.path(), ordinal))
+            .collect::<Vec<_>>();
+        let page = store.reserve_terminal_reclaim_page_with(3, false).unwrap();
+        assert_eq!(page.absent_skipped, 0);
+        assert_eq!(
+            page.candidates
+                .iter()
+                .map(|candidate| candidate.session_id)
+                .collect::<Vec<_>>(),
+            vec![ids[0], ids[1], ids[2]]
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn pressure_page_reaches_newest_rows_inside_the_frozen_window_without_moving_the_walk() {
+        let fixture = FixtureDirectory::create("target-reclaim-sweep-recent-inside");
+        let mut store = Store::open_in_memory().unwrap();
+        let ids = (0..6)
+            .map(|ordinal| seed_candidate(&mut store, fixture.path(), ordinal))
+            .collect::<Vec<_>>();
+        // The walk starts at the oldest row; the newest rows sit at the end of
+        // the frozen window, one full cycle away.
+        let first = store.reserve_terminal_reclaim_page(1).unwrap();
+        assert_eq!(first.candidates[0].session_id, ids[0]);
+
+        let pressure = store.reserve_terminal_reclaim_page_with(4, true).unwrap();
+        let reached = pressure
+            .candidates
+            .iter()
+            .map(|candidate| candidate.session_id)
+            .collect::<Vec<_>>();
+        // Two newest rows lead; the walk continues from its own cursor.
+        assert_eq!(reached, vec![ids[5], ids[4], ids[1], ids[2]]);
+        assert_eq!(
+            pressure
+                .evidence
+                .cursor_after
+                .as_ref()
+                .map(|k| k.session_id),
+            Some(ids[2])
+        );
+        assert_eq!(pressure.evidence.upper_bound, first.evidence.upper_bound);
+
+        // A row reached by both sources is attempted once.
+        let overlap = store.reserve_terminal_reclaim_page_with(8, true).unwrap();
+        let mut seen = overlap
+            .candidates
+            .iter()
+            .map(|candidate| candidate.session_id)
+            .collect::<Vec<_>>();
+        let total = seen.len();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), total);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn pressure_page_keeps_walking_when_recent_rows_have_no_reclaim_event() {
+        let fixture = FixtureDirectory::create("target-reclaim-recent-refusals");
+        let mut store = Store::open_in_memory().unwrap();
+        let ids = (0..6)
+            .map(|ordinal| seed_candidate(&mut store, fixture.path(), ordinal))
+            .collect::<Vec<_>>();
+        // Refusals leave no intent/event. The recent lane rotates while the
+        // fair walk retains at least half the page and finishes its cycle.
+        for (ordinal, owner) in ids.iter().enumerate() {
+            let page = store.reserve_terminal_reclaim_page_with(2, true).unwrap();
+            assert_eq!(page.candidates[0].session_id, ids[5 - ordinal]);
+            assert_eq!(
+                page.evidence.cursor_after.as_ref().unwrap().session_id,
+                *owner
+            );
+            assert!(
+                page.candidates
+                    .iter()
+                    .any(|candidate| candidate.session_id == *owner)
+            );
+            assert!(page.evidence.inspected_terminal_rows <= 2);
+        }
+        let wrapped = store.reserve_terminal_reclaim_page_with(2, true).unwrap();
+        assert!(wrapped.evidence.wrapped);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn pressure_page_advances_past_absent_targets_durably_and_retries_next_cycle() {
+        let fixture = FixtureDirectory::create("target-reclaim-absent-rotation");
+        let database = fixture.path().join("rotation.db");
+        let mut store = Store::open(&database).unwrap();
+        let ids = (0..6)
+            .map(|ordinal| seed_candidate(&mut store, fixture.path(), ordinal))
+            .collect::<Vec<_>>();
+        let absent_target = fixture.path().join("sandbox-5/target");
+        std::fs::create_dir_all(absent_target.parent().unwrap()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&absent_target).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        std::fs::create_dir_all(fixture.path().join("sandbox-4/target")).unwrap();
+
+        let first = store.reserve_terminal_reclaim_page_with(2, true).unwrap();
+        assert_eq!(first.candidates[0].session_id, ids[5]);
+        // TargetAbsent creates no reclaim intent/event. Closing the store
+        // models a restart after that refusal, before another pressure pass.
+        drop(store);
+        let store = Store::open(&database).unwrap();
+        let preview = store.preview_terminal_reclaim_page_with(2, true).unwrap();
+        assert_eq!(preview.candidates[0].session_id, ids[4]);
+        assert_eq!(
+            store.preview_terminal_reclaim_page_with(2, true).unwrap(),
+            preview
+        );
+        let next = store.reserve_terminal_reclaim_page_with(2, true).unwrap();
+        assert_eq!(next.candidates, preview.candidates);
+        assert_eq!(next.evidence.upper_bound, first.evidence.upper_bound);
+        assert_eq!(
+            next.evidence.cursor_after.as_ref().unwrap().session_id,
+            ids[1]
+        );
+
+        for _ in 0..4 {
+            store.reserve_terminal_reclaim_page_with(2, true).unwrap();
+        }
+        assert!(
+            store
+                .reserve_terminal_reclaim_page_with(2, true)
+                .unwrap()
+                .evidence
+                .wrapped
+        );
+        // A rebuilt target remains eligible in the next recent cycle without
+        // changing custody generation or manufacturing a deletion event.
+        std::fs::create_dir_all(&absent_target).unwrap();
+        let retry = store.reserve_terminal_reclaim_page_with(2, true).unwrap();
+        assert_eq!(retry.candidates[0].session_id, ids[5]);
+        assert_eq!(retry.evidence.cycle_after, first.evidence.cycle_after + 1);
+        assert_eq!(store.target_reclaim_intent_counts().unwrap().completed, 0);
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn target_reclaim_sweep_upper_bound_defers_new_rows_and_forward_guards_reject_rewind() {
@@ -2368,6 +2903,330 @@ mod tests {
             .reserve_effect(deleting.custody_id, deleting.generation, boot)
             .unwrap();
         store.settle_effect(reservation, false).unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn target_reclaim_retains_an_idle_appointed_manager() {
+        let fixture = FixtureDirectory::create("target-manager-seat");
+        let mut store = Store::open_in_memory().unwrap();
+        let owner = seed_candidate(&mut store, fixture.path(), 0);
+        let (config, _) = crate::store::manager_coordinator::tests::fixture(
+            &store,
+            rsi_common::harness_manager_v2::ManagerPolicyV2::default(),
+        );
+        // Appoint the terminal custody owner through the real operator path.
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET project_id=?2 WHERE id=?1",
+                params![owner.to_string(), config.project_id.to_string()],
+            )
+            .unwrap();
+        store
+            .configure_harness_manager(
+                &rsi_common::harness_manager::ConfigureHarnessManagerRequestV1 {
+                    project_id: config.project_id,
+                    session_id: owner,
+                    group_ids: vec![],
+                    epic_ids: config.selected_epic_ids.clone(),
+                    expected_row_version: config.row_version,
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .target_reclaim_has_live_consumer(Uuid::from_u128(10_000), 1)
+                .unwrap()
+        );
+        assert!(
+            store
+                .reclaim_terminal_target_locked(Uuid::from_u128(10_000), 1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .prepare_target_reclaim_intent(Uuid::from_u128(10_000), 1, 1, 1)
+                .is_err()
+        );
+    }
+
+    fn assert_continuation_protects_target(store: &Store, custody: Uuid) {
+        for pressure in [false, true] {
+            let page = store
+                .preview_terminal_reclaim_page_with(4, pressure)
+                .unwrap();
+            assert!(
+                page.candidates.is_empty(),
+                "continuation must retain target: {page:?}"
+            );
+        }
+        assert!(
+            store
+                .reclaim_terminal_target_locked(custody, 1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .prepare_target_reclaim_intent(custody, 1, 1, 1)
+                .is_err()
+        );
+        assert!(store.target_reclaim_intent(custody, 1).unwrap().is_none());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn target_reclaim_continuation_wakes_fence_both_lanes_and_preparation() {
+        use rsi_common::types::{Recurrence, ScheduleSpec, ScheduledJob, WakeMode};
+        use rsi_common::wake_predicate::{WakePredicate, WakeWhenState};
+        let fixture = FixtureDirectory::create("target-continuation-wakes");
+        for (mode, predicate) in [
+            (WakeMode::Resume, false),
+            (WakeMode::Resume, true),
+            (WakeMode::OnTerminal(Uuid::new_v4()), false),
+        ] {
+            let mut store = Store::open_in_memory().unwrap();
+            let owner = seed_candidate(&mut store, fixture.path(), 0);
+            let custody = Uuid::from_u128(10_000);
+            let now = Utc::now();
+            let job = ScheduledJob {
+                id: Uuid::new_v4(),
+                name: "continuation".into(),
+                message: "continue after work settles".into(),
+                schedule: ScheduleSpec {
+                    recurrence: Recurrence::Once,
+                    anchor: now,
+                },
+                last_fired_at: None,
+                next_fire_at: now,
+                enabled: true,
+                working_dir: None,
+                provider: None,
+                model: None,
+                project_id: None,
+                created_at: now,
+                updated_at: now,
+                wake_mode: mode,
+                wake_session_id: Some(owner),
+            };
+            if predicate {
+                store
+                    .insert_wake_when(
+                        &job,
+                        &WakeWhenState {
+                            predicate: WakePredicate {
+                                jobs_terminal: None,
+                                sha_on_rolling: Some("a".repeat(40)),
+                            },
+                            armed_at: now,
+                            deadline: None,
+                            repo_dir: Some(fixture.path().display().to_string()),
+                        },
+                        false,
+                    )
+                    .unwrap();
+            } else {
+                store.insert_scheduled_job(&job).unwrap();
+            }
+            assert_continuation_protects_target(&store, custody);
+            // Cancelling the continuation restores eligibility in both lanes.
+            store
+                .cancel_owned_scheduled_jobs(owner, Some(job.id), None)
+                .unwrap();
+            for pressure in [false, true] {
+                let page = store
+                    .preview_terminal_reclaim_page_with(4, pressure)
+                    .unwrap();
+                assert_eq!(page.candidates.len(), 1);
+                assert_eq!(page.candidates[0].session_id, owner);
+            }
+            assert!(
+                store
+                    .reclaim_terminal_target_locked(custody, 1)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn target_reclaim_pending_and_claimed_restart_intents_retain_target() {
+        let fixture = FixtureDirectory::create("target-restart-intent");
+        let mut store = Store::open_in_memory().unwrap();
+        let owner = seed_candidate(&mut store, fixture.path(), 0);
+        let custody = Uuid::from_u128(10_000);
+        let invocation = Uuid::new_v4();
+        store
+            .conn
+            .execute(
+                "INSERT INTO model_invocations
+             (id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,
+              trigger_source,session_id,created_at)
+             VALUES(?1,'session.launch','session','foreground','paid','admitted','running',
+                    'launch_session',?2,?3)",
+                params![
+                    invocation.to_string(),
+                    owner.to_string(),
+                    Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
+                ],
+            )
+            .unwrap();
+        store
+            .set_session_model_invocation(owner, Some(invocation))
+            .unwrap();
+        store
+            .update_session_status(owner, SessionStatus::Running)
+            .unwrap();
+        let boot = Uuid::new_v4();
+        assert!(store.record_restart_intent(owner, boot).unwrap());
+        store.mark_restart_interrupt_sent(owner, boot).unwrap();
+        store
+            .update_session_status(owner, SessionStatus::Interrupted)
+            .unwrap();
+        assert_continuation_protects_target(&store, custody);
+        let intent = store.next_restart_intent(None).unwrap().unwrap();
+        assert!(store.claim_restart_intent(&intent, Uuid::new_v4()).unwrap());
+        assert_continuation_protects_target(&store, custody);
+        store
+            .conn
+            .execute(
+                "UPDATE daemon_restart_intents SET state='failed' WHERE id=?1",
+                [intent.id.to_string()],
+            )
+            .unwrap();
+        let page = store.preview_terminal_reclaim_page_with(4, true).unwrap();
+        assert_eq!(page.candidates.len(), 1);
+        assert_eq!(page.candidates[0].session_id, owner);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn target_reclaim_live_job_fences_selection_and_preparation() {
+        use crate::store::agent_jobs::NewAgentJob;
+        use rsi_common::agent_jobs::{BuildCommand, BuildJobParams, JobParams, JobWake};
+        let fixture = FixtureDirectory::create("target-live-job");
+        let mut store = Store::open_in_memory().unwrap();
+        let owner = seed_candidate(&mut store, fixture.path(), 0);
+        let custody = Uuid::from_u128(10_000);
+        assert!(
+            store
+                .reclaim_terminal_target_locked(custody, 1)
+                .unwrap()
+                .is_some()
+        );
+        let id = Uuid::new_v4();
+        store
+            .insert_agent_job(
+                &NewAgentJob {
+                    id,
+                    owner_session_id: owner,
+                    project_id: None,
+                    name: None,
+                    params: JobParams::Build(BuildJobParams {
+                        command: BuildCommand::Check,
+                        package: None,
+                        workspace: false,
+                        all_targets: false,
+                        release: false,
+                    }),
+                    // The job belongs to the owner even if it builds from a gate clone.
+                    cwd: fixture.path().join("gate").display().to_string(),
+                    unit_name: format!("rsi-test-{id}"),
+                    log_path: "/tmp/job.log".into(),
+                    status_path: "/tmp/job.status".into(),
+                    idempotency_key: None,
+                    wake: JobWake::None,
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        assert_continuation_protects_target(&store, custody);
+        assert!(
+            store
+                .reclaim_terminal_target_locked(custody, 1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .prepare_target_reclaim_intent(custody, 1, 1, 1)
+                .is_err()
+        );
+        assert!(store.target_reclaim_intent(custody, 1).unwrap().is_none());
+        // Reverse writer order: Prepared wins, so a new job cannot enter.
+        let next_owner = seed_candidate(&mut store, fixture.path(), 1);
+        let next_custody = Uuid::from_u128(10_001);
+        store
+            .prepare_target_reclaim_intent(next_custody, 1, 1, 2)
+            .unwrap();
+        let row = store.get_agent_job(id).unwrap().unwrap();
+        let next_id = Uuid::new_v4();
+        let mut next_job = NewAgentJob {
+            id: next_id,
+            owner_session_id: next_owner,
+            project_id: None,
+            name: None,
+            params: row.job.params.clone(),
+            cwd: fixture.path().join("sandbox-1").display().to_string(),
+            unit_name: format!("rsi-test-{next_id}"),
+            log_path: "/tmp/job2.log".into(),
+            status_path: "/tmp/job2.status".into(),
+            idempotency_key: None,
+            wake: JobWake::None,
+        };
+        assert!(
+            store
+                .insert_agent_job(&next_job, Utc::now())
+                .unwrap_err()
+                .to_string()
+                .contains("sandbox_reclaim_prepared")
+        );
+        // The other session's job is protected by cwd as well as owner id.
+        next_job.owner_session_id = owner;
+        assert!(store.insert_agent_job(&next_job, Utc::now()).is_err());
+        assert!(store.get_agent_job(next_id).unwrap().is_none());
+        let prepared = store
+            .target_reclaim_intent(next_custody, 1)
+            .unwrap()
+            .unwrap();
+        store.mark_target_reclaim_staged(&prepared).unwrap();
+        assert!(store.insert_agent_job(&next_job, Utc::now()).is_ok());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn target_reclaim_routes_friction_and_manager_notice() {
+        let store = Store::open_in_memory().unwrap();
+        let (config, lead) = crate::store::manager_coordinator::tests::fixture(
+            &store,
+            rsi_common::harness_manager_v2::ManagerPolicyV2::default(),
+        );
+        let custody = Uuid::new_v4();
+        let job = store
+            .record_target_reclaim_notice(lead.id, custody, 3, 4096, false)
+            .unwrap()
+            .unwrap();
+        let state: String = store.conn.query_row(
+            "SELECT state_json FROM harness_manager_notices WHERE job_id=?1 AND source_session_id=?2",
+            params![job.to_string(), lead.id.to_string()], |row| row.get(0)).unwrap();
+        let state: serde_json::Value = serde_json::from_str(&state).unwrap();
+        assert_eq!(state["record_kind"], "sandbox_target_reclaim");
+        assert_eq!(state["generation"], 3);
+        assert_eq!(state["bytes"], 4096);
+        assert_eq!(state["outcome"], "removed");
+        let signature: String = store
+            .conn
+            .query_row(
+                "SELECT signature FROM friction_events WHERE session_id=?1 AND project_id=?2",
+                params![lead.id.to_string(), config.project_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(signature, "sandbox_target_reclaim:removed");
+        assert_eq!(store.manager_notice_undelivered_count(job).unwrap(), 1);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]

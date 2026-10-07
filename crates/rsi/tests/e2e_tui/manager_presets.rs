@@ -457,7 +457,7 @@ async fn run(h: &mut E2eHarness, fixture: &mut Value) -> E2eResult<()> {
         custom.allowed_launches = vec![
             ManagerLaunchChoiceV2 {
                 provider: SessionProvider::Codex,
-                model: "retained-legacy-choice".into(),
+                model: "gpt-6-sol".into(),
                 effort: None,
             },
             ManagerLaunchChoiceV2 {
@@ -480,7 +480,7 @@ async fn run(h: &mut E2eHarness, fixture: &mut Value) -> E2eResult<()> {
         command(&term, "manager policy").await?;
         visible(&term, "Saved: Custom").await?;
         visible(&term, "Draft: Custom").await?;
-        visible(&term, "retained-legacy-choice").await?;
+        visible(&term, "gpt-6-sol").await?;
         press(&term, Key::Char('s')).await?;
         visible(&term, &format!("policy {}", saved.row_version + 1)).await?;
         let reopened = client

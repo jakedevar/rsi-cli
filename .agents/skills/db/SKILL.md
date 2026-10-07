@@ -13,7 +13,7 @@ You are tasked with interacting with the rsi SQLite database safely and efficien
 | --- | --- | --- |
 | SQLite database | `~/.rsi/rsi.db` | Override with `$RSI_DB` (`${RSI_DB:-$HOME/.rsi/rsi.db}`) |
 | Unix socket | `~/.rsi/daemon.sock` | JSON-RPC endpoint; daemon must be running for RPC |
-| Schema truth (code) | `crates/rsid-store/src/store/migrations/vNNN.rs` (runner: `store/mod.rs`) | one file per version, head = highest file (`LATEST_SCHEMA_VERSION`) |
+| Schema truth (code) | `crates/rsid-store/src/store/migrations/vNNN.rs` (runner: `store/mod.rs`) | One file per version; `crates/rsid-store/build.rs` discovers the files and generates `LATEST_SCHEMA_VERSION` from the highest version |
 
 ## Discover the schema (do this FIRST — never guess columns)
 
@@ -50,7 +50,7 @@ If `rsi-diag` is not built, `sqlite3 "$RSI_DB" ".schema <table>"` and `sqlite3 "
 
 Only break out raw SQL writes with explicit user consent. When you do:
 
-1. **Never change schema without a versioned migration** in `crates/rsid-store/src/store/` plus a matching `PRAGMA user_version` bump and the `LATEST_SCHEMA_VERSION` constant.
+1. **Never change schema without a new versioned migration file** at `crates/rsid-store/src/store/migrations/vNNN.rs`. Choose the highest migration version on `rolling` plus one; put the `if version < N` block and matching `PRAGMA user_version` bump in that file. `build.rs` discovers the files and generates the runner list and `LATEST_SCHEMA_VERSION`; do not edit a shared list or constant. Released migrations are immutable.
 2. **Never hard-delete rows without explicit user consent.** Prefer logical delete, archive, or a status transition.
 3. **Timestamps** must be RFC3339 with nanosecond precision.
 4. **UUIDs** must be lowercase canonical strings.
@@ -61,4 +61,4 @@ Only break out raw SQL writes with explicit user consent. When you do:
 
 - Discover before you query: run `rsi-diag schema <table>` so you never go back and forth on missing or misnamed columns.
 - Read-only by default. Mutations go through the daemon RPC unless the user explicitly approves raw SQL.
-- The schema is large and evolving (`user_version` is in the 60s). Pull only the slice you need with `--grep`.
+- The schema evolves with migrations. Read the applied version with `rsi-diag schema --version`, and pull only the slice you need with `--grep`.

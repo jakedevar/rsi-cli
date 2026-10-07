@@ -1,5 +1,6 @@
 use super::*;
 use crate::error::DaemonError;
+use crate::store::harness_manager_v2::ManagerCallerV1;
 use crate::store::harness_manager_v2::{
     BOOKKEEPING_LIMIT, COORDINATION_BUDGET_COUNT_SQL, LIVE_BOOKKEEPING_COUNTS_SQL,
     REQUEST_MARKER_KINDS, bookkeeping_class, bookkeeping_class_limit, live_class_count_sql,
@@ -25,27 +26,62 @@ struct Cursor {
 }
 
 impl Store {
+    fn manager_inspection_policy(
+        &self,
+        config: &HarnessManagerConfigV1,
+    ) -> Result<Option<HarnessManagerPolicyConfigV2>> {
+        let mut policy = self.manager_policy_for_config(config)?;
+        if let Some(grant) = &mut policy {
+            grant.policy.allowed_launches =
+                self.manager_effective_launches(config, &grant.policy.allowed_launches)?;
+        }
+        Ok(policy)
+    }
+
     pub fn manager_v2_inspect(
         &self,
         caller: Uuid,
         query: &AgentManagerInspectRequestV2,
     ) -> Result<ManagerInspectionV2> {
-        let (mut config, is_manager, mut is_area) = match self.manager_config_for_caller(caller) {
-            Ok((config, is_manager)) => (config, is_manager, false),
-            Err(legacy_denial) => {
-                let Some(authority) = self.manager_area_authority_current(caller)? else {
-                    return Err(legacy_denial);
-                };
-                (authority.config, true, true)
-            }
-        };
+        // #1235: `project_id` targets a granted project for the global seat.
+        let (mut config, is_manager, mut is_area) =
+            match self.resolve_manager_caller(caller, query.project_id)? {
+                ManagerCallerV1::Legacy { config, is_manager } => (config, is_manager, false),
+                ManagerCallerV1::Area(authority) => (authority.config, true, true),
+                ManagerCallerV1::Global(authority) => (authority.config, true, false),
+            };
         let mut q = query.clone();
         if is_manager && !is_area {
             config.epic_ids = self.manager_direct_epics(&config, config.manager_session_id)?;
             config.selected_epic_ids = Some(config.epic_ids.clone());
         }
+        // #1415: the decision records this seat may settle with a ruling.
+        if q.section == ManagerInspectSectionV2::Rulings {
+            if !is_manager || is_area {
+                return Err(refused("manager_v2_scope_denied"));
+            }
+            q.validate().map_err(refused)?;
+            if q.cursor.is_some() {
+                return Err(refused("manager_v2_invalid_cursor"));
+            }
+            let (rows, complete) =
+                self.manager_v2_rulings_rows(&config, q.epic_id, usize::from(q.limit))?;
+            return Ok(ManagerInspectionV2 {
+                observed_at: chrono::Utc::now(),
+                scope_version: config.row_version,
+                policy: self.manager_inspection_policy(&config)?,
+                section: ManagerInspectSectionV2::Rulings,
+                rows,
+                next_cursor: None,
+                complete,
+            });
+        }
         if !is_manager {
-            if q.section == ManagerInspectSectionV2::Archive {
+            // #1333: the friction rollup is project-wide, a manager read.
+            if matches!(
+                q.section,
+                ManagerInspectSectionV2::Archive | ManagerInspectSectionV2::Friction
+            ) {
                 return Err(refused("manager_v2_scope_denied"));
             }
             let epic = self
@@ -131,7 +167,7 @@ impl Store {
             self.manager_v2_refresh_question_decisions(config)?;
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
-        let policy = self.manager_policy_for_config(config)?;
+        let policy = self.manager_inspection_policy(config)?;
         let revision:i64=self.conn.query_row("SELECT COALESCE(MAX(sequence),0) FROM harness_manager_v2_events WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3 AND kind != 'decision_retrieval'",params![config.project_id.to_string(),config.manager_session_id.to_string(),config.row_version],|r|r.get(0))?;
         let leaf_scope = if matches!(
             q.section,
@@ -216,6 +252,7 @@ impl Store {
                         | ManagerInspectSectionV2::Decisions
                         | ManagerInspectSectionV2::Health
                         | ManagerInspectSectionV2::Satellites
+                        | ManagerInspectSectionV2::Friction
                 ) && leaf_scope.is_none()
                     && c.revision != revision)
             {
@@ -250,6 +287,20 @@ impl Store {
             // Satellite peers are a daemon-wide registry, not Epic-scoped; the
             // rows are read-only health, so any appointed manager may read them.
             ManagerInspectSectionV2::Satellites => self.manager_v2_satellite_rows()?,
+            // Served by `manager_v2_inspect` for a manager seat only.
+            ManagerInspectSectionV2::Rulings => {
+                return Err(refused("manager_v2_scope_denied"));
+            }
+            // #1333: the project's friction rollup (codes and ids only), one
+            // page; a truncated rollup is partial coverage. An Epic filter
+            // (required of an area, validated against its selected Epics
+            // above) confines the rows to that Epic's sessions (#1395).
+            ManagerInspectSectionV2::Friction => {
+                let (rows, complete) =
+                    self.manager_v2_friction_rows(config.project_id, q.epic_id)?;
+                coverage = complete;
+                rows
+            }
             ManagerInspectSectionV2::MigrationAllocations => {
                 let (rows, complete) = self.manager_v2_migration_allocation_rows(
                     config,
@@ -400,21 +451,34 @@ impl Store {
                     usize::from(q.limit) + 1,
                 )? {
                     if q.epic_id.is_none_or(|e| record.epic_id == Some(e)) {
+                        let archived = record.archived;
                         let mut row = record_row(record);
-                        if let Some(target) = self.manager_v2_record(
+                        let target = self.manager_v2_record(
                             config,
                             "decision_target",
                             row["key"].as_str().unwrap_or_default(),
-                        )? {
+                        )?;
+                        if let Some(target) = &target {
                             row["session_id"] = target.payload["session_id"].clone();
                         }
                         self.manager_v2_project_decision_retrieval(config, &mut row)?;
+                        // #1415: who may answer, what it blocks, age, staleness.
+                        self.manager_v2_decorate_decision_row(
+                            config,
+                            &mut row,
+                            archived,
+                            target.is_some(),
+                        )?;
                         out.push(row);
                     }
                 }
-                let (legacy, scan_after, scan_complete) =
+                let (mut legacy, scan_after, scan_complete) =
                     self.manager_v2_approval_gate_rows(config, q.epic_id, &after)?;
                 coverage = scan_complete;
+                // #1415: a human approval is a real gate, operator-only.
+                for row in &mut legacy {
+                    Store::manager_v2_mark_operator_gate_row(row);
+                }
                 out.extend(legacy);
                 // A legacy or malformed question is still a visible human gate.
                 for record in self.manager_v2_records(config, "intent")? {
@@ -430,6 +494,7 @@ impl Store {
                         row["next_action"] = json!(
                             "Open the exact session question; its provenance is unavailable to this inbox."
                         );
+                        Store::manager_v2_mark_operator_gate_row(&mut row);
                         out.push(row);
                     }
                 }
@@ -1255,8 +1320,9 @@ impl Store {
             let caller = config
                 .current_session_id
                 .ok_or_else(|| refused("manager_v2_scope_changed"))?;
-            let authority = self.manager_v2_authorize(
+            let authority = self.manager_v2_authorize_in(
                 caller,
+                Some(config.project_id),
                 &ManagerFenceV2 {
                     scope_version: config.row_version,
                     policy_version: grant.row_version,
@@ -1553,7 +1619,7 @@ impl Store {
         Ok(rows)
     }
 }
-fn record_row(r: ManagerRecordV2) -> Value {
+pub(crate) fn record_row(r: ManagerRecordV2) -> Value {
     let mut v = r.payload;
     v["type"] = json!(r.kind);
     v["key"] = json!(r.key);

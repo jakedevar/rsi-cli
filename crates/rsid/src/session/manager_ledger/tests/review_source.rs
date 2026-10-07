@@ -3,6 +3,184 @@
 //! sandbox. Stage and Integration keep today's archived-source refusal.
 use super::*;
 
+async fn reclaim_source(f: &Fixture) {
+    let repository = f.dir.path().join("repo");
+    command(
+        &repository,
+        &["worktree", "remove", f.source_root.to_str().unwrap()],
+    );
+    let mut store = f.handle.store.lock().await;
+    let custody = store.live_custody_for_session(f.source).unwrap();
+    store
+        .tombstone_custody_root(custody.custody_id, custody.generation, CustodyCause::Purge)
+        .unwrap();
+    store
+        .update_session_status(f.source, SessionStatus::Archived)
+        .unwrap();
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn reclaimed_author_review_forks_exact_source_from_recorded_repository() {
+    let f = fixture().await;
+    record_db_review_source(&f, "reclaimed-source").await;
+    reclaim_source(&f).await;
+    let repository = f.dir.path().join("repo");
+    commit_file(
+        &repository,
+        "code.txt",
+        "later rolling code\n",
+        "advance rolling",
+    );
+    let receipt = review_at(&f, "reclaimed-review").await.unwrap();
+    assert_review_at_seal(&f, &receipt).await;
+    let claim = {
+        let store = f.handle.store.lock().await;
+        hold_for_acceptance(&store, &f);
+        let claim = store.claim_manager_action(Uuid::new_v4()).unwrap().unwrap();
+        assert!(
+            store
+                .manager_review_evidence_action(&claim.operation)
+                .unwrap()
+        );
+        store.manager_action_runtime_gate(&claim, true).unwrap();
+        claim
+    };
+    let runtime = f.sessions.custody_execution_runtime();
+    super::super::super::manager_actions::manager_action_source_gate(
+        &runtime,
+        &f.handle.store,
+        &claim,
+    )
+    .await
+    .unwrap();
+    let author = f
+        .handle
+        .store
+        .lock()
+        .await
+        .get_session(f.source)
+        .unwrap()
+        .unwrap();
+    let fork = runtime
+        .prepare_manager_review_fork_at(&author, &f.source_head)
+        .await
+        .unwrap();
+    assert_eq!(fork.fork_origin(), repository);
+    assert_eq!(fork.fork_commit(), f.source_head);
+    assert_eq!(
+        command(
+            fork.fork_origin(),
+            &["show", &format!("{}:code.txt", fork.fork_commit())]
+        ),
+        "implemented"
+    );
+    assert!(
+        runtime
+            .prepare_manager_action_fork_at(&author, &f.source_head)
+            .await
+            .is_err()
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn reclaimed_review_refuses_unreachable_source_and_names_old_sandbox() {
+    let f = fixture().await;
+    record_db_review_source(&f, "reclaimed-unreachable").await;
+    reclaim_source(&f).await;
+    let repository = f.dir.path().join("repo");
+    command(
+        &repository,
+        &["worktree", "remove", f.review_root.to_str().unwrap()],
+    );
+    command(&repository, &["branch", "-D", "source", "review"]);
+    let error = refusal(review_at(&f, "reclaimed-unreachable-review").await);
+    assert!(
+        error.contains("manager_review_reclaimed_source_unavailable"),
+        "{error}"
+    );
+    assert!(error.contains(f.source_root.to_str().unwrap()), "{error}");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn reclaimed_review_rejects_replaced_repository_and_inherited_base() {
+    let f = fixture().await;
+    record_db_review_source(&f, "reclaimed-proofs").await;
+    reclaim_source(&f).await;
+    let mut proof = {
+        let store = f.handle.store.lock().await;
+        let author = store.get_session(f.source).unwrap().unwrap();
+        store
+            .manager_review_reclaimed_source(&author)
+            .unwrap()
+            .unwrap()
+    };
+    assert!(
+        proof
+            .verify(&f.allocation_commit)
+            .unwrap_err()
+            .to_string()
+            .contains("manager_review_source_not_authored")
+    );
+    let foreign = f.dir.path().join("foreign");
+    std::fs::create_dir(&foreign).unwrap();
+    command(&foreign, &["init", "-b", "rolling"]);
+    proof.repository = foreign;
+    assert!(
+        proof
+            .verify(&f.source_head)
+            .unwrap_err()
+            .to_string()
+            .contains("manager_v2_custody_repository_changed")
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn missing_live_review_source_does_not_use_repository_fallback() {
+    let f = fixture().await;
+    record_db_review_source(&f, "missing-live").await;
+    command(
+        &f.dir.path().join("repo"),
+        &["worktree", "remove", f.source_root.to_str().unwrap()],
+    );
+    assert!(review_at(&f, "missing-live-review").await.is_err());
+    let store = f.handle.store.lock().await;
+    let author = store.get_session(f.source).unwrap().unwrap();
+    assert_eq!(
+        store.manager_review_reclaimed_source(&author).unwrap(),
+        None
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn reclaimed_review_infrastructure_retry_keeps_author_and_exact_commit() {
+    let f = fixture().await;
+    record_db_review_source(&f, "reclaimed-retry").await;
+    reclaim_source(&f).await;
+    let receipt = review_at(&f, "reclaimed-retry-review").await.unwrap();
+    let id = Uuid::parse_str(&receipt.key).unwrap();
+    let store = f.handle.store.lock().await;
+    let claim = store.claim_manager_action(Uuid::new_v4()).unwrap().unwrap();
+    store.conn.execute("UPDATE harness_manager_v2_operations SET state='failed',row_version=row_version+1 WHERE id=?1", [claim.operation.receipt.operation_id.to_string()]).unwrap();
+    assert!(store.refresh_manager_review_assignment(id).unwrap());
+    let next: String = store.conn.query_row("SELECT superseded_by_assignment_id FROM manager_review_assignments WHERE assignment_id=?1", [id.to_string()], |row| row.get(0)).unwrap();
+    let next = Uuid::parse_str(&next).unwrap();
+    assert!(store.allocate_manager_review_assignment(next).unwrap());
+    let (author, sha, state): (String, String, String) = store.conn.query_row("SELECT author_session_id,source_sha,state FROM manager_review_assignments WHERE assignment_id=?1", [next.to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+    assert_eq!(
+        (author, sha, state),
+        (
+            f.source.to_string(),
+            f.source_head.clone(),
+            "allocating".into()
+        )
+    );
+}
+
 async fn review_at(f: &Fixture, key: &str) -> Result<ManagerMutationReceiptV2> {
     f.handle
         .agent_manager_update(
@@ -488,6 +666,11 @@ pub(super) fn hold_for_acceptance(store: &Store, f: &Fixture) {
                 status: "pending".into(),
                 answer: None,
                 delivery: None,
+                gate: None,
+                options: Vec::new(),
+                asked_by: None,
+                answered_by: None,
+                history: Vec::new(),
             }),
         )
         .unwrap();
@@ -643,4 +826,40 @@ async fn launch_gate_refuses_every_persisted_invalid_rotated_source_while_decisi
             "{scenario:?}: the reviewer launch effect never started"
         );
     }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn reclaimed_review_refuses_a_revised_commit_not_recorded_for_the_author() {
+    let f = fixture().await;
+    record_db_review_source(&f, "reclaimed-revised").await;
+    reclaim_source(&f).await;
+    let repository = f.dir.path().join("repo");
+    // A commit of someone else's work: reachable from a repository ref and
+    // not inherited from the author's base, but never recorded for this Work.
+    let other = commit_file(&repository, "other.txt", "other author\n", "other work");
+    let error = refusal(
+        f.handle
+            .agent_manager_update(
+                f.manager,
+                req(
+                    ManagerUpdateV2::RequestReview {
+                        key: "product".into(),
+                        expected_row_version: 2,
+                        source_commit: other,
+                        query: "Delta review.".into(),
+                        launch: ManagerLaunchChoiceV2 {
+                            provider: SessionProvider::Claude,
+                            model: "claude-sonnet-5".into(),
+                            effort: None,
+                        },
+                        delta_of: Some(Uuid::new_v4()),
+                        finding_keys: vec!["finding".into()],
+                    },
+                    "reclaimed-revised-review",
+                ),
+            )
+            .await,
+    );
+    assert!(error.contains("manager_review_source_changed"), "{error}");
 }

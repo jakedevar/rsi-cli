@@ -1,7 +1,7 @@
 //! V115 storage foundation for daemon-authored manager preparations.
 //! Admission and transport APIs deliberately live outside this migration.
 
-use super::harness_manager_v2::{ManagerAuthorityV2, fingerprint, now, refused};
+use super::harness_manager_v2::{ManagerAuthorityV2, ManagerCallerV1, fingerprint, now, refused};
 use super::manager_actions::{
     MANAGER_ACTION_HOLD_KIND, ManagerActionAdmissionV2, ManagerActionHoldReasonV2,
     ManagerActionOriginV2, ManagerActionRuntimeHoldV2, action_epic, manager_action_hold_key,
@@ -408,11 +408,13 @@ fn materialize_prepared_action(
             kind,
             query,
             launch,
+            sandbox_source,
         } => ManagerActionV2::CreateSession {
             parent_id: *parent_id,
             kind: *kind,
             query: query.clone(),
             launch: launch.clone(),
+            sandbox_source: sandbox_source.clone(),
         },
         PreparedManagerActionV2::AssignLead {
             epic_id,
@@ -446,11 +448,22 @@ fn admission_digest(
     request: &AgentManagerControlRequestV2,
     admission: &ManagerActionAdmissionV2,
 ) -> Result<String> {
+    // #1195: a `rolling` create resolves its base at launch; the checkout
+    // HEAD it carries is only a fallback, so the operator's checkout moving
+    // between prepare and commit does not change the prepared target.
+    let mut source = serde_json::to_value(&admission.source)?;
+    if admission
+        .source
+        .as_ref()
+        .is_some_and(super::manager_actions::ManagerActionSourceV2::resolves_rolling_at_launch)
+    {
+        source["commit"] = Value::Null;
+    }
     fingerprint(&json!({
         "fence": request.fence,
         "operation": request.operation,
         "target": target_projection(admission.target.as_ref()),
-        "source": admission.source,
+        "source": source,
         "launch": admission.launch,
         "delay_seconds": admission.delay_seconds,
     }))
@@ -526,12 +539,33 @@ fn capture_blocker(
 }
 
 impl Store {
+    /// The caller's current authority plus the target project to journal
+    /// (`Some` only for the global seat, #1235, so a project manager's
+    /// journalled requests stay byte-identical).
     fn current_prepared_manager_authority(
         &self,
         caller: Uuid,
+        project: Option<Uuid>,
         capability: ManagerCapabilityV2,
-    ) -> Result<ManagerAuthorityV2> {
-        let (config, is_manager) = self.manager_config_for_caller(caller)?;
+    ) -> Result<(ManagerAuthorityV2, Option<Uuid>)> {
+        let (config, is_manager) = match self.resolve_manager_caller(caller, project)? {
+            ManagerCallerV1::Global(authority) => {
+                let policy = &authority.grant.policy;
+                if !policy.capabilities.contains(&capability)
+                    || matches!(capability, ManagerCapabilityV2::SelfSuccession)
+                {
+                    return Err(refused("manager_v2_capability_denied"));
+                }
+                let project = authority.config.project_id;
+                return Ok((authority, Some(project)));
+            }
+            ManagerCallerV1::Legacy { config, is_manager } => (config, is_manager),
+            // Unchanged for an area node: the legacy appointment's refusal.
+            ManagerCallerV1::Area(_) => {
+                self.manager_config_for_caller(caller)?;
+                return Err(refused("manager_scope_denied"));
+            }
+        };
         let grant = self
             .get_harness_manager_policy(config.project_id)?
             .ok_or_else(|| refused("manager_v2_grant_required"))?;
@@ -541,12 +575,15 @@ impl Store {
         if !is_manager || !grant.policy.capabilities.contains(&capability) {
             return Err(refused("manager_v2_capability_denied"));
         }
-        Ok(ManagerAuthorityV2 {
-            config,
-            grant,
-            caller,
-            is_manager,
-        })
+        Ok((
+            ManagerAuthorityV2 {
+                config,
+                grant,
+                caller,
+                is_manager,
+            },
+            None,
+        ))
     }
 
     fn prepared_snapshot_blockers(
@@ -758,8 +795,11 @@ impl Store {
     ) -> Result<ManagerPreparedActionReceiptV2> {
         request.validate().map_err(refused)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let authority =
-            self.current_prepared_manager_authority(caller, request.operation.capability())?;
+        let (authority, target_project) = self.current_prepared_manager_authority(
+            caller,
+            request.project_id,
+            request.operation.capability(),
+        )?;
         let lead = prepared_action_epic(&request.operation)
             .map(|epic| self.manager_action_lead_fence(epic))
             .transpose()?;
@@ -772,6 +812,7 @@ impl Store {
         };
         let materialized = materialize_prepared_action(&request.operation, resolved.lead.clone())?;
         let full_request = AgentManagerControlRequestV2 {
+            project_id: target_project,
             fence: resolved.manager.clone(),
             idempotency_key: "prepared-snapshot".into(),
             operation: materialized,
@@ -847,6 +888,11 @@ impl Store {
     ) -> Result<ManagerPreparedActionCommitResultV2> {
         request.validate().map_err(refused)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        // #1235: a project outside the caller's reach refuses with its own
+        // code before any preparation is read.
+        if let Some(project) = request.project_id {
+            self.resolve_manager_caller(caller, Some(project))?;
+        }
         let row = self
             .prepared_action_row(request.prepared_id)?
             .ok_or_else(|| refused("manager_v2_prepared_action_unavailable"))?;
@@ -856,7 +902,25 @@ impl Store {
         if row.target_digest != request.target_digest {
             return Err(refused("manager_v2_prepared_digest_changed"));
         }
-        let (current_config, is_manager) = self.manager_config_for_caller(caller)?;
+        // #1235: the preparation's own project is the target; a different
+        // `project_id` names another preparation scope.
+        if request
+            .project_id
+            .is_some_and(|project| project != row.project_id)
+        {
+            return Err(refused("manager_v2_prepared_action_unavailable"));
+        }
+        let (current_config, is_manager) =
+            match self.resolve_manager_caller(caller, Some(row.project_id)) {
+                Ok(ManagerCallerV1::Legacy { config, is_manager }) => (config, is_manager),
+                Ok(ManagerCallerV1::Global(authority)) => (authority.config, true),
+                Ok(ManagerCallerV1::Area(_)) => {
+                    self.manager_config_for_caller(caller)?;
+                    return Err(refused("manager_v2_prepared_action_unavailable"));
+                }
+                // A revoked or replaced global grant keeps its refusal code.
+                Err(error) => return Err(error),
+            };
         if !is_manager
             || current_config.project_id != row.project_id
             || current_config.manager_session_id != row.manager_session_id
@@ -897,7 +961,11 @@ impl Store {
             tx.commit()?;
             return Err(refused("manager_v2_prepared_action_expired"));
         }
-        let authority = self.current_prepared_manager_authority(caller, row.action.capability())?;
+        let (authority, target_project) = self.current_prepared_manager_authority(
+            caller,
+            Some(row.project_id),
+            row.action.capability(),
+        )?;
         if authority.config.row_version != row.scope_version
             || authority.grant.row_version != row.policy_version
             || row.resolved.manager.scope_version != row.scope_version
@@ -908,6 +976,7 @@ impl Store {
         }
         let operation = materialize_prepared_action(&row.action, row.resolved.lead.clone())?;
         let full_request = AgentManagerControlRequestV2 {
+            project_id: target_project,
             fence: row.resolved.manager,
             idempotency_key: request.idempotency_key,
             operation,
@@ -957,23 +1026,46 @@ impl Store {
         request: AgentManagerGetActionRequestV2,
     ) -> Result<ManagerActionReceiptV2> {
         request.validate().map_err(refused)?;
-        let (config, is_manager) = self.manager_config_for_caller(caller)?;
-        if !is_manager {
+        let (config, is_manager, project_seat) =
+            match self.resolve_manager_caller(caller, request.project_id)? {
+                ManagerCallerV1::Legacy { config, is_manager } => (config, is_manager, is_manager),
+                ManagerCallerV1::Global(authority) => (authority.config, true, false),
+                ManagerCallerV1::Area(_) => {
+                    self.manager_config_for_caller(caller)?;
+                    return Err(refused("manager_v2_action_unavailable"));
+                }
+            };
+        if !is_manager || config.is_revoked() {
             return Err(refused("manager_v2_action_unavailable"));
         }
-        let owner: Option<(String, String)> = self
+        let owner: Option<(String, String, i64, bool)> = self
             .conn
             .query_row(
-                "SELECT project_id,manager_session_id FROM harness_manager_v2_operations
-                 WHERE id=?1 AND kind='lifecycle_action'",
+                "SELECT o.project_id,o.manager_session_id,o.scope_version,
+                    EXISTS(SELECT 1 FROM harness_manager_notice_scope_retirements r
+                      WHERE r.project_id=o.project_id AND r.manager_session_id=o.manager_session_id
+                        AND r.scope_version=o.scope_version)
+                 FROM harness_manager_v2_operations o
+                 WHERE o.id=?1 AND o.kind='lifecycle_action'",
                 [request.operation_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        if owner.as_ref().is_none_or(|(project, manager)| {
-            project != &config.project_id.to_string()
-                || manager != &config.manager_session_id.to_string()
-        }) {
+        // #1553: the manager seat of a project outlives the session that holds
+        // it. An appointment of another session starts a new scope version
+        // under a new anchor, so an action the displaced holder left pending
+        // names the old anchor and an older scope version. The project's
+        // current PM reads it by id only with a retirement record proving the
+        // older appointment. Global epochs and node scopes are independent
+        // counters, not earlier versions of the project's seat.
+        if owner
+            .as_ref()
+            .is_none_or(|(project, manager, scope, retired)| {
+                project != &config.project_id.to_string()
+                    || (manager != &config.manager_session_id.to_string()
+                        && !(project_seat && *scope < config.row_version && *retired))
+            })
+        {
             return Err(refused("manager_v2_action_unavailable"));
         }
         self.manager_action_operation(request.operation_id)?
@@ -1507,5 +1599,218 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 7);
+    }
+
+    /// #1553: appointing another session as the project's manager starts a new
+    /// anchor and scope version. An action the displaced holder left pending
+    /// stays readable by id to the project's current manager; another
+    /// project's manager still cannot read it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn displaced_seat_actions_stay_readable_by_the_current_manager_only() {
+        use crate::store::manager_actions::ManagerActionOriginV2;
+        use crate::store::manager_coordinator::tests::fixture;
+        use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
+        use rsi_common::harness_manager_v2::{
+            AgentManagerControlRequestV2, AgentManagerGetActionRequestV2, ManagerActionStateV2,
+            ManagerActionV2, ManagerCapabilityV2, ManagerFenceV2, ManagerOperatingModeV2,
+            ManagerPolicyV2,
+        };
+        use rsi_common::types::{SessionKind, SessionStatus};
+
+        let store = Store::open_in_memory().unwrap();
+        let (config, lead) = fixture(
+            &store,
+            ManagerPolicyV2 {
+                mode: ManagerOperatingModeV2::Execute,
+                capabilities: vec![ManagerCapabilityV2::LeadControl],
+                ..Default::default()
+            },
+        );
+        let epic = lead.parent_id.unwrap();
+        let policy_version = store
+            .get_harness_manager_policy(config.project_id)
+            .unwrap()
+            .unwrap()
+            .row_version;
+        let queued = store
+            .enqueue_manager_action(
+                ManagerActionOriginV2::Agent {
+                    caller: config.manager_session_id,
+                },
+                AgentManagerControlRequestV2 {
+                    project_id: None,
+                    fence: ManagerFenceV2 {
+                        scope_version: config.row_version,
+                        policy_version,
+                    },
+                    idempotency_key: "left-pending".into(),
+                    operation: ManagerActionV2::PauseLead {
+                        epic_id: epic,
+                        expected: store.manager_action_lead_fence(epic).unwrap(),
+                        reason: "pending when the seat changes hands".into(),
+                    },
+                },
+            )
+            .unwrap();
+        let read = |caller: Uuid| {
+            store.manager_action_receipt_for_caller(
+                caller,
+                AgentManagerGetActionRequestV2 {
+                    project_id: None,
+                    operation_id: queued.operation_id,
+                },
+            )
+        };
+        assert_eq!(
+            read(config.manager_session_id).unwrap().state,
+            ManagerActionStateV2::Queued
+        );
+
+        let mut successor = make_test_session();
+        successor.session_kind = SessionKind::Standard;
+        successor.project_id = Some(config.project_id);
+        successor.status = SessionStatus::Completed;
+        store.insert_session(&successor).unwrap();
+        let appointed = store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                project_id: config.project_id,
+                session_id: successor.id,
+                epic_ids: Some(vec![epic]),
+                group_ids: Vec::new(),
+                expected_row_version: config.row_version,
+            })
+            .unwrap();
+        assert_eq!(appointed.manager_session_id, successor.id);
+        assert!(appointed.row_version > config.row_version);
+
+        let seen = read(successor.id).unwrap();
+        assert_eq!(seen.operation_id, queued.operation_id);
+        assert_eq!(seen.state, ManagerActionStateV2::Queued);
+        assert!(read(config.manager_session_id).is_err());
+
+        let (other, _) = fixture(&store, ManagerPolicyV2::default());
+        assert_ne!(other.project_id, config.project_id);
+        assert!(read(other.manager_session_id).is_err());
+
+        // A portfolio epoch is not a project scope version. A global seat
+        // cannot read this PM action even once its epoch is numerically newer.
+        use rsi_common::global_manager::ConfigureGlobalManagerRequestV1;
+        let mut global = make_test_session();
+        global.session_kind = SessionKind::Standard;
+        global.project_id = Some(other.project_id);
+        global.status = SessionStatus::Completed;
+        store.insert_session(&global).unwrap();
+        for version in 0..3 {
+            store
+                .configure_global_manager(
+                    &ConfigureGlobalManagerRequestV1 {
+                        session_id: global.id,
+                        project_ids: vec![config.project_id],
+                        allowed_launches: vec![ManagerLaunchChoiceV2 {
+                            provider: rsi_common::types::SessionProvider::Claude,
+                            model: "claude-opus-5-5".into(),
+                            effort: Some("high".into()),
+                        }],
+                        project_policy: ManagerPolicyV2 {
+                            mode: ManagerOperatingModeV2::Execute,
+                            capabilities: vec![ManagerCapabilityV2::LeadControl],
+                            ..Default::default()
+                        },
+                        expected_grant_version: version,
+                        idempotency_key: format!("global-review-{version}"),
+                    },
+                    "operator:test",
+                )
+                .unwrap();
+        }
+        let global_authority = store
+            .global_manager_authority_current(global.id, config.project_id)
+            .unwrap()
+            .unwrap();
+        assert!(global_authority.config.row_version > config.row_version);
+        let foreign_read = store.manager_action_receipt_for_caller(
+            global.id,
+            AgentManagerGetActionRequestV2 {
+                project_id: Some(config.project_id),
+                operation_id: queued.operation_id,
+            },
+        );
+        assert!(foreign_read.is_err());
+
+        // An action from a different same-project principal is not an older
+        // PM appointment merely because its scope number is lower.
+        let global_action = store
+            .enqueue_manager_action(
+                ManagerActionOriginV2::Agent { caller: global.id },
+                AgentManagerControlRequestV2 {
+                    project_id: Some(config.project_id),
+                    fence: ManagerFenceV2 {
+                        scope_version: global_authority.config.row_version,
+                        policy_version: global_authority.grant.row_version,
+                    },
+                    idempotency_key: "foreign-principal-action".into(),
+                    operation: ManagerActionV2::PauseLead {
+                        epic_id: epic,
+                        expected: store.manager_action_lead_fence(epic).unwrap(),
+                        reason: "belongs to the portfolio seat".into(),
+                    },
+                },
+            )
+            .unwrap();
+        let mut current = appointed;
+        for version in 0..3 {
+            let mut next = make_test_session();
+            next.session_kind = SessionKind::Standard;
+            next.project_id = Some(config.project_id);
+            next.status = SessionStatus::Completed;
+            store.insert_session(&next).unwrap();
+            current = store
+                .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                    project_id: config.project_id,
+                    session_id: next.id,
+                    epic_ids: Some(vec![epic]),
+                    group_ids: Vec::new(),
+                    expected_row_version: current.row_version,
+                })
+                .unwrap();
+            assert!(
+                read(next.id).is_ok(),
+                "PM history stays readable after appointment {version}"
+            );
+        }
+        assert!(current.row_version > global_authority.config.row_version);
+        assert!(
+            store
+                .manager_action_receipt_for_caller(
+                    current.manager_session_id,
+                    AgentManagerGetActionRequestV2 {
+                        project_id: None,
+                        operation_id: global_action.operation_id,
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .manager_action_receipt_for_caller(
+                    global.id,
+                    AgentManagerGetActionRequestV2 {
+                        project_id: Some(config.project_id),
+                        operation_id: global_action.operation_id,
+                    }
+                )
+                .is_ok()
+        );
+        store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                project_id: config.project_id,
+                session_id: current.manager_session_id,
+                epic_ids: Some(Vec::new()),
+                group_ids: Vec::new(),
+                expected_row_version: current.row_version,
+            })
+            .unwrap();
+        assert!(read(current.manager_session_id).is_err());
     }
 }

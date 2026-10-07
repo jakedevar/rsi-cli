@@ -382,12 +382,18 @@ pub(super) fn check_released_migrations(
     Ok(())
 }
 
+// Unit tests inherit the worker's transport credentials. Never let their
+// informational binding lookup reach the live daemon (#1559).
+#[cfg(test)]
 fn inspect_work() -> Result<Vec<Value>, String> {
-    #[cfg(test)]
-    if let Some(path) = std::env::var_os("RSI_LANDER_TEST_WORK_ROWS") {
-        let data = std::fs::read(path).map_err(|error| error.to_string())?;
-        return serde_json::from_slice(&data).map_err(|error| error.to_string());
-    }
+    let path = std::env::var_os("RSI_LANDER_TEST_WORK_ROWS")
+        .ok_or_else(|| "test ownership ledger fixture not configured".to_owned())?;
+    let data = std::fs::read(path).map_err(|error| error.to_string())?;
+    serde_json::from_slice(&data).map_err(|error| error.to_string())
+}
+
+#[cfg(not(test))]
+fn inspect_work() -> Result<Vec<Value>, String> {
     if std::env::var_os("RSI_SESSION_TOKEN").is_none() {
         return Err("protected landing requires an rsi-managed Epic lead".into());
     }
@@ -605,6 +611,36 @@ mod tests {
         assert_eq!(integrated[0].state, "unbound");
         let unknown = report_bindings(&[pair()], || Err("no lead token".into()));
         assert_eq!(unknown[0].state, "unknown");
+    }
+
+    #[test]
+    fn test_binding_lookup_uses_only_the_local_fixture() {
+        let _env = super::super::tests::env_lock();
+        let previous = std::env::var_os("RSI_LANDER_TEST_WORK_ROWS");
+        unsafe { std::env::remove_var("RSI_LANDER_TEST_WORK_ROWS") };
+        let missing = inspect_work();
+        let unknown = report_bindings(&[pair()], inspect_work);
+
+        let fixture = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(fixture.path(), json!([row(false)]).to_string()).unwrap();
+        unsafe { std::env::set_var("RSI_LANDER_TEST_WORK_ROWS", fixture.path()) };
+        let bound = report_bindings(&[pair()], inspect_work);
+        std::fs::write(fixture.path(), "invalid fixture").unwrap();
+        let invalid = report_bindings(&[pair()], inspect_work);
+        unsafe {
+            match previous {
+                Some(path) => std::env::set_var("RSI_LANDER_TEST_WORK_ROWS", path),
+                None => std::env::remove_var("RSI_LANDER_TEST_WORK_ROWS"),
+            }
+        }
+
+        assert_eq!(
+            missing.unwrap_err(),
+            "test ownership ledger fixture not configured"
+        );
+        assert_eq!(unknown[0].state, "unknown");
+        assert_eq!(bound[0].state, "bound");
+        assert_eq!(invalid[0].state, "unknown");
     }
 
     #[test]

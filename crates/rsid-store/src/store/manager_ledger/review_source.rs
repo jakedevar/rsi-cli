@@ -11,23 +11,88 @@ use std::path::Path;
 /// Bound on custody transfer hops walked from the author to the tip.
 const TRANSFER_LINEAGE_LIMIT: usize = 64;
 
+/// Repository authority retained after executable sandbox custody is purged.
+/// This permits an exact-source review fork, never execution in the old root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimedReviewSource {
+    pub custody_id: Uuid,
+    pub generation: u64,
+    pub repository: std::path::PathBuf,
+    pub repository_identity: String,
+    pub base_commit: String,
+    pub reclaimed_root: String,
+}
+
+impl ReclaimedReviewSource {
+    pub fn verify(&self, commit: &str) -> Result<()> {
+        crate::sandbox::git_worktree::review_repository_source_holds_bounded(
+            &self.repository,
+            &self.repository_identity,
+            &self.base_commit,
+            commit,
+        )
+        .map_err(|error| {
+            crate::error::DaemonError::InvalidParam(format!(
+                "manager_review_reclaimed_source_unavailable: sandbox {}: {error}",
+                self.reclaimed_root
+            ))
+        })
+    }
+}
+
 fn unavailable() -> crate::error::DaemonError {
     refused("manager_review_source_unavailable")
 }
 
 impl Store {
+    /// Resolve only a daemon-recorded purged root, with its executable paths
+    /// atomically cleared. Missing or quarantined live custody never falls back.
+    pub fn manager_review_reclaimed_source(
+        &self,
+        author: &Session,
+    ) -> Result<Option<ReclaimedReviewSource>> {
+        let row: Option<(String, i64, String, String, String, String)> = self.conn.query_row(
+            "SELECT r.custody_id,r.generation,r.canonical_repo_dir,r.repository_identity,r.source_commit,r.sandbox_root
+               FROM sessions s JOIN sandbox_custody_roots r ON r.custody_id=s.sandbox_custody_id
+              WHERE s.id=?1 AND s.sandbox_kind='GitWorktree'
+                AND s.sandbox_cleanup_state='Purged' AND s.sandbox_root IS NULL AND s.sandbox_branch IS NULL
+                AND r.state='purged' AND r.owner_session_id IS NULL
+                AND r.validation_state='verified' AND r.validated_generation=r.generation
+                AND r.reserved_effects=0 AND r.active_effects=0",
+            [author.id.to_string()],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+        ).optional()?;
+        let Some((id, generation, repository, identity, base, root)) = row else {
+            return Ok(None);
+        };
+        if Path::new(&repository) != author.working_dir {
+            return Err(refused("manager_v2_custody_repository_changed"));
+        }
+        Ok(Some(ReclaimedReviewSource {
+            custody_id: Uuid::parse_str(&id).map_err(|_| unavailable())?,
+            generation: u64::try_from(generation).map_err(|_| unavailable())?,
+            repository: repository.into(),
+            repository_identity: identity,
+            base_commit: base,
+            reclaimed_root: root,
+        }))
+    }
+
     /// Return `author` when it still holds its own live custody (or never had
     /// sandbox custody, preserving today's observation path). Otherwise
-    /// return the single live rotation tip that owns the author's custody
+    /// return the author for a durably purged root (repository-only review),
+    /// or the single live rotation tip that owns the author's custody
     /// root at the same sandbox root, proven by an unbroken chain of
     /// `transferred` custody events from the author, inside the same Epic.
     /// Anything else is `manager_review_source_unavailable`.
     pub(crate) fn manager_review_source_holder(
         &self,
         config: &HarnessManagerConfigV1,
-        epic: Uuid,
         author: &Session,
     ) -> Result<Session> {
+        if self.manager_review_reclaimed_source(author)?.is_some() {
+            return Ok(author.clone());
+        }
         let custody_id: Option<String> = self
             .conn
             .query_row(
@@ -66,7 +131,10 @@ impl Store {
             || tip.project_id != author.project_id
             || author.sandbox_root.is_none()
             || tip.sandbox_root != author.sandbox_root
-            || self.manager_v2_descendant_epic(config, tip.id)? != epic
+            // #1493: the author may sit under any Epic of the manager scope;
+            // the tip must stay under that same Epic.
+            || self.manager_v2_descendant_epic(config, tip.id)?
+                != self.manager_v2_descendant_epic(config, author.id)?
         {
             return Err(unavailable());
         }

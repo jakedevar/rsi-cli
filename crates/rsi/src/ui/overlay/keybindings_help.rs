@@ -11,7 +11,7 @@ use crate::action_registry::{
 };
 use crate::app::App;
 use crate::overlay::keybindings_help::HelpView;
-use crate::ui::theme;
+use crate::ui::{glyphs, theme};
 
 use super::fixed_centered_rect;
 
@@ -149,6 +149,63 @@ fn all_commands_lines(app: &App, filter: &str) -> Vec<Line<'static>> {
     lines
 }
 
+fn symbols_lines(filter: &str) -> Vec<Line<'static>> {
+    let terms: Vec<_> = filter.split_whitespace().map(str::to_lowercase).collect();
+    let mut lines = Vec::new();
+    let mut category = None;
+    for entry in glyphs::legend::entries() {
+        let haystack = format!(
+            "{} {} {} {} {}",
+            entry.category, entry.glyph, entry.name, entry.location, entry.description
+        )
+        .to_lowercase();
+        if !terms.iter().all(|term| haystack.contains(term)) {
+            continue;
+        }
+        if category != Some(entry.category) {
+            if lines.is_empty() {
+                lines.push(Line::from(
+                    "Read the location: the same shape can have different meanings.",
+                ));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                entry.category,
+                Style::default()
+                    .fg(theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            )));
+            category = Some(entry.category);
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {}  ", entry.glyph),
+                Style::default()
+                    .fg(entry.color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                entry.name,
+                Style::default()
+                    .fg(theme::text())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · {}", entry.location),
+                Style::default().fg(theme::subtext1()),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("    {}", entry.description),
+            Style::default().fg(theme::text()),
+        )));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from("No symbols match this filter."));
+    }
+    lines
+}
+
 fn help_footer(filter: &str, search_active: bool) -> String {
     let navigation = if search_active {
         format!("/{filter}█")
@@ -157,7 +214,11 @@ fn help_footer(filter: &str, search_active: bool) -> String {
     } else {
         format!("filter: {filter} · / edit · Esc clear · q/? return")
     };
-    format!("{navigation} · Tab all/context · m manual · M pager")
+    if search_active {
+        format!("{navigation} · Enter accept · Esc clear")
+    } else {
+        format!("s symbols · Tab/Shift-Tab views · {navigation} · m manual · M pager")
+    }
 }
 
 pub fn render_keybindings_help(
@@ -182,6 +243,7 @@ pub fn render_keybindings_help(
                 " All Commands ({}) ",
                 crate::action_registry::all_commands_descriptor_count()
             ),
+            HelpView::Symbols => " Symbols — meaning and location ".to_string(),
         })
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::overlay_border()))
@@ -191,20 +253,31 @@ pub fn render_keybindings_help(
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let content_height = inner.height.saturating_sub(2);
+    let content_width = inner.width.saturating_sub(2);
+    if content_width == 0 || inner.height == 0 {
+        return;
+    }
+    let footer = Paragraph::new(help_footer(filter, search_active))
+        .style(Style::default().fg(theme::subtext1()))
+        .wrap(Wrap { trim: false });
+    let footer_height = footer
+        .line_count(content_width)
+        .min(2)
+        .min(inner.height as usize) as u16;
+    let content_height = inner.height.saturating_sub(footer_height + 1);
     let lines = match view {
         HelpView::Contextual => contextual_lines(app, filter),
         HelpView::All => all_commands_lines(app, filter),
+        HelpView::Symbols => symbols_lines(filter),
     };
-    let content_width = inner.width.saturating_sub(2);
     let logical_lines = lines.len();
     let paragraph = match view {
         HelpView::Contextual => Paragraph::new(lines),
-        HelpView::All => Paragraph::new(lines).wrap(Wrap { trim: false }),
+        HelpView::All | HelpView::Symbols => Paragraph::new(lines).wrap(Wrap { trim: false }),
     };
     let visible_lines = match view {
         HelpView::Contextual => logical_lines,
-        HelpView::All => paragraph.line_count(content_width),
+        HelpView::All | HelpView::Symbols => paragraph.line_count(content_width),
     };
     let max_scroll = visible_lines.saturating_sub(content_height as usize);
     let scroll = scroll_offset.min(max_scroll);
@@ -213,14 +286,13 @@ pub fn render_keybindings_help(
         Rect::new(inner.x + 1, inner.y, content_width, content_height),
     );
 
-    let search = help_footer(filter, search_active);
     frame.render_widget(
-        Paragraph::new(search).style(Style::default().fg(theme::subtext1())),
+        footer,
         Rect::new(
             inner.x + 1,
-            inner.y + inner.height.saturating_sub(1),
-            inner.width.saturating_sub(2),
-            1,
+            inner.y + inner.height - footer_height,
+            content_width,
+            footer_height,
         ),
     );
 }
@@ -270,8 +342,101 @@ mod tests {
     #[test]
     fn help_footer_shows_all_manual_pager_hints() {
         let footer = help_footer("", false);
-        for hint in ["Tab all/context", "m manual", "M pager"] {
+        for hint in ["s symbols", "Tab/Shift-Tab views", "m manual", "M pager"] {
             assert!(footer.contains(hint));
+        }
+    }
+
+    #[test]
+    fn symbol_help_search_matches_shape_location_and_all_words() {
+        let text = |filter| {
+            symbols_lines(filter)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let ambiguous = text("◉");
+        for expected in [
+            "Running descendants",
+            "Container status (S)",
+            "Codex App Server",
+            "Provider / model column",
+        ] {
+            assert!(ambiguous.contains(expected), "{expected}: {ambiguous}");
+        }
+        let codex = text("CoDeX app server");
+        assert!(codex.contains("◉  Codex App Server · Provider / model column"));
+        let stale = text("stale percentage");
+        assert!(stale.contains("!  Stale usage · After context percentage"));
+        assert_eq!(
+            text("no-such-symbol-meaning"),
+            "No symbols match this filter."
+        );
+    }
+
+    #[test]
+    fn symbols_help_wraps_and_scrolls_to_last_explanation_on_narrow_screen() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = with_session_list(0);
+        crate::overlay::keybindings_help::open_contextual_help(&mut app);
+        if let crate::types::OverlayState::KeybindingsHelp { view, .. } = &mut app.overlay {
+            *view = HelpView::Symbols;
+        }
+        let mut terminal = Terminal::new(TestBackend::new(28, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_keybindings_help(
+                    frame,
+                    area,
+                    &app,
+                    9999,
+                    "42%≈·R",
+                    false,
+                    HelpOrigin::SessionList,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..12)
+            .map(|y| (0..28).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("budget from repository") && text.contains("fallback."),
+            "last wrapped explanation must be reachable: {text}"
+        );
+        assert!(
+            text.contains("s symbols"),
+            "symbol shortcut remains visible: {text}"
+        );
+    }
+
+    #[test]
+    fn symbols_help_handles_tiny_terminal_bounds() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = with_session_list(0);
+        crate::overlay::keybindings_help::open_contextual_help(&mut app);
+        if let crate::types::OverlayState::KeybindingsHelp { view, .. } = &mut app.overlay {
+            *view = HelpView::Symbols;
+        }
+        for (width, height) in [(1, 1), (2, 2), (4, 3), (5, 5), (20, 8)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    render_keybindings_help(
+                        frame,
+                        area,
+                        &app,
+                        0,
+                        "",
+                        false,
+                        HelpOrigin::SessionList,
+                    )
+                })
+                .unwrap();
         }
     }
 
@@ -302,7 +467,6 @@ mod tests {
             crate::action_registry::ActionId::JumpTop,
             crate::action_registry::ActionId::JumpBottom,
             crate::action_registry::ActionId::OpenThemePicker,
-            crate::action_registry::ActionId::OpenLegacyColors,
         ] {
             assert!(ids.contains(&id), "session help omitted {id:?}");
         }

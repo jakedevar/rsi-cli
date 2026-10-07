@@ -391,6 +391,21 @@ impl AgentControlHandle {
             self.event_bus
                 .publish(crate::bus::DaemonEvent::ManagerNoticeQueued { job_id });
         }
+        // #1415: the operator sees a manager settle a decision record.
+        if !receipt.deduplicated {
+            let verb = match &request.change {
+                ManagerUpdateV2::DecisionRuling { .. } => Some("ruled on"),
+                ManagerUpdateV2::DecisionWithdraw { .. } => Some("withdrawn by its owner"),
+                _ => None,
+            };
+            if let Some(verb) = verb {
+                self.event_bus
+                    .publish(crate::bus::DaemonEvent::SystemMessage {
+                        level: "info".into(),
+                        message: format!("Harness manager decision {} {verb}.", receipt.key),
+                    });
+            }
+        }
         Ok(receipt)
     }
 
@@ -480,6 +495,54 @@ impl AgentControlHandle {
                 .source_session
                 .as_ref()
                 .ok_or_else(|| refused("manager_review_author_missing"))?;
+            let reclaimed = self
+                .store
+                .lock()
+                .await
+                .manager_review_reclaimed_source(source)?;
+            if let Some(reclaimed) = reclaimed {
+                // The purged branch can no longer prove authorship, and a
+                // repository ref proves only reachability. A delta round's
+                // revised commit would therefore be unbound to this author:
+                // only the SHA the Work already recorded under its custody
+                // may be reviewed.
+                if context
+                    .work
+                    .as_ref()
+                    .and_then(|work| work.source_commit.as_deref())
+                    != Some(source_commit.as_str())
+                {
+                    return Err(refused("manager_review_source_changed"));
+                }
+                let proof = reclaimed.clone();
+                let commit = source_commit.clone();
+                tokio::task::spawn_blocking(move || proof.verify(&commit))
+                    .await
+                    .map_err(|_| refused("manager_v2_git_unavailable"))??;
+                let work = context
+                    .work
+                    .as_ref()
+                    .ok_or_else(|| refused("manager_v2_work_missing"))?;
+                let author = work
+                    .source_session_id
+                    .ok_or_else(|| refused("manager_review_author_missing"))?;
+                let review_unrelated = self
+                    .boxed_review_unrelated_descendants(
+                        context.authority.config.project_id,
+                        work.epic_id,
+                        author,
+                        &reclaimed.repository,
+                        &reclaimed.base_commit,
+                        source_commit,
+                    )
+                    .await?;
+                return Ok(LedgerObservation {
+                    source_commit: Some(source_commit.clone()),
+                    custody: vec![(source.id, reclaimed.custody_id, reclaimed.generation)],
+                    review_unrelated,
+                    ..Default::default()
+                });
+            }
             let custody = self
                 .store
                 .lock()

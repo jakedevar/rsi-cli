@@ -632,7 +632,7 @@ async fn section_strip_renders_every_section_label_and_marks_active() {
 }
 
 #[tokio::test]
-async fn decision_receipt_keeps_observed_pending_state_until_explicit_refresh() {
+async fn decision_receipt_reloads_the_record_and_shows_its_new_state() {
     let (mut app, config) = fixture();
     let inspection = page(
         &config,
@@ -640,6 +640,15 @@ async fn decision_receipt_keeps_observed_pending_state_until_explicit_refresh() 
         vec![json!({
             "type":"decision", "key":"approval-target", "row_version":4,
             "payload":{"status":"pending", "question":"Approve this exact invocation?", "target_digest":"sha256:invocation"}
+        })],
+        None,
+    );
+    let reloaded = page(
+        &config,
+        ManagerInspectSectionV2::Decisions,
+        vec![json!({
+            "type":"decision", "key":"approval-target", "row_version":5,
+            "payload":{"status":"answered", "answer":"allow", "question":"Approve this exact invocation?", "target_digest":"sha256:invocation"}
         })],
         None,
     );
@@ -651,6 +660,7 @@ async fn decision_receipt_keeps_observed_pending_state_until_explicit_refresh() 
                 "AnswerHarnessManagerDecision",
                 json!({"result":{"state":"queued"}}),
             ),
+            ("GetHarnessManagerState", json!({"result":reloaded})),
         ],
     )
     .await;
@@ -664,9 +674,9 @@ async fn decision_receipt_keeps_observed_pending_state_until_explicit_refresh() 
     key(&mut app, KeyCode::Enter).await;
     finish(task).await;
     let text = screen(&mut app);
-    assert!(text.contains("approval-target (version 4): queued"));
-    assert!(text.contains("status: pending"));
-    assert!(text.contains("r refreshes delivery and gate state"));
+    assert!(text.contains("Answered approval-target with “allow”"));
+    assert!(text.contains("answered"));
+    assert!(text.contains("CLOSED 1"));
 }
 
 #[test]
@@ -1187,7 +1197,7 @@ async fn board_renders_kpis_and_banded_decisions_requests_leads() {
         "REQUESTS 1",
         "LEADS 1",
         "SIGNALS 1",
-        "Choose release target · pending",
+        "Choose release target · needs answer",
         "Please rebase the lead onto rolling",
         "Orchestration Agent Process Fix · fence current",
         "Ship manager board · active",
@@ -1238,6 +1248,13 @@ async fn board_answers_decision_row_in_place_with_exact_fences() {
         "AnswerHarnessManagerDecision",
         json!({"result":{"state":"queued"}}),
     ));
+    // The answer reloads the whole Board.
+    cases.extend(board_cases(
+        &config,
+        board_overview_rows(&config),
+        vec![],
+        vec![],
+    ));
     let (_dir, task) = connect(&mut app, cases).await;
     board::open(&mut app, config, "Coordination desk".into(), false)
         .await
@@ -1265,7 +1282,7 @@ async fn board_answers_decision_row_in_place_with_exact_fences() {
         app.overlay,
         OverlayState::HarnessManagerV2(ref s) if s.section == ManagerSection::Board
     ));
-    assert!(screen(&mut app).contains("release-target (version 7): queued"));
+    assert!(screen(&mut app).contains("Answered release-target with “rolling”"));
 }
 
 #[tokio::test]
@@ -1696,7 +1713,8 @@ async fn manager_surface_help_lists_section_keys_close_and_decision_answer() {
         origin,
         HelpOrigin::OverlayClass(OverlayHelpClass::ManagerDecisions)
     );
-    assert!(text.contains("Answer selected decision"), "{text}");
+    assert!(text.contains("Answer the highlighted option"), "{text}");
+    assert!(text.contains("Accept the asker's recommendation"), "{text}");
     assert!(text.contains("Close manager"), "{text}");
 }
 
@@ -2347,4 +2365,315 @@ fn daemon_setting_action_row_shows_key_value_previous_and_reason() {
         board::row_title(&row),
         "Daemon setting · sandbox_max_source_roots → 16384 · succeeded (was 512) · wrapped to 512 with 1490 live roots"
     );
+}
+
+fn menu_decision(key: &str, question: &str, version: i64, age_secs: i64) -> Value {
+    let at = (chrono::Utc::now() - chrono::Duration::seconds(age_secs)).to_rfc3339();
+    json!({"type":"decision","key":key,"row_version":version,"created_at":at,"updated_at":at,
+        "payload":{"status":"pending","question":question,"target_digest":format!("sha256:{key}"),"epic_id":null}})
+}
+
+const MENU: &str = "Pick a mirror\nA) Direct\nB) API\nC) Mirror\nRecommend: C";
+
+async fn open_decisions(
+    app: &mut App,
+    config: &HarnessManagerConfigV1,
+    rows: Vec<Value>,
+    extra: Vec<Case>,
+) -> tokio::task::JoinHandle<Vec<Value>> {
+    let mut cases = vec![(
+        "GetHarnessManagerState",
+        json!({"result":page(config, ManagerInspectSectionV2::Decisions, rows, None)}),
+    )];
+    cases.extend(extra);
+    let (dir, task) = connect(app, cases).await;
+    std::mem::forget(dir);
+    board::open(app, config.clone(), "Coordination desk".into(), true)
+        .await
+        .unwrap();
+    task
+}
+
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn decisions_view_lists_live_first_and_shows_options_with_the_recommendation() {
+    let (mut app, config) = fixture();
+    let mut closed = menu_decision("closed-one", "Retire it?", 2, 500);
+    closed["payload"]["status"] = json!("answered");
+    closed["payload"]["answer"] = json!("A: yes");
+    let rows = vec![
+        closed,
+        menu_decision("stale-one", "Old question?", 1, 20 * 86_400),
+        menu_decision("census", MENU, 1, 7200),
+    ];
+    let task = open_decisions(&mut app, &config, rows, vec![]).await;
+    finish(task).await;
+    let text = screen(&mut app);
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("{needle}: {text}"))
+    };
+    assert!(at("NEEDS YOU 1") < at("STALE 1"));
+    assert!(at("STALE 1") < at("CLOSED 1"));
+    // The first live record is selected and shown whole.
+    assert_eq!(board_state(&app).selected, 0);
+    for value in [
+        "Pick a mirror",
+        "needs answer",
+        "census",
+        "OPTIONS",
+        "Direct",
+        "★ recommended",
+        "HISTORY",
+        "y accept ★ recommendation",
+    ] {
+        assert!(text.contains(value), "{value}: {text}");
+    }
+    assert_eq!(board_state(&app).effective_option(), Some(2));
+}
+
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn decisions_enter_answers_the_highlighted_option_and_reloads() {
+    let (mut app, config) = fixture();
+    let reloaded = {
+        let mut row = menu_decision("census", MENU, 2, 7200);
+        row["payload"]["status"] = json!("answered");
+        row["payload"]["answer"] = json!("B: API");
+        vec![row]
+    };
+    let task = open_decisions(
+        &mut app,
+        &config,
+        vec![menu_decision("census", MENU, 1, 7200)],
+        vec![
+            (
+                "AnswerHarnessManagerDecision",
+                json!({"result":{"state":"answered"}}),
+            ),
+            (
+                "GetHarnessManagerState",
+                json!({"result":page(&config, ManagerInspectSectionV2::Decisions, reloaded, None)}),
+            ),
+        ],
+    )
+    .await;
+    // Starts on the recommendation (C); h moves to B.
+    key(&mut app, KeyCode::Char('h')).await;
+    assert_eq!(board_state(&app).effective_option(), Some(1));
+    key(&mut app, KeyCode::Enter).await;
+    let requests = finish(task).await;
+    let params = &requests[1]["params"];
+    assert_eq!(params["answer"], "B: API");
+    assert_eq!(params["decision_key"], "census");
+    assert_eq!(params["expected_row_version"], 1);
+    assert_eq!(params["target_digest"], "sha256:census");
+    let text = screen(&mut app);
+    assert!(text.contains("CLOSED 1"), "{text}");
+    assert!(text.contains("Answered census with “B: API”"), "{text}");
+}
+
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn decisions_y_accepts_the_recommendation_and_refuses_without_one() {
+    let (mut app, config) = fixture();
+    let reloaded = page(&config, ManagerInspectSectionV2::Decisions, vec![], None);
+    let task = open_decisions(
+        &mut app,
+        &config,
+        vec![menu_decision("census", MENU, 1, 7200)],
+        vec![
+            (
+                "AnswerHarnessManagerDecision",
+                json!({"result":{"state":"answered"}}),
+            ),
+            ("GetHarnessManagerState", json!({"result":reloaded})),
+        ],
+    )
+    .await;
+    key(&mut app, KeyCode::Char('h')).await;
+    key(&mut app, KeyCode::Char('y')).await;
+    let requests = finish(task).await;
+    // `y` answers the recommendation even with the cursor moved off it.
+    assert_eq!(requests[1]["params"]["answer"], "C: Mirror");
+
+    let (mut app, config) = fixture();
+    let task = open_decisions(
+        &mut app,
+        &config,
+        vec![menu_decision("plain", "Pick\nA) one\nB) two", 1, 60)],
+        vec![],
+    )
+    .await;
+    key(&mut app, KeyCode::Char('y')).await;
+    finish(task).await;
+    assert!(screen(&mut app).contains("no recommendation"));
+    assert!(board_state(&app).answer.is_none());
+}
+
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn decisions_enter_on_a_question_without_options_opens_the_answer_prompt() {
+    let (mut app, config) = fixture();
+    let task = open_decisions(
+        &mut app,
+        &config,
+        vec![menu_decision("free", "Who is on call?", 1, 60)],
+        vec![],
+    )
+    .await;
+    key(&mut app, KeyCode::Enter).await;
+    finish(task).await;
+    assert!(board_state(&app).answer.is_some());
+    assert!(screen(&mut app).contains("Answering free"));
+}
+
+#[test]
+fn answer_refusals_are_explained_in_plain_words() {
+    assert!(
+        board::answer_error("rpc error: manager_v2_decision_changed")
+            .contains("changed since the board loaded")
+    );
+    assert!(board::answer_error("manager_v2_explicit_grant_required").contains(":manager policy"));
+    assert_eq!(board::answer_error("unmapped"), "unmapped");
+}
+
+fn stale_listing(question: &str, n: usize) -> Value {
+    let rows: Vec<Value> = (0..n)
+        .map(|i| {
+            json!({"decision":{"project_id":Uuid::new_v4(),"owner_manager_session_id":Uuid::new_v4(),
+                    "scope_version":3,"key":format!("old-{i}"),"expected_row_version":1},
+                "epic_id":null,"question":question,"status":"pending","answerable_by":"manager",
+                "gate":null,"created_at":"2026-09-01T00:00:00Z","age_seconds":3_000_000,
+                "stale_reason":"older_than_days"})
+        })
+        .collect();
+    json!({"older_than_days":7,"rows":rows,"complete":true})
+}
+
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn decisions_show_structured_options_ruling_and_withdrawal() {
+    let (mut app, config) = fixture();
+    let mut ruled = menu_decision("ruled-one", "Mirror or API?", 2, 3600);
+    ruled["status"] = json!("answered");
+    ruled["answer"] = json!("A: Mirror");
+    ruled["answered_by"] = json!({"kind":"portfolio_manager","session_id":Uuid::new_v4(),"node_label":"Global","at":"x"});
+    ruled["answerable_by"] = json!(null);
+    ruled["blocks"] = json!({"launches":false,"epic_ids":[]});
+    let mut withdrawn = menu_decision("gone-one", "Old plan?", 2, 7200);
+    withdrawn["status"] = json!("withdrawn");
+    let mut live = menu_decision("live-one", "Pick a mirror?", 1, 600);
+    live["answerable_by"] = json!("operator");
+    live["gate"] = json!("spend");
+    live["blocks"] = json!({"launches":true,"epic_ids":["abcdef12-0000"]});
+    live["options"] = json!([
+        {"label":"A","detail":"Read the DB","recommended":false},
+        {"label":"B","detail":"Nightly mirror","recommended":true}]);
+    let task = open_decisions(&mut app, &config, vec![ruled, withdrawn, live], vec![]).await;
+    finish(task).await;
+    let text = screen(&mut app);
+    for value in [
+        "Nightly mirror",
+        "★ recommended",
+        "Answerable by: you (operator) · a real gate: spend",
+        "Blocks: create_session under Epic abcdef12",
+        "ruled",
+        "withdrawn",
+    ] {
+        assert!(text.contains(value), "{value}: {text}");
+    }
+    // The structured recommendation (B) is where Enter starts.
+    assert_eq!(board_state(&app).effective_option(), Some(1));
+    // Select the ruled record: it names the manager and shows no options cursor.
+    key(&mut app, KeyCode::Char('j')).await;
+    let text = screen(&mut app);
+    for value in ["ruled by Global", "Ruled by: Global", "Mirror or API?"] {
+        assert!(text.contains(value), "{value}: {text}");
+    }
+    key(&mut app, KeyCode::Char('j')).await;
+    let text = screen(&mut app);
+    assert!(text.contains("⊘ withdrawn"), "{text}");
+}
+
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn stale_bulk_archive_confirms_the_count_then_archives_and_reloads() {
+    let (mut app, config) = fixture();
+    let reloaded = page(&config, ManagerInspectSectionV2::Decisions, vec![], None);
+    let task = open_decisions(
+        &mut app,
+        &config,
+        vec![menu_decision("old", "Old question?", 1, 20 * 86_400)],
+        vec![
+            (
+                "ListStaleManagerDecisions",
+                json!({"result":stale_listing("Retire the mirror?", 3)}),
+            ),
+            (
+                "ArchiveStaleManagerDecisions",
+                json!({"result":{"archived":stale_listing("q", 3)["rows"].as_array().unwrap()
+                    .iter().map(|r| r["decision"].clone()).collect::<Vec<_>>(),"skipped":[]}}),
+            ),
+            ("GetHarnessManagerState", json!({"result":reloaded})),
+        ],
+    )
+    .await;
+    key(&mut app, KeyCode::Char('X')).await;
+    let text = screen(&mut app);
+    for value in [
+        "Archive 3 stale decisions?",
+        "Retire the mirror?",
+        "never deleted",
+    ] {
+        assert!(text.contains(value), "{value}: {text}");
+    }
+    key(&mut app, KeyCode::Enter).await;
+    let requests = finish(task).await;
+    assert_eq!(
+        requests[1]["params"]["project_id"],
+        json!(config.project_id)
+    );
+    let items = requests[2]["params"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    assert_eq!(requests[2]["params"]["older_than_days"], 7);
+    assert!(board_state(&app).archive.is_none());
+    assert!(screen(&mut app).contains("Archived 3 stale decisions"));
+}
+
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn stale_bulk_archive_cancel_sends_nothing_and_empty_list_says_so() {
+    let (mut app, config) = fixture();
+    let task = open_decisions(
+        &mut app,
+        &config,
+        vec![menu_decision("old", "Old question?", 1, 20 * 86_400)],
+        vec![(
+            "ListStaleManagerDecisions",
+            json!({"result":stale_listing("Retire it?", 1)}),
+        )],
+    )
+    .await;
+    key(&mut app, KeyCode::Char('X')).await;
+    assert!(screen(&mut app).contains("Archive 1 stale decision?"));
+    key(&mut app, KeyCode::Esc).await;
+    finish(task).await;
+    assert!(board_state(&app).archive.is_none());
+    assert!(screen(&mut app).contains("Nothing archived."));
+
+    let (mut app, config) = fixture();
+    let task = open_decisions(
+        &mut app,
+        &config,
+        vec![],
+        vec![(
+            "ListStaleManagerDecisions",
+            json!({"result":stale_listing("x", 0)}),
+        )],
+    )
+    .await;
+    key(&mut app, KeyCode::Char('X')).await;
+    finish(task).await;
+    assert!(screen(&mut app).contains("No stale decisions"));
 }

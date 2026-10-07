@@ -217,6 +217,14 @@ pub(crate) fn caller_kind(store: &Store, caller: Uuid) -> Option<&'static str> {
     TopologyCaller::resolve(store, caller)
         .ok()
         .map(|caller| caller.kind())
+        .or_else(|| {
+            // #1235: a portfolio seat acts as a manager in its granted projects.
+            store
+                .portfolio_seat_grant(caller)
+                .ok()
+                .flatten()
+                .map(|_| "manager")
+        })
 }
 
 /// Append the one ledger row for a call. `key` binds a ledger-owned
@@ -309,17 +317,43 @@ pub(crate) enum TopologyCaller {
 impl TopologyCaller {
     /// Resolve the caller from durable rows only; never from request fields.
     pub(crate) fn resolve(store: &Store, caller: Uuid) -> Result<Self> {
-        if let Some(lead) = Self::lead(store, caller)? {
+        Self::resolve_in(store, caller, None)
+    }
+
+    /// [`Self::resolve`] with an optional target project (#1235): omitted or
+    /// the caller's own project keeps the lead-then-manager order; the
+    /// global seat is served inside its grant; any other project is refused
+    /// `manager_project_not_in_scope`. The project is a target, not identity.
+    pub(crate) fn resolve_in(store: &Store, caller: Uuid, project: Option<Uuid>) -> Result<Self> {
+        let own = store
+            .get_session(caller)?
+            .and_then(|session| session.project_id);
+        let foreign = project.filter(|project| own != Some(*project));
+        if foreign.is_none()
+            && let Some(lead) = Self::lead(store, caller)?
+        {
             return Ok(lead);
         }
-        let (config, is_manager) = store
-            .manager_config_for_caller(caller)
-            .map_err(|_| denied())?;
-        if !is_manager {
-            return Err(denied());
-        }
+        let config = match store.resolve_manager_caller(caller, project) {
+            Ok(crate::store::harness_manager_v2::ManagerCallerV1::Legacy {
+                config,
+                is_manager: true,
+            }) => config,
+            Ok(crate::store::harness_manager_v2::ManagerCallerV1::Global(authority)) => {
+                authority.config
+            }
+            Err(DaemonError::InvalidParam(code))
+                if code == rsi_common::global_manager::MANAGER_PROJECT_NOT_IN_SCOPE =>
+            {
+                return Err(refusal(
+                    rsi_common::global_manager::MANAGER_PROJECT_NOT_IN_SCOPE,
+                    "name a project in your global grant, or omit project_id for your own project",
+                ));
+            }
+            _ => return Err(denied()),
+        };
         let grant = store
-            .get_harness_manager_policy(config.project_id)
+            .manager_policy_for_config(&config)
             .map_err(|_| denied())?
             .ok_or_else(denied)?;
         let fence = ManagerFenceV2 {
@@ -327,7 +361,12 @@ impl TopologyCaller {
             policy_version: grant.row_version,
         };
         let authority = store
-            .manager_v2_authorize(caller, &fence, Some(ManagerCapabilityV2::Automation))
+            .manager_v2_authorize_in(
+                caller,
+                Some(config.project_id),
+                &fence,
+                Some(ManagerCapabilityV2::Automation),
+            )
             .map_err(|error| match error {
                 DaemonError::InvalidParam(code) if code == "manager_v2_capability_denied" => {
                     refusal(
@@ -415,15 +454,34 @@ impl TopologyCaller {
     /// own grant, or (for a lead) its project's grant when one is in force.
     /// `None` means no constraint was granted, which fails closed.
     fn policy(&self, store: &Store) -> Result<Option<ManagerPolicyV2>> {
-        match self {
-            Self::Manager { authority, .. } => Ok(Some(authority.grant.policy.clone())),
-            Self::Lead { project_id, .. } => Ok(project_id
-                .map(|project| store.get_harness_manager_policy(project))
+        let (mut policy, config) = match self {
+            Self::Manager { authority, .. } => (
+                Some(authority.grant.policy.clone()),
+                Some(authority.config.clone()),
+            ),
+            Self::Lead { project_id, .. } => (
+                project_id
+                    .map(|project| store.get_harness_manager_policy(project))
+                    .transpose()?
+                    .flatten()
+                    .filter(|grant| !grant.revoked)
+                    .map(|grant| grant.policy),
+                None,
+            ),
+        };
+        let config = match config {
+            Some(config) => Some(config),
+            None => self
+                .project_id()
+                .map(|project| store.get_harness_manager(project))
                 .transpose()?
-                .flatten()
-                .filter(|grant| !grant.revoked)
-                .map(|grant| grant.policy)),
+                .flatten(),
+        };
+        if let (Some(policy), Some(config)) = (&mut policy, config) {
+            policy.allowed_launches =
+                store.manager_effective_launches(&config, &policy.allowed_launches)?;
         }
+        Ok(policy)
     }
 
     /// Require `epic_id` inside this caller's scope at `reach`.
@@ -933,6 +991,76 @@ fn fanout_diagnostics(
 /// Re-check live policy before one agent-requested session launch. Returns
 /// the refusal code, or `None` to launch. Epic parenting applies the
 /// active, provider and spend caps inside the launch itself.
+fn global_launch_gate(
+    store: &Store,
+    execution: &ExecutionRow,
+    attempt: &AttemptRow,
+    project: Uuid,
+    requester: Uuid,
+    launch: &ManagerLaunchChoiceV2,
+) -> Result<Option<&'static str>> {
+    let Ok(crate::store::harness_manager_v2::ManagerCallerV1::Global(authority)) =
+        store.resolve_manager_caller(requester, Some(project))
+    else {
+        return Ok(Some("manager_scope_changed"));
+    };
+    let policy = &authority.grant.policy;
+    let allowed = store.manager_effective_launches(&authority.config, &policy.allowed_launches)?;
+    if !launch_granted(&allowed, launch) {
+        return Ok(Some("launch_not_granted"));
+    }
+    if execution.scope_version != Some(authority.config.row_version) {
+        return Ok(Some("manager_scope_changed"));
+    }
+    if !policy
+        .capabilities
+        .contains(&ManagerCapabilityV2::Automation)
+    {
+        return Ok(Some("capability_denied"));
+    }
+    let epic = execution.epic_id.or(execution.parent_session_id);
+    if epic.is_none_or(|epic| !authority.config.epic_ids.contains(&epic)) {
+        return Ok(Some("epic_out_of_scope"));
+    }
+    if policy.mode != ManagerOperatingModeV2::Execute
+        || policy.paused
+        || epic.is_some_and(|epic| policy.paused_epic_ids.contains(&epic))
+    {
+        return Ok(Some("manager_paused"));
+    }
+    let usage = store.manager_v2_created_usage(&authority.config, false)?;
+    let own = i64::from(attempt.boot_id.is_some());
+    if usage - own >= i64::from(policy.max_created_sessions) {
+        return Ok(Some("creation_limit"));
+    }
+    ancestor_allowance(store, &authority.config, 1, own)
+}
+
+/// #1275: a topology session launch is charged against every ancestor's
+/// allowance too, exactly as a lifecycle `create_session` is. `counted` is
+/// the launches already charged (a relaunch of this attempt).
+fn ancestor_allowance(
+    store: &Store,
+    config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+    needed: i64,
+    counted: i64,
+) -> Result<Option<&'static str>> {
+    match store.manager_ancestor_creation_allowance(config, false, needed, counted) {
+        Ok(()) => Ok(None),
+        Err(DaemonError::InvalidParam(code)) if code == "manager_v2_creation_limit" => {
+            Ok(Some("creation_limit"))
+        }
+        Err(DaemonError::InvalidParam(code))
+            if code == rsi_common::global_manager::MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED =>
+        {
+            Ok(Some(
+                rsi_common::global_manager::MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED,
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn launch_gate(
     store: &Store,
     execution: &ExecutionRow,
@@ -952,19 +1080,33 @@ pub(crate) fn launch_gate(
     let Some(launch) = node_launch(node) else {
         return Ok(Some("launch_not_explicit"));
     };
+    // #1235: an execution the global seat requested is governed only by its
+    // grant, re-resolved here; a rotated, revoked or replaced seat's
+    // execution never falls back to the project manager's policy.
+    if execution.requested_by_kind == "manager"
+        && let Some(requester) = execution.requested_by_session_id
+        && store.is_global_seat_ever(requester)?
+    {
+        return global_launch_gate(store, execution, attempt, project, requester, &launch);
+    }
     let grant = store
         .get_harness_manager_policy(project)?
         .filter(|grant| !grant.revoked);
     let Some(grant) = grant else {
         return Ok(Some("launch_not_granted"));
     };
-    if !launch_granted(&grant.policy.allowed_launches, &launch) {
+    let config = store.get_harness_manager(project)?;
+    let allowed = match &config {
+        Some(config) => store.manager_effective_launches(config, &grant.policy.allowed_launches)?,
+        None => grant.policy.allowed_launches.clone(),
+    };
+    if !launch_granted(&allowed, &launch) {
         return Ok(Some("launch_not_granted"));
     }
     if execution.requested_by_kind != "manager" {
         return Ok(None);
     }
-    let Some(config) = store.get_harness_manager(project)? else {
+    let Some(config) = config else {
         return Ok(Some("manager_scope_changed"));
     };
     let policy = &grant.policy;
@@ -993,7 +1135,7 @@ pub(crate) fn launch_gate(
     if usage - own >= i64::from(policy.max_created_sessions) {
         return Ok(Some("creation_limit"));
     }
-    Ok(None)
+    ancestor_allowance(store, &config, 1, own)
 }
 
 // ─── verbs ─────────────────────────────────────────────────────────────────
@@ -1082,7 +1224,7 @@ fn upsert_in_tx(
     digest: &str,
 ) -> Result<UpsertDone> {
     request.validate().map_err(invalid)?;
-    let caller = TopologyCaller::resolve(store, caller_id)?;
+    let caller = TopologyCaller::resolve_in(store, caller_id, request.project_id)?;
     let (epic_id, project_id) = match (request.scope, &caller) {
         (
             AgentTopologyScopeV1::Epic,
@@ -1303,7 +1445,7 @@ pub(crate) fn list(
     request: &AgentTopologyListRequestV1,
 ) -> Result<AgentTopologyListResultV1> {
     let limit = request.validated_limit().map_err(invalid)?;
-    let caller = TopologyCaller::resolve(store, caller)?;
+    let caller = TopologyCaller::resolve_in(store, caller, request.project_id)?;
     if let Some(epic) = request.epic_id {
         caller.require_epic(store, epic, Reach::Read)?;
     }
@@ -1465,7 +1607,14 @@ pub(crate) fn get_execution(
     request: &AgentTopologyGetExecutionRequestV1,
 ) -> Result<AgentTopologyGetExecutionResultV1> {
     let limit = request.validated_limit().map_err(invalid)?;
-    let caller = TopologyCaller::resolve(store, caller)?;
+    let project = execution_project(store, request.execution_id, request.project_id)?;
+    let caller = TopologyCaller::resolve_in(store, caller, project).map_err(|error| {
+        if request.project_id.is_none() {
+            derived_project_denial(error)
+        } else {
+            error
+        }
+    })?;
     caller.require_execution(store, request.execution_id, Reach::Read)?;
     let execution = execution_summary(&store.conn, request.execution_id)?.ok_or_else(not_found)?;
     let nodes = rows::load_attempts(store, request.execution_id)?
@@ -1620,6 +1769,21 @@ fn admission_policy(
                 "ask the operator to raise max_created_sessions for this manager",
             ));
         }
+        match ancestor_allowance(store, &authority.config, needed, 0)? {
+            None => {}
+            Some("creation_limit") => {
+                return Err(refusal(
+                    "creation_limit",
+                    "ask the operator to raise max_created_sessions for this manager",
+                ));
+            }
+            Some(code) => {
+                return Err(refusal(
+                    code,
+                    "a manager above you has no session allowance left in this project; report up",
+                ));
+            }
+        }
         Some(authority.config.row_version)
     } else {
         None
@@ -1741,7 +1905,7 @@ pub(crate) async fn prepare_execute(
     let fingerprint = execute_fingerprint(request);
     let admitted = {
         let store = store.lock().await;
-        let caller = TopologyCaller::resolve(&store, caller_id)?;
+        let caller = TopologyCaller::resolve_in(&store, caller_id, request.project_id)?;
         // Authorize first, replay second (review R2): a replay passes the
         // same live authority and Epic scope a fresh request needs, plus the
         // prior execution's own scope.
@@ -1803,7 +1967,7 @@ pub(crate) fn accept_prepared(
         base_commit,
         custody_plan,
     } = prepared;
-    let caller = TopologyCaller::resolve(store, caller_id)?;
+    let caller = TopologyCaller::resolve_in(store, caller_id, request.project_id)?;
     caller.require_epic(store, request.epic_id, Reach::Effect)?;
     let current = TopologyRecord::load(&store.conn, admitted.record.id)?
         .filter(|record| !record.archived && caller.may_execute(record, request.epic_id))
@@ -1921,6 +2085,7 @@ fn interrupt_authorized(
     request: &AgentTopologyInterruptRequestV1,
 ) -> Result<(AgentTopologyInterruptResultV1, Vec<GraphExecutionUpdate>)> {
     request.validate().map_err(invalid)?;
+    execution_project(store, request.execution_id, request.project_id)?;
     let (caller, _) = authorize_execution(store, caller, request.execution_id, Reach::Stop)?;
     let requested_at = Utc::now();
     let outcome = rows::request_agent_interrupt(
@@ -2030,6 +2195,39 @@ pub(crate) async fn resolve<E: NodeEffects>(
     outcome
 }
 
+/// A project the daemon derived from an execution (not one the caller named)
+/// keeps the ordinary `authority_denied` for a caller outside it.
+fn derived_project_denial(error: DaemonError) -> DaemonError {
+    if error_code(&error) == rsi_common::global_manager::MANAGER_PROJECT_NOT_IN_SCOPE {
+        denied()
+    } else {
+        error
+    }
+}
+
+/// The project of an execution's Epic (#1235). A named `project_id` that
+/// differs is refused `manager_project_not_in_scope`; an unknown execution
+/// resolves to `None` so the ordinary not-found path answers.
+fn execution_project(
+    store: &Store,
+    execution_id: Uuid,
+    named: Option<Uuid>,
+) -> Result<Option<Uuid>> {
+    let project = rows::load_execution(store, execution_id)?
+        .and_then(|execution| execution.epic_id.or(execution.parent_session_id))
+        .map(|epic| store.get_session(epic))
+        .transpose()?
+        .flatten()
+        .and_then(|epic| epic.project_id);
+    if named.is_some_and(|named| Some(named) != project) {
+        return Err(refusal(
+            rsi_common::global_manager::MANAGER_PROJECT_NOT_IN_SCOPE,
+            "name the project that owns the execution, or omit project_id",
+        ));
+    }
+    Ok(project)
+}
+
 /// Live authority of `caller_id` over `execution_id` at `reach`, read from
 /// durable rows under the caller's store guard: current manager appointment
 /// with `Automation`, the execution's Epic in live scope (plus Execute mode
@@ -2041,7 +2239,10 @@ pub(crate) fn authorize_execution(
     execution_id: Uuid,
     reach: Reach,
 ) -> Result<(TopologyCaller, ExecutionRow)> {
-    let caller = TopologyCaller::resolve(store, caller_id)?;
+    // #1235: an execution-keyed verb acts in the execution's own project.
+    let project = execution_project(store, execution_id, None)?;
+    let caller =
+        TopologyCaller::resolve_in(store, caller_id, project).map_err(derived_project_denial)?;
     let execution = caller.require_execution(store, execution_id, reach)?;
     Ok((caller, execution))
 }

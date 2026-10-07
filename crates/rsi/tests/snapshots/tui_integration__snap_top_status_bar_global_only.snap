@@ -2,4 +2,4 @@
 source: crates/rsi/tests/tui_integration.rs
 expression: snapshot
 ---
- ● 1
+ ● 1 running                                                                                             default ✻ sonnet-5 · xhigh

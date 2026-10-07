@@ -189,7 +189,6 @@ impl App {
             selected_session: self.session_id_at(0),
             scroll_offset: 0,
             active_zone: Default::default(),
-            taskrabbit_selected_index: 0,
             archive_selected_index: 0,
             jobs_selected_index: 0,
         };
@@ -344,7 +343,6 @@ impl App {
                     selected_session: first_session,
                     scroll_offset: 0,
                     active_zone: Default::default(),
-                    taskrabbit_selected_index: 0,
                     archive_selected_index: 0,
                     jobs_selected_index: 0,
                 },

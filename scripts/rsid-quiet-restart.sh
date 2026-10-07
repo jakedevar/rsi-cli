@@ -107,7 +107,7 @@ PY
 }
 
 # The deployable binaries, as AgentRequestDeploy names them (DEPLOY_BINARIES).
-RSID_DEPLOY_BINARIES=(rsid rsi rsi-rpc rsi-agent-mcp rsi-build-rustc rsi-contract-validate rsi-rolling-land rsi-remote)
+RSID_DEPLOY_BINARIES=(rsid rsi rsi-rpc rsi-agent-mcp rsi-build-rustc rsi-contract-validate rsi-rolling-land rsi-remote rsid-supervisor.sh)
 
 # stabilize_installed_binaries <bin-dir> <cargo-release-dir> <stable-dir>
 #
@@ -152,4 +152,22 @@ install_built_binaries() {
         chmod 755 "$temp"
         mv -f "$temp" "$install_dir/$name"
     done
+}
+
+# install_supervisor_script <install-dir>   (#1217)
+#
+# Copy rsid-supervisor.sh next to the installed rsid, atomically. Everything
+# that launches the daemon under the supervisor (install-release's restart and
+# the TUI's auto-start) runs this installed copy, never a script from a sandbox
+# or the operator checkout. A running supervisor refreshes between lifetimes.
+install_supervisor_script() {
+    local install_dir="$1" src temp
+    src="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/rsid-supervisor.sh"
+    [[ -f "$src" ]] || return 1
+    mkdir -p "$install_dir"
+    temp="$(mktemp "$install_dir/.rsid-supervisor.sh.XXXXXX")"
+    cp -p "$src" "$temp"
+    bash -n "$temp" || { rm -f "$temp"; return 1; }
+    chmod 755 "$temp"
+    mv -f "$temp" "$install_dir/rsid-supervisor.sh"
 }

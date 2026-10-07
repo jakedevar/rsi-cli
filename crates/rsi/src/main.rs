@@ -6,6 +6,12 @@ use std::process::Command;
 const ENV_TUI_NO_AUTO_START_DAEMON: &str = "RSI_TUI_NO_AUTO_START_DAEMON";
 const RSID_SCOPE_SETTINGS_FILE: &str = "rsid-scope.env";
 const RSID_SCOPE_PREFIX: &str = "rsid-tui";
+/// Where `scripts/install-release.sh` installs the supervised daemon set
+/// (`~/.rsi/install`): `rsid` and `rsid-supervisor.sh`.
+#[cfg(target_os = "linux")]
+const INSTALL_SUBDIR: &str = "install";
+#[cfg(target_os = "linux")]
+const SUPERVISOR_SCRIPT: &str = "rsid-supervisor.sh";
 #[cfg(target_os = "linux")]
 const WORKER_SLICE: &str = "rsi-workers.slice";
 
@@ -199,8 +205,11 @@ impl RsidScopeSettings {
         Ok(())
     }
 
-    fn systemd_run_args(self, daemon_cmd: &Path, unit: &str) -> Vec<String> {
-        vec![
+    /// `systemd-run` arguments for one bounded scope running `argv` (the bare
+    /// daemon, or `rsid-supervisor.sh <rsid>`), the same properties
+    /// `scripts/install-release.sh` `restart_rsid` uses.
+    fn systemd_run_args(self, unit: &str, argv: &[PathBuf]) -> Vec<String> {
+        let mut args = vec![
             "--user".to_string(),
             "--scope".to_string(),
             "--collect".to_string(),
@@ -211,9 +220,70 @@ impl RsidScopeSettings {
             format!("--property=MemorySwapMax={}M", self.memory_swap_max_mib),
             format!("--property=CPUWeight={}", self.cpu_weight),
             "--".to_string(),
-            daemon_cmd.display().to_string(),
-        ]
+        ];
+        args.extend(argv.iter().map(|part| part.display().to_string()));
+        args
     }
+}
+
+/// How the TUI starts a daemon: the argv the launch runs and whether it is
+/// under `rsid-supervisor.sh` (managed deploys need it, #1217).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonLaunch {
+    argv: Vec<PathBuf>,
+    supervised: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// Choose the daemon launch. A release TUI uses the supervisor script and
+/// `rsid` that `install-release.sh` installs under `<data_dir>/install`, never
+/// a script from a sandbox or the operator checkout. Without that install, and
+/// for dev (`target/debug`) builds, it falls back to the bare daemon.
+#[cfg(target_os = "linux")]
+fn plan_daemon_launch(
+    current_exe: Option<&Path>,
+    path_daemon: Option<&Path>,
+    data_dir: &Path,
+) -> DaemonLaunch {
+    let bare = || DaemonLaunch {
+        argv: vec![resolve_daemon_command_with(current_exe, path_daemon)],
+        supervised: false,
+    };
+    if current_exe.is_some_and(prefer_sibling_daemon) {
+        return bare();
+    }
+    let install_dir = data_dir.join(INSTALL_SUBDIR);
+    let supervisor = install_dir.join(SUPERVISOR_SCRIPT);
+    let rsid = install_dir.join(rsi_common::identity::DAEMON_BINARY);
+    if is_executable_file(&supervisor) && is_executable_file(&rsid) {
+        return DaemonLaunch {
+            argv: vec![supervisor, rsid],
+            supervised: true,
+        };
+    }
+    tracing::warn!(
+        supervisor = %supervisor.display(),
+        "no installed rsid-supervisor.sh; starting rsid unsupervised (run `make release-install`)"
+    );
+    bare()
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_daemon_launch() -> DaemonLaunch {
+    let current_exe = std::env::current_exe().ok();
+    let path_daemon = which::which(rsi_common::identity::DAEMON_BINARY).ok();
+    plan_daemon_launch(
+        current_exe.as_deref(),
+        path_daemon.as_deref(),
+        &rsi_common::identity::data_dir(),
+    )
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -223,6 +293,26 @@ async fn main() -> color_eyre::Result<()> {
     // Initialize tracing to file (not stdout — that's the terminal)
     let log_dir = rsi_common::identity::data_dir();
     let _ = std::fs::create_dir_all(&log_dir);
+
+    // #1406: `rsi export --clean` / `rsi init --from` are operator CLI
+    // commands, not the TUI. They talk to the daemon and exit.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(parsed) = rsi::portable_cli::parse(&args) {
+        let command = match parsed {
+            Ok(command) => command,
+            Err(error) => {
+                eprintln!("rsi: {error}\n\n{}", rsi::portable_cli::USAGE);
+                std::process::exit(2);
+            }
+        };
+        let mut client = DaemonClient::new(DaemonClient::default_socket_path());
+        let start = || try_auto_start_daemon(&log_dir).map_err(|error| error.to_string());
+        if let Err(error) = rsi::portable_cli::run(command, &mut client, start).await {
+            eprintln!("rsi: {error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     let log_path = log_dir.join("tui.log");
     if log_path.exists() {
@@ -350,10 +440,11 @@ fn try_auto_start_daemon(log_dir: &Path) -> color_eyre::Result<()> {
         let result = ensure_daemon_socket(&socket_path, || {
             let scope = read_or_initialize_rsid_scope_settings()?;
             provision_worker_slice(scope.worker)?;
-            let daemon_cmd = resolve_daemon_command();
+            let launch = resolve_daemon_launch();
+            tracing::info!(supervised = launch.supervised, argv = ?launch.argv, "launching rsid");
             let daemon_log = open_daemon_log(&daemon_log_path)?;
             let child = Command::new("systemd-run")
-                .args(scope.systemd_run_args(&daemon_cmd, &unit))
+                .args(scope.systemd_run_args(&unit, &launch.argv))
                 .stdin(std::process::Stdio::null())
                 .stdout(daemon_log.try_clone()?)
                 .stderr(daemon_log)
@@ -851,6 +942,7 @@ fn is_truthy_env_value(value: &str) -> bool {
     )
 }
 
+#[cfg(target_os = "macos")]
 fn resolve_daemon_command() -> PathBuf {
     let current_exe = std::env::current_exe().ok();
     let path_daemon = which::which(rsi_common::identity::DAEMON_BINARY).ok();
@@ -1240,7 +1332,8 @@ mod tests {
             "rsid_scope_memory_high_mib=6144\nrsid_scope_memory_max_mib=8192\nrsid_scope_memory_swap_max_mib=0\nrsid_scope_cpu_weight=20\n",
         )
         .unwrap();
-        let args = settings.systemd_run_args(Path::new("/opt/rsi/rsid"), "rsid-tui-123.scope");
+        let args =
+            settings.systemd_run_args("rsid-tui-123.scope", &[PathBuf::from("/opt/rsi/rsid")]);
         assert_eq!(
             args,
             [
@@ -1257,6 +1350,82 @@ mod tests {
                 "/opt/rsi/rsid",
             ]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        touch(path);
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tui_launch_runs_the_installed_supervisor_with_the_installed_rsid() {
+        let data = temp_dir("launch-supervised");
+        let install = data.join("install");
+        make_executable(&install.join("rsid-supervisor.sh"));
+        make_executable(&install.join("rsid"));
+        // A sandbox or operator checkout next to the TUI must never be used.
+        let release_rsi = data.join("checkout/target/release/rsi");
+        make_executable(&release_rsi.with_file_name("rsid"));
+        make_executable(&data.join("checkout/scripts/rsid-supervisor.sh"));
+
+        let launch = super::plan_daemon_launch(Some(&release_rsi), None, &data);
+        assert!(launch.supervised);
+        assert_eq!(
+            launch.argv,
+            [install.join("rsid-supervisor.sh"), install.join("rsid")]
+        );
+
+        let settings = RsidScopeSettings::defaults();
+        let args = settings.systemd_run_args("rsid-tui-1.scope", &launch.argv);
+        let separator = args.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(
+            args[separator + 1..],
+            [
+                install.join("rsid-supervisor.sh").display().to_string(),
+                install.join("rsid").display().to_string()
+            ]
+        );
+        assert!(args.contains(&"--property=MemoryMax=8192M".to_string()));
+        assert!(args.contains(&"--slice=user.slice".to_string()));
+
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tui_launch_falls_back_to_the_bare_daemon_without_an_installed_supervisor() {
+        let data = temp_dir("launch-bare");
+        let release_rsi = data.join("target/release/rsi");
+        let path_rsid = data.join("bin/rsid");
+        make_executable(&path_rsid);
+        // The script exists but is not executable, and there is no installed rsid.
+        touch(&data.join("install/rsid-supervisor.sh"));
+
+        let launch = super::plan_daemon_launch(Some(&release_rsi), Some(&path_rsid), &data);
+        assert!(!launch.supervised);
+        assert_eq!(launch.argv, [path_rsid]);
+
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tui_dev_build_launch_never_uses_the_installed_supervisor() {
+        let data = temp_dir("launch-dev");
+        make_executable(&data.join("install/rsid-supervisor.sh"));
+        make_executable(&data.join("install/rsid"));
+        let debug_rsi = data.join("target/debug/rsi");
+        let sibling = data.join("target/debug/rsid");
+        make_executable(&sibling);
+
+        let launch = super::plan_daemon_launch(Some(&debug_rsi), None, &data);
+        assert!(!launch.supervised);
+        assert_eq!(launch.argv, [sibling]);
+
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[cfg(target_os = "linux")]

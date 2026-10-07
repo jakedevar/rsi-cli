@@ -322,10 +322,17 @@ impl SessionManager {
             crate::session::RotationPublicationGuards::acquire(predecessor, successor).await;
         let published = {
             let store = self.store.lock().await;
-            store.publish_rotation_successor(&guards, rotation_id, &metadata)
+            store.publish_rotation_successor_with_chain(&guards, rotation_id, &metadata)
         };
         drop(guards);
-        for epic_id in published? {
+        let publication = published?;
+        if !publication.archived.is_empty() {
+            let mut completed = self.completed.write().await;
+            for archived in &publication.archived {
+                completed.remove(archived);
+            }
+        }
+        for epic_id in publication.epics {
             self.set_lead_in_memory(epic_id, Some(successor)).await;
             self.event_bus.publish(DaemonEvent::SessionMetadataChanged {
                 session_id: epic_id,
@@ -443,40 +450,71 @@ impl SessionManager {
                 // predecessor. Closing the intent would strand the seat with
                 // nobody owning the recovery, so it stays open: recovery never
                 // allocates another successor, never moves custody back, and
-                // tells the operator once.
-                let blocked = {
+                // tells the operator once per holder. #1176: after an operator
+                // abandon the holder is the newest replacement bound to the
+                // sandbox, a `continued_from` descendant of the successor.
+                let holder = {
                     let store = self.store.lock().await;
                     if store.rotation_successor_holds_transferred_custody(predecessor, successor)? {
-                        Some(store.record_rotation_recovery_blocked(
-                            predecessor,
-                            rotation_id,
-                            successor,
-                        )?)
+                        Some((successor, status))
                     } else {
-                        None
+                        store.blocked_rotation_holder(successor)?
                     }
                 };
-                if let Some(first) = blocked {
-                    if first {
-                        let message = format!(
-                            "Rotation {rotation_id} of {predecessor} stopped after its sandbox moved to successor {successor}, which never started. The daemon keeps the rotation open and does not move the sandbox back (custody only moves forward). Continue {successor} to start it: it holds the sandbox, and the daemon publishes it as {predecessor}'s successor once it runs."
-                        );
-                        tracing::error!("{message}");
-                        self.event_bus.publish(DaemonEvent::SystemMessage {
-                            level: "error".into(),
-                            message,
-                        });
+                let Some((holder, holder_status)) = holder else {
+                    self.refuse_recovered_rotation(
+                        predecessor,
+                        None,
+                        rotation_id,
+                        "successor_not_live",
+                    )
+                    .await?;
+                    return Ok(RecoveredRotation::Refused("successor_not_live"));
+                };
+                if holder != successor {
+                    match holder_status {
+                        SessionStatus::Starting
+                        | SessionStatus::Running
+                        | SessionStatus::WaitingApproval => {
+                            return Ok(RecoveredRotation::InFlight(holder));
+                        }
+                        SessionStatus::Completed | SessionStatus::Interrupted => {
+                            // The replacement settled live: publish it, and with it
+                            // the blocked chain, under its own abandon rotation.
+                            let hop = self.store.lock().await.rotation_abandon_hop_of(holder)?;
+                            if let Some((from, abandon_rotation_id)) = hop {
+                                return Box::pin(self.settle_existing_rotation_successor(
+                                    from,
+                                    holder,
+                                    holder_status,
+                                    &abandon_rotation_id,
+                                ))
+                                .await;
+                            }
+                        }
+                        _ => {}
                     }
-                    return Ok(RecoveredRotation::Blocked(successor));
                 }
-                self.refuse_recovered_rotation(
-                    predecessor,
-                    None,
-                    rotation_id,
-                    "successor_not_live",
-                )
-                .await?;
-                Ok(RecoveredRotation::Refused("successor_not_live"))
+                let first = {
+                    let store = self.store.lock().await;
+                    if let Some(closed) =
+                        store.close_interrupted_rotation_abandon(predecessor, rotation_id)?
+                    {
+                        tracing::warn!(%predecessor, rotation_id, closed, "Closed an abandon of a blocked rotation that a restart interrupted");
+                    }
+                    store.record_rotation_recovery_blocked(predecessor, rotation_id, holder)?
+                };
+                if first {
+                    let message = format!(
+                        "Rotation {rotation_id} of {predecessor} stopped after its sandbox moved to {holder}, which never started. The daemon keeps the rotation open and does not move the sandbox back. Continue {holder} (it holds the sandbox), abandon the rotation to a fresh replacement with :rotation-abandon [provider[/model]] on {predecessor}, or reconcile the sandbox by hand."
+                    );
+                    tracing::error!("{message}");
+                    self.event_bus.publish(DaemonEvent::SystemMessage {
+                        level: "error".into(),
+                        message,
+                    });
+                }
+                Ok(RecoveredRotation::Blocked(holder))
             }
         }
     }
@@ -1577,7 +1615,7 @@ mod tests {
         let parent = seat.fixture.parent.id;
         // A real rotation successor is a direct child of the Epic it leads
         // (restore clears a lead pointer to a row that is not); the shared
-        // fixture does not set it.
+        // Keep the successor on the seat's Epic across restart.
         manager.store.lock().await.conn.execute(
             "UPDATE sessions SET parent_id=?1 WHERE id=?2",
             [seat.epic.to_string(), failed.id.to_string()],
@@ -1766,6 +1804,1059 @@ mod tests {
             store.find_published_rotation_successor(parent)?,
             Some(failed.id)
         );
+        Ok(())
+    }
+
+    // ── #1176: operator abandon of a blocked rotation ──────────────────────
+
+    const BLOCKED_ROTATION: &str = "rot-bound";
+
+    fn abandon_params(
+        session_id: Uuid,
+        key: &str,
+    ) -> rsi_common::rpc::AbandonBlockedRotationParams {
+        rsi_common::rpc::AbandonBlockedRotationParams {
+            session_id,
+            provider: None,
+            model: None,
+            idempotency_key: key.to_string(),
+        }
+    }
+
+    /// The #1156 state: the seat's rotation reserved and bound a successor
+    /// that never started, and the daemon died. Returns the seat fixture, the
+    /// never-started successor and its Epic, with the seat's global grant
+    /// and hierarchy matching production across restart.
+    async fn blocked_seat(
+        manager: SessionManager,
+        dir: &Path,
+    ) -> anyhow::Result<(super::super::tests::LiveRotationFixture, Session, Uuid)> {
+        let seat = seated_live_parent(&manager, dir).await?;
+        let fixture = seat.fixture;
+        let epic = seat.epic;
+        {
+            let store = manager.store.lock().await;
+            assert!(store.record_completed_trigger_intent(
+                fixture.parent.id,
+                BLOCKED_ROTATION,
+                "manual_triggered"
+            )?);
+        }
+        let child =
+            reserve_and_bind_live_successor_for_test(&manager, &fixture, BLOCKED_ROTATION).await?;
+        // This fixture stops before provider launch; a thread id would be
+        // durable execution evidence, not a harmless fixture default.
+        manager.store.lock().await.conn.execute(
+            "UPDATE sessions SET claude_session_id=NULL WHERE id=?1",
+            [child.id.to_string()],
+        )?;
+        drop(manager); // the daemon dies
+        Ok((fixture, child, epic))
+    }
+
+    /// Reserve and bind an abandon replacement of `holder`, exactly as the
+    /// abandon decider does before the replacement's first turn.
+    async fn reserve_and_bind_abandon_replacement(
+        manager: &SessionManager,
+        holder: Uuid,
+        repo: &Path,
+        rotation_id: &str,
+    ) -> anyhow::Result<Session> {
+        reserve_and_bind_abandon_replacement_with_history(manager, holder, repo, rotation_id, false)
+            .await
+    }
+
+    async fn reserve_and_bind_abandon_replacement_with_history(
+        manager: &SessionManager,
+        holder: Uuid,
+        repo: &Path,
+        rotation_id: &str,
+        inject_history: bool,
+    ) -> anyhow::Result<Session> {
+        let holder = manager
+            .store
+            .lock()
+            .await
+            .get_session(holder)?
+            .expect("holder row");
+        let runtime = manager.custody_execution_runtime();
+        let candidate = runtime
+            .prepare_rotation_successor_from(&holder, RotationPredecessorSource::BlockedHolder)
+            .await?;
+        let mut child = test_session(Uuid::new_v4(), SessionStatus::Starting);
+        child.claude_session_id = None;
+        child.session_kind = holder.session_kind;
+        child.provider = rsi_common::types::SessionProvider::Claude;
+        child.working_dir = repo.to_path_buf();
+        child.project_id = holder.project_id;
+        child.parent_id = holder.parent_id;
+        child.continued_from = Some(holder.id);
+        child.rotation_depth = holder.rotation_depth + 1;
+        child.query = holder.query.clone();
+        crate::sandbox::custody::CustodyExecutionRuntime::apply_rotation_successor_tuple(
+            &candidate, &holder, &mut child,
+        )?;
+        let invocation_id = Uuid::new_v4();
+        {
+            let mut store = manager.store.lock().await;
+            super::super::tests::insert_rotation_invocation_fixture(
+                &store,
+                child.id,
+                invocation_id,
+                "running",
+            );
+            store.insert_reserved_rotation_session_with_invocation(
+                &child,
+                invocation_id,
+                rotation_id,
+            )?;
+        }
+        if inject_history {
+            manager.store.lock().await.conn.execute(
+                "INSERT INTO conversation_events(session_id,sequence,event_type,role,content,created_at) VALUES(?1,99,'Message','Assistant','effect after capture',?2)",
+                rusqlite::params![holder.id.to_string(), chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)],
+            )?;
+        }
+        runtime
+            .bind_rotation_successor(candidate, &holder, &child)
+            .await
+            .map_err(|_| anyhow::anyhow!("bind the abandon replacement"))?;
+        Ok(child)
+    }
+
+    /// Release the scripted replacement and wait for the holder rotation's
+    /// terminal decision; returns its event type.
+    async fn settle_abandon(
+        manager: &SessionManager,
+        holder: Uuid,
+        replacement: Uuid,
+        rotation_id: &str,
+    ) -> String {
+        use rusqlite::OptionalExtension as _;
+        let launched = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while !manager.active.read().await.contains_key(&replacement) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if launched.is_err() {
+            let events: Vec<(String, String)> = {
+                let store = manager.store.lock().await;
+                let mut statement = store
+                    .conn
+                    .prepare("SELECT rotation_id, event_type FROM rotation_events WHERE session_id=?1 ORDER BY id")
+                    .expect("prepare");
+                statement
+                    .query_map([holder.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .expect("events")
+                    .collect::<std::result::Result<_, _>>()
+                    .expect("rows")
+            };
+            panic!("the replacement never launched; holder rotation events: {events:?}");
+        }
+        super::super::super::launch::drop_controller_candidate_test_stream(replacement);
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let terminal: Option<String> = manager
+                    .store
+                    .lock()
+                    .await
+                    .conn
+                    .query_row(
+                        "SELECT event_type FROM rotation_events WHERE session_id=?1 AND rotation_id=?2
+                           AND (event_type='completed' OR event_type LIKE 'refused:%')",
+                        rusqlite::params![holder.to_string(), rotation_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .expect("terminal lookup");
+                if let Some(terminal) = terminal {
+                    return terminal;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the abandon rotation settles")
+    }
+
+    /// `(event_kind, cause, from_owner, to_owner)` of every custody event.
+    fn custody_chain(
+        store: &crate::store::Store,
+        custody_id: Uuid,
+    ) -> Vec<(String, String, Option<String>, Option<String>)> {
+        let mut statement = store
+            .conn
+            .prepare(
+                "SELECT event_kind, cause, from_owner_session_id, to_owner_session_id
+                 FROM sandbox_custody_events WHERE custody_id=?1 ORDER BY sequence",
+            )
+            .expect("prepare");
+        statement
+            .query_map([custody_id.to_string()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("custody events")
+            .collect::<std::result::Result<_, _>>()
+            .expect("custody rows")
+    }
+
+    fn status_of(store: &crate::store::Store, session_id: Uuid) -> SessionStatus {
+        store
+            .get_session(session_id)
+            .expect("read")
+            .expect("row")
+            .status
+    }
+
+    async fn lead_epic(manager: &SessionManager, epic: Uuid, lead: Uuid) -> anyhow::Result<()> {
+        manager
+            .store
+            .lock()
+            .await
+            .set_lead_session(epic, Some(lead))?;
+        manager.set_lead_in_memory(epic, Some(lead)).await;
+        Ok(())
+    }
+
+    fn lead_of(store: &crate::store::Store, epic: Uuid) -> Option<Uuid> {
+        store
+            .get_session(epic)
+            .expect("read")
+            .expect("epic")
+            .lead_session_id
+    }
+
+    async fn wait_archived(manager: &SessionManager, session_id: Uuid) {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while status_of(&*manager.store.lock().await, session_id) != SessionStatus::Archived {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the rotated holder is archived");
+    }
+
+    /// #1176: the operator abandons a blocked rotation. A fresh replacement
+    /// rotates from the never-started successor, takes the sandbox forward
+    /// (cause `rotation`, every session an owner once), and its publication
+    /// moves the seat's Epic lead to it and settles the blocked chain. A replay
+    /// of the request returns the same replacement.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn operator_abandon_moves_a_blocked_seat_to_a_fresh_replacement() -> anyhow::Result<()> {
+        let (manager, dir) = rotation_manager_with_context_rotation(true);
+        let (fixture, child, epic) = blocked_seat(manager, dir.path()).await?;
+        let parent = fixture.parent.id;
+        let restarted = rotation_manager_on(dir.path(), true);
+        restarted.restore_sessions().await?;
+        let blocked = restarted
+            .store
+            .lock()
+            .await
+            .blocked_rotation_chain_of(parent)?
+            .expect("the rotation is blocked");
+        assert_eq!(blocked.holder, child.id);
+        lead_epic(&restarted, epic, parent).await?;
+
+        let replacement = Uuid::new_v4();
+        install_rotation_child_id_for_test(child.id, replacement);
+        let _scripted =
+            super::super::super::launch::install_controller_candidate_test_process(replacement);
+        let receipt = restarted
+            .abandon_blocked_rotation(abandon_params(parent, "k1"))
+            .await?;
+        assert_eq!(receipt.status, "dispatched");
+        assert_eq!(receipt.predecessor_id, parent);
+        assert_eq!(receipt.holder_id, child.id);
+        let abandon_rotation = format!("{BLOCKED_ROTATION}:abandon:1");
+        assert_eq!(receipt.abandon_rotation_id, abandon_rotation);
+        assert_eq!(
+            settle_abandon(&restarted, child.id, replacement, &abandon_rotation).await,
+            "completed"
+        );
+        wait_archived(&restarted, child.id).await;
+
+        let store = restarted.store.lock().await;
+        let parent_s = parent.to_string();
+        let child_s = child.id.to_string();
+        let replacement_s = replacement.to_string();
+        let chain: Vec<_> = custody_chain(&store, fixture.custody_id)
+            .into_iter()
+            .map(|(kind, cause, from, to)| (kind, cause, from, to))
+            .collect();
+        assert_eq!(chain.len(), 3, "{chain:?}");
+        assert_eq!(chain[0].0, "allocated");
+        assert_eq!(chain[0].3.as_deref(), Some(parent_s.as_str()));
+        assert_eq!(
+            chain[1],
+            (
+                "transferred".to_string(),
+                "rotation".to_string(),
+                Some(parent_s.clone()),
+                Some(child_s.clone())
+            )
+        );
+        assert_eq!(
+            chain[2],
+            (
+                "transferred".to_string(),
+                "rotation".to_string(),
+                Some(child_s.clone()),
+                Some(replacement_s.clone())
+            )
+        );
+        assert_eq!(
+            custody_owner_and_projection(&store, fixture.custody_id, parent).0,
+            replacement_s
+        );
+        assert_eq!(
+            seat_holders(&store, epic),
+            (Some(replacement), Some(replacement))
+        );
+        assert_eq!(status_of(&store, parent), SessionStatus::Archived);
+        assert_eq!(status_of(&store, child.id), SessionStatus::Archived);
+        assert_eq!(store.published_lineage_tip(parent)?, Some(replacement));
+        assert_eq!(store.latest_open_rotation_intent(parent)?, None);
+        let replacement_row = store.get_session(replacement)?.expect("replacement");
+        assert_eq!(replacement_row.continued_from, Some(child.id));
+        assert_eq!(replacement_row.rotation_depth, child.rotation_depth + 1);
+        assert_eq!(replacement_row.query, child.query);
+        drop(store);
+
+        let replay = restarted
+            .abandon_blocked_rotation(abandon_params(parent, "k1"))
+            .await?;
+        assert_eq!(replay.status, "replayed");
+        assert_eq!(replay.replacement_id, Some(replacement));
+        Ok(())
+    }
+
+    async fn appoint_project_manager(
+        manager: &SessionManager,
+        fixture: &super::super::tests::LiveRotationFixture,
+        epic: Uuid,
+    ) -> anyhow::Result<()> {
+        let store = manager.store.lock().await;
+        store.conn.execute(
+            "UPDATE sessions SET project_id=?2 WHERE id=?1 OR id=(SELECT parent_id FROM sessions WHERE id=?1)",
+            rusqlite::params![epic.to_string(), fixture.parent.project_id.unwrap().to_string()],
+        )?;
+        store.conn.execute(
+            "UPDATE sessions SET session_kind='Task' WHERE id=?1 OR continued_from=?1",
+            [fixture.parent.id.to_string()],
+        )?;
+        let config = store.configure_harness_manager(
+            &rsi_common::harness_manager::ConfigureHarnessManagerRequestV1 {
+                project_id: fixture.parent.project_id.expect("project"),
+                session_id: fixture.parent.id,
+                epic_ids: None,
+                group_ids: vec![],
+                expected_row_version: 0,
+            },
+        )?;
+        assert!(!config.is_revoked());
+        drop(store);
+        for turn in manager.completed.write().await.values_mut() {
+            if turn.session.id == fixture.parent.id
+                || turn.session.continued_from == Some(fixture.parent.id)
+            {
+                turn.session.session_kind = rsi_common::types::SessionKind::Task;
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_manager_tip(
+        store: &crate::store::Store,
+        fixture: &super::super::tests::LiveRotationFixture,
+        owner: Uuid,
+    ) {
+        assert_eq!(store.manager_lineage_tip(fixture.parent.id).unwrap(), owner);
+        let config = store
+            .get_harness_manager(fixture.parent.project_id.unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(!config.is_revoked());
+        assert_eq!(config.current_session_id, Some(owner));
+    }
+
+    async fn fail_abandon_provider_spawn(
+        manager: &SessionManager,
+        parent: Uuid,
+        holder: Uuid,
+    ) -> anyhow::Result<(Uuid, String)> {
+        let replacement = Uuid::new_v4();
+        install_rotation_child_id_for_test(holder, replacement);
+        super::super::install_rotation_provider_unavailable_for_test(replacement);
+        let request = manager
+            .abandon_blocked_rotation(abandon_params(parent, "spawn-failure"))
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let store = manager.store.lock().await;
+                let blocked = store.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM rotation_events WHERE session_id=?1 AND rotation_id=?2 AND event_type='recovery_blocked')",
+                    rusqlite::params![holder.to_string(), request.abandon_rotation_id], |row| row.get::<_, bool>(0),
+                ).unwrap();
+                if blocked && store.get_session(replacement).unwrap().is_some_and(|row| row.status == SessionStatus::Failed) {
+                    assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM rotation_events WHERE session_id=?1 AND event_type='provider_spawn_failed'", [replacement.to_string()], |row| row.get::<_, i64>(0)).unwrap(), 1);
+                    assert!(terminal_rotation_events(&store, holder).unwrap().is_empty());
+                    break;
+                }
+                drop(store);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await?;
+        Ok((replacement, request.abandon_rotation_id))
+    }
+
+    /// Exercise the actual provider-spawn error tail after the custody commit,
+    /// both remedies in this boot and after restart. Publication must already
+    /// include every manager edge when the continuation returns.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_abandon_provider_spawn_keeps_continue_and_abandon_recoverable()
+    -> anyhow::Result<()> {
+        for restart in [false, true] {
+            for continue_replacement in [false, true] {
+                let (manager, dir) = rotation_manager_with_context_rotation(true);
+                let (fixture, child, epic) = blocked_seat(manager, dir.path()).await?;
+                let parent = fixture.parent.id;
+                let boot = rotation_manager_on(dir.path(), true);
+                boot.restore_sessions().await?;
+                appoint_project_manager(&boot, &fixture, epic).await?;
+                let (failed, rotation_id) =
+                    fail_abandon_provider_spawn(&boot, parent, child.id).await?;
+                assert_eq!(
+                    custody_owner_and_projection(
+                        &*boot.store.lock().await,
+                        fixture.custody_id,
+                        parent
+                    )
+                    .0,
+                    failed.to_string()
+                );
+                let boot = if restart {
+                    drop(boot);
+                    let boot = rotation_manager_on(dir.path(), true);
+                    boot.restore_sessions().await?;
+                    boot
+                } else {
+                    boot
+                };
+                assert!(terminal_rotation_events(&*boot.store.lock().await, child.id)?.is_empty());
+                let owner = if continue_replacement {
+                    let _scripted =
+                        super::super::super::launch::install_controller_candidate_test_process(
+                            failed,
+                        );
+                    boot.continue_session_operator(failed, "finish the replacement".into())
+                        .await?;
+                    assert_manager_tip(&*boot.store.lock().await, &fixture, failed);
+                    super::super::super::launch::drop_controller_candidate_test_stream(failed);
+                    failed
+                } else {
+                    let final_owner = Uuid::new_v4();
+                    install_rotation_child_id_for_test(failed, final_owner);
+                    let _scripted =
+                        super::super::super::launch::install_controller_candidate_test_process(
+                            final_owner,
+                        );
+                    let request = boot
+                        .abandon_blocked_rotation(abandon_params(parent, "after-failure"))
+                        .await?;
+                    assert_eq!(request.holder_id, failed);
+                    assert_eq!(
+                        settle_abandon(&boot, failed, final_owner, &request.abandon_rotation_id)
+                            .await,
+                        "completed"
+                    );
+                    final_owner
+                };
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while boot.active.read().await.contains_key(&owner) {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await?;
+                {
+                    let store = boot.store.lock().await;
+                    assert_eq!(seat_holders(&store, epic), (Some(owner), Some(owner)));
+                    assert_manager_tip(&store, &fixture, owner);
+                    assert_eq!(
+                        custody_owner_and_projection(&store, fixture.custody_id, parent).0,
+                        owner.to_string()
+                    );
+                    assert_eq!(store.published_lineage_tip(parent)?, Some(owner));
+                    assert_eq!(status_of(&store, child.id), SessionStatus::Archived);
+                    assert_eq!(
+                        terminal_rotation_events(&store, child.id)?.len(),
+                        1,
+                        "{rotation_id}"
+                    );
+                }
+                drop(boot);
+                let boot = rotation_manager_on(dir.path(), true);
+                boot.restore_sessions().await?;
+                let store = boot.store.lock().await;
+                assert_manager_tip(&store, &fixture, owner);
+                assert_eq!(seat_holders(&store, epic), (Some(owner), Some(owner)));
+                assert_eq!(
+                    custody_owner_and_projection(&store, fixture.custody_id, parent).0,
+                    owner.to_string()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn abandon_refuses_failed_holders_with_execution_history_and_running_holders()
+    -> anyhow::Result<()> {
+        for evidence in [
+            "thread",
+            "assistant",
+            "tool",
+            "second-user",
+            "spawn-ambiguous",
+            "continue-ambiguous",
+            "running",
+        ] {
+            let (manager, dir) = rotation_manager_with_context_rotation(true);
+            let (fixture, child, _) = blocked_seat(manager, dir.path()).await?;
+            let boot = rotation_manager_on(dir.path(), true);
+            boot.restore_sessions().await?;
+            {
+                let store = boot.store.lock().await;
+                match evidence {
+                    "thread" => {
+                        store.conn.execute(
+                            "UPDATE sessions SET claude_session_id='thread-that-ran' WHERE id=?1",
+                            [child.id.to_string()],
+                        )?;
+                    }
+                    "running" => {
+                        store.conn.execute(
+                            "UPDATE sessions SET status='Running' WHERE id=?1",
+                            [child.id.to_string()],
+                        )?;
+                    }
+                    "spawn-ambiguous" => {
+                        store.insert_rotation_event(
+                            child.id,
+                            BLOCKED_ROTATION,
+                            "launch",
+                            "provider_spawn_attempt",
+                            Some("{}"),
+                        )?;
+                    }
+                    "continue-ambiguous" => {
+                        let invocation = Uuid::new_v4();
+                        super::super::tests::insert_rotation_invocation_fixture(
+                            &store, child.id, invocation, "failed",
+                        );
+                        store.conn.execute(
+                            "UPDATE model_invocations SET purpose='session.continue.resume' WHERE id=?1",
+                            [invocation.to_string()],
+                        )?;
+                    }
+                    _ => {
+                        let (event_type, role, content) = match evidence {
+                            "assistant" => ("Message", "Assistant", "effect"),
+                            "tool" => ("ToolUse", "Assistant", "effect"),
+                            _ => ("Message", "User", "another query"),
+                        };
+                        store.conn.execute("INSERT INTO conversation_events(session_id,sequence,event_type,role,content,created_at) VALUES(?1,99,?2,?3,?4,?5)", rusqlite::params![child.id.to_string(), event_type, role, content, chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)])?;
+                    }
+                }
+            }
+            assert!(
+                matches!(
+                    boot.abandon_blocked_rotation(abandon_params(fixture.parent.id, evidence))
+                        .await,
+                    Err(DaemonError::PolicyDenied(_))
+                ),
+                "{evidence}"
+            );
+            let store = boot.store.lock().await;
+            assert_eq!(
+                store.conn.query_row(
+                    "SELECT COUNT(*) FROM rotation_events WHERE event_type='abandon_requested'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )?,
+                0
+            );
+            assert_eq!(
+                custody_owner_and_projection(&store, fixture.custody_id, fixture.parent.id).0,
+                child.id.to_string()
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn abandon_rechecks_execution_history_at_the_final_bind_fence() -> anyhow::Result<()> {
+        use crate::store::rotation_abandon::RotationAbandonAdmission;
+        let (manager, dir) = rotation_manager_with_context_rotation(true);
+        let (fixture, child, _) = blocked_seat(manager, dir.path()).await?;
+        let boot = rotation_manager_on(dir.path(), true);
+        boot.restore_sessions().await?;
+        let request = {
+            let mut store = boot.store.lock().await;
+            let blocked = store.blocked_rotation_chain_of(fixture.parent.id)?.unwrap();
+            let RotationAbandonAdmission::Admitted(request) = store
+                .record_rotation_abandon_request(
+                    &blocked,
+                    "history-after-admission",
+                    None,
+                    None,
+                    false,
+                )?
+            else {
+                panic!("admitted")
+            };
+            request
+        };
+        let error = reserve_and_bind_abandon_replacement_with_history(
+            &boot,
+            child.id,
+            &fixture.repo,
+            &request.abandon_rotation_id,
+            true,
+        )
+        .await
+        .expect_err("history landed after capture");
+        assert_eq!(error.to_string(), "bind the abandon replacement");
+        let store = boot.store.lock().await;
+        assert_eq!(
+            custody_owner_and_projection(&store, fixture.custody_id, fixture.parent.id).0,
+            child.id.to_string()
+        );
+        assert_eq!(custody_chain(&store, fixture.custody_id).len(), 2);
+        assert_eq!(
+            store.rotation_abandon_replacement(&request)?.unwrap().1,
+            SessionStatus::Failed
+        );
+        Ok(())
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn continue_wins_the_spawn_guard_before_abandon_admission() -> anyhow::Result<()> {
+        use super::super::super::lifecycle::{
+            ContinuationPauseSeam, install_continuation_seam_pause_for_test,
+        };
+        let (manager, dir) = rotation_manager_with_context_rotation(true);
+        let (fixture, child, epic) = blocked_seat(manager, dir.path()).await?;
+        let boot = Arc::new(rotation_manager_on(dir.path(), true));
+        boot.restore_sessions().await?;
+        let (reached, resume) = install_continuation_seam_pause_for_test(
+            ContinuationPauseSeam::AfterFenceCheck,
+            child.id,
+        );
+        let _scripted =
+            super::super::super::launch::install_controller_candidate_test_process(child.id);
+        let continuing = {
+            let boot = Arc::clone(&boot);
+            tokio::spawn(async move {
+                boot.continue_session_operator(child.id, "continue first".into())
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached).await??;
+        let abandoning =
+            boot.abandon_blocked_rotation(abandon_params(fixture.parent.id, "racing-abandon"));
+        tokio::pin!(abandoning);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut abandoning)
+                .await
+                .is_err(),
+            "abandon waits for Continue's guard"
+        );
+        resume.send(()).unwrap();
+        let (continued, abandoned) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(continuing, &mut abandoning)
+            })
+            .await?;
+        continued??;
+        assert!(matches!(abandoned, Err(DaemonError::PolicyDenied(_))));
+        super::super::super::launch::drop_controller_candidate_test_stream(child.id);
+        let store = boot.store.lock().await;
+        assert_eq!(seat_holders(&store, epic), (Some(child.id), Some(child.id)));
+        assert_eq!(
+            custody_owner_and_projection(&store, fixture.custody_id, fixture.parent.id).0,
+            child.id.to_string()
+        );
+        assert_eq!(
+            store.conn.query_row(
+                "SELECT COUNT(*) FROM rotation_events WHERE event_type='abandon_requested'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    /// #1176: nothing to abandon, or no idempotency key, is refused.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn abandon_refuses_a_session_without_a_blocked_rotation() -> anyhow::Result<()> {
+        let (manager, _dir) = rotation_manager();
+        let session = test_session(Uuid::new_v4(), SessionStatus::Completed);
+        manager.store.lock().await.insert_session(&session)?;
+        let error = manager
+            .abandon_blocked_rotation(abandon_params(session.id, "k1"))
+            .await
+            .expect_err("not blocked");
+        assert!(
+            matches!(&error, DaemonError::PolicyDenied(reason) if reason.starts_with("rotation_not_blocked")),
+            "{error}"
+        );
+        let error = manager
+            .abandon_blocked_rotation(abandon_params(session.id, " "))
+            .await
+            .expect_err("no key");
+        assert!(matches!(error, DaemonError::Rpc(_)), "{error}");
+        Ok(())
+    }
+
+    /// #1176 crash window: the daemon died after the abandon recorded its
+    /// request, before the decider reserved a replacement. Restart closes the
+    /// interrupted request, the rotation stays blocked on the same holder
+    /// (no second escalation), and a new request is admitted; while it is in
+    /// flight another key is refused and its own key replays.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restart_before_the_replacement_was_reserved_closes_the_abandon_request()
+    -> anyhow::Result<()> {
+        use crate::store::rotation_abandon::RotationAbandonAdmission;
+        let (manager, dir) = rotation_manager_with_context_rotation(true);
+        let (fixture, child, _) = blocked_seat(manager, dir.path()).await?;
+        let parent = fixture.parent.id;
+        let boot1 = rotation_manager_on(dir.path(), true);
+        boot1.restore_sessions().await?;
+        let first = {
+            let mut store = boot1.store.lock().await;
+            let blocked = store.blocked_rotation_chain_of(parent)?.expect("blocked");
+            store.record_rotation_abandon_request(&blocked, "k1", None, None, false)?
+        };
+        let RotationAbandonAdmission::Admitted(first) = first else {
+            panic!("the first request is admitted");
+        };
+        drop(boot1); // the daemon dies before the decider reserved anything
+
+        let boot2 = rotation_manager_on(dir.path(), true);
+        let mut events = boot2.event_bus.subscribe();
+        boot2.restore_sessions().await?;
+        let mut store = boot2.store.lock().await;
+        let closed: String = store.conn.query_row(
+            "SELECT event_type FROM rotation_events WHERE session_id=?1 AND rotation_id=?2
+               AND event_type LIKE 'refused:%'",
+            rusqlite::params![child.id.to_string(), first.abandon_rotation_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(closed, "refused:abandon_interrupted");
+        let blocked = store
+            .blocked_rotation_chain_of(parent)?
+            .expect("still blocked");
+        assert_eq!(blocked.holder, child.id);
+        let escalations: i64 = store.conn.query_row(
+            "SELECT COUNT(*) FROM rotation_events WHERE session_id=?1 AND event_type='recovery_blocked'",
+            [parent.to_string()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(escalations, 1, "the holder did not change");
+        assert_eq!(system_errors(&mut events), 0, "no second escalation");
+        let second = store.record_rotation_abandon_request(&blocked, "k2", None, None, false)?;
+        let RotationAbandonAdmission::Admitted(second) = second else {
+            panic!("a new request is admitted after the interrupted one closed");
+        };
+        assert_eq!(second.seq, 2);
+        assert_eq!(
+            second.abandon_rotation_id,
+            format!("{BLOCKED_ROTATION}:abandon:2")
+        );
+        let in_flight = store
+            .record_rotation_abandon_request(&blocked, "k3", None, None, false)
+            .expect_err("an abandon is in flight");
+        assert!(
+            matches!(&in_flight, DaemonError::PolicyDenied(reason) if reason.starts_with("rotation_abandon_in_flight")),
+            "{in_flight}"
+        );
+        assert_eq!(
+            store.record_rotation_abandon_request(&blocked, "k2", None, None, false)?,
+            RotationAbandonAdmission::Replayed(second)
+        );
+        Ok(())
+    }
+
+    /// #1176 crash window: the daemon died after the abandon bound its
+    /// replacement to the sandbox, before the replacement started. Restart
+    /// blocks the rotation on the replacement (the new holder, escalated
+    /// once), and a second abandon rotates from it and publishes the whole
+    /// chain: every session owned the sandbox exactly once, in order.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_replacement_that_never_started_is_abandoned_in_turn() -> anyhow::Result<()> {
+        use crate::store::rotation_abandon::RotationAbandonAdmission;
+        let (manager, dir) = rotation_manager_with_context_rotation(true);
+        let (fixture, child, epic) = blocked_seat(manager, dir.path()).await?;
+        let parent = fixture.parent.id;
+        let boot1 = rotation_manager_on(dir.path(), true);
+        boot1.restore_sessions().await?;
+        let admission = {
+            let mut store = boot1.store.lock().await;
+            let blocked = store.blocked_rotation_chain_of(parent)?.expect("blocked");
+            store.record_rotation_abandon_request(&blocked, "k1", None, None, false)?
+        };
+        let RotationAbandonAdmission::Admitted(request) = admission else {
+            panic!("admitted");
+        };
+        let stranded = reserve_and_bind_abandon_replacement(
+            &boot1,
+            child.id,
+            &fixture.repo,
+            &request.abandon_rotation_id,
+        )
+        .await?;
+        drop(boot1); // the daemon dies before the replacement started
+
+        let boot2 = rotation_manager_on(dir.path(), true);
+        let mut events = boot2.event_bus.subscribe();
+        boot2.restore_sessions().await?;
+        lead_epic(&boot2, epic, parent).await?;
+        {
+            let store = boot2.store.lock().await;
+            assert_eq!(status_of(&store, stranded.id), SessionStatus::Failed);
+            let blocked = store
+                .blocked_rotation_chain_of(parent)?
+                .expect("still blocked");
+            assert_eq!(
+                blocked.holder, stranded.id,
+                "the replacement holds the sandbox"
+            );
+            assert_eq!(blocked.reserved_successor, child.id);
+            let escalations: i64 = store.conn.query_row(
+                "SELECT COUNT(*) FROM rotation_events WHERE session_id=?1 AND event_type='recovery_blocked'",
+                [parent.to_string()],
+                |row| row.get(0),
+            )?;
+            assert_eq!(escalations, 2, "one escalation per holder");
+            assert!(terminal_rotation_events(&store, parent)?.is_empty());
+        }
+        assert_eq!(
+            system_errors(&mut events),
+            1,
+            "the new holder is escalated once"
+        );
+
+        let replacement = Uuid::new_v4();
+        install_rotation_child_id_for_test(stranded.id, replacement);
+        let _scripted =
+            super::super::super::launch::install_controller_candidate_test_process(replacement);
+        let receipt = boot2
+            .abandon_blocked_rotation(abandon_params(parent, "k2"))
+            .await?;
+        assert_eq!(receipt.holder_id, stranded.id);
+        let abandon_rotation = format!("{BLOCKED_ROTATION}:abandon:2");
+        assert_eq!(receipt.abandon_rotation_id, abandon_rotation);
+        assert_eq!(
+            settle_abandon(&boot2, stranded.id, replacement, &abandon_rotation).await,
+            "completed"
+        );
+        wait_archived(&boot2, stranded.id).await;
+
+        let store = boot2.store.lock().await;
+        let owners: Vec<Option<String>> = custody_chain(&store, fixture.custody_id)
+            .into_iter()
+            .map(|(_, _, _, to)| to)
+            .collect();
+        assert_eq!(
+            owners,
+            vec![
+                Some(parent.to_string()),
+                Some(child.id.to_string()),
+                Some(stranded.id.to_string()),
+                Some(replacement.to_string()),
+            ]
+        );
+        assert_eq!(lead_of(&store, epic), Some(replacement));
+        assert_eq!(store.published_lineage_tip(parent)?, Some(replacement));
+        for archived in [parent, child.id, stranded.id] {
+            assert_eq!(
+                status_of(&store, archived),
+                SessionStatus::Archived,
+                "{archived}"
+            );
+        }
+        Ok(())
+    }
+
+    /// #1186 owns controller movement; abandon leaves the predecessor's
+    /// durable assignment intact while moving its sandbox and rotation seat.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn abandon_preserves_the_predecessors_assigned_idea_controller() -> anyhow::Result<()> {
+        let (manager, dir) = rotation_manager_with_context_rotation(true);
+        let (project, idea, fixture, _) = super::super::tests::d03_live_rotation_fixture(
+            &manager,
+            dir.path(),
+            "abandon-controller",
+        )
+        .await?;
+        let parent = fixture.parent.id;
+        // The older controller fixture predates typed invocation kinds;
+        // restart recovery reads this record through the current decoder.
+        manager.store.lock().await.conn.execute(
+            "UPDATE model_invocations SET invocation_kind='session_lifecycle'
+             WHERE session_id=?1 AND invocation_kind='model'",
+            [parent.to_string()],
+        )?;
+        manager.store.lock().await.record_completed_trigger_intent(
+            parent,
+            BLOCKED_ROTATION,
+            "manual_triggered",
+        )?;
+        let child =
+            reserve_and_bind_live_successor_for_test(&manager, &fixture, BLOCKED_ROTATION).await?;
+        manager.store.lock().await.conn.execute(
+            "UPDATE sessions SET claude_session_id=NULL WHERE id=?1",
+            [child.id.to_string()],
+        )?;
+        drop(manager);
+        let restarted = rotation_manager_on(dir.path(), true);
+        restarted.restore_sessions().await?;
+        let before = restarted
+            .store
+            .lock()
+            .await
+            .load_idea_controller_projection_v1(project.id, idea.id)?;
+        assert_eq!(before.current_controller_session_id, Some(parent));
+        let replacement = Uuid::new_v4();
+        install_rotation_child_id_for_test(child.id, replacement);
+        let _scripted =
+            super::super::super::launch::install_controller_candidate_test_process(replacement);
+        let request = restarted
+            .abandon_blocked_rotation(abandon_params(parent, "controller-k1"))
+            .await?;
+        assert_eq!(
+            settle_abandon(
+                &restarted,
+                child.id,
+                replacement,
+                &request.abandon_rotation_id
+            )
+            .await,
+            "completed"
+        );
+        let store = restarted.store.lock().await;
+        let after = store.load_idea_controller_projection_v1(project.id, idea.id)?;
+        assert_eq!(after, before);
+        assert_eq!(store.published_lineage_tip(parent)?, Some(replacement));
+        Ok(())
+    }
+
+    /// A crash after abandon binds R still lets the operator Continue R,
+    /// including after publication but before R reports its first thread.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn operator_continue_of_an_abandon_replacement_publishes_and_restarts_it()
+    -> anyhow::Result<()> {
+        use crate::store::rotation_abandon::RotationAbandonAdmission;
+        let (manager, dir) = rotation_manager_with_context_rotation(true);
+        let (fixture, child, epic) = blocked_seat(manager, dir.path()).await?;
+        let parent = fixture.parent.id;
+        let boot1 = rotation_manager_on(dir.path(), true);
+        boot1.restore_sessions().await?;
+        appoint_project_manager(&boot1, &fixture, epic).await?;
+        let request = {
+            let mut store = boot1.store.lock().await;
+            let blocked = store.blocked_rotation_chain_of(parent)?.expect("blocked");
+            let RotationAbandonAdmission::Admitted(request) = store
+                .record_rotation_abandon_request(&blocked, "continue-k1", None, None, false)?
+            else {
+                panic!("new request")
+            };
+            request
+        };
+        let replacement = reserve_and_bind_abandon_replacement(
+            &boot1,
+            child.id,
+            &fixture.repo,
+            &request.abandon_rotation_id,
+        )
+        .await?;
+        drop(boot1);
+        let boot2 = rotation_manager_on(dir.path(), true);
+        boot2.restore_sessions().await?;
+        let captured = boot2
+            .store
+            .lock()
+            .await
+            .blocked_rotation_of_successor(replacement.id)?
+            .expect("replacement bootstrap");
+        assert_eq!(captured.predecessor, child.id);
+        assert_eq!(captured.rotation_id, request.abandon_rotation_id);
+        let _scripted =
+            super::super::super::launch::install_controller_candidate_test_process(replacement.id);
+        boot2
+            .continue_session_operator(replacement.id, "start replacement".into())
+            .await?;
+        boot2.publish_continued_blocked_successor(&captured).await?; // #1180 replay
+        super::super::super::launch::drop_controller_candidate_test_stream(replacement.id);
+        {
+            let store = boot2.store.lock().await;
+            assert_eq!(
+                seat_holders(&store, epic),
+                (Some(replacement.id), Some(replacement.id))
+            );
+            assert_manager_tip(&store, &fixture, replacement.id);
+            assert_eq!(store.published_lineage_tip(parent)?, Some(replacement.id));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while boot2.active.read().await.contains_key(&replacement.id) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dropped stream settles");
+        boot2.store.lock().await.conn.execute(
+            "UPDATE sessions SET status='Running', claude_session_id=NULL WHERE id=?1",
+            [replacement.id.to_string()],
+        )?;
+        drop(boot2);
+        let boot3 = rotation_manager_on(dir.path(), true);
+        boot3.restore_sessions().await?;
+        assert_eq!(
+            boot3
+                .store
+                .lock()
+                .await
+                .published_blocked_rotation_of_successor(replacement.id)?,
+            Some(captured)
+        );
+        assert_manager_tip(&*boot3.store.lock().await, &fixture, replacement.id);
+        let _scripted =
+            super::super::super::launch::install_controller_candidate_test_process(replacement.id);
+        boot3
+            .continue_session_operator(replacement.id, "restart published replacement".into())
+            .await?;
+        super::super::super::launch::drop_controller_candidate_test_stream(replacement.id);
+        let store = boot3.store.lock().await;
+        assert_eq!(
+            seat_holders(&store, epic),
+            (Some(replacement.id), Some(replacement.id))
+        );
+        assert_eq!(terminal_rotation_events(&store, parent)?.len(), 1);
+        assert_eq!(terminal_rotation_events(&store, child.id)?.len(), 1);
+        drop(store);
+        assert_eq!(continued_from_rows(&boot3, child.id).await.len(), 1);
         Ok(())
     }
 }

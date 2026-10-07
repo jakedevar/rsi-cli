@@ -61,6 +61,24 @@ pub const ACTIONS: &[(Action, Capability)] = &[
     (Action::OperatorCall, Capability::OperatorDelegation),
 ];
 
+/// #1235: capabilities the global arm withholds in S1 (the store refuses them
+/// with `manager_v2_capability_denied`), so the catalog never lists them.
+const GLOBAL_WITHHELD: &[Capability] = &[
+    Capability::SelfSuccession,
+    Capability::GitEffect,
+    Capability::OperatorDelegation,
+    Capability::StorageControl,
+    Capability::DaemonSettings,
+];
+
+/// #1235: update variants the global arm does not drive in S1.
+const GLOBAL_WITHHELD_UPDATES: &[&str] = &[
+    "request_review",
+    "migration",
+    "migration_transfer",
+    "migration_release",
+];
+
 const PREPARED: &[(&str, Capability)] = &[
     ("resume_lead", Capability::LeadControl),
     ("pause_lead", Capability::LeadControl),
@@ -115,6 +133,20 @@ const UPDATES: &[(&str, Capability, Option<Capability>, UpdateRole)] = &[
     ),
     ("request", Capability::WorkPlan, None, UpdateRole::Lead),
     ("decision", Capability::WorkPlan, None, UpdateRole::Either),
+    // #1415: a delegated manager's ruling on a non-gate decision record, and
+    // the owning manager's withdrawal of its own.
+    (
+        "decision_ruling",
+        Capability::WorkPlan,
+        None,
+        UpdateRole::Manager,
+    ),
+    (
+        "decision_withdraw",
+        Capability::WorkPlan,
+        None,
+        UpdateRole::Manager,
+    ),
     ("handoff", Capability::WorkPlan, None, UpdateRole::Manager),
 ];
 
@@ -148,8 +180,17 @@ pub struct VerbRights {
     pub reviewer: bool,
     pub issue_lead: bool,
     pub issue_manager: bool,
+    /// #1235: Issue reads only (a Status-mode global project policy).
+    pub issue_reader: bool,
+    /// #1235: the global seat's project-manager reads (progress, inspect,
+    /// action receipts) inside its grant.
+    pub portfolio_reader: bool,
+    /// #1235: the global seat lands from an in-reach session's sandbox.
+    pub portfolio_lander: bool,
     /// A worker bound to one Issue by `AgentManagerLaunchIssueWorker`.
     pub issue_bound: bool,
+    /// #1284: that binding is live, so the worker may append to its Issue.
+    pub issue_bound_writer: bool,
     pub session_create: bool,
     pub work_writer: bool,
     pub control: bool,
@@ -158,6 +199,12 @@ pub struct VerbRights {
     pub deploy: bool,
     pub global_manager: bool,
     pub global_reporter: bool,
+    /// #1238: the caller holds a manager node seat (area, project or
+    /// portfolio), so it may report up and send down.
+    pub tier_seat: bool,
+    /// #1238: an Epic lead in a project with no live PM that a portfolio node
+    /// covers: its `AgentManagerNotify` goes to that node.
+    pub portfolio_lead: bool,
 }
 
 /// Whether every live leaf session holds `verb` regardless of role. This is
@@ -185,22 +232,35 @@ pub fn permitted_verb(verb: Verb, rights: &VerbRights) -> bool {
         | Verb::ListJobs
         | Verb::CancelJob
         | Verb::QueryFailureSignatures => true,
-        Verb::GetIssue => rights.issue_lead || rights.issue_manager || rights.issue_bound,
-        Verb::ManagerLaunchIssueWorker => rights.session_create && rights.issue_manager,
-        Verb::ListIssues
-        | Verb::UpdateIssue
-        | Verb::UpdateIssueStatus
-        | Verb::ArchiveIssue
-        | Verb::RestoreIssue
-        | Verb::ListIssueEvents => rights.issue_lead || rights.issue_manager,
-        Verb::ManagerInbox => rights.managed_lead || rights.manager,
-        Verb::ManagerReply | Verb::ManagerNotify => rights.managed_lead,
-        Verb::EnqueueLandingSource | Verb::GetProviderStatus | Verb::GetDaemonInfo => {
-            rights.lead || rights.manager
+        Verb::GetIssue => {
+            rights.issue_lead || rights.issue_manager || rights.issue_reader || rights.issue_bound
         }
+        Verb::ManagerLaunchIssueWorker => rights.session_create && rights.issue_manager,
+        Verb::ListIssues | Verb::ListIssueEvents => {
+            rights.issue_lead || rights.issue_manager || rights.issue_reader
+        }
+        Verb::UpdateIssue => rights.issue_lead || rights.issue_manager || rights.issue_bound_writer,
+        Verb::UpdateIssueStatus | Verb::ArchiveIssue | Verb::RestoreIssue => {
+            rights.issue_lead || rights.issue_manager
+        }
+        Verb::ManagerInbox => rights.managed_lead || rights.manager,
+        Verb::ManagerReply => rights.managed_lead,
+        Verb::ManagerNotify => rights.managed_lead || rights.portfolio_lead,
+        Verb::EnqueueLandingSource => rights.lead || rights.manager || rights.portfolio_lander,
+        Verb::GetProviderStatus | Verb::GetDaemonInfo => rights.lead || rights.manager,
         Verb::SendSatelliteMessage | Verb::ReportToHub => rights.manager,
         Verb::RequestDeploy => rights.deploy,
         Verb::ManagerWorkView => rights.managed_worker,
+        Verb::ManagerProgress | Verb::ManagerInspect | Verb::ManagerGetAction
+            if rights.portfolio_reader =>
+        {
+            true
+        }
+        // #1238: a portfolio seat rules or forwards the escalation hops
+        // addressed to it.
+        Verb::ManagerListEscalations | Verb::ManagerResolveEscalation if rights.global_manager => {
+            true
+        }
         Verb::ManagerProgress
         | Verb::ManagerSend
         | Verb::ManagerInspect
@@ -213,10 +273,14 @@ pub fn permitted_verb(verb: Verb, rights: &VerbRights) -> bool {
         Verb::ManagerControl => rights.control,
         Verb::ManagerPrepareControl | Verb::ManagerCommitPreparedControl => rights.prepared,
         Verb::SubmitReviewReceipt => rights.reviewer,
-        Verb::GlobalOverview | Verb::GlobalSend | Verb::GlobalAppointManager => {
-            rights.global_manager
-        }
+        Verb::GlobalOverview
+        | Verb::GlobalSend
+        | Verb::GlobalAppointManager
+        // #1239: any portfolio node seat delegates to its children.
+        | Verb::ManagerAppointChild
+        | Verb::ManagerRevokeChild => rights.global_manager,
         Verb::ReportToGlobal => rights.global_reporter,
+        Verb::ReportUp | Verb::SendDown | Verb::ManagerOverview => rights.tier_seat,
         Verb::TopologyUpsert
         | Verb::TopologyList
         | Verb::TopologyExecute
@@ -227,6 +291,114 @@ pub fn permitted_verb(verb: Verb, rights: &VerbRights) -> bool {
 }
 
 impl Store {
+    /// #1277-#1279: the stable authority fence of `caller` (and, for a verb
+    /// that acts on another session's sandbox, its `target`). It names the
+    /// grant epoch and version, never a volatile field such as a timestamp,
+    /// so an effect that re-resolves it under the store lock refuses exactly
+    /// when the admitted authority changed (a revoked, replaced or rotated
+    /// grant, a retired seat, a moved project).
+    ///
+    /// # Errors
+    /// `agent_authority_caller_unavailable` for a caller that is not a live
+    /// leaf, or a persistence error.
+    pub fn agent_authority_fence(&self, caller: Uuid, target: Option<Uuid>) -> Result<String> {
+        let _snapshot = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let session = self
+            .get_session(caller)?
+            .filter(|s| {
+                rsi_common::is_leaf_kind(s.session_kind)
+                    && !matches!(s.status, SessionStatus::Archived | SessionStatus::Deleted)
+            })
+            .ok_or_else(|| {
+                DaemonError::InvalidParam("agent_authority_caller_unavailable".into())
+            })?;
+        let lead = match session.parent_id {
+            Some(parent) => self
+                .get_session(parent)?
+                .filter(|epic| epic.session_kind == SessionKind::Epic)
+                .map(|epic| (epic.id, epic.lead_session_id, epic.project_id)),
+            None => None,
+        };
+        let (manager, policy) = match session.project_id {
+            Some(project) => (
+                self.get_harness_manager(project)?
+                    .map(|c| (c.manager_session_id, c.current_session_id, c.row_version)),
+                self.get_harness_manager_policy(project)?.map(|g| {
+                    (
+                        g.manager_session_id,
+                        g.scope_version,
+                        g.row_version,
+                        g.revoked,
+                    )
+                }),
+            ),
+            None => (None, None),
+        };
+        let seat_grant = self
+            .portfolio_seat_grant(caller)?
+            .map(|grant| (grant.grant_id, grant.grant_version, grant.seat_session_id));
+        let area = self
+            .manager_area_authority_current(caller)
+            .ok()
+            .flatten()
+            .map(|a| {
+                (
+                    a.config.manager_session_id,
+                    a.config.row_version,
+                    a.grant.manager_session_id,
+                    a.grant.scope_version,
+                    a.grant.row_version,
+                )
+            });
+        let target = match target {
+            Some(target) => self
+                .manager_session_control_scope(caller, target, false)?
+                .map(|scope| {
+                    let grant = self
+                        .manager_policy_for_config(&scope.config)
+                        .ok()
+                        .flatten()
+                        .map(|g| {
+                            (
+                                g.manager_session_id,
+                                g.scope_version,
+                                g.row_version,
+                                g.revoked,
+                            )
+                        });
+                    (
+                        scope.target.id,
+                        scope.target.project_id,
+                        scope.config.manager_session_id,
+                        scope.config.current_session_id,
+                        scope.config.row_version,
+                        grant,
+                    )
+                }),
+            None => None,
+        };
+        let covering = match session.project_id {
+            Some(project) => self
+                .covering_portfolio_grant(project)?
+                .map(|record| (record.grant.grant_version, record.grant.seat_session_id)),
+            None => None,
+        };
+        Ok(format!(
+            "v1:{}",
+            json!({
+                "caller": caller,
+                "project": session.project_id,
+                "lead": lead,
+                "manager": manager,
+                "policy": policy,
+                "seat_grant": seat_grant,
+                "covering": covering,
+                "area": area,
+                "target": target,
+            })
+        ))
+    }
+
     /// Resolve one coherent SQLite read. No role, capability or caller identity
     /// is accepted from request JSON; `caller` is transport-bound upstream.
     pub fn agent_authority_projection(&self, caller: Uuid) -> Result<AgentAuthorityProjection> {
@@ -436,10 +608,66 @@ impl Store {
             }
         }
 
-        let is_global_manager = self.is_global_seat(caller)?;
-        let global_grant_version = self
-            .active_global_grant()?
-            .map(|grant| (grant.grant_version, grant.seat_session_id));
+        // #1236: the caller's own portfolio node (one active grant per seat).
+        let active_global = self.portfolio_seat_grant(caller)?;
+        let is_global_manager = active_global.is_some();
+        // The node covering the caller's project decides `AgentReportToGlobal`.
+        let covering_global = match session.project_id {
+            Some(project) => self
+                .covering_portfolio_grant(project)?
+                .map(|record| (record.grant.grant_version, record.grant.seat_session_id)),
+            None => None,
+        };
+        let global_grant_version = (
+            active_global
+                .as_ref()
+                .map(|grant| (grant.grant_version, grant.seat_session_id)),
+            covering_global,
+        );
+        // #1235: the global seat holds the PM verb set its grant's project
+        // policy grants (one policy for every covered project in S1). Execute
+        // mode lists controls; Status mode lists reads only.
+        let global_policy = active_global
+            .as_ref()
+            .filter(|_| is_global_manager)
+            .map(|grant| grant.project_policy.clone());
+        let global_executes = global_policy
+            .as_ref()
+            .is_some_and(|p| p.mode == ManagerOperatingModeV2::Execute && !p.paused);
+        let global_has = |capability: Capability| {
+            global_executes
+                && !GLOBAL_WITHHELD.contains(&capability)
+                && global_policy
+                    .as_ref()
+                    .is_some_and(|p| p.capabilities.contains(&capability))
+        };
+        let global_issue = global_policy
+            .as_ref()
+            .is_some_and(|p| p.capabilities.contains(&Capability::IssueCoordinate));
+        let mut control_actions = control_actions;
+        let mut prepared_actions = prepared_actions;
+        let mut update_variants = update_variants;
+        if global_executes {
+            for (action, capability) in ACTIONS {
+                if global_has(*capability) && !control_actions.contains(action) {
+                    control_actions.push(*action);
+                }
+            }
+            for (name, capability) in PREPARED {
+                if global_has(*capability) && !prepared_actions.contains(name) {
+                    prepared_actions.push(*name);
+                }
+            }
+            let capabilities = global_policy
+                .as_ref()
+                .map(|p| p.capabilities.clone())
+                .unwrap_or_default();
+            for name in permitted_updates(&capabilities, true, false) {
+                if !GLOBAL_WITHHELD_UPDATES.contains(&name) && !update_variants.contains(&name) {
+                    update_variants.push(name);
+                }
+            }
+        }
         let rights = VerbRights {
             lead: is_lead,
             managed_lead: lead_in_manager_scope,
@@ -448,17 +676,34 @@ impl Store {
             reviewer: is_reviewer,
             issue_lead,
             issue_manager: manager_grant
-                .is_some_and(|g| g.policy.capabilities.contains(&Capability::IssueCoordinate)),
+                .is_some_and(|g| g.policy.capabilities.contains(&Capability::IssueCoordinate))
+                || (global_issue && global_executes),
+            issue_reader: global_issue,
+            portfolio_reader: global_policy.is_some(),
+            portfolio_lander: global_executes,
             issue_bound: Self::bound_issue_for_worker_on(&self.conn, caller)?.is_some(),
-            session_create: has(Capability::SessionCreate),
+            issue_bound_writer: Self::live_issue_binding_for_worker_on(&self.conn, caller)?
+                .is_some(),
+            session_create: has(Capability::SessionCreate) || global_has(Capability::SessionCreate),
             work_writer: !update_variants.is_empty(),
             control: !control_actions.is_empty(),
             prepared: !prepared_actions.is_empty(),
-            deploy: has(Capability::Deploy),
+            deploy: has(Capability::Deploy) || global_has(Capability::Deploy),
             topology_manager: manager_grant
-                .is_some_and(|g| g.policy.capabilities.contains(&Capability::Automation)),
+                .is_some_and(|g| g.policy.capabilities.contains(&Capability::Automation))
+                || global_has(Capability::Automation),
             global_manager: is_global_manager,
             global_reporter: is_manager && self.global_reporter(caller)?,
+            tier_seat: self.tier_caller_node(caller)?.is_some(),
+            portfolio_lead: is_lead
+                && match session.project_id {
+                    Some(project) => {
+                        self.global_live_manager(project)?.is_none()
+                            && super::portfolio_nodes::covering_node_on(&self.conn, project)?
+                                .is_some()
+                    }
+                    None => false,
+                },
         };
         let verbs = agent_control_catalog_v1()
             .iter()
@@ -476,6 +721,7 @@ impl Store {
         }
         if is_global_manager {
             guidance_ids.push("global_manager");
+            guidance_ids.push("portfolio_manager");
         }
         let facts = json!({
             "caller": caller,

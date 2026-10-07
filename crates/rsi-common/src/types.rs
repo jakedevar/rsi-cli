@@ -925,7 +925,7 @@ pub struct SandboxSpec {
     pub branch: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Default)]
 #[non_exhaustive]
 pub enum SessionProvider {
     #[default]
@@ -940,7 +940,6 @@ pub enum SessionProvider {
     /// Local models via Ollama or any local OpenAI-compatible server.
     Local,
     /// Google Antigravity CLI (`agy`) — subprocess-based, plain-text `--print` output.
-    #[serde(alias = "Gemini")]
     Antigravity,
     /// Codex via app-server bidirectional JSON-RPC protocol.
     /// Uses `codex app-server` for structured approval flows and multi-turn continuation.
@@ -948,6 +947,52 @@ pub enum SessionProvider {
     /// Direct API harness — owns the conversation loop, tools, and compaction.
     /// Model string determines which backend API to call (Anthropic, OpenAI, compatible).
     Harness,
+}
+
+impl SessionProvider {
+    /// Canonical serde spellings, in declaration order.
+    pub const CANONICAL_NAMES: &'static [&'static str] = &[
+        "Claude",
+        "Codex",
+        "Pioneer",
+        "OpenRouter",
+        "Bedrock",
+        "Local",
+        "Antigravity",
+        "CodexAppServer",
+        "Harness",
+    ];
+
+    /// Parses a provider name case-insensitively (`claude`, `CLAUDE` and
+    /// `Claude` are one provider); the legacy `Gemini` spelling maps to
+    /// `Antigravity`. Storage keeps the canonical serde spelling.
+    #[must_use]
+    pub fn parse_name(name: &str) -> Option<Self> {
+        Some(match name.trim().to_ascii_lowercase().as_str() {
+            "claude" => Self::Claude,
+            "codex" => Self::Codex,
+            "pioneer" => Self::Pioneer,
+            "openrouter" => Self::OpenRouter,
+            "bedrock" => Self::Bedrock,
+            "local" => Self::Local,
+            "antigravity" | "gemini" => Self::Antigravity,
+            "codexappserver" => Self::CodexAppServer,
+            "harness" => Self::Harness,
+            _ => return None,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionProvider {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Self::parse_name(&name).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown session provider {name:?} for field `provider`; accepted (case-insensitive): {}",
+                Self::CANONICAL_NAMES.join(", ")
+            ))
+        })
+    }
 }
 
 /// Categorizes sessions by their creation intent.
@@ -5511,6 +5556,11 @@ pub struct IssueEventPageRequestV1 {
     pub after_sequence: i64,
     #[serde(default)]
     pub limit: Option<u32>,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl IssueEventPageRequestV1 {
@@ -5675,6 +5725,35 @@ mod tests {
             serde_json::to_string(&SessionProvider::Antigravity).unwrap(),
             "\"Antigravity\""
         );
+    }
+
+    #[test]
+    fn test_session_provider_deserializes_case_insensitively_and_stores_canonical() {
+        for (raw, want) in [
+            ("claude", SessionProvider::Claude),
+            ("CLAUDE", SessionProvider::Claude),
+            ("openrouter", SessionProvider::OpenRouter),
+            ("codexappserver", SessionProvider::CodexAppServer),
+            ("gemini", SessionProvider::Antigravity),
+        ] {
+            let got: SessionProvider = serde_json::from_str(&format!("\"{raw}\"")).unwrap();
+            assert_eq!(got, want);
+        }
+        assert_eq!(
+            serde_json::to_string(&SessionProvider::Claude).unwrap(),
+            "\"Claude\""
+        );
+    }
+
+    #[test]
+    fn test_session_provider_unknown_name_error_names_field_and_spellings() {
+        let error = serde_json::from_str::<SessionProvider>("\"nope\"")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`provider`"), "{error}");
+        for name in SessionProvider::CANONICAL_NAMES {
+            assert!(error.contains(name), "{error}");
+        }
     }
 
     #[test]

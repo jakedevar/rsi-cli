@@ -2,15 +2,15 @@
 //! read-only `GetManagerTree` snapshot.
 //!
 //! The snapshot is operator-only and bounded: rows are a flat, depth-first
-//! page of the visible hierarchy (global grant, granted project seats, area
-//! nodes, Epics with leads). A count the daemon could not traverse completely
+//! page of the visible hierarchy (portfolio nodes of any tier, project seats,
+//! area nodes, Epics with leads). A count the daemon could not traverse completely
 //! is `None` / `complete == false`, never zero.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::harness_manager_v2::ManagerCapabilityV2;
+use crate::harness_manager_v2::{ManagerCapabilityV2, ManagerLaunchChoiceV2};
 use crate::types::SessionStatus;
 
 /// Most rows one page may carry.
@@ -51,7 +51,12 @@ impl GetManagerTreeRequestV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagerTreeKindV1 {
+    /// The v0 global grant row. Daemons since #1236 render every manager
+    /// above project level as a `Portfolio` row instead; the variant stays so
+    /// a newer client reads an older daemon's snapshot.
     Global,
+    /// #1236: a portfolio node of any tier (`tier_label` names it).
+    Portfolio,
     Project,
     Area,
     Epic,
@@ -99,12 +104,21 @@ pub struct ManagerTreeLoadV1 {
 /// One row of the flat depth-first tree page.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ManagerTreeRowV1 {
-    /// Stable per-row key: `global`, `project:<id>`, `area:<id>`, `epic:<id>`.
+    /// Stable per-row key: `portfolio:<id>` (`global` from a pre-#1236
+    /// daemon), `project:<id>`, `area:<id>`, `epic:<id>`.
     pub key: String,
     pub parent_key: Option<String>,
     pub depth: u16,
     pub kind: ManagerTreeKindV1,
     pub label: String,
+    /// #1236: a portfolio row's display tier ("global", "pinnacle", ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_label: Option<String>,
+    /// #1239: who granted this row's seat: `operator` or `node:<uuid>` (a
+    /// portfolio node, or the PM a node appointed). `None` for rows without
+    /// a seat grant (an unappointed project, area and Epic rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grantor: Option<String>,
     pub project_id: Option<Uuid>,
     pub node_id: Option<Uuid>,
     pub epic_id: Option<Uuid>,
@@ -114,6 +128,12 @@ pub struct ManagerTreeRowV1 {
     /// The session Enter jumps to (the seat, or an Epic's lead).
     pub focus_session_id: Option<Uuid>,
     pub grant: Option<ManagerTreeGrantV1>,
+    /// #1412: the launches this row's manager may make now: a node's grant
+    /// list narrowed by its project policy, a project manager's own list (or
+    /// "any" when empty) intersected live with every node above it. Empty for
+    /// rows that launch nothing (Epic) or whose set is unrestricted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launches: Vec<ManagerLaunchChoiceV2>,
     pub load: ManagerTreeLoadV1,
     /// False when this row's children could not be listed completely.
     pub complete: bool,
@@ -130,6 +150,7 @@ pub struct GetManagerTreeResultV1 {
     /// False when any row's traversal is incomplete: the total is then a
     /// lower bound and the operator view says so.
     pub complete: bool,
-    /// The active global grant version, when one exists.
+    /// The grant version of the single active root labelled `global`, when
+    /// exactly one exists (the `*GlobalManager` shims' node).
     pub global_grant_version: Option<i64>,
 }

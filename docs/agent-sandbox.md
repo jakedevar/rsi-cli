@@ -311,7 +311,7 @@ Key `s` toggles `sandbox_enabled` on the focused `OverlayState::Prompt`. The
 toggle is a no-op when `app.poll.sandbox_supported` is `false` (daemon older than
 V39, or capability not advertised).
 
-Applies to `PromptPurpose::Blank` and `PromptPurpose::TaskRabbit`. Does not apply
+Applies to `PromptPurpose::Blank`. Does not apply
 to `ContinueSession` overlays (continuing always reuses the existing row's sandbox
 state).
 

@@ -117,14 +117,14 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     // this field and discards it. Default launches get zero automatic retries
     // unless the launch carries an explicit retry policy (fail-closed; kept).
     page("retry_max_default", ApplyClass::NotApplied),
-    // S-040: the stall-retry handler is spawned at boot.
-    page("retry_on_stall", DaemonRestart),
+    // The subscriber stays alive; runtime retry_on_stall gates each event.
+    page("retry_on_stall", LIVE),
     // rsid session/lifecycle.rs:4206 loads the atomic per backoff.
     page("retry_max_backoff_ms", LIVE),
-    // S-041.
-    page("reconciliation_enabled", DaemonRestart),
-    // S-042.
-    page("stall_detection_enabled", DaemonRestart),
+    // Runtime-gated loop remains alive; disabled passes maintain the watchdog heartbeat.
+    page("reconciliation_enabled", LIVE),
+    // The detector stays alive; the runtime switch gates each tick.
+    page("stall_detection_enabled", LIVE),
     // S-043.
     page("context_rotation_enabled", PartialLive),
     // Read from RuntimeConfig on every context usage update, including active sessions.
@@ -161,12 +161,12 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("dream_model", LIVE),
     page("dream_model_provider", LIVE),
     page("dream_model_base_url", LIVE),
-    // S-031: DreamConfig is built at boot (rsid main.rs:662-665).
-    page("dream_observation_threshold", DaemonRestart),
+    // Dream scheduler refreshes future-run policy on every control wake/tick.
+    page("dream_observation_threshold", LIVE),
     // rsid dreamer/scheduler.rs:593 loads the atomic per cycle.
     page("dream_idle_secs", LIVE),
-    // S-032.
-    page("dream_cooldown_secs", DaemonRestart),
+    // New runs snapshot the live cooldown; existing run caps stay immutable.
+    page("dream_cooldown_secs", LIVE),
     // Prompt compiler: rsid prompt_compile/engine.rs:102-111 reads per compile.
     page("prompt_compile_model_local", LIVE),
     page("prompt_compile_model_provider", LIVE),
@@ -175,17 +175,17 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("codex_sandbox_mode", NextSpawn),
     // S-049 (rsid claude.rs:484).
     page("claude_config_isolation", NextSpawn),
-    // Unverified: no read site outside config.rs was found; safe default.
-    page("system_prompt_preset", DaemonRestart),
-    // S-062.
-    page("stall_classifier_enabled", LiveOffRestartOn),
-    // S-025: the classifier is built at boot (rsid config.rs:1218, main.rs:226).
-    page("stall_classifier_model", DaemonRestart),
-    // S-064 .. S-067.
-    page("stall_classifier_idle_secs", DaemonRestart),
-    page("stall_classifier_idle_secs_codex", DaemonRestart),
-    page("stall_classifier_cooldown_secs", DaemonRestart),
-    page("stall_classifier_max_per_session", DaemonRestart),
+    // The TUI updates its cache after save and includes the preset in launches.
+    page("system_prompt_preset", NextSpawn),
+    // Classifier wiring stays alive; detector and receiver both gate on runtime.
+    page("stall_classifier_enabled", LIVE),
+    // The classifier snapshots the live model before admission and execution.
+    page("stall_classifier_model", LIVE),
+    // Detector refreshes all four classifier gates every tick.
+    page("stall_classifier_idle_secs", LIVE),
+    page("stall_classifier_idle_secs_codex", LIVE),
+    page("stall_classifier_cooldown_secs", LIVE),
+    page("stall_classifier_max_per_session", LIVE),
     // S-068.
     page("stall_classifier_confidence_floor", LIVE),
     // Recursive DAG controls: rsid rpc.rs:5013-5397 and 7224-7292 read the
@@ -242,8 +242,19 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("rolling_queue_enabled", LIVE),
     page("rolling_queue_batch_size", LIVE),
     page("rolling_queue_speculation_depth", LIVE),
+    // Issue #1208: read when a batch is claimed (its gate deadline).
+    page("rolling_queue_gate_timeout_mins", LIVE),
+    // Issue #1337: AgentSubmitJob reads the test-job timeout default at each
+    // submit; the CPU-time andon reads its two thresholds at every sample.
+    page("job_test_timeout_mins", LIVE),
+    page("cpu_andon_cpu_minutes", LIVE),
+    page("cpu_andon_host_load", LIVE),
     // Issue #1073: the deploy loop reads the toggle at every 5 s poll.
     page("deploy_drain_enabled", LIVE),
+    // Issue #1320/#1311: the deploy loop reads the hold cap at every 5 s poll.
+    page("deploy_drain_hold_secs", LIVE),
+    // Issue #1417: every manager create_session admission reads the threshold.
+    page("host_load_admission_threshold", LIVE),
     // Issue #794 S3: the scheduler reads these settings on every tick.
     page("program_hold_while_children_run", LIVE),
     page("child_keepalive_enabled", LIVE),
@@ -302,6 +313,23 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     // of a coordinating seat. Overrides are `coordinator_context_cap.<key>`
     // fields written by the TUI command `:context-cap`.
     page("coordinator_context_cap_tokens", LIVE),
+    // #1254: rsid session/context_cap.rs reads the worker baton cap at each
+    // usage update of a non-seat session. Overrides are
+    // `worker_context_cap.<key>` fields written by `:worker-context-cap`.
+    page("worker_context_cap_tokens", LIVE),
+    // #1407: `RuntimeConfig::launch_model_refusal` reads the profile at every
+    // launch check; the region is read at each Bedrock launch and check.
+    page("provider_profile", LIVE),
+    // Written by the TUI command `:aws-setup <region>` (the first-run AWS
+    // setup step, which also stores the Bedrock key and verifies it).
+    DaemonFieldSpec {
+        field: crate::provider_profile::BEDROCK_REGION_FIELD,
+        apply: NextSpawn,
+        operator_surface: OperatorSurface::Elsewhere {
+            surface: ":aws-setup command",
+            writer: "action_handler/aws_setup.rs",
+        },
+    },
 ];
 
 /// The catalog entry for `field`, if any.

@@ -408,18 +408,6 @@ async fn settings_side_keeps_launch_chords_and_swallows_text_tools() {
     assert_eq!(app.blank_draft, vec!["keep".to_string()]);
 }
 
-#[tokio::test]
-async fn taskrabbit_settings_side_offers_no_manager() {
-    let mut app = test_app();
-    app.current_project_id = Some(Uuid::new_v4());
-    crate::overlay::open_taskrabbit_popup(&mut app);
-    press(&mut app, ctrl(KeyCode::Char('o'))).await;
-    press(&mut app, key(KeyCode::Char('G'))).await;
-    assert_eq!(selected(&app), Some(LaunchSettingRow::Sandbox));
-    press(&mut app, key(KeyCode::Char(' '))).await;
-    assert_eq!(launch(&app).manager, None);
-}
-
 // === Manager appointment plan =================================================
 
 #[tokio::test]

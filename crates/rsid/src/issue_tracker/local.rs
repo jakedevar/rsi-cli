@@ -435,6 +435,7 @@ mod tests {
             (
                 s.get_issue(issue.id).unwrap().unwrap(),
                 s.list_issue_events_v1(&rsi_common::types::IssueEventPageRequestV1 {
+                    project_id: None,
                     issue_id: issue.id,
                     after_sequence: 0,
                     limit: None,

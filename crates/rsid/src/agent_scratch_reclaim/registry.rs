@@ -14,6 +14,15 @@
 //! progress, outside the tree being deleted, so a resumed removal can only
 //! delete what the final proof saw.
 //!
+//! Registry growth (#1171): a reclaim that deletes an allocation writes a
+//! `<nonce>.reclaimed` tombstone once its contents, provenance and directory
+//! are gone (and the deletions durable), then removes the entry, manifest and
+//! tombstone; the pass-level prune finishes any such removal that was
+//! interrupted. Prune drops only tombstoned
+//! allocations and never infers absence from a filesystem, so an allocation
+//! removed by anything other than this reclaim keeps its entry (a few hundred
+//! bytes), and so does one the reclaim stopped on before the tombstone.
+//!
 //! Trust boundary: the registry lives where only the daemon user can write. A
 //! process running as that same user and set on forging provenance can write
 //! it too; no file a same-user process can rewrite defends against that. The
@@ -21,7 +30,6 @@
 //! records, look-alike names, other tools' directories, and records written by
 //! mistake.
 
-use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -33,8 +41,10 @@ const ENTRY_LIMIT: usize = 16 * 1024;
 const MANIFEST_MAGIC: &[u8] = b"rsi-scratch-manifest v1\n";
 const MANIFEST_LIMIT: usize = 128 << 20;
 const MANIFEST_SUFFIX: &str = ".manifest";
-/// Entries untouched this long whose directory is gone are pruned.
-const STALE_ENTRY_SECS: u64 = 24 * 3600;
+const TOMBSTONE_MAGIC: &str = "rsi-scratch-reclaimed v1";
+/// A sibling of the entry (`<nonce>.reclaimed`): an older daemon's registry
+/// code skips names that are not a bare nonce or `<nonce>.manifest`.
+const TOMBSTONE_SUFFIX: &str = ".reclaimed";
 
 /// `~/.rsi/scratch-registry`.
 pub(super) fn default_registry_path() -> PathBuf {
@@ -207,6 +217,13 @@ fn parse_manifest(data: &[u8]) -> Option<Vec<u64>> {
     hashes.windows(2).all(|w| w[0] < w[1]).then_some(hashes)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs right after `put_new` created the entry.
+    pub(super) static AFTER_PUT_NEW: std::cell::Cell<Option<fn(&Registry, &Entry)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// The private registry directory.
 pub(super) struct Registry {
     dir: Pinned,
@@ -236,10 +253,16 @@ impl Registry {
         }
     }
 
+    /// The entry of a live allocation. A reclaimed allocation (tombstoned) has
+    /// no entry any more, whether or not the file was removed yet.
     pub(super) fn get(&self, nonce: &str) -> Option<Entry> {
-        if !valid_nonce(nonce) {
+        if !valid_nonce(nonce) || self.tombstone_exists(nonce) {
             return None;
         }
+        self.read_entry(nonce)
+    }
+
+    fn read_entry(&self, nonce: &str) -> Option<Entry> {
         let (data, stat) = fsys::read_file_at(self.dir.raw(), nonce, ENTRY_LIMIT, Some(self.uid))
             .ok()
             .flatten()?;
@@ -251,8 +274,32 @@ impl Registry {
         (entry.nonce == nonce).then_some(entry)
     }
 
+    /// Create the entry. A nonce a reclaim already tombstoned is never reused:
+    /// a finish still in progress for it could otherwise drop the new entry
+    /// (UUID collisions do not happen; this is the safe answer if one is forced).
     pub(super) fn put_new(&self, entry: &Entry) -> io::Result<()> {
-        fsys::create_file(&self.dir, &entry.nonce, entry.to_text().as_bytes())
+        if self.tombstone_exists(&entry.nonce) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "scratch nonce was already reclaimed",
+            ));
+        }
+        fsys::create_file(&self.dir, &entry.nonce, entry.to_text().as_bytes())?;
+        #[cfg(test)]
+        if let Some(hook) = AFTER_PUT_NEW.with(std::cell::Cell::get) {
+            hook(self, entry);
+        }
+        // A tombstone that appeared between the check and the create (the nonce
+        // was reclaimed concurrently): do not leave an entry a finish would
+        // drop. Residual: a UUID collision plus a sub-second window.
+        if self.tombstone_exists(&entry.nonce) {
+            self.remove_entry(&entry.nonce);
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "scratch nonce was already reclaimed",
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn replace(&self, entry: &Entry) -> io::Result<()> {
@@ -334,26 +381,98 @@ impl Registry {
         Ok(fsys::try_flock(&file, exclusive)?.then_some(CustodyGuard { _file: file }))
     }
 
-    /// Drop entries (and manifests) whose allocation is provably gone, at most
-    /// `max` names per call and within the pass budget, serialized with every
-    /// reclaim by the custody lock (a busy lock prunes nothing this pass).
+    /// Completion tombstone for `entry`: this daemon's reclaim has deleted the
+    /// allocation's contents and provenance and removed its directory (the
+    /// final `rmdir` succeeded, and the deletions were made durable). A
+    /// directory kept for any reason (late contents, a failed sync) never gets
+    /// one. Written by the reclaim itself, as a fresh file renamed into place
+    /// relative to the pinned registry directory, never inferred from what a
+    /// filesystem path shows.
+    pub(super) fn tombstone_put(&self, entry: &Entry) -> io::Result<()> {
+        let text = Tombstone::of(entry, unix_now()).to_text();
+        fsys::replace_file(
+            &self.dir,
+            &Self::tombstone_name(&entry.nonce),
+            text.as_bytes(),
+        )
+    }
+
+    fn tombstone_name(nonce: &str) -> String {
+        format!("{nonce}{TOMBSTONE_SUFFIX}")
+    }
+
+    /// The valid tombstone of `nonce`: ours, private, parseable, naming `nonce`.
+    fn tombstone_get(&self, nonce: &str) -> Option<Tombstone> {
+        if !valid_nonce(nonce) {
+            return None;
+        }
+        let (data, stat) = fsys::read_file_at(
+            self.dir.raw(),
+            &Self::tombstone_name(nonce),
+            ENTRY_LIMIT,
+            Some(self.uid),
+        )
+        .ok()
+        .flatten()?;
+        if fsys::file_mode(&stat) & 0o022 != 0 {
+            return None;
+        }
+        let tombstone = Tombstone::parse(std::str::from_utf8(&data).ok()?)?;
+        (tombstone.nonce == nonce).then_some(tombstone)
+    }
+
+    /// Whether anything is named `<nonce>.reclaimed`. A name that cannot be
+    /// examined counts: a reclaimed allocation is never bound again.
+    fn tombstone_exists(&self, nonce: &str) -> bool {
+        !matches!(
+            fsys::stat_opt(&self.dir, &Self::tombstone_name(nonce)),
+            Ok(None)
+        )
+    }
+
+    /// Remove a reclaimed allocation's registry files: its entry, its manifest,
+    /// then (after the removals are durable) its tombstone, so an interrupted
+    /// finish is repeated by a later prune. The tombstone is kept unless both
+    /// other files are provably gone and the registry directory synced.
     ///
-    /// An allocation is dropped only when its directory is proved absent from
-    /// its authenticated registered parent: the parent is opened component by
-    /// component without a symlink and must be the very directory the entry
-    /// registered, every name in it is inventoried twice, and none of them is
-    /// the allocation's device, inode and birth time (so a rename within the
-    /// parent, to any name, keeps it). Anything that cannot be proved - a
-    /// parent that moved, cannot be opened or listed, a stat error, an
-    /// exhausted budget, a manifest of a reclaim, a live aside name - keeps the
-    /// entry.
-    pub(super) fn prune(
-        &self,
-        now_unix: u64,
-        max: usize,
-        budget: &mut Budget,
-        mounts: Option<&[PathBuf]>,
-    ) -> usize {
+    /// Registry files only; no scratch tree is opened, listed or touched.
+    pub(super) fn finish_reclaimed(&self, nonce: &str) -> bool {
+        if !valid_nonce(nonce) {
+            return false;
+        }
+        let manifest = Self::manifest_name(nonce);
+        fsys::remove_file_quiet(&self.dir, nonce);
+        fsys::remove_file_quiet(&self.dir, &manifest);
+        let gone = |name: &str| matches!(fsys::stat_opt(&self.dir, name), Ok(None));
+        if !(gone(nonce) && gone(&manifest)) {
+            return false;
+        }
+        // The tombstone is the only proof left: it must not become durably
+        // gone while the removals above could still be undone by a crash.
+        if fsys::sync_dir(&self.dir).is_err() {
+            return false;
+        }
+        fsys::remove_file_quiet(&self.dir, &Self::tombstone_name(nonce));
+        true
+    }
+
+    /// Drop the registry files of allocations this daemon's reclaim finished
+    /// (#1171), at most `max` tombstones per call and within the pass budget,
+    /// serialized with every reclaim by the custody lock (a busy lock prunes
+    /// nothing this pass).
+    ///
+    /// The proof is a durable positive record, not an inference: the registry
+    /// itself holds a valid tombstone, written by a reclaim after it deleted
+    /// the allocation's contents and provenance. Nothing about the filesystem
+    /// is examined, so an allocation whose directory was removed by hand or by
+    /// another tool keeps its entry (a few hundred bytes), and a reclaim that
+    /// stopped before writing the tombstone keeps it too. A tombstone that
+    /// does not agree with the entry it names (device, inode, birth time), or
+    /// is not ours and private, is left alone with the entry.
+    ///
+    /// Removes only `<nonce>`, `<nonce>.manifest` and `<nonce>.reclaimed` of a
+    /// tombstoned nonce. Never touches a scratch tree.
+    pub(super) fn prune(&self, max: usize, budget: &mut Budget) -> usize {
         let Some(_custody) = self.prune_guard() else {
             return 0;
         };
@@ -361,208 +480,114 @@ impl Registry {
             return 0;
         };
         let mut pruned = 0;
-        let mut parents: HashMap<PathBuf, Option<ParentView>> = HashMap::new();
-        for name in names.into_iter().take(max) {
-            let (nonce, is_manifest) = match name.strip_suffix(MANIFEST_SUFFIX) {
-                Some(nonce) => (nonce, true),
-                None => (name.as_str(), false),
-            };
-            if !valid_nonce(nonce) {
-                continue;
-            }
-            if is_manifest {
-                // A manifest whose entry is provably absent is unreachable.
-                if matches!(fsys::stat_opt(&self.dir, nonce), Ok(None)) {
-                    fsys::remove_file_quiet(&self.dir, &name);
-                    pruned += 1;
-                }
-                continue;
-            }
-            let Some(entry) = self.get(nonce) else {
-                continue;
-            };
-            if entry.uid != self.uid
-                || now_unix <= entry.created_unix.saturating_add(STALE_ENTRY_SECS)
-            {
-                continue;
-            }
-            // A reclaim in progress has a manifest; an unreadable state keeps it.
-            if !self.manifest_is_absent(nonce) {
-                continue;
-            }
-            if !self.allocation_absent(&entry, &mut parents, budget, mounts) {
-                continue;
-            }
-            // The cached view may be stale by now (a name moved out and back
-            // since it was taken). Prove absence again from a fresh view of the
-            // parent, immediately before the drop, under the same lock.
+        for nonce in tombstone_candidates(&names, max) {
             if budget.expired() {
                 break;
             }
-            let fresh = Path::new(&entry.path)
-                .parent()
-                .and_then(|parent| ParentView::open(parent, self.uid, budget, mounts));
-            if !Self::absent_in(fresh.as_ref(), &entry) || budget.expired() {
+            // Re-read under the custody lock, immediately before the drop.
+            let Some(tombstone) = self.tombstone_get(&nonce) else {
+                continue;
+            };
+            if !self.agrees_with_entry(&tombstone) {
                 continue;
             }
-            // Re-read under the lock just before the drop.
-            //
-            // Residual, stated plainly: a rename that lands after this last
-            // check and before the `unlinkat` below cannot be excluded without
-            // kernel support (the registry file and the scratch tree are in
-            // different directories and no primitive makes the pair atomic).
-            // Its cost is bounded to registry-only loss: the entry is dropped,
-            // the tree is kept and can no longer bind. No scratch data is ever
-            // removed here. The same bound covers an adversarial same-user
-            // process, which the registry's trust boundary already excludes.
-            if self.manifest_is_absent(nonce) {
-                self.remove_entry(nonce);
+            if self.finish_reclaimed(&nonce) {
                 pruned += 1;
             }
         }
         pruned
     }
 
-    fn manifest_is_absent(&self, nonce: &str) -> bool {
-        matches!(
-            fsys::stat_opt(&self.dir, &Self::manifest_name(nonce)),
-            Ok(None)
+    /// An entry still present must be readable and be the allocation the
+    /// tombstone records; only a proven absence skips the comparison. An entry
+    /// whose identity cannot be established is kept, with its tombstone.
+    fn agrees_with_entry(&self, tombstone: &Tombstone) -> bool {
+        match fsys::stat_opt(&self.dir, &tombstone.nonce) {
+            Ok(None) => return true,
+            Err(_) => return false,
+            Ok(Some(_)) => {}
+        }
+        self.read_entry(&tombstone.nonce)
+            .is_some_and(|e| e.ident == tombstone.ident && e.btime == tombstone.btime)
+    }
+}
+
+/// The nonces whose tombstones a prune examines: at most `max`, chosen among
+/// the tombstone names only, so the (many) live entries cannot crowd them out.
+pub(super) fn tombstone_candidates(names: &[String], max: usize) -> Vec<String> {
+    names
+        .iter()
+        .filter_map(|name| name.strip_suffix(TOMBSTONE_SUFFIX))
+        .filter(|nonce| valid_nonce(nonce))
+        .take(max)
+        .map(str::to_string)
+        .collect()
+}
+
+/// What a reclaim records when it has deleted an allocation: the allocation's
+/// nonce and identity, so the record can only ever drop that entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Tombstone {
+    nonce: String,
+    ident: Ident,
+    btime: i128,
+    reclaimed_unix: u64,
+}
+
+impl Tombstone {
+    fn of(entry: &Entry, reclaimed_unix: u64) -> Self {
+        Self {
+            nonce: entry.nonce.clone(),
+            ident: entry.ident,
+            btime: entry.btime,
+            reclaimed_unix,
+        }
+    }
+
+    fn to_text(&self) -> String {
+        format!(
+            "{TOMBSTONE_MAGIC}\nnonce={}\ndev={}\nino={}\nbtime_ns={}\nreclaimed_unix={}\n",
+            self.nonce, self.ident.dev, self.ident.ino, self.btime, self.reclaimed_unix
         )
     }
 
-    /// Whether `entry`'s directory is proved absent from the parent it was
-    /// registered in (see [`Registry::prune`]).
-    fn allocation_absent(
-        &self,
-        entry: &Entry,
-        parents: &mut HashMap<PathBuf, Option<ParentView>>,
-        budget: &mut Budget,
-        mounts: Option<&[PathBuf]>,
-    ) -> bool {
-        let Some(parent_path) = Path::new(&entry.path).parent() else {
-            return false;
-        };
-        let view = parents
-            .entry(parent_path.to_path_buf())
-            .or_insert_with(|| ParentView::open(parent_path, self.uid, budget, mounts));
-        Self::absent_in(view.as_ref(), entry)
-    }
-
-    /// Whether `view` proves `entry` absent from its registered parent.
-    fn absent_in(view: Option<&ParentView>, entry: &Entry) -> bool {
-        let Some(view) = view else {
-            return false;
-        };
-        // The registered parent is this directory, not a namesake.
-        if view.parent.ident != entry.parent {
-            return false;
+    fn parse(text: &str) -> Option<Self> {
+        let mut lines = text.lines();
+        if lines.next()? != TOMBSTONE_MAGIC {
+            return None;
         }
-        !view.names_allocation(entry)
+        let (mut nonce, mut dev, mut ino, mut btime, mut at) = (None, None, None, None, None);
+        for line in lines {
+            let (key, value) = line.split_once('=')?;
+            match key {
+                "nonce" => nonce = Some(value.to_string()),
+                "dev" => dev = value.parse::<u64>().ok(),
+                "ino" => ino = value.parse::<u64>().ok(),
+                "btime_ns" => btime = value.parse::<i128>().ok(),
+                "reclaimed_unix" => at = value.parse::<u64>().ok(),
+                _ => {}
+            }
+        }
+        Some(Self {
+            nonce: nonce.filter(|n| valid_nonce(n))?,
+            ident: Ident {
+                dev: dev?,
+                ino: ino?,
+            },
+            btime: btime?,
+            reclaimed_unix: at?,
+        })
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// An exclusive or shared hold of the registry's custody lock; released when
 /// dropped (or when the process ends).
 pub(super) struct CustodyGuard {
     _file: std::fs::File,
-}
-
-/// Inventories (each listing plus a stat of every name) of one parent that must
-/// agree for it to count as a snapshot, and how often they are retried when the
-/// directory changes underneath them.
-const INVENTORY_ATTEMPTS: usize = 3;
-
-#[cfg(test)]
-thread_local! {
-    /// Called after the final inventory of a parent view, before it is used.
-    pub(super) static AFTER_INVENTORIES: std::cell::Cell<Option<fn()>> =
-        const { std::cell::Cell::new(None) };
-    /// Called when a view is accepted, before it is used.
-    pub(super) static AFTER_VIEW: std::cell::Cell<Option<fn()>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// A registered parent directory, authenticated and inventoried: a stable
-/// snapshot of every name in it, what each names (identity, birth time, mount)
-/// and proof that no mount can mask any of them.
-struct ParentView {
-    parent: Pinned,
-    names: Vec<fsys::Named>,
-}
-
-impl ParentView {
-    /// `None` (retain everything under this parent) unless the parent can be
-    /// authenticated and inventoried as an unmodified, unmasked snapshot.
-    fn open(
-        path: &Path,
-        uid: u32,
-        budget: &mut Budget,
-        mounts: Option<&[PathBuf]>,
-    ) -> Option<Self> {
-        // Without a readable mount table a mount point cannot be excluded; with
-        // one, a mount below the parent could cover a name in it.
-        let mounts = mounts?;
-        if mounts.iter().any(|m| m != path && m.starts_with(path)) {
-            return None;
-        }
-        let parent = fsys::open_root(path, uid).ok()?;
-        for _ in 0..INVENTORY_ATTEMPTS {
-            let before = fsys::dir_stamp(&parent).ok()?;
-            let first = fsys::named_inventory(&parent, budget);
-            let second = fsys::named_inventory(&parent, budget);
-            #[cfg(test)]
-            if let Some(hook) = AFTER_INVENTORIES.with(std::cell::Cell::get) {
-                hook();
-            }
-            let (first, second) = match (first, second) {
-                (Ok(first), Ok(second)) => (first, second),
-                (Err(fsys::InventoryError::Unproven), _)
-                | (_, Err(fsys::InventoryError::Unproven)) => {
-                    return None;
-                }
-                // Modified while it was read: look again.
-                _ => continue,
-            };
-            let after = fsys::dir_stamp(&parent).ok()?;
-            // A snapshot, as far as it can be established without kernel
-            // support: the two inventories agree exactly (name, device, inode,
-            // birth time, mount) and hold no repeated directory identity, the
-            // directory's own stamps did not move, and the path still names this
-            // directory. Residual: stamps have the filesystem's timestamp grain,
-            // so several renames inside one tick can leave them equal, and two
-            // unsynchronized readings can in principle both miss a name that
-            // never left. That needs a same-user process doing exact-timed
-            // exchanges, outside the registry's trust boundary, and costs only
-            // a dropped registry entry (the tree is kept), never data.
-            if first != second || before != after || !fsys::root_unchanged(path, uid, &parent) {
-                continue;
-            }
-            // A name on another mount than its parent is a mount point (a bind
-            // mount of the same device included) hiding what is under it.
-            let unmasked = first
-                .iter()
-                .all(|n| fsys::same_known_mount(parent.mount, n.mount));
-            if !unmasked || budget.expired() {
-                return None;
-            }
-            #[cfg(test)]
-            if let Some(hook) = AFTER_VIEW.with(std::cell::Cell::get) {
-                hook();
-            }
-            return Some(Self {
-                parent,
-                names: first,
-            });
-        }
-        None
-    }
-
-    /// Whether any inventoried name is the allocation: same device and inode,
-    /// and not provably a later occupant of a reused inode (a different birth
-    /// time). Decided on what the inventory saw, never by reopening a name.
-    fn names_allocation(&self, entry: &Entry) -> bool {
-        self.names
-            .iter()
-            .any(|n| n.ident == entry.ident && n.btime.is_none_or(|b| b == entry.btime))
-    }
 }

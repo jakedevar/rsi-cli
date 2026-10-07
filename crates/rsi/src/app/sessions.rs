@@ -38,6 +38,15 @@ impl App {
             let new_status = session.status;
             let session_kind = session.session_kind;
             let mut changed = false;
+            // A soft pause only describes the Interrupted state it produced.
+            // Once the session moves on (running, failed, ...), drop the cached
+            // marker so a later, unrelated Interrupted does not show it again.
+            if old_status == rsi_common::types::SessionStatus::Interrupted
+                && new_status != rsi_common::types::SessionStatus::Interrupted
+                && self.operator_pauses.get(&id) == Some(&crate::client::OperatorPauseLevel::Soft)
+            {
+                self.operator_pauses.remove(&id);
+            }
             if state.session.updated_at != session.updated_at
                 || old_status != new_status
                 || state.session.project_id != session.project_id
@@ -72,28 +81,9 @@ impl App {
                 state.live_context_pct = state.session.context_fill_pct;
             }
 
-            // Detect TaskRabbit/Bug completion/failure for notification
+            // Detect Bug completion/failure for notification
             if old_status != new_status {
                 match session_kind {
-                    rsi_common::types::SessionKind::TaskRabbit => match new_status {
-                        rsi_common::types::SessionStatus::Completed => {
-                            self.push_notification(
-                                crate::types::NotificationKind::TaskRabbitComplete,
-                                crate::types::NotificationPriority::Medium,
-                                "TaskRabbit: done ✓".to_string(),
-                                Some(id),
-                            );
-                        }
-                        rsi_common::types::SessionStatus::Failed => {
-                            self.push_notification(
-                                crate::types::NotificationKind::TaskRabbitFailed,
-                                crate::types::NotificationPriority::High,
-                                "TaskRabbit: failed ✗".to_string(),
-                                Some(id),
-                            );
-                        }
-                        _ => {}
-                    },
                     rsi_common::types::SessionKind::Bug => match new_status {
                         rsi_common::types::SessionStatus::Completed => {
                             self.push_notification(
@@ -260,36 +250,19 @@ impl App {
 
     // --- Session List Navigation ---
 
-    /// Total number of navigable items in the session list (main + taskrabbit, excluding separators).
+    /// Total number of navigable items in the Main session list.
     pub fn session_list_len(&self) -> usize {
-        self.filtered_session_order.len() + self.filtered_taskrabbit_order.len()
+        self.filtered_session_order.len()
     }
 
-    /// Get session ID by combined index (skipping separator).
-    /// Indices 0..main.len() -> main sessions
-    /// Indices main.len()..total -> taskrabbit sessions
+    /// Get session ID by index into the Main session list.
     pub fn session_id_at(&self, index: usize) -> Option<Uuid> {
-        let main_len = self.filtered_session_order.len();
-        if index < main_len {
-            self.filtered_session_order.get(index).copied()
-        } else {
-            self.filtered_taskrabbit_order
-                .get(index - main_len)
-                .copied()
-        }
+        self.filtered_session_order.get(index).copied()
     }
 
-    /// Find combined index for a session ID.
+    /// Find the Main-list index for a session ID.
     pub fn session_index_of(&self, id: &Uuid) -> Option<usize> {
-        let main_len = self.filtered_session_order.len();
-        if let Some(pos) = self.filtered_session_order.iter().position(|x| x == id) {
-            Some(pos)
-        } else {
-            self.filtered_taskrabbit_order
-                .iter()
-                .position(|x| x == id)
-                .map(|pos| main_len + pos)
-        }
+        self.filtered_session_order.iter().position(|x| x == id)
     }
 
     /// Update session state from daemon response.
@@ -334,6 +307,7 @@ impl App {
         for id in &removed_ids {
             self.sessions.remove(id);
             self.operator_pauses.remove(id);
+            self.operator_pause_info.remove(id);
             changed = true;
         }
         if !removed_ids.is_empty() {
@@ -472,9 +446,7 @@ impl App {
         {
             return false;
         }
-        if state.session.session_kind == rsi_common::types::SessionKind::TaskRabbit
-            || is_jobs_zone_session(&state.session)
-        {
+        if is_jobs_zone_session(&state.session) {
             return false;
         }
         !search_active || {
@@ -632,78 +604,6 @@ impl App {
         // All main sessions stay in the main zone.
         self.filtered_session_order = expanded_main;
 
-        // Build TaskRabbit filtered list
-
-        let taskrabbit_candidates: Vec<Uuid> = self
-            .session_order
-            .iter()
-            .filter(|id| {
-                let Some(state) = self.sessions.get(id) else {
-                    return false;
-                };
-                if !is_visible_session_state(state) {
-                    return false;
-                }
-
-                // Must match project filter
-                let project_match = match self.current_project_id {
-                    None => true,
-                    Some(project_id) => state.session.project_id == Some(project_id),
-                };
-                // Must be TaskRabbit
-                let kind_match = project_match
-                    && state.session.session_kind == rsi_common::types::SessionKind::TaskRabbit;
-                if !kind_match {
-                    return false;
-                }
-
-                // Apply search filter
-                if !search_active {
-                    return true;
-                }
-                self.sessions.get(id).map_or(false, |s| {
-                    let (root_query, _) = resolve_session_display(&s.session, &self.sessions);
-                    root_query.to_lowercase().contains(&query_lower)
-                })
-            })
-            .copied()
-            .collect();
-
-        // Separate pinned (always shown) from unpinned
-        let (pinned, unpinned): (Vec<_>, Vec<_>) =
-            taskrabbit_candidates.into_iter().partition(|id| {
-                self.sessions
-                    .get(id)
-                    .map(|s| s.session.pinned_at.is_some())
-                    .unwrap_or(false)
-            });
-
-        // Always show the 10 most recent unpinned TaskRabbit sessions
-        let mut by_recency = unpinned.clone();
-        by_recency.sort_by(|a, b| {
-            let a_time = self.sessions.get(a).map(|s| s.session.updated_at);
-            let b_time = self.sessions.get(b).map(|s| s.session.updated_at);
-            b_time.cmp(&a_time)
-        });
-        let top_10: HashSet<Uuid> = by_recency.into_iter().take(10).collect();
-        let visible_unpinned: Vec<Uuid> = unpinned
-            .into_iter()
-            .filter(|id| top_10.contains(id))
-            .collect();
-
-        // Merge pinned + visible unpinned, preserving session_order ordering
-        let visible_set: HashSet<Uuid> = pinned
-            .iter()
-            .chain(visible_unpinned.iter())
-            .copied()
-            .collect();
-        self.filtered_taskrabbit_order = self
-            .session_order
-            .iter()
-            .filter(|id| visible_set.contains(id))
-            .copied()
-            .collect();
-
         // Build Jobs filtered list (sessions with a scheduled_job_id)
         let mut jobs_candidates: Vec<Uuid> = self
             .session_order
@@ -811,7 +711,6 @@ impl App {
 
     pub(crate) fn reconcile_all_session_list_selections(&mut self, preserve_visual_position: bool) {
         let filtered_session_order = self.filtered_session_order.clone();
-        let filtered_taskrabbit_order = self.filtered_taskrabbit_order.clone();
         let filtered_archived_order = self.filtered_archived_order.clone();
         let filtered_jobs_order = self.filtered_jobs_order.clone();
 
@@ -821,7 +720,6 @@ impl App {
                 selected_index,
                 selected_session,
                 active_zone,
-                taskrabbit_selected_index,
                 archive_selected_index,
                 jobs_selected_index,
                 ..
@@ -829,13 +727,11 @@ impl App {
             {
                 Self::reconcile_single_pane_selection(
                     &filtered_session_order,
-                    &filtered_taskrabbit_order,
                     &filtered_archived_order,
                     &filtered_jobs_order,
                     active_zone,
                     selected_index,
                     selected_session,
-                    taskrabbit_selected_index,
                     archive_selected_index,
                     jobs_selected_index,
                     preserve_visual_position,
@@ -849,7 +745,6 @@ impl App {
                     selected_index,
                     selected_session,
                     active_zone,
-                    taskrabbit_selected_index,
                     archive_selected_index,
                     jobs_selected_index,
                     ..
@@ -857,13 +752,11 @@ impl App {
                 {
                     Self::reconcile_single_pane_selection(
                         &filtered_session_order,
-                        &filtered_taskrabbit_order,
                         &filtered_archived_order,
                         &filtered_jobs_order,
                         active_zone,
                         selected_index,
                         selected_session,
-                        taskrabbit_selected_index,
                         archive_selected_index,
                         jobs_selected_index,
                         preserve_visual_position,
@@ -875,19 +768,16 @@ impl App {
 
     fn reconcile_single_pane_selection(
         filtered_session_order: &[Uuid],
-        filtered_taskrabbit_order: &[Uuid],
         filtered_archived_order: &[Uuid],
         filtered_jobs_order: &[Uuid],
         active_zone: &crate::types::SessionListZone,
         selected_index: &mut usize,
         selected_session: &mut Option<Uuid>,
-        taskrabbit_selected_index: &mut usize,
         archive_selected_index: &mut usize,
         jobs_selected_index: &mut usize,
         preserve_visual_position: bool,
     ) {
         let main_len = filtered_session_order.len();
-        let tr_len = filtered_taskrabbit_order.len();
         let arc_len = filtered_archived_order.len();
         let jobs_len = filtered_jobs_order.len();
 
@@ -896,12 +786,6 @@ impl App {
             *selected_index = 0;
         } else if *selected_index >= main_len {
             *selected_index = main_len - 1;
-        }
-
-        if tr_len == 0 {
-            *taskrabbit_selected_index = 0;
-        } else if *taskrabbit_selected_index >= tr_len {
-            *taskrabbit_selected_index = tr_len - 1;
         }
 
         if arc_len == 0 {
@@ -919,14 +803,12 @@ impl App {
         // 2. Resolve active list and active index ref
         let list_to_check = match active_zone {
             crate::types::SessionListZone::Main => filtered_session_order,
-            crate::types::SessionListZone::TaskRabbit => filtered_taskrabbit_order,
             crate::types::SessionListZone::Archive => filtered_archived_order,
             crate::types::SessionListZone::Jobs => filtered_jobs_order,
         };
 
         let active_index_ref = match active_zone {
             crate::types::SessionListZone::Main => selected_index,
-            crate::types::SessionListZone::TaskRabbit => taskrabbit_selected_index,
             crate::types::SessionListZone::Archive => archive_selected_index,
             crate::types::SessionListZone::Jobs => jobs_selected_index,
         };
@@ -1060,7 +942,6 @@ mod tests {
                     selected_session: None,
                     scroll_offset: 0,
                     active_zone: Default::default(),
-                    taskrabbit_selected_index: 0,
                     archive_selected_index: 0,
                     jobs_selected_index: 0,
                 },

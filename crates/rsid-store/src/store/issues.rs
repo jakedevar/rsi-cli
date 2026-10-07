@@ -13,7 +13,10 @@ use super::daemon_settings::{
     source_session_id_from_c5_pending_key,
 };
 use super::row_mappers::parse_timestamp;
-use crate::error::{DaemonError, Result, agent_issue_error, issue_workspace_error};
+use crate::error::{
+    DaemonError, Result, agent_issue_bound_field_not_allowed, agent_issue_error,
+    issue_workspace_error,
+};
 use chrono::{SecondsFormat, Utc};
 use rsi_common::issue_workspace::{
     ArchiveIssueRequestV1, CreateIssueV2RequestV1, GetIssueInProjectRequestV1,
@@ -411,6 +414,17 @@ pub(super) enum AgentIssueActor {
     /// The current appointed manager holding the V2 `IssueCoordinate` grant
     /// bound to the live appointment `scope_version`.
     Manager { scope_version: i64 },
+    /// #1284: a worker whose live `AgentManagerLaunchIssueWorker` binding
+    /// (`operation_id`) names `issue_id`. It may only append to that Issue's
+    /// body through `AgentUpdateIssue`; every other Issue mutation resolves
+    /// the lead and manager arms alone and never yields this actor.
+    /// `epic_id` is the worker's own owning Epic, recorded on the receipt
+    /// beside the worker's session id (it confers no lead authority).
+    BoundWorker {
+        issue_id: Uuid,
+        operation_id: Uuid,
+        epic_id: Uuid,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2328,6 +2342,62 @@ impl Store {
         new: &NewIssue,
         idempotency_key: &str,
     ) -> Result<IdempotentIssueCreate> {
+        self.create_agent_issue_idempotent_inner(caller_session_id, id, new, idempotency_key, false)
+    }
+
+    /// The authenticated creator's original create receipt, never the current
+    /// projection or another actor's Issue. Used to preserve provenance on
+    /// exact retries after the daemon's attribution format changes.
+    pub fn agent_issue_create_receipt(
+        &self,
+        caller_session_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<Option<Issue>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let event = Self::event_by_actor_key_tx(&tx, caller_session_id, idempotency_key)?;
+        tx.commit()?;
+        Ok(event
+            .filter(|event| {
+                matches!(
+                    event.operation,
+                    IssueEventOperationV1::Created | IssueEventOperationV1::LegacyCreateAdopted
+                ) && event.issue.created_by_session_id == Some(caller_session_id)
+            })
+            .map(|event| event.issue))
+    }
+
+    /// Check a caller-supplied source reference without returning Issue content.
+    /// The source project comes from the authenticated session's persisted row.
+    pub fn agent_issue_source_exists(&self, caller_session_id: Uuid, number: u32) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM issues i JOIN sessions s ON s.project_id=i.project_id WHERE s.id=?1 AND i.display_number=?2)",
+            params![caller_session_id.to_string(), number],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// #1389: create-only filing into the harness project from any session.
+    /// The caller's project is not required to match; the target project must
+    /// exist. No global-manager grant is needed because the daemon resolved
+    /// the target as the harness project and the write is create-only.
+    pub fn create_agent_harness_issue_idempotent(
+        &self,
+        caller_session_id: Uuid,
+        id: Uuid,
+        new: &NewIssue,
+        idempotency_key: &str,
+    ) -> Result<IdempotentIssueCreate> {
+        self.create_agent_issue_idempotent_inner(caller_session_id, id, new, idempotency_key, true)
+    }
+
+    fn create_agent_issue_idempotent_inner(
+        &self,
+        caller_session_id: Uuid,
+        id: Uuid,
+        new: &NewIssue,
+        idempotency_key: &str,
+        harness_target: bool,
+    ) -> Result<IdempotentIssueCreate> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let project_id: Option<String> = tx
             .query_row(
@@ -2336,12 +2406,33 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?;
-        if project_id.as_deref() != Some(&new.project_id.to_string())
-            || new.created_by_session_id != Some(caller_session_id)
-        {
+        if new.created_by_session_id != Some(caller_session_id) {
             return Err(DaemonError::Store(format!(
                 "agent_create_issue_project_unavailable:{caller_session_id}"
             )));
+        }
+        // #1235: creating in another project needs the active global seat
+        // whose grant covers it, with IssueCoordinate in an executing policy.
+        if project_id.as_deref() != Some(&new.project_id.to_string()) {
+            let project_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1)",
+                [new.project_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if !project_exists
+                || (!harness_target
+                    && super::harness_manager_v2::global_issue_authority_on(
+                        &tx,
+                        caller_session_id,
+                        new.project_id,
+                        true,
+                    )?
+                    .is_none())
+            {
+                return Err(DaemonError::InvalidParam(
+                    rsi_common::global_manager::MANAGER_PROJECT_NOT_IN_SCOPE.into(),
+                ));
+            }
         }
         let outcome = Self::idempotent_issue_in_tx(
             &tx,
@@ -3414,19 +3505,129 @@ impl Store {
     /// owning-Epic lead (checked first), or the current appointed manager
     /// holding the V2 `IssueCoordinate` grant. Resolved first in every guarded
     /// transaction, so a refused caller writes no Issue row and no event.
+    ///
+    /// #1235: `project` names the target project (omitted means the caller's
+    /// own). The caller's own project keeps the lead-then-manager order and
+    /// then admits the global seat; another project is served only by the
+    /// global seat inside its grant and is otherwise refused
+    /// `manager_project_not_in_scope`.
     pub(super) fn resolve_agent_issue_authority(
         tx: &Transaction<'_>,
         caller_session_id: Uuid,
+        project: Option<Uuid>,
+        mutation: bool,
     ) -> Result<AgentIssueAuthority> {
-        Self::resolve_agent_issue_authority_tx(tx, caller_session_id)
-            .or_else(|_| Self::resolve_agent_issue_coordinator_authority_tx(tx, caller_session_id))
-            .map_err(|_| {
-                agent_issue_error(
-                    rsi_common::rpc::AgentIssueErrorCodeV1::AuthorityDenied,
-                    None,
-                    None,
-                )
+        let denied = || {
+            agent_issue_error(
+                rsi_common::rpc::AgentIssueErrorCodeV1::AuthorityDenied,
+                None,
+                None,
+            )
+        };
+        if Self::agent_issue_foreign_project_tx(tx, caller_session_id, project)?.is_none()
+            && let Ok(authority) = Self::resolve_agent_issue_authority_tx(tx, caller_session_id)
+        {
+            return Ok(authority);
+        }
+        match Self::resolve_agent_issue_manager_authority_tx(
+            tx,
+            caller_session_id,
+            project,
+            mutation,
+        ) {
+            Ok(authority) => Ok(authority),
+            Err(DaemonError::InvalidParam(code))
+                if code == rsi_common::global_manager::MANAGER_PROJECT_NOT_IN_SCOPE =>
+            {
+                Err(DaemonError::InvalidParam(code))
+            }
+            Err(_) => Err(denied()),
+        }
+    }
+
+    /// `project` when it names a project other than the caller's own.
+    fn agent_issue_foreign_project_tx(
+        tx: &Transaction<'_>,
+        caller_session_id: Uuid,
+        project: Option<Uuid>,
+    ) -> Result<Option<Uuid>> {
+        let Some(project) = project else {
+            return Ok(None);
+        };
+        Ok(
+            (Self::agent_issue_caller_project_tx(tx, caller_session_id)? != Some(project))
+                .then_some(project),
+        )
+    }
+
+    fn agent_issue_caller_project_tx(
+        tx: &Transaction<'_>,
+        caller_session_id: Uuid,
+    ) -> Result<Option<Uuid>> {
+        let project: Option<Option<String>> = tx
+            .query_row(
+                "SELECT project_id FROM sessions WHERE id=?1",
+                [caller_session_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        project
+            .flatten()
+            .map(|id| {
+                Uuid::parse_str(&id)
+                    .map_err(|_| DaemonError::PolicyDenied("agent_issue_authority_denied".into()))
             })
+            .transpose()
+    }
+
+    /// The manager arms of the guarded Issue authority (#1235): the caller's
+    /// own project's appointed manager (unchanged), then the active global
+    /// seat whose grant covers the target project. The actor's scope version
+    /// is the appointment scope or the global authority epoch, so the CAS
+    /// recheck refuses after a re-appointment, a re-grant or a revoke.
+    pub(super) fn resolve_agent_issue_manager_authority_tx(
+        tx: &Transaction<'_>,
+        caller_session_id: Uuid,
+        project: Option<Uuid>,
+        mutation: bool,
+    ) -> Result<AgentIssueAuthority> {
+        let foreign = Self::agent_issue_foreign_project_tx(tx, caller_session_id, project)?;
+        if foreign.is_none() {
+            if let Ok(authority) =
+                Self::resolve_agent_issue_coordinator_authority_tx(tx, caller_session_id)
+            {
+                return Ok(authority);
+            }
+        }
+        let target = match foreign {
+            Some(project) => project,
+            None => Self::agent_issue_caller_project_tx(tx, caller_session_id)?
+                .ok_or_else(|| DaemonError::PolicyDenied("agent_issue_authority_denied".into()))?,
+        };
+        let global = super::harness_manager_v2::global_issue_authority_on(
+            tx,
+            caller_session_id,
+            target,
+            mutation,
+        );
+        let global = if foreign.is_some() {
+            global?
+        } else {
+            super::harness_manager_v2::uncovered_is_none(global)?
+        };
+        match global {
+            Some(scope_version) => Ok(AgentIssueAuthority {
+                caller_session_id,
+                project_id: target,
+                actor: AgentIssueActor::Manager { scope_version },
+            }),
+            None if foreign.is_some() => Err(DaemonError::InvalidParam(
+                rsi_common::global_manager::MANAGER_PROJECT_NOT_IN_SCOPE.into(),
+            )),
+            None => Err(DaemonError::PolicyDenied(
+                "agent_issue_authority_denied".into(),
+            )),
+        }
     }
 
     /// The current appointed manager (the committed lineage tip of the
@@ -4176,6 +4377,29 @@ impl Store {
                     idempotency_key: idempotency_key.to_string(),
                 }
             }
+            AgentIssueActor::BoundWorker {
+                issue_id,
+                operation_id,
+                epic_id,
+            } => {
+                Self::agent_issue_bound_worker_projection_cas_tx(
+                    tx,
+                    authority,
+                    issue_id,
+                    operation_id,
+                    prior,
+                    next,
+                    operation,
+                )?;
+                // The receipt records the worker as itself under its own
+                // owning Epic (V97 requires one for a session content
+                // update); the actor id is the worker, never the lead.
+                IssueWriteActor::Session {
+                    session_id: authority.caller_session_id,
+                    owning_epic_id: Some(epic_id),
+                    idempotency_key: idempotency_key.to_string(),
+                }
+            }
         };
         issue_projection_written()?;
         let event = build_issue_event(
@@ -4308,6 +4532,158 @@ impl Store {
         Ok(())
     }
 
+    /// #1284 bound-worker CAS: re-resolve the live binding inside this
+    /// immediate transaction (which holds the write lock through commit), so a
+    /// binding that ended or was superseded since admission refuses, then
+    /// apply a content-only row-version UPDATE. Only a body append reaches
+    /// here; any other operation is refused.
+    fn agent_issue_bound_worker_projection_cas_tx(
+        tx: &Transaction<'_>,
+        authority: AgentIssueAuthority,
+        issue_id: Uuid,
+        operation_id: Uuid,
+        prior: &Issue,
+        next: &Issue,
+        operation: IssueEventOperationV1,
+    ) -> Result<()> {
+        use rsi_common::rpc::AgentIssueErrorCodeV1 as Code;
+        // #1545: each refusal names the condition that failed, so the worker
+        // can tell an ended binding from a wrong Issue, a non-append field or
+        // a body that does not extend the current one.
+        let live = Self::live_issue_binding_for_worker_on(tx, authority.caller_session_id)?;
+        if live != Some((authority.project_id, issue_id, operation_id)) {
+            return Err(agent_issue_error(
+                Code::BoundIssueBindingNotLive,
+                None,
+                None,
+            ));
+        }
+        if prior.id != issue_id {
+            return Err(agent_issue_error(Code::BoundIssueWrongIssue, None, None));
+        }
+        if operation != IssueEventOperationV1::ContentUpdated {
+            return Err(agent_issue_bound_field_not_allowed(None));
+        }
+        if !Self::bound_worker_append_only(prior, next) {
+            return Err(agent_issue_error(Code::BoundIssueNotAppendOnly, None, None));
+        }
+        let changed = tx.execute(
+            "UPDATE issues SET body=?1, updated_at=?2, row_version=row_version+1
+             WHERE id=?3 AND project_id=?4 AND row_version=?5",
+            params![
+                &next.body,
+                canonical_timestamp(next.updated_at),
+                prior.id.to_string(),
+                authority.project_id.to_string(),
+                prior.row_version,
+            ],
+        )?;
+        if changed != 1 {
+            let actual = Self::get_issue_in_project_tx(tx, authority.project_id, prior.id)?
+                .map(|issue| issue.row_version);
+            return Err(agent_issue_error(
+                rsi_common::rpc::AgentIssueErrorCodeV1::StaleVersion,
+                Some(prior.row_version),
+                actual,
+            ));
+        }
+        Ok(())
+    }
+
+    /// #1284: `next` differs from `prior` only by text appended to the body.
+    fn bound_worker_append_only(prior: &Issue, next: &Issue) -> bool {
+        next.body.len() > prior.body.len()
+            && next.body.starts_with(prior.body.as_str())
+            && next.title == prior.title
+            && next.labels == prior.labels
+            && next.priority == prior.priority
+            && next.assignee == prior.assignee
+            && next.status == prior.status
+            && next.archived_at == prior.archived_at
+            && next.closed_at == prior.closed_at
+    }
+
+    /// The #1284 bound-worker arm of `AgentUpdateIssue`, tried only after the
+    /// lead and manager arms refused. The caller must hold a live binding,
+    /// name its bound Issue in the bound project, and send a body-only request
+    /// (no title, labels, priority or assignee change). A caller that is not a
+    /// bound worker keeps the original refusal (`agent_issue_authority_denied`);
+    /// a bound worker gets the `bound_issue_*` code naming what failed (#1545).
+    fn resolve_agent_issue_bound_worker_authority_tx(
+        tx: &Transaction<'_>,
+        caller_session_id: Uuid,
+        request: &AgentUpdateIssueRequestV1,
+    ) -> Result<Option<AgentIssueAuthority>> {
+        use rsi_common::rpc::{
+            AgentIssueErrorCodeV1 as Code, AgentIssueValidationFieldV1 as Field,
+        };
+        let Some((project_id, issue_id, operation_id)) =
+            Self::live_issue_binding_for_worker_on(tx, caller_session_id)?
+        else {
+            // A worker that was bound but whose binding ended (it finished, or
+            // a later launch of the Issue superseded it) is told so; any
+            // other caller keeps the plain authority refusal.
+            if Self::bound_issue_for_worker_on(tx, caller_session_id)?.is_some() {
+                return Err(agent_issue_error(
+                    Code::BoundIssueBindingNotLive,
+                    None,
+                    None,
+                ));
+            }
+            return Ok(None);
+        };
+        if request
+            .project_id
+            .is_some_and(|project| project != project_id)
+        {
+            return Err(agent_issue_error(Code::BoundIssueWrongIssue, None, None));
+        }
+        let disallowed = if request.title.is_some() {
+            Some(Field::Title)
+        } else if request.labels.is_some() {
+            Some(Field::Labels)
+        } else if request.priority.is_some() {
+            Some(Field::Priority)
+        } else if request.clear_priority {
+            Some(Field::ClearPriority)
+        } else if request.assignee.is_some() {
+            Some(Field::Assignee)
+        } else if request.clear_assignee {
+            Some(Field::ClearAssignee)
+        } else if request.body.is_none() {
+            Some(Field::Body)
+        } else {
+            None
+        };
+        if disallowed.is_some() {
+            return Err(agent_issue_bound_field_not_allowed(disallowed));
+        }
+        let Ok(target) = Self::resolve_agent_issue_target_tx(
+            tx,
+            project_id,
+            request.issue_id,
+            request.display_number,
+        ) else {
+            return Err(agent_issue_error(Code::BoundIssueWrongIssue, None, None));
+        };
+        if target != issue_id {
+            return Err(agent_issue_error(Code::BoundIssueWrongIssue, None, None));
+        }
+        let Some(epic_id) = Self::owning_epic_in_project_tx(tx, caller_session_id, project_id)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(AgentIssueAuthority {
+            caller_session_id,
+            project_id,
+            actor: AgentIssueActor::BoundWorker {
+                issue_id,
+                operation_id,
+                epic_id,
+            },
+        }))
+    }
+
     /// Manager CAS: re-resolve the `IssueCoordinate` grant against the live
     /// appointment scope inside this immediate transaction (which holds the
     /// write lock through commit), then apply a plain row-version UPDATE. There
@@ -4320,13 +4696,17 @@ impl Store {
         next: &Issue,
         operation: IssueEventOperationV1,
     ) -> Result<()> {
-        let still_authorized =
-            Self::resolve_agent_issue_coordinator_authority_tx(tx, authority.caller_session_id)
-                .ok()
-                .is_some_and(|current| {
-                    current.project_id == authority.project_id
-                        && current.actor == AgentIssueActor::Manager { scope_version }
-                });
+        let still_authorized = Self::resolve_agent_issue_manager_authority_tx(
+            tx,
+            authority.caller_session_id,
+            Some(authority.project_id),
+            true,
+        )
+        .ok()
+        .is_some_and(|current| {
+            current.project_id == authority.project_id
+                && current.actor == AgentIssueActor::Manager { scope_version }
+        });
         if !still_authorized {
             return Err(agent_issue_error(
                 rsi_common::rpc::AgentIssueErrorCodeV1::AuthorityDenied,
@@ -4447,7 +4827,8 @@ impl Store {
             )
         })?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let authority = Self::resolve_agent_issue_authority(&tx, caller_session_id)?;
+        let authority =
+            Self::resolve_agent_issue_authority(&tx, caller_session_id, request.project_id, false)?;
         let status = request.status.map(|status| status.as_str().to_string());
         let archive_filter = match request.archive {
             IssueArchiveFilterV1::Active => 0,
@@ -4557,7 +4938,12 @@ impl Store {
                 None,
             )
         };
-        let authority = match Self::resolve_agent_issue_authority(tx, caller_session_id) {
+        let authority = match Self::resolve_agent_issue_authority(
+            tx,
+            caller_session_id,
+            request.project_id,
+            false,
+        ) {
             Ok(authority) => authority,
             Err(error) => {
                 let (project_id, bound_issue) =
@@ -4679,7 +5065,8 @@ impl Store {
             )
         })?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let authority = Self::resolve_agent_issue_authority(&tx, caller_session_id)?;
+        let authority =
+            Self::resolve_agent_issue_authority(&tx, caller_session_id, request.project_id, false)?;
         if Self::get_issue_in_project_tx(&tx, authority.project_id, request.issue_id)?.is_none() {
             return Err(agent_issue_error(
                 rsi_common::rpc::AgentIssueErrorCodeV1::NotFoundInScope,
@@ -4770,7 +5157,21 @@ impl Store {
             )
         })?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let authority = Self::resolve_agent_issue_authority(&tx, caller_session_id)?;
+        let authority = match Self::resolve_agent_issue_authority(
+            &tx,
+            caller_session_id,
+            request.project_id,
+            true,
+        ) {
+            Ok(authority) => authority,
+            // #1284: a live Issue-bound worker appends to its own Issue.
+            Err(error) => Self::resolve_agent_issue_bound_worker_authority_tx(
+                &tx,
+                caller_session_id,
+                request,
+            )?
+            .ok_or(error)?,
+        };
         let result = Self::agent_update_issue_in_tx(&tx, authority, request)?;
         issue_write_before_commit()?;
         tx.commit()?;
@@ -4838,7 +5239,11 @@ impl Store {
                 None,
             ));
         }
-        if !matches!(prior.status, IssueStatus::Open | IssueStatus::InProgress) {
+        // #1595: a live bound worker's append-only handoff (checked again in
+        // `agent_issue_bound_worker_projection_cas_tx`) still lands after the
+        // manager closed its Issue; every other actor keeps the fence.
+        let bound_worker = matches!(authority.actor, AgentIssueActor::BoundWorker { .. });
+        if !bound_worker && !matches!(prior.status, IssueStatus::Open | IssueStatus::InProgress) {
             return Err(agent_issue_error(
                 rsi_common::rpc::AgentIssueErrorCodeV1::InvalidTransition,
                 None,
@@ -4907,7 +5312,8 @@ impl Store {
             )
         })?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let authority = Self::resolve_agent_issue_authority(&tx, caller_session_id)?;
+        let authority =
+            Self::resolve_agent_issue_authority(&tx, caller_session_id, request.project_id, true)?;
         let result = Self::agent_update_issue_status_in_tx(&tx, authority, request)?;
         issue_write_before_commit()?;
         tx.commit()?;
@@ -5014,13 +5420,14 @@ impl Store {
     fn agent_archive_state_change(
         &self,
         caller_session_id: Uuid,
+        project: Option<Uuid>,
         issue_id: Uuid,
         expected_row_version: i64,
         idempotency_key: &str,
         restore: bool,
     ) -> Result<AgentIssueMutationResultV1> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let authority = Self::resolve_agent_issue_authority(&tx, caller_session_id)?;
+        let authority = Self::resolve_agent_issue_authority(&tx, caller_session_id, project, true)?;
         let operation = if restore {
             IssueEventOperationV1::Restored
         } else {
@@ -5119,6 +5526,7 @@ impl Store {
         })?;
         self.agent_archive_state_change(
             caller_session_id,
+            request.project_id,
             request.issue_id,
             request.expected_row_version,
             &request.idempotency_key,
@@ -5140,6 +5548,7 @@ impl Store {
         })?;
         self.agent_archive_state_change(
             caller_session_id,
+            request.project_id,
             request.issue_id,
             request.expected_row_version,
             &request.idempotency_key,

@@ -80,6 +80,11 @@ pub struct AgentTopologyUpsertRequestV1 {
     #[serde(default)]
     pub validate_only: bool,
     pub idempotency_key: String,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl AgentTopologyUpsertRequestV1 {
@@ -137,6 +142,11 @@ pub struct AgentTopologyListRequestV1 {
     pub cursor: Option<String>,
     #[serde(default)]
     pub limit: Option<u32>,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl AgentTopologyListRequestV1 {
@@ -228,6 +238,11 @@ pub struct AgentTopologyExecuteRequestV1 {
     #[serde(default)]
     pub base_commit: Option<String>,
     pub idempotency_key: String,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl AgentTopologyExecuteRequestV1 {
@@ -279,6 +294,11 @@ pub struct AgentTopologyGetExecutionRequestV1 {
     pub after_sequence: Option<u64>,
     #[serde(default)]
     pub limit: Option<u32>,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl AgentTopologyGetExecutionRequestV1 {
@@ -329,6 +349,11 @@ pub struct AgentTopologyInterruptRequestV1 {
     pub execution_id: Uuid,
     pub expected_row_version: i64,
     pub idempotency_key: String,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl AgentTopologyInterruptRequestV1 {
@@ -397,6 +422,7 @@ mod tests {
         });
         assert!(serde_json::from_value::<AgentTopologyInterruptRequestV1>(spoof).is_err());
         let execute = AgentTopologyExecuteRequestV1 {
+            project_id: None,
             topology_id: Uuid::new_v4(),
             expected_digest: format!("sha256:{}", "a".repeat(64)),
             epic_id: Uuid::new_v4(),

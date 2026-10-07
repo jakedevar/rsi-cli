@@ -442,16 +442,17 @@ fn codegraph_operator_reads_stay_outside_attributed_agent_surface() {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[test]
 fn claim_boundary_mail_is_hook_only_not_cataloged() {
-    assert!(agent_gate::is_allowed_for_attributed_caller(
-        "ClaimBoundaryMail"
-    ));
-    assert!(!agent_gate::AGENT_VERBS.contains(&"ClaimBoundaryMail"));
-    assert!(!agent_gate::READ_VERBS.contains(&"ClaimBoundaryMail"));
-    assert!(
-        !rsi_common::agent_control_schema::agent_control_catalog_v1()
-            .iter()
-            .any(|descriptor| descriptor.method == "ClaimBoundaryMail")
-    );
+    // #1183: the hook's confirmation verb has the same audience.
+    for verb in ["ClaimBoundaryMail", "ConfirmBoundaryMail"] {
+        assert!(agent_gate::is_allowed_for_attributed_caller(verb));
+        assert!(!agent_gate::AGENT_VERBS.contains(&verb));
+        assert!(!agent_gate::READ_VERBS.contains(&verb));
+        assert!(
+            !rsi_common::agent_control_schema::agent_control_catalog_v1()
+                .iter()
+                .any(|descriptor| descriptor.method == verb)
+        );
+    }
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -4651,6 +4652,9 @@ async fn manager_rpc_appointment_is_operator_only() {
         "AnswerHarnessManagerDecision",
         "ConfigureGlobalManager",
         "GetGlobalManager",
+        "GetGlobalManagerWorkspace",
+        "GetManagerNodeWorkspace",
+        "GetFleetOverview",
         "RevokeGlobalManager",
         "RequestOperatorRestart",
         "GetOperatorRestart",
@@ -5902,6 +5906,49 @@ async fn provider_credential_methods_are_operator_only_and_attributed_denied() {
     );
 }
 
+/// #1407: the first-run Bedrock setup check is operator-only: absent from
+/// every agent-facing catalog and refused for a tokened caller before any
+/// Bedrock call, with a secret-free error.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn verify_bedrock_setup_is_operator_only_and_attributed_denied() {
+    let fixture = recursive_dag_rpc_fixture();
+    let catalog = rsi_common::agent_control_schema::agent_control_catalog_v1();
+    for method in rsi_common::provider_profile::OPERATOR_METHODS {
+        assert!(!agent_gate::AGENT_VERBS.contains(&method), "{method}");
+        assert!(!agent_gate::READ_VERBS.contains(&method), "{method}");
+        assert!(
+            !agent_gate::is_allowed_for_attributed_caller(method),
+            "{method}"
+        );
+        for descriptor in catalog {
+            assert_ne!(descriptor.method, method, "agent CLI catalog: {method}");
+        }
+        let mut request = RpcRequest::new(
+            method,
+            serde_json::json!({"model": "bedrock-api-key-rpc-canary"}),
+        );
+        request.session_token = Some("some-token".to_string());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("expected response for {method}");
+        };
+        assert!(response.result.is_none(), "{method}");
+        let error = response
+            .error
+            .unwrap_or_else(|| panic!("attributed call to {method} must be denied"));
+        assert!(
+            error
+                .message
+                .contains("not available to session-attributed callers"),
+            "{method}: {}",
+            error.message
+        );
+        assert!(!error.message.contains("bedrock-api-key-rpc-canary"));
+    }
+}
+
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[tokio::test]
@@ -6408,6 +6455,64 @@ async fn efficiency_metrics_rpc_is_operator_only_and_not_agent_cataloged() {
     );
 }
 
+/// #1176: abandoning a blocked rotation moves custody and a seat, so it is an
+/// operator-only method: not an agent or read verb, refused for an attributed
+/// caller, and dispatched for the operator (who gets the typed refusal for a
+/// session with nothing blocked).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn abandon_blocked_rotation_is_operator_only_and_dispatched_for_the_operator() {
+    let catalog = rsi_common::agent_control_schema::agent_control_catalog_v1();
+    assert!(
+        !catalog
+            .iter()
+            .any(|entry| entry.method == "AbandonBlockedRotation")
+    );
+    for source in [
+        include_str!("../tool_registry.rs"),
+        include_str!("../session/harness/tools/rsi_control.rs"),
+    ] {
+        assert!(!source.contains("AbandonBlockedRotation"));
+        assert!(!source.contains("rsi_control_abandon_blocked_rotation"));
+    }
+    assert!(!agent_gate::AGENT_VERBS.contains(&"AbandonBlockedRotation"));
+    assert!(!agent_gate::READ_VERBS.contains(&"AbandonBlockedRotation"));
+    assert!(!agent_gate::is_allowed_for_attributed_caller(
+        "AbandonBlockedRotation"
+    ));
+    let fixture = recursive_dag_rpc_fixture();
+    let params = serde_json::json!({
+        "session_id": Uuid::new_v4(),
+        "idempotency_key": "rpc-1176",
+    });
+    let mut attributed = RpcRequest::new("AbandonBlockedRotation", params.clone());
+    attributed.session_token = Some("some-token".to_string());
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&attributed).await
+    else {
+        panic!("expected response for an attributed AbandonBlockedRotation");
+    };
+    let error = response.error.expect("attributed abandon must be denied");
+    assert_eq!(error.code, INVALID_PARAMS);
+    assert!(
+        error
+            .message
+            .contains("not available to session-attributed callers")
+    );
+    let operator = RpcRequest::new("AbandonBlockedRotation", params);
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&operator).await
+    else {
+        panic!("expected response for the operator's AbandonBlockedRotation");
+    };
+    let error = response
+        .error
+        .expect("nothing is blocked for an unknown session");
+    assert!(
+        error.message.contains("rotation_not_blocked"),
+        "{}",
+        error.message
+    );
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[test]
 fn agent_job_verbs_are_agent_cataloged_and_not_read_verbs() {
@@ -6448,17 +6553,19 @@ async fn rolling_queue_enqueue_is_agent_cataloged_and_settings_stay_operator_onl
             .contains("not available to session-attributed callers")
     );
 
-    // The operator surface round-trips the three settings.
+    // The operator surface round-trips the queue settings.
     let initial = call_rpc(&fixture.server, "GetRollingQueue", serde_json::Value::Null).await;
     let initial = initial.result.expect("operator queue read");
     assert_eq!(initial["enabled"], false);
     assert_eq!(initial["batch_size"], 4);
     assert_eq!(initial["speculation_depth"], 1);
+    assert_eq!(initial["gate_timeout_mins"], 360);
     assert_eq!(initial["entries"], serde_json::json!([]));
     for (field, value) in [
         ("rolling_queue_enabled", serde_json::json!(true)),
         ("rolling_queue_batch_size", serde_json::json!(8)),
         ("rolling_queue_speculation_depth", serde_json::json!(2)),
+        ("rolling_queue_gate_timeout_mins", serde_json::json!(120)),
     ] {
         let response = call_rpc(
             &fixture.server,
@@ -6473,10 +6580,12 @@ async fn rolling_queue_enqueue_is_agent_cataloged_and_settings_stay_operator_onl
     assert_eq!(updated["enabled"], true);
     assert_eq!(updated["batch_size"], 8);
     assert_eq!(updated["speculation_depth"], 2);
+    assert_eq!(updated["gate_timeout_mins"], 120);
     for (field, value) in [
         ("rolling_queue_batch_size", serde_json::json!(0)),
         ("rolling_queue_batch_size", serde_json::json!(9)),
         ("rolling_queue_speculation_depth", serde_json::json!(3)),
+        ("rolling_queue_gate_timeout_mins", serde_json::json!(10)),
         ("rolling_queue_enabled", serde_json::json!("on")),
     ] {
         let response = call_rpc(
@@ -6491,6 +6600,88 @@ async fn rolling_queue_enqueue_is_agent_cataloged_and_settings_stay_operator_onl
             "{field}"
         );
     }
+}
+
+/// #1254: the worker baton cap is an operator setting with an RPC surface:
+/// it round-trips through UpdateDaemonConfig/GetDaemonConfig with its
+/// overrides, persists, refuses values outside its two ranges and stays out
+/// of the agent surface.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn worker_context_cap_round_trips_through_the_operator_rpc_inside_its_bounds() {
+    for operator in ["GetDaemonConfig", "UpdateDaemonConfig"] {
+        assert!(!agent_gate::AGENT_VERBS.contains(&operator), "{operator}");
+        assert!(!agent_gate::READ_VERBS.contains(&operator), "{operator}");
+    }
+    let fixture = recursive_dag_rpc_fixture();
+    let read = || async {
+        call_rpc(&fixture.server, "GetDaemonConfig", serde_json::Value::Null)
+            .await
+            .result
+            .expect("config read")
+    };
+    assert_eq!(read().await["worker_context_cap_tokens"], 60);
+    for (field, value) in [
+        ("worker_context_cap_tokens", serde_json::json!(50)),
+        ("worker_context_cap_tokens", serde_json::json!(250_000)),
+        ("worker_context_cap.Claude", serde_json::json!(70)),
+        ("worker_context_cap.Codex/gpt-6-astra", serde_json::json!(0)),
+    ] {
+        let response = call_rpc(
+            &fixture.server,
+            "UpdateDaemonConfig",
+            serde_json::json!({"field": field, "value": value}),
+        )
+        .await;
+        assert!(response.error.is_none(), "{field}: {:?}", response.error);
+    }
+    let config = read().await;
+    assert_eq!(config["worker_context_cap_tokens"], 250_000);
+    assert_eq!(config["worker_context_cap.Claude"], 70);
+    assert_eq!(config["worker_context_cap.Codex/gpt-6-astra"], 0);
+    let store = fixture.manager.store.lock().await;
+    assert_eq!(
+        store
+            .get_daemon_setting("worker_context_cap_tokens")
+            .unwrap()
+            .as_deref(),
+        Some("250000")
+    );
+    assert_eq!(
+        store
+            .get_daemon_setting("worker_context_cap.Claude")
+            .unwrap()
+            .as_deref(),
+        Some("70")
+    );
+    drop(store);
+    assert_eq!(
+        fixture.runtime_config.worker_context_cap(
+            rsi_common::types::SessionProvider::Claude,
+            Some("claude-opus-5-5"),
+            1_000_000
+        ),
+        Some(700_000)
+    );
+    for value in [
+        serde_json::json!(101),
+        serde_json::json!(31_999),
+        serde_json::json!(2_000_001),
+        serde_json::json!("sixty"),
+    ] {
+        let response = call_rpc(
+            &fixture.server,
+            "UpdateDaemonConfig",
+            serde_json::json!({"field": "worker_context_cap_tokens", "value": value}),
+        )
+        .await;
+        assert_eq!(
+            response.error.expect("rejected").code,
+            INVALID_PARAMS,
+            "{value}"
+        );
+    }
+    assert_eq!(read().await["worker_context_cap_tokens"], 250_000);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -7011,6 +7202,115 @@ async fn operator_can_queue_a_fenced_model_update() {
     assert_eq!(receipt["new_effort"], "high");
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn session_model_switch_options_report_fence_and_the_allowlist_gates_queueing() {
+    let fixture = recursive_dag_rpc_fixture();
+    let method = "GetSessionModelSwitchOptions";
+    assert!(!agent_gate::AGENT_VERBS.contains(&method));
+    assert!(!agent_gate::READ_VERBS.contains(&method));
+
+    let session_id = Uuid::new_v4();
+    let invocation_id = Uuid::new_v4();
+    let mut session = mk_agent_test_session(
+        session_id,
+        rsi_common::types::SessionKind::Standard,
+        None,
+        None,
+    );
+    session.model = Some("claude-sonnet-4-5".to_string());
+    session.effort = Some("medium".to_string());
+    {
+        let store = fixture.manager.store();
+        let store = store.lock().await;
+        store.insert_session(&session).expect("insert session");
+        store
+            .set_session_model_invocation(session_id, Some(invocation_id))
+            .expect("set invocation fence");
+    }
+
+    let response = call_rpc(
+        &fixture.server,
+        method,
+        serde_json::json!({"session_id": session_id}),
+    )
+    .await;
+    assert!(response.error.is_none(), "{response:?}");
+    let options: rsi_common::rpc::SessionModelSwitchOptions =
+        serde_json::from_value(response.result.expect("options")).expect("typed options");
+    assert!(options.switchable, "{:?}", options.unavailable_reason);
+    assert!(options.keeps_context);
+    assert_eq!(options.model.as_deref(), Some("claude-sonnet-4-5"));
+    assert_eq!(options.effort.as_deref(), Some("medium"));
+    assert_eq!(options.model_invocation_id, Some(invocation_id));
+    assert!(options.model_allowlist.is_empty());
+
+    fixture
+        .runtime_config
+        .update_field(
+            "launch_model_allowlist",
+            &serde_json::json!(["claude-sonnet-4-5"]),
+        )
+        .expect("set allowlist");
+    let response = call_rpc(
+        &fixture.server,
+        method,
+        serde_json::json!({"session_id": session_id}),
+    )
+    .await;
+    let options: rsi_common::rpc::SessionModelSwitchOptions =
+        serde_json::from_value(response.result.expect("options")).expect("typed options");
+    assert_eq!(
+        options.model_allowlist,
+        vec!["claude-sonnet-4-5".to_string()]
+    );
+
+    let refused = call_rpc(
+        &fixture.server,
+        "QueueSessionModelUpdate",
+        serde_json::json!({
+            "session_id": session_id,
+            "expected_model_invocation_id": invocation_id,
+            "new_model": "claude-opus-4-1",
+            "new_effort": "high",
+            "idempotency_key": "allowlist-refused",
+        }),
+    )
+    .await;
+    assert!(
+        refused.error.is_some(),
+        "a model off the allowlist must be refused at queue time"
+    );
+    let admitted = call_rpc(
+        &fixture.server,
+        "QueueSessionModelUpdate",
+        serde_json::json!({
+            "session_id": session_id,
+            "expected_model_invocation_id": invocation_id,
+            "new_model": "claude-sonnet-4-5",
+            "new_effort": "high",
+            "idempotency_key": "allowlist-admitted",
+        }),
+    )
+    .await;
+    assert!(admitted.error.is_none(), "{admitted:?}");
+    let response = call_rpc(
+        &fixture.server,
+        method,
+        serde_json::json!({"session_id": session_id}),
+    )
+    .await;
+    let options: rsi_common::rpc::SessionModelSwitchOptions =
+        serde_json::from_value(response.result.expect("options")).expect("typed options");
+    assert_eq!(
+        options.pending,
+        Some(rsi_common::rpc::PendingSessionModelUpdate {
+            model: "claude-sonnet-4-5".into(),
+            effort: Some("high".into()),
+        })
+    );
+}
+
 /// P-003/D04: the 8 local-issue-tracker operator verbs are deliberately
 /// absent from `AGENT_VERBS`/`READ_VERBS` — operator-only is enforced
 /// for free by the pre-dispatch default-deny gate. This never reaches
@@ -7115,19 +7415,35 @@ async fn agent_issue_rpc_lead_can_get_while_generic_issue_get_stays_denied() {
         serde_json::from_value(response.result.unwrap()).unwrap();
     assert_eq!(returned.id, issue.id);
 
-    let mut malformed = RpcRequest::new(
+    // #1235: project_id is a target, never identity. The caller's own
+    // project serves exactly as an omitted one does.
+    let mut own_project = RpcRequest::new(
         "AgentGetIssue",
         serde_json::json!({"issue_id":issue.id,"project_id":project.id}),
     );
-    malformed.session_token = Some(token.clone());
-    let HandleResult::Response(response) = fixture.server.handle_request_inner(&malformed).await
+    own_project.session_token = Some(token.clone());
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&own_project).await
     else {
-        panic!("expected malformed AgentGetIssue response");
+        panic!("expected own-project AgentGetIssue response");
     };
-    let error = response.error.expect("spoofed project must be rejected");
-    assert_eq!(
-        error.data.unwrap()["code"],
-        serde_json::json!("invalid_request")
+    assert!(response.error.is_none(), "{response:?}");
+    let returned: rsi_common::types::Issue =
+        serde_json::from_value(response.result.unwrap()).unwrap();
+    assert_eq!(returned.id, issue.id);
+    // Another project is outside every arm of a lead and is refused.
+    let mut spoofed = RpcRequest::new(
+        "AgentGetIssue",
+        serde_json::json!({"issue_id":issue.id,"project_id":Uuid::new_v4()}),
+    );
+    spoofed.session_token = Some(token.clone());
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&spoofed).await
+    else {
+        panic!("expected spoofed AgentGetIssue response");
+    };
+    let error = response.error.expect("a foreign project must be rejected");
+    assert!(
+        format!("{error:?}").contains("manager_project_not_in_scope"),
+        "{error:?}"
     );
 
     let initial_row_version = issue.row_version;
@@ -7137,6 +7453,7 @@ async fn agent_issue_rpc_lead_can_get_while_generic_issue_get_stays_denied() {
             .agent_list_issue_events(
                 caller_id,
                 &rsi_common::types::IssueEventPageRequestV1 {
+                    project_id: None,
                     issue_id: issue.id,
                     after_sequence: 0,
                     limit: None,
@@ -7195,6 +7512,7 @@ async fn agent_issue_rpc_lead_can_get_while_generic_issue_get_stays_denied() {
                 .agent_list_issue_events(
                     caller_id,
                     &rsi_common::types::IssueEventPageRequestV1 {
+                        project_id: None,
                         issue_id: issue.id,
                         after_sequence: 0,
                         limit: None,
@@ -8870,6 +9188,52 @@ async fn agent_send_message_rpc_entry_point_is_token_bound_and_strict() {
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[tokio::test]
+async fn launch_session_refuses_the_removed_taskrabbit_kind_before_any_side_effect() {
+    let fixture = recursive_dag_rpc_fixture();
+    let before = fixture
+        .manager
+        .store()
+        .lock()
+        .await
+        .load_sessions()
+        .expect("load sessions")
+        .len();
+    // A non-existent working dir would fail path resolution; the kind refusal
+    // must win because it runs before any path or custody work.
+    let response = call_rpc(
+        &fixture.server,
+        "LaunchSession",
+        serde_json::json!({
+            "query": "one-shot",
+            "provider": "Claude",
+            "tags": ["legacy"],
+            "session_kind": "TaskRabbit",
+            "working_dir": "/nonexistent/taskrabbit-refusal",
+        }),
+    )
+    .await;
+    let error = response.error.expect("TaskRabbit launch is refused");
+    assert_eq!(error.code, INVALID_PARAMS, "{}", error.message);
+    assert!(
+        error
+            .message
+            .contains("TaskRabbit sessions were removed; launch a Standard session"),
+        "{}",
+        error.message
+    );
+    let after = fixture
+        .manager
+        .store()
+        .lock()
+        .await
+        .load_sessions()
+        .expect("load sessions")
+        .len();
+    assert_eq!(before, after, "refusal creates no session row");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
 async fn agent_gate_unattributed_launch_session_is_unaffected() {
     // (c) unattributed TUI LaunchSession unaffected by the gate — it may
     // still fail validation for unrelated reasons (e.g. missing query),
@@ -10291,7 +10655,11 @@ async fn agent_successor_in_process_rpc_server_unix_socket_harness_restart_fixtu
     use rsi_common::types::{SessionKind, SessionStatus};
     use std::sync::atomic::Ordering;
 
-    let root = tempfile::TempDir::new().expect("successor fixture root");
+    // The successor launch allocates a sandbox, and sandbox execution scratch
+    // refuses a root on tmpfs/ramfs. The lander's test gate runs with TMPDIR on
+    // /dev/shm, so `TempDir::new()` here made the reconcile fail with
+    // ExecutionScratchUnavailable before the injected commit fault (#1221).
+    let root = crate::test_support::disk_backed_tempdir("successor-fixture-");
     initialize_successor_fixture_repository(root.path());
     let first_daemon = successor_unix_socket_daemon_fixture(root.path());
     let epic_id = Uuid::new_v4();
@@ -10450,7 +10818,8 @@ async fn agent_successor_in_process_rpc_server_unix_socket_harness_restart_fixtu
     assert!(
         injected
             .to_string()
-            .contains("injected successor authority commit fault")
+            .contains("injected successor authority commit fault"),
+        "{injected}"
     );
     {
         let store = restarted_daemon.manager.store().lock().await;
@@ -18096,6 +18465,7 @@ fn every_non_agent_dispatch_arm_has_its_frozen_audience() {
         ("GetConversationsSince", RpcVerbAudience::Read),
         ("GetTurnMetrics", RpcVerbAudience::Read),
         ("ClaimBoundaryMail", RpcVerbAudience::Hook),
+        ("ConfirmBoundaryMail", RpcVerbAudience::Hook),
     ];
     let arms = dispatch_arm_methods();
     for (method, _) in FROZEN {
@@ -18341,7 +18711,9 @@ async fn operator_rpc_manager_tree_snapshots_pages_and_reports_counts() {
     assert!(error.is_none(), "{error:?}");
     let full = full.unwrap();
     let kinds: Vec<_> = full.rows.iter().map(|r| r.kind).collect();
-    assert_eq!(kinds[0], ManagerTreeKindV1::Global);
+    // #1236: the global grant renders as its portfolio node's row.
+    assert_eq!(kinds[0], ManagerTreeKindV1::Portfolio);
+    assert_eq!(full.rows[0].tier_label.as_deref(), Some("global"));
     assert_eq!(full.total_rows, full.rows.len() as u64);
     assert_eq!(full.global_grant_version, Some(1));
     assert!(full.complete);
@@ -18403,4 +18775,990 @@ async fn operator_rpc_manager_tree_snapshots_pages_and_reports_counts() {
             .message
             .contains("manager_tree_invalid_request")
     );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn operator_rpc_global_manager_workspace_reports_grant_seat_and_portfolio() {
+    use rsi_common::global_manager::GlobalManagerWorkspaceV1;
+    use rsi_common::harness_manager_v2::{ManagerLaunchChoiceV2, ManagerPolicyV2};
+    use rsi_common::types::{Project, SessionKind, SessionProvider};
+    let fixture = recursive_dag_rpc_fixture();
+    let project = issue_rpc_project_id();
+    let project2 = Uuid::new_v4();
+    let (pm, global_seat) = (Uuid::new_v4(), Uuid::new_v4());
+    let read = || {
+        let server = &fixture.server;
+        async move {
+            let response =
+                call_rpc(server, "GetGlobalManagerWorkspace", serde_json::json!({})).await;
+            assert!(response.error.is_none(), "{:?}", response.error);
+            serde_json::from_value::<GlobalManagerWorkspaceV1>(response.result.unwrap()).unwrap()
+        }
+    };
+    // Never appointed: an empty snapshot, not an error.
+    let empty = read().await;
+    assert_eq!(empty, GlobalManagerWorkspaceV1::default());
+    {
+        let store = fixture.manager.store().lock().await;
+        store
+            .insert_project(&Project {
+                id: project2,
+                name: "Second project".into(),
+                path: None,
+                description: None,
+                color: Project::DEFAULT_COLOR.to_string(),
+                context_files: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        for (id, in_project) in [(pm, Some(project)), (global_seat, Some(project2))] {
+            let mut session = mk_agent_test_session(id, SessionKind::Standard, None, None);
+            session.project_id = in_project;
+            store.insert_session(&session).unwrap();
+        }
+    }
+    let appointed = call_rpc(&fixture.server, "ConfigureHarnessManager", serde_json::json!({
+        "project_id":project,"session_id":pm,"epic_ids":null,"group_ids":[],"expected_row_version":0
+    })).await;
+    assert!(appointed.error.is_none(), "{:?}", appointed.error);
+    let granted = call_rpc(
+        &fixture.server,
+        "ConfigureGlobalManager",
+        serde_json::json!({
+            "session_id": global_seat,
+            "project_ids": [project, project2],
+            "allowed_launches": [ManagerLaunchChoiceV2 {
+                provider: SessionProvider::Claude,
+                model: "claude-opus-5-5".into(),
+                effort: Some("high".into()),
+            }],
+            "project_policy": ManagerPolicyV2::default(),
+            "expected_grant_version": 0,
+            "idempotency_key": "workspace-global",
+        }),
+    )
+    .await;
+    assert!(granted.error.is_none(), "{:?}", granted.error);
+
+    let active = read().await;
+    let grant = active.grant.expect("active grant");
+    assert_eq!(grant.state, "active");
+    let seat = active.seat.expect("seat session");
+    assert_eq!(seat.session_id, global_seat);
+    assert_eq!(seat.project_id, Some(project2));
+    assert_eq!(active.projects.len(), 2);
+    let first = &active.projects[0];
+    assert_eq!(first.overview.project_id, project);
+    assert_eq!(
+        first.overview.manager.as_ref().map(|seat| seat.session_id),
+        Some(pm)
+    );
+    assert!(!first.scope_revoked);
+    assert_eq!(active.projects[1].overview.project_id, project2);
+    assert_eq!(active.projects[1].overview.manager, None);
+    assert!(active.missing_project_ids.is_empty());
+
+    let revoked = call_rpc(
+        &fixture.server,
+        "RevokeGlobalManager",
+        serde_json::json!({"expected_grant_version": grant.grant_version, "idempotency_key": "workspace-revoke"}),
+    )
+    .await;
+    assert!(revoked.error.is_none(), "{:?}", revoked.error);
+    let after = read().await;
+    let last = after.grant.expect("the revoked grant stays visible");
+    assert_eq!(last.state, "revoked");
+    assert_eq!(last.grant_id, grant.grant_id);
+    assert_eq!(after.projects.len(), 2);
+}
+
+/// #1239: the delegation verbs are attributed agent write verbs (never read
+/// verbs); the operator portfolio methods stay out (pinned below).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn delegation_verbs_are_agent_write_verbs() {
+    for method in [
+        "AgentManagerAppointChild",
+        "AgentManagerRevokeChild",
+        "AgentGlobalAppointManager",
+    ] {
+        assert!(agent_gate::AGENT_VERBS.contains(&method), "{method}");
+        assert!(!agent_gate::READ_VERBS.contains(&method), "{method}");
+        assert!(
+            agent_gate::is_allowed_for_attributed_caller(method),
+            "{method}"
+        );
+    }
+}
+
+/// #1236 catalog pin: every portfolio operator method is absent from every
+/// agent-facing catalog and a tokened caller is refused before dispatch.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn portfolio_node_methods_are_operator_only_and_attributed_denied() {
+    let fixture = recursive_dag_rpc_fixture();
+    let catalog = rsi_common::agent_control_schema::agent_control_catalog_v1();
+    for method in rsi_common::portfolio_nodes::OPERATOR_METHODS {
+        assert!(!agent_gate::AGENT_VERBS.contains(&method), "{method}");
+        assert!(!agent_gate::READ_VERBS.contains(&method), "{method}");
+        assert!(
+            !agent_gate::is_allowed_for_attributed_caller(method),
+            "{method}"
+        );
+        for descriptor in catalog {
+            assert_ne!(descriptor.method, method, "agent CLI catalog: {method}");
+            if let Some(tool) = descriptor.native_tool {
+                assert!(
+                    !tool.name().to_ascii_lowercase().contains("portfolio_node"),
+                    "native tool {} exposes {method}",
+                    tool.name()
+                );
+            }
+        }
+        let mut request = RpcRequest::new(
+            method,
+            serde_json::json!({"node_id": null, "tier_label": "global"}),
+        );
+        request.session_token = Some("manager-token".to_string());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("expected response for {method}");
+        };
+        assert!(response.result.is_none(), "{method}");
+        let error = response
+            .error
+            .unwrap_or_else(|| panic!("attributed call to {method} must be denied"));
+        assert_eq!(error.code, INVALID_PARAMS, "method: {method}");
+        assert!(
+            error
+                .message
+                .contains("not available to session-attributed callers"),
+            "{method}: {}",
+            error.message
+        );
+    }
+}
+
+/// #1238 catalog pin: the operator escalation queue and notice methods are
+/// absent from every agent-facing catalog and refused to a tokened caller;
+/// I5: so are the human-answer methods (the gate is by method, so it holds
+/// for every tier's seat). `AgentReportUp`/`AgentSendDown` are agent write
+/// verbs, never read verbs.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn tier_routing_operator_methods_and_human_answers_are_attributed_denied() {
+    let fixture = recursive_dag_rpc_fixture();
+    let catalog = rsi_common::agent_control_schema::agent_control_catalog_v1();
+    let operator_only = rsi_common::manager_tier_routing::OPERATOR_METHODS
+        .into_iter()
+        .chain(["AnswerQuestion", "AnswerHarnessManagerDecision"]);
+    for method in operator_only {
+        assert!(!agent_gate::AGENT_VERBS.contains(&method), "{method}");
+        assert!(!agent_gate::READ_VERBS.contains(&method), "{method}");
+        assert!(
+            !agent_gate::is_allowed_for_attributed_caller(method),
+            "{method}"
+        );
+        for descriptor in catalog {
+            assert_ne!(descriptor.method, method, "agent CLI catalog: {method}");
+            if let Some(tool) = descriptor.native_tool {
+                let name = tool.name().to_ascii_lowercase();
+                assert!(
+                    !name.contains("operator_escalation") && !name.contains("operator_notice"),
+                    "native tool {} exposes {method}",
+                    tool.name()
+                );
+            }
+        }
+        let mut request = RpcRequest::new(
+            method,
+            serde_json::json!({"hop_id": Uuid::new_v4(), "ruling": "yes", "idempotency_key": "k"}),
+        );
+        request.session_token = Some("manager-token".to_string());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("expected response for {method}");
+        };
+        assert!(response.result.is_none(), "{method}");
+        let error = response
+            .error
+            .unwrap_or_else(|| panic!("attributed call to {method} must be denied"));
+        assert_eq!(error.code, INVALID_PARAMS, "method: {method}");
+        assert!(
+            error
+                .message
+                .contains("not available to session-attributed callers"),
+            "{method}: {}",
+            error.message
+        );
+    }
+    for method in ["AgentReportUp", "AgentSendDown"] {
+        assert!(agent_gate::AGENT_VERBS.contains(&method), "{method}");
+        assert!(!agent_gate::READ_VERBS.contains(&method), "{method}");
+    }
+}
+
+/// #1333 pin: `ListFrictionRollup` is operator-only (absent from every
+/// agent-facing catalog, native tool and the CLI, refused to a tokened
+/// caller); managers read the rollup through `AgentManagerInspect`.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn friction_rollup_is_operator_only_and_out_of_agent_catalogs() {
+    let fixture = recursive_dag_rpc_fixture();
+    let catalog = rsi_common::agent_control_schema::agent_control_catalog_v1();
+    assert_eq!(
+        rsi_common::friction::OPERATOR_METHODS,
+        ["ListFrictionRollup"]
+    );
+    for method in rsi_common::friction::OPERATOR_METHODS {
+        assert!(!agent_gate::AGENT_VERBS.contains(&method), "{method}");
+        assert!(!agent_gate::READ_VERBS.contains(&method), "{method}");
+        assert!(
+            !agent_gate::UNSCOPED_READ_VERBS.contains(&method),
+            "{method}"
+        );
+        assert!(
+            !agent_gate::is_allowed_for_attributed_caller(method),
+            "{method}"
+        );
+        assert!(
+            !rsi_common::rpc_verb_registry::cli_verb_methods().contains(&method),
+            "{method}"
+        );
+        assert!(!catalog.iter().any(|entry| entry.method == method));
+        let mut request = RpcRequest::new(method, serde_json::json!({}));
+        request.session_token = Some("manager-token".to_string());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("expected response for {method}");
+        };
+        let error = response.error.expect("attributed call must be denied");
+        assert!(
+            error
+                .message
+                .contains("not available to session-attributed callers"),
+            "{method}: {}",
+            error.message
+        );
+    }
+    for source in [
+        include_str!("../tool_registry.rs"),
+        include_str!("../session/harness/tools/rsi_control.rs"),
+    ] {
+        let source = source.to_ascii_lowercase();
+        assert!(!source.contains("listfrictionrollup"));
+        assert!(!source.contains("list_friction_rollup"));
+    }
+}
+
+/// #1415 pin: listing and archiving stale decision records are operator-only
+/// (absent from every agent-facing catalog, native tool and the CLI, refused
+/// to a tokened caller); the operator reaches both over RPC and an archive of
+/// a record that is not there deletes nothing and reports why.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn stale_decision_methods_are_operator_only_and_reachable_by_the_operator() {
+    let fixture = recursive_dag_rpc_fixture();
+    let catalog = rsi_common::agent_control_schema::agent_control_catalog_v1();
+    for method in ["ListStaleManagerDecisions", "ArchiveStaleManagerDecisions"] {
+        assert!(!agent_gate::AGENT_VERBS.contains(&method), "{method}");
+        assert!(!agent_gate::READ_VERBS.contains(&method), "{method}");
+        assert!(
+            !agent_gate::is_allowed_for_attributed_caller(method),
+            "{method}"
+        );
+        assert!(
+            !rsi_common::rpc_verb_registry::cli_verb_methods().contains(&method),
+            "{method}"
+        );
+        assert!(!catalog.iter().any(|entry| entry.method == method));
+        let mut request = RpcRequest::new(method, serde_json::json!({}));
+        request.session_token = Some("manager-token".to_string());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("expected response for {method}");
+        };
+        let error = response.error.expect("attributed call must be denied");
+        assert!(
+            error
+                .message
+                .contains("not available to session-attributed callers"),
+            "{method}: {}",
+            error.message
+        );
+    }
+    let listed = call_rpc(
+        &fixture.server,
+        "ListStaleManagerDecisions",
+        serde_json::json!({"older_than_days": 7}),
+    )
+    .await
+    .result
+    .expect("the operator lists stale decisions");
+    let listed: rsi_common::harness_manager_v2::ListStaleManagerDecisionsResponseV2 =
+        serde_json::from_value(listed).unwrap();
+    assert_eq!(listed.older_than_days, 7);
+    assert!(listed.rows.is_empty());
+    let missing = rsi_common::harness_manager_v2::ManagerDecisionRefV2 {
+        project_id: Uuid::new_v4(),
+        owner_manager_session_id: Uuid::new_v4(),
+        scope_version: 1,
+        key: "gone".into(),
+        expected_row_version: 1,
+    };
+    let archived = call_rpc(
+        &fixture.server,
+        "ArchiveStaleManagerDecisions",
+        serde_json::json!({"items": [missing]}),
+    )
+    .await
+    .result
+    .expect("the operator archives stale decisions");
+    let archived: rsi_common::harness_manager_v2::ArchiveStaleManagerDecisionsResponseV2 =
+        serde_json::from_value(archived).unwrap();
+    assert!(archived.archived.is_empty());
+    assert_eq!(archived.skipped[0].reason, "missing");
+    let invalid = call_rpc(
+        &fixture.server,
+        "ArchiveStaleManagerDecisions",
+        serde_json::json!({"items": []}),
+    )
+    .await;
+    assert!(
+        invalid.error.is_some(),
+        "an empty archive request is refused"
+    );
+}
+
+/// #1333 andon recording point: a tokened `Agent*` verb that is refused
+/// records `agent_refusal:<verb>:<code>` friction for the caller, and the
+/// operator reads it with `ListFrictionRollup`.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn refused_agent_verbs_record_friction_the_operator_rolls_up() {
+    let fixture = recursive_dag_rpc_fixture();
+    let caller = Uuid::new_v4();
+    fixture
+        .manager
+        .register_agent_token("friction-caller-token".into(), caller)
+        .await;
+    let mut request = RpcRequest::new(
+        "AgentGetIssue",
+        serde_json::json!({"display_number": 999_999}),
+    );
+    request.session_token = Some("friction-caller-token".to_string());
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+    else {
+        panic!("expected response");
+    };
+    assert!(response.error.is_some(), "the lookup is refused");
+
+    let rollup = call_rpc(
+        &fixture.server,
+        "ListFrictionRollup",
+        serde_json::json!({"window_hours": 1}),
+    )
+    .await
+    .result
+    .expect("ListFrictionRollup succeeds for the operator");
+    let rollup: rsi_common::friction::ListFrictionRollupResultV1 =
+        serde_json::from_value(rollup).unwrap();
+    let row = rollup
+        .rows
+        .iter()
+        .find(|row| row.signature.starts_with("agent_refusal:AgentGetIssue:"))
+        .expect("refusal recorded");
+    assert_eq!((row.occurrences, row.sessions), (1, 1));
+    assert!(rsi_common::friction::is_friction_signature(&row.signature));
+    let invalid = call_rpc(
+        &fixture.server,
+        "ListFrictionRollup",
+        serde_json::json!({"window_hours": 0}),
+    )
+    .await;
+    assert!(invalid.error.is_some());
+}
+
+/// #1240 catalog pin: `GetManagerNodeWorkspace` is absent from every
+/// agent-facing catalog and refused to a tokened caller; the operator reads
+/// any node with it. `AgentManagerOverview` is the agent verb (catalog, CLI
+/// and native tool), never a read verb.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn manager_node_workspace_is_operator_only_and_the_overview_is_an_agent_verb() {
+    use rsi_common::manager_node_workspace::ManagerNodeWorkspaceV1;
+    let fixture = recursive_dag_rpc_fixture();
+    let catalog = rsi_common::agent_control_schema::agent_control_catalog_v1();
+    let project = issue_rpc_project_id();
+    let params = serde_json::json!({"node": {"kind": "project", "project_id": project}});
+    for method in rsi_common::manager_node_workspace::OPERATOR_METHODS {
+        assert!(!agent_gate::AGENT_VERBS.contains(&method), "{method}");
+        assert!(!agent_gate::READ_VERBS.contains(&method), "{method}");
+        assert!(
+            !agent_gate::is_allowed_for_attributed_caller(method),
+            "{method}"
+        );
+        assert!(
+            !rsi_common::rpc_verb_registry::cli_verb_methods().contains(&method),
+            "{method}"
+        );
+        for descriptor in catalog {
+            assert_ne!(descriptor.method, method, "agent CLI catalog: {method}");
+            if let Some(tool) = descriptor.native_tool {
+                assert!(
+                    !tool.name().to_ascii_lowercase().contains("workspace"),
+                    "native tool {} exposes {method}",
+                    tool.name()
+                );
+            }
+        }
+        let mut request = RpcRequest::new(method, params.clone());
+        request.session_token = Some("manager-token".to_string());
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("expected response for {method}");
+        };
+        assert!(response.result.is_none(), "{method}");
+        let error = response.error.expect("attributed call must be denied");
+        assert_eq!(error.code, INVALID_PARAMS, "method: {method}");
+        assert!(
+            error
+                .message
+                .contains("not available to session-attributed callers"),
+            "{method}: {}",
+            error.message
+        );
+    }
+    let overview = catalog
+        .iter()
+        .find(|descriptor| descriptor.method == "AgentManagerOverview")
+        .expect("AgentManagerOverview is catalogued");
+    assert_eq!(
+        overview.native_tool.map(|tool| tool.name()),
+        Some("rsi_control_manager_overview")
+    );
+    assert!(agent_gate::AGENT_VERBS.contains(&"AgentManagerOverview"));
+    assert!(!agent_gate::READ_VERBS.contains(&"AgentManagerOverview"));
+    assert!(rsi_common::rpc_verb_registry::cli_verb_methods().contains(&"AgentManagerOverview"));
+
+    // The operator reads a project node and is told an unknown node apart.
+    let response = call_rpc(&fixture.server, "GetManagerNodeWorkspace", params).await;
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let workspace: ManagerNodeWorkspaceV1 =
+        serde_json::from_value(response.result.unwrap()).unwrap();
+    assert_eq!(
+        workspace.node,
+        rsi_common::manager_tier_routing::ManagerNodeRefV1::Project {
+            project_id: project
+        }
+    );
+    assert_eq!(
+        workspace
+            .projects
+            .iter()
+            .map(|row| row.overview.project_id)
+            .collect::<Vec<_>>(),
+        vec![project]
+    );
+    let unknown = call_rpc(
+        &fixture.server,
+        "GetManagerNodeWorkspace",
+        serde_json::json!({"node": {"kind": "portfolio", "node_id": Uuid::new_v4()}}),
+    )
+    .await;
+    assert!(
+        unknown
+            .error
+            .unwrap()
+            .message
+            .contains("manager_tier_target_unknown")
+    );
+    let malformed = call_rpc(
+        &fixture.server,
+        "GetManagerNodeWorkspace",
+        serde_json::json!({"node_id": Uuid::new_v4()}),
+    )
+    .await;
+    assert!(
+        malformed
+            .error
+            .unwrap()
+            .message
+            .contains("manager_tier_invalid_request")
+    );
+}
+
+/// #1236: two roots over [A, B] and [C] through the operator RPCs; an
+/// overlapping third root is refused, the `*GlobalManager` shims behave as v0
+/// with one `global` root and refuse `global_manager_ambiguous` with two.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn operator_rpc_portfolio_nodes_round_trip_and_global_shims() {
+    use rsi_common::harness_manager_v2::{ManagerLaunchChoiceV2, ManagerPolicyV2};
+    use rsi_common::portfolio_nodes::{ListPortfolioNodesResultV1, PortfolioNodeV1};
+    use rsi_common::types::{Project, SessionKind, SessionProvider};
+    let fixture = recursive_dag_rpc_fixture();
+    let a = issue_rpc_project_id();
+    let (b, c) = (Uuid::new_v4(), Uuid::new_v4());
+    let (seat_ab, seat_c, seat_third) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let seat_fourth = Uuid::new_v4();
+    {
+        let store = fixture.manager.store().lock().await;
+        for (id, name) in [(b, "B"), (c, "C")] {
+            store
+                .insert_project(&Project {
+                    id,
+                    name: name.into(),
+                    path: None,
+                    description: None,
+                    color: Project::DEFAULT_COLOR.to_string(),
+                    context_files: None,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                })
+                .unwrap();
+        }
+        for id in [seat_ab, seat_c, seat_third, seat_fourth] {
+            let session = mk_agent_test_session(id, SessionKind::Standard, None, None);
+            store.insert_session(&session).unwrap();
+        }
+    }
+    let launch = ManagerLaunchChoiceV2 {
+        provider: SessionProvider::Claude,
+        model: "claude-opus-5-5".into(),
+        effort: Some("high".into()),
+    };
+    let configure = |seat: Uuid, projects: Vec<Uuid>, key: &str| {
+        serde_json::json!({
+            "tier_label": "global",
+            "seat_session_id": seat,
+            "project_ids": projects,
+            "allowed_launches": [launch.clone()],
+            "policy": ManagerPolicyV2::default(),
+            "expected_node_grant_version": 0,
+            "expected_authority_epoch": 0,
+            "idempotency_key": key,
+        })
+    };
+    // One `global` root through the shim behaves as v0.
+    let shim = call_rpc(
+        &fixture.server,
+        "ConfigureGlobalManager",
+        serde_json::json!({
+            "session_id": seat_ab,
+            "project_ids": [a, b],
+            "allowed_launches": [launch.clone()],
+            "project_policy": ManagerPolicyV2::default(),
+            "expected_grant_version": 0,
+            "idempotency_key": "shim-ab",
+        }),
+    )
+    .await;
+    assert!(shim.error.is_none(), "{:?}", shim.error);
+    let got = call_rpc(&fixture.server, "GetGlobalManager", serde_json::json!({})).await;
+    assert_eq!(got.result.unwrap()["seat_session_id"], seat_ab.to_string());
+
+    let created = call_rpc(
+        &fixture.server,
+        "ConfigurePortfolioNode",
+        configure(seat_c, vec![c], "root-c"),
+    )
+    .await;
+    assert!(created.error.is_none(), "{:?}", created.error);
+    let root_c: PortfolioNodeV1 = serde_json::from_value(created.result.unwrap()).unwrap();
+    assert_eq!(root_c.grant.project_ids, [c]);
+    assert_eq!(root_c.parent_node_id, None);
+
+    let overlap = call_rpc(
+        &fixture.server,
+        "ConfigurePortfolioNode",
+        configure(seat_third, vec![a], "root-third"),
+    )
+    .await;
+    assert!(
+        overlap
+            .error
+            .unwrap()
+            .message
+            .contains("manager_scope_overlap")
+    );
+    // #1237: a node nests under an existing parent it narrows, and an
+    // adoption names only current roots (the nested node is not one).
+    let mut nested = configure(seat_third, vec![c], "nested");
+    nested["parent_node_id"] = serde_json::json!(root_c.node_id);
+    nested["tier_label"] = serde_json::json!("region");
+    nested["policy"]["max_active_sessions"] = serde_json::json!(3);
+    let nested = call_rpc(&fixture.server, "ConfigurePortfolioNode", nested).await;
+    assert!(nested.error.is_none(), "{:?}", nested.error);
+    let nested: PortfolioNodeV1 = serde_json::from_value(nested.result.unwrap()).unwrap();
+    assert_eq!(nested.parent_node_id, Some(root_c.node_id));
+    let mut adopt = configure(seat_fourth, vec![c], "adopt-nested");
+    adopt["adopt_node_ids"] = serde_json::json!([nested.node_id]);
+    let adopt = call_rpc(&fixture.server, "ConfigurePortfolioNode", adopt).await;
+    assert!(
+        adopt
+            .error
+            .unwrap()
+            .message
+            .contains("portfolio_adopt_not_root")
+    );
+
+    let listed = call_rpc(&fixture.server, "ListPortfolioNodes", serde_json::json!({})).await;
+    let listed: ListPortfolioNodesResultV1 =
+        serde_json::from_value(listed.result.unwrap()).unwrap();
+    assert_eq!(listed.nodes.len(), 3);
+    let fetched = call_rpc(
+        &fixture.server,
+        "GetPortfolioNode",
+        serde_json::json!({"node_id": root_c.node_id}),
+    )
+    .await;
+    let fetched: PortfolioNodeV1 = serde_json::from_value(fetched.result.unwrap()).unwrap();
+    assert_eq!(fetched, root_c);
+
+    // Two `global` roots: every shim refuses.
+    for (method, params) in [
+        ("GetGlobalManager", serde_json::json!({})),
+        ("GetGlobalManagerWorkspace", serde_json::json!({})),
+        (
+            "RevokeGlobalManager",
+            serde_json::json!({"expected_grant_version": 1, "idempotency_key": "r"}),
+        ),
+    ] {
+        let refused = call_rpc(&fixture.server, method, params).await;
+        assert!(
+            refused
+                .error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("global_manager_ambiguous")),
+            "{method}: {:?}",
+            refused.error
+        );
+    }
+
+    let revoked = call_rpc(
+        &fixture.server,
+        "RevokePortfolioNode",
+        serde_json::json!({
+            "node_id": root_c.node_id,
+            "expected_grant_version": root_c.grant.grant_version,
+            "expected_authority_epoch": root_c.authority_epoch,
+            "idempotency_key": "revoke-c",
+        }),
+    )
+    .await;
+    assert!(revoked.error.is_none(), "{:?}", revoked.error);
+    assert_eq!(revoked.result.unwrap()["state"], "revoked");
+    // The operator-granted region re-roots (grantor-scoped revoke).
+    let region = call_rpc(
+        &fixture.server,
+        "GetPortfolioNode",
+        serde_json::json!({"node_id": nested.node_id}),
+    )
+    .await;
+    let region: PortfolioNodeV1 = serde_json::from_value(region.result.unwrap()).unwrap();
+    assert_eq!(region.state, "active");
+    assert_eq!(region.parent_node_id, None);
+    // One `global` root again: the shim answers.
+    let got = call_rpc(&fixture.server, "GetGlobalManager", serde_json::json!({})).await;
+    assert!(got.error.is_none(), "{:?}", got.error);
+    assert_eq!(got.result.unwrap()["seat_session_id"], seat_ab.to_string());
+}
+
+/// A tokened agent call: `Ok(result)` or the refusal message.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+async fn agent_rpc(
+    server: &RpcServer,
+    token: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> std::result::Result<serde_json::Value, String> {
+    let mut rpc = RpcRequest::new(method, params);
+    rpc.session_token = Some(token.into());
+    let HandleResult::Response(response) = server.handle_request_inner(&rpc).await else {
+        panic!("expected a response to {method}");
+    };
+    match response.error {
+        None => Ok(response.result.unwrap_or_default()),
+        Some(error) => Err(error.message),
+    }
+}
+
+/// #1237 I11: swarm → pinnacle → global → project → area, built with
+/// operator RPCs only. Each tier holds the PM verb set over its own coverage
+/// (an Issue and the ledger fence per covered project, a refusal outside),
+/// the area holds equal capabilities with a carved allowance, and the
+/// results by role are identical under any tier labels.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+async fn five_tier_authority_by_role(labels: [&str; 3]) -> Vec<String> {
+    use rsi_common::harness_manager_v2::{
+        ConfigureHarnessManagerPolicyRequestV2, ManagerCapabilityV2, ManagerLaunchChoiceV2,
+        ManagerOperatingModeV2, ManagerPolicyV2,
+    };
+    use rsi_common::manager_nodes::{
+        ConfigureManagerNodeRequestV1, ManagerNodeAllowanceV1, ManagerNodeGrantV1,
+        ManagerNodeSelectorV1,
+    };
+    use rsi_common::portfolio_nodes::PortfolioNodeV1;
+    use rsi_common::types::{Project, SessionKind, SessionProvider};
+    let fixture = recursive_dag_rpc_fixture();
+    let a = issue_rpc_project_id();
+    let (b, c) = (Uuid::new_v4(), Uuid::new_v4());
+    let tier_seats = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    let (owner, area_seat, group, epic) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    {
+        let store = fixture.manager.store().lock().await;
+        for (id, name) in [(b, "B"), (c, "C")] {
+            store
+                .insert_project(&Project {
+                    id,
+                    name: name.into(),
+                    path: None,
+                    description: None,
+                    color: Project::DEFAULT_COLOR.to_string(),
+                    context_files: None,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                })
+                .unwrap();
+        }
+        for id in tier_seats {
+            let mut session = mk_agent_test_session(id, SessionKind::Standard, None, None);
+            session.project_id = None;
+            store.insert_session(&session).unwrap();
+        }
+        for (id, kind, parent) in [
+            (owner, SessionKind::Standard, None),
+            (area_seat, SessionKind::Standard, None),
+            (group, SessionKind::Group, None),
+            (epic, SessionKind::Epic, Some(group)),
+        ] {
+            let mut session = mk_agent_test_session(id, kind, parent, None);
+            session.project_id = Some(a);
+            store.insert_session(&session).unwrap();
+        }
+    }
+    let capabilities = vec![
+        ManagerCapabilityV2::IssueCoordinate,
+        ManagerCapabilityV2::WorkPlan,
+        ManagerCapabilityV2::LeadControl,
+    ];
+    let tier_policy = |level: u16| ManagerPolicyV2 {
+        mode: ManagerOperatingModeV2::Execute,
+        capabilities: capabilities.clone(),
+        max_active_sessions: 10 - level,
+        ..Default::default()
+    };
+    let launch = ManagerLaunchChoiceV2 {
+        provider: SessionProvider::Claude,
+        model: "claude-opus-5-5".into(),
+        effort: Some("high".into()),
+    };
+    // Operator RPCs only: three portfolio levels ...
+    let coverage = [vec![a, b, c], vec![a, b], vec![a]];
+    let mut parent: Option<Uuid> = None;
+    for level in 0..3 {
+        let created = call_rpc(
+            &fixture.server,
+            "ConfigurePortfolioNode",
+            serde_json::json!({
+                "parent_node_id": parent,
+                "tier_label": labels[level],
+                "seat_session_id": tier_seats[level],
+                "project_ids": coverage[level],
+                "allowed_launches": [launch.clone()],
+                "policy": tier_policy(level as u16),
+                "expected_node_grant_version": 0,
+                "expected_authority_epoch": 0,
+                "idempotency_key": format!("tier-{level}"),
+            }),
+        )
+        .await;
+        assert!(created.error.is_none(), "{:?}", created.error);
+        let node: PortfolioNodeV1 = serde_json::from_value(created.result.unwrap()).unwrap();
+        parent = Some(node.node_id);
+    }
+    // ... the project manager ...
+    let appointed = call_rpc(&fixture.server, "ConfigureHarnessManager", serde_json::json!({
+        "project_id": a, "session_id": owner, "epic_ids": null, "group_ids": [], "expected_row_version": 0
+    }))
+    .await;
+    assert!(appointed.error.is_none(), "{:?}", appointed.error);
+    let pm_policy = call_rpc(
+        &fixture.server,
+        "ConfigureHarnessManagerPolicy",
+        serde_json::json!(ConfigureHarnessManagerPolicyRequestV2 {
+            project_id: a,
+            expected_scope_version: 1,
+            expected_policy_version: 0,
+            idempotency_key: "pm-grant".into(),
+            policy: ManagerPolicyV2 {
+                max_active_sessions: 8,
+                ..tier_policy(3)
+            },
+        }),
+    )
+    .await;
+    assert!(pm_policy.error.is_none(), "{:?}", pm_policy.error);
+    // ... and an area node with the PM's capabilities, its allowance carved.
+    let listed = call_rpc(
+        &fixture.server,
+        "ListManagerNodes",
+        serde_json::json!({"project_id": a, "limit": 64}),
+    )
+    .await;
+    let root = listed.result.unwrap()["rows"][0].clone();
+    let area = call_rpc(
+        &fixture.server,
+        "ConfigureManagerNode",
+        serde_json::json!(ConfigureManagerNodeRequestV1 {
+            node_id: None,
+            parent_node_id: serde_json::from_value(root["node_id"].clone()).unwrap(),
+            project_id: a,
+            seat_root_session_id: area_seat,
+            selector: ManagerNodeSelectorV1::Selected {
+                group_ids: vec![],
+                epic_ids: vec![epic],
+            },
+            grant: ManagerNodeGrantV1 {
+                capabilities: capabilities.clone(),
+                allowed_launches: vec![],
+                allowance: ManagerNodeAllowanceV1 {
+                    max_created_containers: 0,
+                    max_created_sessions: 0,
+                    max_active_sessions: 3,
+                    max_build_slots: 0,
+                    max_disk_gib: 0,
+                    provider_limits: vec![],
+                    max_spend_usd: None,
+                },
+                max_direct_reports: 4,
+            },
+            policy: ManagerPolicyV2 {
+                max_active_sessions: 3,
+                ..tier_policy(3)
+            },
+            expected_parent_grant_version: root["grant_version"].as_i64().unwrap(),
+            expected_parent_policy_version: root["policy_version"].as_i64().unwrap(),
+            expected_parent_authority_epoch: root["authority_epoch"].as_i64().unwrap(),
+            expected_node_grant_version: 0,
+            idempotency_key: "area".into(),
+        }),
+    )
+    .await;
+    assert!(area.error.is_none(), "{:?}", area.error);
+
+    let roles = [
+        ("role0", tier_seats[0]),
+        ("role1", tier_seats[1]),
+        ("role2", tier_seats[2]),
+        ("project", owner),
+        ("area", area_seat),
+    ];
+    for (role, seat) in roles {
+        fixture
+            .manager
+            .register_agent_token(format!("token-{role}"), seat)
+            .await;
+    }
+    let outcome = |result: std::result::Result<serde_json::Value, String>| match result {
+        Ok(_) => "ok".to_string(),
+        Err(message) if message.contains("manager_project_not_in_scope") => {
+            "manager_project_not_in_scope".to_string()
+        }
+        Err(message) => message,
+    };
+    let mut results = Vec::new();
+    for (role, _) in roles {
+        let token = format!("token-{role}");
+        for (name, project) in [("a", a), ("b", b), ("c", c)] {
+            // The portfolio levels name the project; the project and area
+            // tiers name it only when it is not their own.
+            let target = (role.starts_with("role") || project != a).then_some(project);
+            let progress = agent_rpc(
+                &fixture.server,
+                &token,
+                "AgentManagerProgress",
+                serde_json::json!({ "project_id": target }),
+            )
+            .await;
+            results.push(format!("{role}:{name}:progress:{}", outcome(progress)));
+            if role != "area" {
+                let issue = agent_rpc(
+                    &fixture.server,
+                    &token,
+                    "AgentCreateIssue",
+                    serde_json::json!({
+                        "title": format!("{role} in {name}"),
+                        "idempotency_key": format!("{role}-{name}"),
+                        "project_id": target,
+                    }),
+                )
+                .await;
+                results.push(format!("{role}:{name}:issue:{}", outcome(issue)));
+            }
+        }
+    }
+    results
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn five_tiers_hold_the_pm_verb_set_over_their_coverage_under_any_labels() {
+    let results = five_tier_authority_by_role(["swarm", "pinnacle", "global"]).await;
+    let not_in_scope = "manager_project_not_in_scope";
+    let mut expected = Vec::new();
+    for (role, covered) in [
+        ("role0", ["a", "b", "c"].as_slice()),
+        ("role1", ["a", "b"].as_slice()),
+        ("role2", ["a"].as_slice()),
+        ("project", ["a"].as_slice()),
+        ("area", ["a"].as_slice()),
+    ] {
+        for name in ["a", "b", "c"] {
+            let verdict = if covered.contains(&name) {
+                "ok"
+            } else {
+                not_in_scope
+            };
+            expected.push(format!("{role}:{name}:progress:{verdict}"));
+            if role != "area" {
+                expected.push(format!("{role}:{name}:issue:{verdict}"));
+            }
+        }
+    }
+    assert_eq!(results, expected);
+    assert_eq!(
+        five_tier_authority_by_role(["global", "swarm", "pinnacle"]).await,
+        results
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn fleet_operator_rpc_returns_typed_bounded_snapshot() {
+    let fixture = recursive_dag_rpc_fixture();
+    let request = RpcRequest::new("GetFleetOverview", serde_json::json!({}));
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+    else {
+        panic!("expected response");
+    };
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let snapshot: rsi_common::fleet::FleetOverview =
+        serde_json::from_value(response.result.unwrap()).unwrap();
+    assert!(snapshot.agents.len() <= 2048);
+    assert_eq!(snapshot.totals.len(), 3);
 }

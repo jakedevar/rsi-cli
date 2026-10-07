@@ -40,9 +40,10 @@ use crate::store::{C5SettlementOutcome, MasterNoIdleStoreRecovery};
 use rsi_common::agent_contract::ProgramContinuationIntentV1;
 use rsi_common::agent_coordination::{
     AGENT_PROGRESS_MAX_COHORT, AgentContinuationCursorV1, AgentContinueChildRequestV1,
-    AgentContinueChildResultV1, AgentGetProgressResultV1, AgentMessageStateEventV1,
-    AgentReserveSuccessorRequestV1, AgentReserveSuccessorResultV1, AgentSendMessageRequestV1,
-    AgentSendMessageResultV1, AgentSpawnChildRequestV1, AgentSpawnChildResultV1,
+    AgentContinueChildResultV1, AgentGetProgressResultV1, AgentMessageDeliveryBoundaryV1,
+    AgentMessageStateEventV1, AgentReserveSuccessorRequestV1, AgentReserveSuccessorResultV1,
+    AgentSendMessageRequestV1, AgentSendMessageResultV1, AgentSpawnChildRequestV1,
+    AgentSpawnChildResultV1,
 };
 use rsi_common::agent_coordination::{AgentArchiveChildRequestV1, AgentArchiveChildResultV1};
 
@@ -123,6 +124,36 @@ pub(crate) enum ArmWatchOutcome {
     /// An identical enabled watch (same caller + watched natural key) already
     /// exists; the EXISTING row is returned and nothing was inserted.
     Deduplicated(ScheduledJob),
+    /// #1391: the existing row had already delivered a terminal state the
+    /// watched child has since left (it was continued, retried or rotated),
+    /// so the re-arm opened a new delivery epoch on that row: its delivery
+    /// witness is cleared and its version advanced, which fences the stale
+    /// confirmation that would otherwise retire it as consumed.
+    Rearmed(ScheduledJob),
+}
+
+/// #1391: whether the watched lineage started a new terminal epoch after an
+/// enabled watch delivered at `delivered_at`. The tip is running again, or it
+/// produced provider output after the delivery (a continued child that
+/// already went terminal again). A tip still sitting in the delivered
+/// terminal state is the same epoch, so its re-arm stays idempotent and the
+/// once-per-epoch delivery guarantee holds.
+fn watched_left_delivered_epoch(
+    store: &crate::store::Store,
+    watched: Uuid,
+    delivered_at: chrono::DateTime<chrono::Utc>,
+) -> Result<bool> {
+    use rsi_common::types::SessionStatus as S;
+    let tip = store.published_lineage_tip(watched)?.unwrap_or(watched);
+    let Some(row) = store.get_session(tip)? else {
+        return Ok(false);
+    };
+    if matches!(row.status, S::Starting | S::Running) {
+        return Ok(true);
+    }
+    Ok(store
+        .last_provider_output_at(tip)?
+        .is_some_and(|at| at > delivered_at))
 }
 
 /// Result of idempotent daemon-authoritative program registration.
@@ -192,9 +223,14 @@ pub struct AgentControlHandle {
     completed: Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
     pub(super) store: Arc<tokio::sync::Mutex<crate::store::Store>>,
     pub(super) event_bus: Arc<crate::bus::EventBus>,
-    spawn_coordinator: Arc<super::spawn_coordinator::SpawnCoordinator>,
+    pub(super) spawn_coordinator: Arc<super::spawn_coordinator::SpawnCoordinator>,
     /// Deploy drain (#1073); `None` for handles built without a manager.
     pub(super) deploy_drain: Option<Arc<crate::deploy_drain::DeployDrain>>,
+    /// Host-load admission (#1417); `None` for handles built without a manager.
+    pub(super) host_load: Option<Arc<crate::host_load::HostLoadAdmission>>,
+    /// Operator runtime settings read at use (#1337 job timeout default);
+    /// `None` for handles built without a manager (the built-in default).
+    pub(super) runtime_config: Option<Arc<crate::config::RuntimeConfig>>,
 }
 
 impl AgentControlHandle {
@@ -218,7 +254,14 @@ impl AgentControlHandle {
             event_bus,
             spawn_coordinator,
             deploy_drain: None,
+            host_load: None,
+            runtime_config: None,
         }
+    }
+
+    pub(super) fn with_runtime_config(mut self, config: Arc<crate::config::RuntimeConfig>) -> Self {
+        self.runtime_config = Some(config);
+        self
     }
 
     pub(super) fn with_deploy_drain(
@@ -226,6 +269,11 @@ impl AgentControlHandle {
         drain: Arc<crate::deploy_drain::DeployDrain>,
     ) -> Self {
         self.deploy_drain = Some(drain);
+        self
+    }
+
+    pub(super) fn with_host_load(mut self, gate: Arc<crate::host_load::HostLoadAdmission>) -> Self {
+        self.host_load = Some(gate);
         self
     }
 
@@ -686,7 +734,11 @@ impl AgentControlHandle {
             .arm_automatic_child_watch_inner(caller_session_id, target_session_id, true)
             .await
         {
-            Ok(ArmWatchOutcome::Armed(_) | ArmWatchOutcome::Deduplicated(_)) => true,
+            Ok(
+                ArmWatchOutcome::Armed(_)
+                | ArmWatchOutcome::Deduplicated(_)
+                | ArmWatchOutcome::Rearmed(_),
+            ) => true,
             Err(error) => {
                 tracing::warn!(
                     target: "agent_coordination",
@@ -707,15 +759,49 @@ impl AgentControlHandle {
         caller_session_id: Uuid,
         params: AgentCreateIssueParams,
     ) -> Result<AgentCreateIssueResult> {
-        let caller = self
-            .get_session(caller_session_id)
-            .await
+        // Resolve routing and provenance from persisted state under the same
+        // store lock as the write, rather than an active-session snapshot.
+        let store = self.store.lock().await;
+        let caller = store
+            .get_session(caller_session_id)?
             .ok_or(DaemonError::SessionNotFound(caller_session_id))?;
-        let project_id = caller.project_id.ok_or_else(|| {
-            DaemonError::InvalidParam(format!(
-                "agent_create_issue_project_unavailable:{caller_session_id}"
-            ))
-        })?;
+        if params.source_issue.is_some() && !params.harness {
+            return Err(DaemonError::InvalidParam(
+                "agent_create_issue_source_issue_requires_harness".into(),
+            ));
+        }
+        // #1389: `harness` files into the RSI harness project from any project.
+        let harness_target = if params.harness {
+            if params.project_id.is_some() {
+                return Err(DaemonError::InvalidParam(
+                    "agent_create_issue_harness_conflicts_with_project_id".into(),
+                ));
+            }
+            let projects = store.load_projects()?;
+            let root = super::preamble::harness_root();
+            Some(resolve_harness_project(&projects, root).ok_or_else(|| {
+                DaemonError::InvalidParam("agent_create_issue_harness_project_unresolved".into())
+            })?)
+        } else {
+            None
+        };
+        // #1235: a global seat may name a granted project; the store checks it.
+        let project_id = harness_target
+            .or(params.project_id)
+            .or(caller.project_id)
+            .ok_or_else(|| {
+                DaemonError::InvalidParam(format!(
+                    "agent_create_issue_project_unavailable:{caller_session_id}"
+                ))
+            })?;
+        let cross_project_harness = harness_target.is_some() && caller.project_id != harness_target;
+        if let Some(number) = params.source_issue
+            && !store.agent_issue_source_exists(caller_session_id, number)?
+        {
+            return Err(DaemonError::InvalidParam(
+                "agent_create_issue_source_issue_not_in_source_project".into(),
+            ));
+        }
         let key = params.idempotency_key.as_bytes();
         if key.is_empty() || key.len() > 128 || key.contains(&0) {
             return Err(DaemonError::InvalidParam(
@@ -731,28 +817,71 @@ impl AgentControlHandle {
         }
 
         let issue_id = deterministic_agent_issue_id(caller_session_id, key);
+        let mut body = params.body;
+        let mut labels = params.labels;
+        if cross_project_harness {
+            // Stable identifiers only: project names can change and can carry
+            // personal metadata. The authenticated session is the creator.
+            let source_project = caller
+                .project_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "no project".to_string());
+            let source_issue = params
+                .source_issue
+                .map(|n| format!(", mirrors Issue #{n} there"))
+                .unwrap_or_default();
+            let prefix = format!("{body}\n\n---\nFiled from project ");
+            let suffix =
+                format!(" by session {caller_session_id}{source_issue} (harness filing, #1389).");
+            body = format!("{prefix}{source_project}{suffix}");
+            // #1533: legacy receipts included a mutable project name. Preserve
+            // their already-recorded stamp only when the submitted body and
+            // authenticated project/session/source reference still match.
+            if let Some(receipt) =
+                store.agent_issue_create_receipt(caller_session_id, &params.idempotency_key)?
+                && receipt.project_id == project_id
+                && let Some(recorded_project) = receipt
+                    .body
+                    .strip_prefix(&prefix)
+                    .and_then(|s| s.strip_suffix(&suffix))
+                && (recorded_project == source_project
+                    || recorded_project.ends_with(&format!(" ({source_project})")))
+            {
+                body = receipt.body;
+            }
+            if !labels.iter().any(|l| l == HARNESS_FILED_LABEL) {
+                labels.push(HARNESS_FILED_LABEL.to_string());
+            }
+        }
         let new = NewIssue {
             project_id,
             title: params.title,
-            body: params.body,
+            body,
             priority: params.priority,
-            labels: params.labels,
+            labels,
             created_by_session_id: Some(caller_session_id),
             assignee: params.assignee,
             idea_id: None,
             source_event_id: None,
             source_finding_ref: None,
         };
-        let outcome = self
-            .store
-            .lock()
-            .await
-            .create_agent_issue_idempotent_with_key(
-                caller_session_id,
-                issue_id,
-                &new,
-                &params.idempotency_key,
-            )?;
+        let outcome = {
+            if cross_project_harness {
+                store.create_agent_harness_issue_idempotent(
+                    caller_session_id,
+                    issue_id,
+                    &new,
+                    &params.idempotency_key,
+                )?
+            } else {
+                store.create_agent_issue_idempotent_with_key(
+                    caller_session_id,
+                    issue_id,
+                    &new,
+                    &params.idempotency_key,
+                )?
+            }
+        };
         if !outcome.create_fields_match {
             return Err(DaemonError::InvalidParam(format!(
                 "agent_create_issue_idempotency_conflict:{issue_id}"
@@ -1796,6 +1925,22 @@ impl AgentControlHandle {
                         "continued child watch reset lost its enabled row".into(),
                     ));
                 }
+            } else if let Some(delivered_at) = existing.last_fired_at
+                && watched_left_delivered_epoch(&store, watched, delivered_at)?
+            {
+                // #1391: the row still carries the previous epoch's delivery
+                // and is about to be retired as consumed. Deduplicating onto
+                // it would lose the child's next terminal wake, so open the
+                // new epoch on it under this same store lock.
+                if !store.reset_child_watch_after_continue(existing.id)? {
+                    return Err(DaemonError::Store(
+                        "terminal watch re-arm lost its enabled row".into(),
+                    ));
+                }
+                let rearmed = store.get_scheduled_job(&existing.id)?.ok_or_else(|| {
+                    DaemonError::Store("terminal watch re-arm lost its row".into())
+                })?;
+                return Ok(ArmWatchOutcome::Rearmed(rearmed));
             }
             // Idempotent re-arm: same (caller, watched) natural key.
             return Ok(ArmWatchOutcome::Deduplicated((**existing).clone()));
@@ -1933,6 +2078,7 @@ impl AgentControlHandle {
         let disposition = match &outcome {
             ArmWatchOutcome::Armed(_) => "armed",
             ArmWatchOutcome::Deduplicated(_) => "deduplicated",
+            ArmWatchOutcome::Rearmed(_) => "rearmed",
         };
         tracing::info!(
             target: "agent_coordination",
@@ -1972,7 +2118,7 @@ impl AgentControlHandle {
                 .arm_automatic_child_watch(request.owner_session_id, request.child_session_id)
                 .await
             {
-                Ok(ArmWatchOutcome::Armed(_)) => tracing::info!(
+                Ok(ArmWatchOutcome::Armed(_) | ArmWatchOutcome::Rearmed(_)) => tracing::info!(
                     target: "agent_coordination",
                     spawn_request_id = %request.spawn_request_id,
                     "automatic terminal watch repaired"
@@ -2006,11 +2152,13 @@ impl AgentControlHandle {
         // #872: the active global seat may read (AgentGetStatus,
         // AgentReadSessionEvents) and arm terminal watches on the PM seat of
         // each granted project. This is the non-mutation path only.
-        let global_read = self
-            .store
-            .lock()
-            .await
-            .global_seat_reads_manager(caller_session_id, target_session_id)?;
+        // #1239: a portfolio seat also reads and watches any descendant
+        // node's seat and any covered project's PM seat.
+        let global_read = {
+            let store = self.store.lock().await;
+            store.global_seat_reads_manager(caller_session_id, target_session_id)?
+                || store.portfolio_seat_reach(caller_session_id, target_session_id, false)?
+        };
         if global_read {
             return self
                 .get_session(target_session_id)
@@ -2129,6 +2277,15 @@ impl AgentControlHandle {
         if let Some(scope) = manager_scope {
             return Ok((target, Some(scope)));
         }
+        // #1239: a portfolio seat halts or continues a direct child seat (a
+        // child node's seat, or the PM of a project it covers deepest).
+        if self.store.lock().await.portfolio_seat_reach(
+            caller_session_id,
+            target_session_id,
+            mutation,
+        )? {
+            return Ok((target, None));
+        }
 
         Err(DaemonError::InvalidParam(format!(
             "agent_verb_scope_denied: session {caller_session_id} may only target itself, a direct child, or a child of an Epic it leads; {target_session_id} is none of these"
@@ -2215,6 +2372,14 @@ impl AgentControlHandle {
             if let Some(scope) = manager_scope {
                 return Ok(AgentMessageTargetAuthority::Manager(scope.epic_id));
             }
+            // #1239: a portfolio seat mails any descendant seat.
+            if self.store.lock().await.portfolio_seat_reach(
+                caller_session_id,
+                target_session_id,
+                false,
+            )? {
+                return Ok(AgentMessageTargetAuthority::LiveSession);
+            }
             return Err(denied());
         }
 
@@ -2273,13 +2438,25 @@ impl AgentControlHandle {
         let authority = self
             .authorize_agent_message_target(caller_session_id, request.target_session_id)
             .await?;
-        let outcome = self.store.lock().await.accept_authorized_agent_message(
-            caller_session_id,
-            authority.spawn_request_id(),
-            authority.manager_epic_id(),
-            &request,
-        )?;
-        let receipt = outcome.receipt().clone();
+        let (outcome, target_provider) = {
+            let store = self.store.lock().await;
+            let outcome = store.accept_authorized_agent_message(
+                caller_session_id,
+                authority.spawn_request_id(),
+                authority.manager_epic_id(),
+                &request,
+            )?;
+            let target_provider = store
+                .get_session(outcome.receipt().target_session_id)
+                .ok()
+                .flatten()
+                .map(|session| session.provider);
+            (outcome, target_provider)
+        };
+        let mut receipt = outcome.receipt().clone();
+        // #1183: say at send time when the target has no mid-turn boundary.
+        receipt.delivery_boundary =
+            target_provider.and_then(AgentMessageDeliveryBoundaryV1::for_provider);
         tracing::info!(
             target: "agent_coordination",
             caller_session_id = %caller_session_id,
@@ -2315,7 +2492,34 @@ impl AgentControlHandle {
         caller: Uuid,
         request: rsi_common::harness_manager::AgentManagerInboxRequestV1,
     ) -> Result<rsi_common::harness_manager::AgentManagerInboxResultV1> {
-        self.store.lock().await.manager_inbox(caller, &request)
+        request
+            .validate()
+            .map_err(|reason| DaemonError::PolicyDenied(reason.into()))?;
+        let store = self.store.lock().await;
+        match store.manager_inbox(caller, &request) {
+            Ok(inbox) => Ok(inbox),
+            // #1266: a portfolio seat holds no project manager inbox; it
+            // still reads its failed and uncertain tier mail here.
+            Err(error) if !request.settle_notice_ids.is_empty() => Err(error),
+            Err(error) => match store.tier_portfolio_ref(caller) {
+                Ok(Some(_)) => {
+                    let (undelivered_tier_mail, more_undelivered_tier_mail) =
+                        store.undelivered_tier_mail_page_for_session(caller)?;
+                    Ok(rsi_common::harness_manager::AgentManagerInboxResultV1 {
+                        messages: Vec::new(),
+                        next_after_sequence: None,
+                        notices: Vec::new(),
+                        more_notices: false,
+                        next_after_notice_sequence: None,
+                        settled_notice_ids: Vec::new(),
+                        manager_seat: None,
+                        undelivered_tier_mail,
+                        more_undelivered_tier_mail,
+                    })
+                }
+                _ => Err(error),
+            },
+        }
     }
 
     /// Issue #548: read-only work/ownership projection for a session the
@@ -2388,7 +2592,37 @@ impl AgentControlHandle {
         let (receipt, job_id) = {
             let store = self.store.lock().await;
             let receipt =
-                store.manager_lead_notice(caller, &request.message, &request.idempotency_key)?;
+                match store.manager_lead_notice(caller, &request.message, &request.idempotency_key)
+                {
+                    Ok(receipt) => receipt,
+                    // #1238: a project with no live PM routes lead mail to the
+                    // deepest portfolio node covering it.
+                    Err(crate::error::DaemonError::InvalidParam(code))
+                        if code == "manager_not_configured"
+                            || code == "manager_current_session_required" =>
+                    {
+                        match store.tier_lead_notice(
+                            caller,
+                            &request.message,
+                            &request.idempotency_key,
+                        )? {
+                            Some(tier) => {
+                                return Ok(
+                                    rsi_common::harness_manager::HarnessManagerMessageReceiptV1 {
+                                        message_id: tier.message_id,
+                                        sequence: 0,
+                                        request_id: None,
+                                        deduplicated: tier.deduplicated,
+                                        rolled_over_from: None,
+                                        manager_seat: None,
+                                    },
+                                );
+                            }
+                            None => return Err(crate::error::DaemonError::InvalidParam(code)),
+                        }
+                    }
+                    Err(error) => return Err(error),
+                };
             let job_id = store.manager_notice_job_for_subject(
                 "message",
                 &receipt.message_id.to_string(),
@@ -3096,6 +3330,8 @@ impl SessionManager {
         .with_custody_runtime(self.custody_execution_runtime())
         .with_topology_agent(Arc::clone(&self.topology_agent_self))
         .with_deploy_drain(Arc::clone(&self.deploy_drain))
+        .with_host_load(Arc::clone(&self.host_load))
+        .with_runtime_config(Arc::clone(&self.runtime_config))
     }
 
     /// `AgentCreateIssue` RPC delegator — creator identity is passed only from
@@ -3218,13 +3454,82 @@ impl SessionManager {
         &self,
         caller_session_id: Uuid,
     ) -> Result<super::boundary_mail::ClaimBoundaryMailResponse> {
-        super::boundary_mail::claim_boundary_mail(
+        let claimed = super::boundary_mail::claim_boundary_mail(
             &self.store,
             &self.agent_message_arbiter,
             &self.active,
+            &self.boundary_deliveries,
             caller_session_id,
         )
-        .await
+        .await?;
+        // #1183: a delivery the hook never confirms settles `uncertain`.
+        let agent_ids: Vec<Uuid> = claimed
+            .messages
+            .iter()
+            .filter(|mail| mail.sender_role != super::boundary_mail::OPERATOR_SENDER_ROLE)
+            .map(|mail| mail.message_id)
+            .collect();
+        if !agent_ids.is_empty() {
+            let store = Arc::clone(&self.store);
+            let pending = Arc::clone(&self.boundary_deliveries);
+            tokio::spawn(async move {
+                tokio::time::sleep(super::boundary_mail::BOUNDARY_MAIL_CONFIRM_DEADLINE).await;
+                super::boundary_mail::settle_unconfirmed_boundary_mail(
+                    &store, &pending, &agent_ids,
+                )
+                .await;
+            });
+        }
+        Ok(claimed)
+    }
+
+    /// `ConfirmBoundaryMail` (#1183): the session's own hook printed these
+    /// agent messages. They become `injected` only once the provider
+    /// transcript shows the hook context was accepted (watched in the
+    /// background until the confirmation deadline); otherwise the deadline
+    /// settles them `uncertain`.
+    pub async fn confirm_boundary_mail(
+        &self,
+        caller_session_id: Uuid,
+        params: &rsi_common::boundary_mail_hook::ConfirmBoundaryMailParams,
+    ) -> Result<super::boundary_mail::ConfirmBoundaryMailResponse> {
+        let confirmed = super::boundary_mail::confirm_boundary_mail(
+            &self.active,
+            &self.boundary_deliveries,
+            caller_session_id,
+            params,
+        )
+        .await?;
+        if !confirmed.confirmed.is_empty() {
+            let store = Arc::clone(&self.store);
+            let pending = Arc::clone(&self.boundary_deliveries);
+            let ids = confirmed.confirmed.clone();
+            // The claim-time deadline task settles whatever is still pending.
+            let deadline =
+                tokio::time::Instant::now() + super::boundary_mail::BOUNDARY_MAIL_CONFIRM_DEADLINE;
+            tokio::spawn(async move {
+                super::boundary_mail::await_boundary_mail_evidence(
+                    &store,
+                    &pending,
+                    &ids,
+                    deadline,
+                    super::boundary_mail::BOUNDARY_MAIL_EVIDENCE_POLL,
+                )
+                .await;
+            });
+        }
+        Ok(confirmed)
+    }
+
+    /// The `ClaimBoundaryMail` reply could not be written (#1183): the claimed
+    /// agent messages become `uncertain` now.
+    pub async fn abandon_agent_boundary_delivery(&self, message_ids: &[Uuid]) {
+        super::boundary_mail::settle_unconfirmed_boundary_mail(
+            &self.store,
+            &self.boundary_deliveries,
+            message_ids,
+        )
+        .await;
     }
 
     /// The `ClaimBoundaryMail` reply reached the hook (#1062): settle the
@@ -3568,6 +3873,29 @@ impl SessionManager {
 /// "https://github.com/jakedevar/rsi/local-issue-tracker/c5").
 fn c5_issue_namespace() -> Uuid {
     Uuid::from_u128(0x5da34881ecc954fba7da3913bc978130)
+}
+
+/// Label stamped on an Issue filed into the harness project from another one.
+const HARNESS_FILED_LABEL: &str = "harness-filed";
+
+/// Resolve only a unique path match to the daemon's trusted harness root.
+/// A mutable display name cannot establish cross-project write authority.
+/// Missing discovery or duplicate paths fail closed instead of choosing by
+/// project list order (including aliases of the same canonical path).
+fn resolve_harness_project(
+    projects: &[rsi_common::types::Project],
+    harness_root: Option<&std::path::Path>,
+) -> Option<Uuid> {
+    let canonical =
+        |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let root = canonical(harness_root?);
+    let mut matches = projects.iter().filter(|p| {
+        p.path
+            .as_deref()
+            .is_some_and(|path| canonical(path) == root)
+    });
+    let project = matches.next()?;
+    matches.next().is_none().then_some(project.id)
 }
 
 fn deterministic_agent_issue_id(caller_session_id: Uuid, idempotency_key: &[u8]) -> Uuid {
@@ -4990,6 +5318,7 @@ pub(crate) mod tests {
             .lock()
             .await
             .list_issue_events_v1(&rsi_common::types::IssueEventPageRequestV1 {
+                project_id: None,
                 issue_id: first_issue.id,
                 after_sequence: 0,
                 limit: None,
@@ -5043,6 +5372,7 @@ pub(crate) mod tests {
                 .lock()
                 .await
                 .list_issue_events_v1(&rsi_common::types::IssueEventPageRequestV1 {
+                    project_id: None,
                     issue_id: first_issue.id,
                     after_sequence: 0,
                     limit: None,
@@ -7441,12 +7771,15 @@ pub(crate) mod tests {
             .insert_session(&test_session(caller, std::path::PathBuf::from("/tmp")))
             .unwrap();
         let params = AgentCreateIssueParams {
+            project_id: None,
             title: "follow up".into(),
             body: "body".into(),
             priority: Some(2),
             labels: vec!["one".into(), "two".into()],
             assignee: None,
             idempotency_key: "stable-key".into(),
+            harness: false,
+            source_issue: None,
         };
         let first = control
             .agent_create_issue(caller, params.clone())
@@ -7501,6 +7834,363 @@ pub(crate) mod tests {
         );
     }
 
+    fn harness_test_project(name: &str, path: Option<&str>) -> rsi_common::types::Project {
+        rsi_common::types::Project {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            path: path.map(std::path::PathBuf::from),
+            description: None,
+            color: rsi_common::types::Project::DEFAULT_COLOR.to_string(),
+            context_files: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[test]
+    fn harness_project_resolves_only_unique_trusted_root() {
+        let by_name = harness_test_project("Rsi", Some("/elsewhere/rsi-named"));
+        let by_path = harness_test_project("Renamed", Some("/srv/rsi-harness-root"));
+        let duplicate = harness_test_project("Duplicate", Some("/srv/rsi-harness-root"));
+        let root = Some(std::path::Path::new("/srv/rsi-harness-root"));
+        assert_eq!(
+            resolve_harness_project(&[by_name.clone(), by_path.clone()], root),
+            Some(by_path.id)
+        );
+        assert_eq!(
+            resolve_harness_project(&[by_path.clone(), duplicate], root),
+            None
+        );
+        assert_eq!(resolve_harness_project(&[by_name.clone()], root), None);
+        assert_eq!(resolve_harness_project(&[by_path], None), None);
+        assert_eq!(
+            resolve_harness_project(&[by_name.clone(), by_name], None),
+            None
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn agent_create_issue_harness_files_into_rsi_project_with_provenance() {
+        let (control, store) = control_handle_with_store();
+        let mut rsi = harness_test_project("Rsi", None);
+        rsi.path = Some(
+            super::super::preamble::harness_root()
+                .unwrap()
+                .to_path_buf(),
+        );
+        let koplik = harness_test_project("Koplik", None);
+        let caller = Uuid::new_v4();
+        {
+            let store = store.lock().await;
+            store.insert_project(&rsi).unwrap();
+            store.insert_project(&koplik).unwrap();
+            let mut session = test_session(caller, std::path::PathBuf::from("/tmp"));
+            session.project_id = Some(koplik.id);
+            store.insert_session(&session).unwrap();
+        }
+        let source = store
+            .lock()
+            .await
+            .create_issue(&NewIssue {
+                project_id: koplik.id,
+                title: "source defect".into(),
+                body: String::new(),
+                priority: None,
+                labels: vec![],
+                created_by_session_id: None,
+                assignee: None,
+                idea_id: None,
+                source_event_id: None,
+                source_finding_ref: None,
+            })
+            .unwrap();
+        let params = AgentCreateIssueParams {
+            project_id: None,
+            title: "succeed_manager blocked by background invocation".into(),
+            body: "evidence".into(),
+            priority: None,
+            labels: vec!["kaizen".into()],
+            assignee: None,
+            idempotency_key: "harness-kaizen".into(),
+            harness: true,
+            source_issue: Some(source.display_number as u32),
+        };
+        let first = control
+            .agent_create_issue(caller, params.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.issue.project_id, rsi.id);
+        assert_eq!(first.issue.created_by_session_id, Some(caller));
+        assert!(first.issue.labels.contains(&"kaizen".to_string()));
+        assert!(
+            first
+                .issue
+                .labels
+                .contains(&HARNESS_FILED_LABEL.to_string())
+        );
+        assert!(first.issue.body.starts_with("evidence"));
+        assert!(first.issue.body.contains(&koplik.id.to_string()));
+        assert!(
+            first
+                .issue
+                .body
+                .contains(&format!("mirrors Issue #{}", source.display_number))
+        );
+        let mut renamed_source = koplik.clone();
+        renamed_source.name = "Renamed source".into();
+        store.lock().await.update_project(&renamed_source).unwrap();
+        let replay = control
+            .agent_create_issue(caller, params.clone())
+            .await
+            .unwrap();
+        assert!(replay.deduplicated);
+        assert_eq!(replay.issue.id, first.issue.id);
+        let conflict = control
+            .agent_create_issue(
+                caller,
+                AgentCreateIssueParams {
+                    harness: false,
+                    source_issue: None,
+                    ..params.clone()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            conflict
+                .to_string()
+                .contains("agent_create_issue_idempotency_conflict")
+        );
+        let second_caller = Uuid::new_v4();
+        let mut session = test_session(second_caller, std::path::PathBuf::from("/tmp"));
+        session.project_id = Some(koplik.id);
+        store.lock().await.insert_session(&session).unwrap();
+        let second = control
+            .agent_create_issue(second_caller, params.clone())
+            .await
+            .unwrap();
+        assert_ne!(second.issue.id, first.issue.id);
+        assert_eq!(second.issue.created_by_session_id, Some(second_caller));
+        // References must exist in the caller's source project, never the
+        // harness target; a missing/foreign reference creates no Issue.
+        for number in [0, u32::MAX, first.issue.display_number as u32] {
+            let error = control
+                .agent_create_issue(
+                    caller,
+                    AgentCreateIssueParams {
+                        source_issue: Some(number),
+                        idempotency_key: format!("invalid-source-{number}"),
+                        ..params.clone()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("agent_create_issue_source_issue_not_in_source_project")
+            );
+        }
+        // Filing grants no read, edit or close access to the harness Issue.
+        assert!(
+            control
+                .agent_get_issue(
+                    caller,
+                    AgentGetIssueRequestV1 {
+                        project_id: Some(rsi.id),
+                        issue_id: Some(first.issue.id),
+                        display_number: None,
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(control.agent_update_issue(caller, serde_json::from_value(serde_json::json!({
+            "project_id": rsi.id, "issue_id": first.issue.id,
+            "expected_row_version": first.issue.row_version, "idempotency_key": "edit-harness",
+            "body": "changed"
+        })).unwrap()).await.is_err());
+        assert!(
+            control
+                .agent_update_issue_status(
+                    caller,
+                    AgentUpdateIssueStatusRequestV1 {
+                        project_id: Some(rsi.id),
+                        issue_id: Some(first.issue.id),
+                        display_number: None,
+                        status: rsi_common::types::IssueStatus::Closed,
+                        expected_row_version: first.issue.row_version,
+                        idempotency_key: "close-harness".into(),
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .lock()
+                .await
+                .get_issue(first.issue.id)
+                .unwrap()
+                .unwrap(),
+            first.issue
+        );
+        assert_eq!(
+            store
+                .lock()
+                .await
+                .list_issues(&Default::default())
+                .unwrap()
+                .len(),
+            3
+        );
+        // An exact retry of a pre-review receipt retains its recorded stamp.
+        let legacy_key = "legacy-harness-receipt";
+        let mut legacy_new = NewIssue {
+            project_id: rsi.id,
+            title: params.title.clone(),
+            body: format!(
+                "{}\n\n---\nFiled from project Koplik ({}) by session {caller}{} (harness filing, #1389).",
+                params.body,
+                koplik.id,
+                format!(", mirrors Issue #{} there", source.display_number)
+            ),
+            priority: params.priority,
+            labels: vec!["kaizen".into(), HARNESS_FILED_LABEL.into()],
+            created_by_session_id: Some(caller),
+            assignee: None,
+            idea_id: None,
+            source_event_id: None,
+            source_finding_ref: None,
+        };
+        let legacy = store
+            .lock()
+            .await
+            .create_agent_harness_issue_idempotent(
+                caller,
+                deterministic_agent_issue_id(caller, legacy_key.as_bytes()),
+                &legacy_new,
+                legacy_key,
+            )
+            .unwrap();
+        let retry = control
+            .agent_create_issue(
+                caller,
+                AgentCreateIssueParams {
+                    idempotency_key: legacy_key.into(),
+                    ..params.clone()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(retry.deduplicated);
+        assert_eq!(retry.issue, legacy.issue);
+        // Caller content changes still conflict even with a legacy receipt.
+        legacy_new.body = "changed".into();
+        let conflict = control
+            .agent_create_issue(
+                caller,
+                AgentCreateIssueParams {
+                    idempotency_key: legacy_key.into(),
+                    body: legacy_new.body,
+                    ..params
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            conflict
+                .to_string()
+                .contains("agent_create_issue_idempotency_conflict")
+        );
+        // Without the flag the Issue lands in the caller's own project.
+        let own = control
+            .agent_create_issue(
+                caller,
+                AgentCreateIssueParams {
+                    project_id: None,
+                    title: "local".into(),
+                    body: String::new(),
+                    priority: None,
+                    labels: vec![],
+                    assignee: None,
+                    idempotency_key: "local-key".into(),
+                    harness: false,
+                    source_issue: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(own.issue.project_id, koplik.id);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn agent_create_issue_harness_rejects_conflicts_and_missing_project() {
+        let (control, store) = control_handle_with_store();
+        let koplik = harness_test_project("Koplik", None);
+        let caller = Uuid::new_v4();
+        {
+            let store = store.lock().await;
+            store.insert_project(&koplik).unwrap();
+            let mut session = test_session(caller, std::path::PathBuf::from("/tmp"));
+            session.project_id = Some(koplik.id);
+            store.insert_session(&session).unwrap();
+        }
+        let base = AgentCreateIssueParams {
+            project_id: None,
+            title: "t".into(),
+            body: String::new(),
+            priority: None,
+            labels: vec![],
+            assignee: None,
+            idempotency_key: "k".into(),
+            harness: true,
+            source_issue: None,
+        };
+        let unresolved = control
+            .agent_create_issue(caller, base.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            unresolved
+                .to_string()
+                .contains("agent_create_issue_harness_project_unresolved")
+        );
+        let both = control
+            .agent_create_issue(
+                caller,
+                AgentCreateIssueParams {
+                    project_id: Some(koplik.id),
+                    ..base.clone()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            both.to_string()
+                .contains("agent_create_issue_harness_conflicts_with_project_id")
+        );
+        let orphan_source = control
+            .agent_create_issue(
+                caller,
+                AgentCreateIssueParams {
+                    harness: false,
+                    source_issue: Some(3),
+                    ..base
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            orphan_source
+                .to_string()
+                .contains("agent_create_issue_source_issue_requires_harness")
+        );
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn agent_issue_guarded_control_handle_routes_all_seven_lead_verbs() {
@@ -7547,12 +8237,15 @@ pub(crate) mod tests {
             .agent_create_issue(
                 caller,
                 AgentCreateIssueParams {
+                    project_id: None,
                     title: "guarded route".into(),
                     body: "original".into(),
                     priority: Some(2),
                     labels: vec!["agent-control".into()],
                     assignee: None,
                     idempotency_key: "agent-control-create".into(),
+                    harness: false,
+                    source_issue: None,
                 },
             )
             .await
@@ -7575,6 +8268,7 @@ pub(crate) mod tests {
             .agent_get_issue(
                 caller,
                 AgentGetIssueRequestV1 {
+                    project_id: None,
                     issue_id: Some(created.issue.id),
                     display_number: None,
                 },
@@ -7589,6 +8283,7 @@ pub(crate) mod tests {
             .agent_update_issue(
                 caller,
                 AgentUpdateIssueRequestV1 {
+                    project_id: None,
                     issue_id: Some(created.issue.id),
                     display_number: None,
                     expected_row_version: created.issue.row_version,
@@ -7608,6 +8303,7 @@ pub(crate) mod tests {
             .agent_update_issue_status(
                 caller,
                 AgentUpdateIssueStatusRequestV1 {
+                    project_id: None,
                     issue_id: Some(created.issue.id),
                     display_number: None,
                     status: rsi_common::types::IssueStatus::Closed,
@@ -7621,6 +8317,7 @@ pub(crate) mod tests {
             .agent_archive_issue(
                 caller,
                 AgentArchiveIssueRequestV1 {
+                    project_id: None,
                     issue_id: created.issue.id,
                     expected_row_version: closed.issue.row_version,
                     idempotency_key: "agent-control-archive".into(),
@@ -7640,6 +8337,7 @@ pub(crate) mod tests {
             .agent_list_issue_events(
                 caller,
                 IssueEventPageRequestV1 {
+                    project_id: None,
                     issue_id: created.issue.id,
                     after_sequence: 0,
                     limit: None,
@@ -7659,6 +8357,7 @@ pub(crate) mod tests {
             .agent_restore_issue(
                 caller,
                 AgentRestoreIssueRequestV1 {
+                    project_id: None,
                     issue_id: created.issue.id,
                     expected_row_version: archived.issue.row_version,
                     idempotency_key: "agent-control-restore".into(),
@@ -7676,6 +8375,7 @@ pub(crate) mod tests {
                 .agent_list_issue_events(
                     caller,
                     IssueEventPageRequestV1 {
+                        project_id: None,
                         issue_id: created.issue.id,
                         after_sequence: 0,
                         limit: None,
@@ -8492,6 +9192,9 @@ pub(crate) mod tests {
             match task.await.expect("join") {
                 Ok(ArmWatchOutcome::Armed(job)) => armed_ids.push(job.id),
                 Ok(ArmWatchOutcome::Deduplicated(job)) => dedup_ids.push(job.id),
+                Ok(ArmWatchOutcome::Rearmed(job)) => {
+                    panic!("an unfired watch cannot rearm: {job:?}")
+                }
                 Err(e) => panic!("unexpected arm error: {e}"),
             }
         }
@@ -8553,7 +9256,7 @@ pub(crate) mod tests {
         for task in tasks {
             match task.await.expect("join") {
                 Ok(ArmWatchOutcome::Armed(_)) => armed += 1,
-                Ok(ArmWatchOutcome::Deduplicated(_)) => {
+                Ok(ArmWatchOutcome::Deduplicated(_) | ArmWatchOutcome::Rearmed(_)) => {
                     panic!("distinct watched subjects cannot deduplicate")
                 }
                 Err(e) => {
@@ -8895,6 +9598,70 @@ mod send_message_tests {
             "a live Session target binds no reservation"
         );
         assert_eq!(message_row_count(&store).await, 1);
+    }
+
+    /// #1183: a target whose provider has no mid-turn boundary gets a typed
+    /// `turn_end_only` hint in the send receipt (and on replay); a provider with
+    /// a boundary gets none.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn agent_send_message_hints_turn_end_only_for_providers_without_a_mid_turn_boundary() {
+        use rsi_common::types::SessionProvider;
+        let (control, store) = control_handle_with_store();
+        let caller = Uuid::new_v4();
+        insert(&store, caller, SessionKind::Task, None, None).await;
+        for (index, (provider, expected)) in [
+            (
+                SessionProvider::Local,
+                Some(AgentMessageDeliveryBoundaryV1::TurnEndOnly),
+            ),
+            (
+                SessionProvider::Antigravity,
+                Some(AgentMessageDeliveryBoundaryV1::TurnEndOnly),
+            ),
+            (
+                SessionProvider::CodexAppServer,
+                Some(AgentMessageDeliveryBoundaryV1::TurnEndOnly),
+            ),
+            (SessionProvider::Claude, None),
+            (SessionProvider::Codex, None),
+            (SessionProvider::Pioneer, None),
+            (SessionProvider::OpenRouter, None),
+            (SessionProvider::Harness, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let child = Uuid::new_v4();
+            let mut row = test_session(child, std::path::PathBuf::from("/tmp"));
+            row.parent_id = Some(caller);
+            row.session_kind = SessionKind::Task;
+            row.status = SessionStatus::Running;
+            row.provider = provider;
+            store
+                .lock()
+                .await
+                .insert_session(&row)
+                .expect("insert child");
+            let key = format!("k-hint-{index}");
+            let receipt = control
+                .agent_send_message(caller, send(child, &key))
+                .await
+                .expect("accepted");
+            assert_eq!(receipt.delivery_boundary, expected, "{provider:?}");
+            assert_eq!(receipt.state, AgentMessageStateV1::Queued);
+            let wire = serde_json::to_value(&receipt).expect("json");
+            match expected {
+                Some(_) => assert_eq!(wire["delivery_boundary"], "turn_end_only"),
+                None => assert!(wire.get("delivery_boundary").is_none(), "{wire}"),
+            }
+            let replay = control
+                .agent_send_message(caller, send(child, &key))
+                .await
+                .expect("replay");
+            assert!(replay.deduplicated);
+            assert_eq!(replay.delivery_boundary, expected, "{provider:?} replay");
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]

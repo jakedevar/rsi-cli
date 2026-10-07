@@ -75,6 +75,10 @@ pub const fn env_vars(slot: Slot) -> &'static [&'static str] {
     }
 }
 
+/// AWS static-credential env vars. Not vault slots (the AWS SDK reads them
+/// directly), but secret: a portable export must never carry their values.
+pub const AWS_SECRET_ENV_VARS: &[&str] = &["AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"];
+
 /// Every credential env var name that must never reach an agent-facing
 /// process unless a launch deliberately injects it.
 pub fn scrubbed_env_var_names() -> impl Iterator<Item = &'static str> {

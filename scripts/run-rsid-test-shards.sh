@@ -34,7 +34,7 @@ list: enumerate the 16 library shards (each across its packages) and check their
 warmup: build shard, integration, binary, and selected workspace test artifacts without running tests.
 shard: list, check, and run one library shard for a bounded edit/verify loop.
 --dry-run checks the static inventory and prints commands without running Cargo.
---keep-rsid-artifacts retains each shard's rsid test build for debugging.
+--keep-rsid-artifacts (or RSI_LANDER_KEEP_RSID_ARTIFACTS=1) retains each shard's rsid test build.
 Cleanup skips while another runner uses the same Cargo target directory.
 EOF
     exit 2
@@ -47,6 +47,9 @@ filterset=""
 evidence_dir=""
 dry_run=0
 keep_rsid_artifacts=0
+# #1244: the lander builds into a private target it discards after the gate,
+# so cleaning there only throws away binaries its prebuild compiled.
+[[ "${RSI_LANDER_KEEP_RSID_ARTIFACTS:-}" == 1 ]] && keep_rsid_artifacts=1
 list_profile=""
 while (( $# )); do
     case "$1" in
@@ -83,8 +86,12 @@ while (( $# )); do
 done
 [[ -z "$filterset" || "$mode" == shard ]] || usage
 if [[ -n "$filterset" ]]; then
-    filterset_pattern='^test\([A-Za-z0-9_:.-]+\)$'
+    # One nextest atom: test(NAME), test(=NAME) or test(/REGEX/) (the shapes
+    # check-touched-shards emits, #1510). Control and non-ASCII bytes are
+    # refused; "$filterset" is always forwarded as one quoted argument.
+    filterset_pattern='^test\((=?[A-Za-z0-9_:.-]+|/.+/)\)$'
     [[ "$filterset" =~ $filterset_pattern ]] || usage
+    [[ -z "$(printf '%s' "$filterset" | LC_ALL=C tr -d '\040-\176')" ]] || usage
 fi
 [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || usage
 if [[ "$mode" == list || "$mode" == warmup || "$mode" == shard ]]; then

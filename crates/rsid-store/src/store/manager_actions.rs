@@ -20,6 +20,7 @@ pub mod fence;
 mod issue_worker;
 mod operator_delegation;
 mod recovery;
+mod sandbox_source;
 mod superseded_wakes;
 
 const ACTION_KIND: &str = "lifecycle_action";
@@ -54,6 +55,16 @@ pub enum OperatorPause {
     Hard,
 }
 
+/// Read model behind `GetOperatorPause` (#1541).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorPauseDetail {
+    pub level: OperatorPause,
+    /// RFC3339 time the marker was last written (inherited markers carry the
+    /// publication time).
+    pub since: Option<String>,
+    pub held_succession: bool,
+}
+
 impl OperatorPause {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -84,10 +95,11 @@ fn delegated_cleanup_allowed_during_lead_pause(action: &ManagerActionV2) -> bool
 pub(super) const REVIEW_ALLOCATION_KEY_PREFIX: &str = "manager-review-allocation:";
 /// Alias `o` is an operation row. A blocked or revoked operation whose target
 /// session was never created consumed nothing and is not charged; queued,
-/// running, succeeded, failed and uncertain operations stay charged. Root
-/// successions keep their existing charge (their `manager_root_successions`
-/// occurrence is retained across scopes and counted exactly once).
-const CREATION_CHARGED: &str = "NOT (o.state IN ('blocked','revoked') AND json_extract(o.payload_json,'$.request.operation.action')!='succeed_manager' AND NOT EXISTS(SELECT 1 FROM sessions s WHERE s.id=o.target_session_id))";
+/// running, succeeded, failed and uncertain operations stay charged. This
+/// includes `succeed_manager` (#1390): a succession refused before its
+/// candidate existed releases its charge, so a retried succession does not
+/// burn `max_created_sessions`.
+const CREATION_CHARGED: &str = "NOT (o.state IN ('blocked','revoked') AND NOT EXISTS(SELECT 1 FROM sessions s WHERE s.id=o.target_session_id))";
 
 /// Which caller runs [`Store::recovery_owner_gate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +129,12 @@ pub(crate) enum RecoveryOwnerMode {
     /// not hold the pause: the action suspends them (recorded, restored by
     /// `resume_lead`). Every genuine human/operator owner still refuses.
     ManagerLeadPause,
+    /// #1408: admission of a manager's own `succeed_manager` handoff. The
+    /// operator pause permits a reservation, which stays queued until cleared.
+    /// Effect and publication gates still enforce the operator pause: provider
+    /// establishment is productive work, not just a metadata handoff.
+    /// Every other human/operator owner still refuses.
+    ManagerSuccession,
 }
 
 // Alias `a` is an operation row. Lost effects fence their still-live lead
@@ -178,6 +196,47 @@ pub struct ManagerActionSourceV2 {
     /// field existed. A moved source is accepted only on this same branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// #1195: the explicit or default sandbox source of a `create_session`.
+    /// `None` is the pre-#1195 pinned fork of the source's own `HEAD` (lead
+    /// replacement, retry and older rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_source: Option<ManagerFrozenSandboxSourceV1>,
+}
+
+/// #1195: how a frozen create source's `commit` was chosen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ManagerFrozenSandboxSourceV1 {
+    /// Resolved at launch to the fetched `origin/rolling` tip; `commit` is
+    /// the checkout `HEAD` used only when the checkout is not on `rolling`
+    /// or no published tip can be observed.
+    Rolling,
+    /// `commit` is the caller-named commit.
+    Commit,
+    /// `commit` is the named worktree's `HEAD`, pinned at admission.
+    Path {
+        path: PathBuf,
+        #[serde(default, skip_serializing_if = "is_false")]
+        source_dirty: bool,
+    },
+}
+
+impl ManagerActionSourceV2 {
+    /// The launch forks from exactly the frozen `commit` (an explicit or
+    /// historical source), not from the source's current `HEAD`.
+    #[must_use]
+    pub const fn forks_at_frozen_commit(&self) -> bool {
+        self.historical_commit || self.sandbox_source.is_some()
+    }
+
+    /// The launch resolves the published `rolling` tip (#1195).
+    #[must_use]
+    pub const fn resolves_rolling_at_launch(&self) -> bool {
+        matches!(
+            self.sandbox_source,
+            Some(ManagerFrozenSandboxSourceV1::Rolling)
+        )
+    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -189,8 +248,20 @@ fn is_false(value: &bool) -> bool {
 /// public action wire type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagerIssueBindingV1 {
+    /// Manager-supplied bounded QA delegation; old bindings default to false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub qa_lane: bool,
     pub issue_id: Uuid,
     pub display_number: i64,
+    /// #1254: the terminal worker this launch continues; the launch sets the
+    /// new worker's `continued_from` and inherits its display identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continue_from: Option<Uuid>,
+    /// #1590: the implementer Issue (display number) whose text and handoff
+    /// the daemon copied into this reviewer's brief. Journalled so a replay
+    /// reuses the original brief.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_of: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +288,22 @@ pub struct ManagerActionOperationV2 {
     pub effect_started: bool,
     pub settled_fence: Option<ManagerLeadFenceV2>,
     pub claim_boot_id: Option<Uuid>,
+}
+
+impl ManagerActionOperationV2 {
+    /// Continuations resume work already admitted, even though their journal
+    /// uses the same CreateSession action as a new Issue worker.
+    pub fn is_new_worker_create(&self) -> bool {
+        matches!(
+            self.context.request.operation,
+            ManagerActionV2::CreateSession { .. }
+        ) && self
+            .context
+            .issue_binding
+            .as_ref()
+            .and_then(|binding| binding.continue_from)
+            .is_none()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -451,8 +538,11 @@ impl Store {
             return Err(refused("manager_succession_agent_origin_required"));
         }
         match origin {
-            ManagerActionOriginV2::Agent { caller } => self.manager_v2_authorize(
+            // #1235: the journalled request carries its target project, so
+            // every effect-time recheck re-resolves the same arm.
+            ManagerActionOriginV2::Agent { caller } => self.manager_v2_authorize_in(
                 *caller,
+                request.project_id,
                 &request.fence,
                 Some(request.operation.capability()),
             ),
@@ -480,6 +570,52 @@ impl Store {
                 }
                 Ok(authority)
             }
+        }
+    }
+
+    /// The authority a JOURNALLED action re-proves at every execution gate.
+    ///
+    /// #1335: an agent's action can wait in the queue (a deploy drain holds a
+    /// create for up to an hour) while its seat rotates: the caller is then
+    /// an archived predecessor and its own authorization fails with
+    /// `manager_current_session_required`. A rotation keeps the appointment
+    /// (same anchor, scope and policy versions, which every caller of this
+    /// re-checks against the journalled row), so the action is re-proved as
+    /// the caller's lineage tip: the seat that holds the caller's authority
+    /// now. A caller with no live successor is refused with
+    /// `manager_v2_actor_seat_retired`, a clear class the receipt and the
+    /// manager notice carry. Admission ([`Self::manager_action_authority`])
+    /// never takes this path: only a stored request is inherited.
+    pub(super) fn manager_stored_action_authority(
+        &self,
+        origin: &ManagerActionOriginV2,
+        request: &AgentManagerControlRequestV2,
+    ) -> Result<ManagerAuthorityV2> {
+        let denial = match self.manager_action_authority(origin, request) {
+            Ok(authority) => return Ok(authority),
+            Err(denial) => denial,
+        };
+        let ManagerActionOriginV2::Agent { caller } = origin else {
+            return Err(denial);
+        };
+        let caller_retired = self.get_session(*caller)?.is_none_or(|session| {
+            matches!(
+                session.status,
+                SessionStatus::Archived | SessionStatus::Deleted
+            )
+        });
+        let tip = self.manager_lineage_tip(*caller).ok();
+        match tip.filter(|tip| tip != caller) {
+            Some(tip) => self
+                .manager_action_authority(&ManagerActionOriginV2::Agent { caller: tip }, request),
+            None if caller_retired
+                && denial
+                    .to_string()
+                    .contains("manager_current_session_required") =>
+            {
+                Err(refused("manager_v2_actor_seat_retired"))
+            }
+            None => Err(denial),
         }
     }
 
@@ -583,6 +719,14 @@ impl Store {
                 {
                     return Err(refused("manager_v2_candidate_out_of_scope"));
                 }
+                // #1276 rule (c): assigning a session an ancestor owns as the
+                // lead is a mutation of it.
+                self.manager_action_refuse_ancestor_owned(authority, candidate.id)?;
+            }
+            // #1276 rule (c): every lead action mutates the current lead, so it
+            // flows down only, at admission and again at effect.
+            if let Some(lead) = container.lead_session_id {
+                self.manager_action_refuse_ancestor_owned(authority, lead)?;
             }
             return container
                 .lead_session_id
@@ -770,7 +914,24 @@ impl Store {
         if !rsi_common::is_leaf_kind(scope.target.session_kind) {
             return Err(refused("manager_v2_leaf_required"));
         }
+        // #1235 rule (c): housekeeping is a mutation and flows down only.
+        self.manager_action_refuse_ancestor_owned(authority, scope.target.id)?;
         Ok((scope.target, scope.epic_id))
+    }
+
+    /// #1235 rule (c), mutations flow down: refuse a target owned by a
+    /// principal above the acting one.
+    fn manager_action_refuse_ancestor_owned(
+        &self,
+        authority: &ManagerAuthorityV2,
+        target: Uuid,
+    ) -> Result<()> {
+        if self.manager_target_owned_by_ancestor(&authority.config, target)? {
+            return Err(refused(
+                rsi_common::global_manager::MANAGER_TARGET_OWNED_BY_ANCESTOR,
+            ));
+        }
+        Ok(())
     }
 
     /// Nearest Epic at or above a session, for notice and gate attribution.
@@ -918,6 +1079,38 @@ impl Store {
             None | Some("false") => OperatorPause::None,
             Some("soft") => OperatorPause::Soft,
             _ => OperatorPause::Hard,
+        })
+    }
+
+    /// #1541: the pause level plus what the operator needs to find a stale
+    /// marker: when it was last written and whether a manager succession for
+    /// this seat is queued behind it (#1539 holds, never drops, it).
+    pub fn get_operator_pause_detail(&self, session: Uuid) -> Result<OperatorPauseDetail> {
+        let level = self.get_operator_pause(session)?;
+        if level == OperatorPause::None {
+            return Ok(OperatorPauseDetail {
+                level,
+                since: None,
+                held_succession: false,
+            });
+        }
+        let since: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT updated_at FROM daemon_settings WHERE key=?1",
+                [format!("manager_operator_pause:{session}")],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let held_succession = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM manager_root_successions WHERE predecessor_session_id=?1 AND state IN ('reserved','executing'))",
+            [session.to_string()],
+            |r| r.get(0),
+        )?;
+        Ok(OperatorPauseDetail {
+            level,
+            since,
+            held_succession,
         })
     }
 
@@ -1167,6 +1360,12 @@ impl Store {
         )
     }
 
+    /// #1408: gate for a manager `succeed_manager`; see
+    /// [`RecoveryOwnerMode::ManagerSuccession`].
+    pub(crate) fn manager_succession_human_gate(&self, target: Uuid) -> Result<()> {
+        self.recovery_owner_gate(target, RecoveryOwnerMode::ManagerSuccession)
+    }
+
     pub fn manager_restart_human_gate(
         &self,
         target: Uuid,
@@ -1222,6 +1421,7 @@ impl Store {
             RecoveryOwnerMode::AgentArchive => (false, true, true, false, false),
             RecoveryOwnerMode::ManagerLeadHandover => (true, true, false, false, true),
             RecoveryOwnerMode::ManagerLeadPause => (true, true, false, false, false),
+            RecoveryOwnerMode::ManagerSuccession => (true, false, true, false, false),
         };
         let held: bool = self.conn.query_row(
             "SELECT pending_question_json IS NOT NULL OR pending_archive=1 OR status='WaitingApproval'
@@ -1251,22 +1451,25 @@ impl Store {
     ) -> Result<()> {
         let policy = &authority.grant.policy;
         launch.validate().map_err(refused)?;
-        if !policy.allowed_launches.is_empty()
-            && !policy.allowed_launches.iter().any(|l| {
-                l.provider == launch.provider
-                    && l.model == launch.model
-                    && l.effort == launch.effort
-            })
-        {
-            return Err(refused("manager_v2_launch_not_granted"));
-        }
+        self.manager_launch_policy_gate(&authority.config, &policy.allowed_launches, launch)?;
         let epic = exclude
             .map(|id| self.get_session(id))
             .transpose()?
             .flatten()
             .and_then(|s| s.parent_id)
             .filter(|id| authority.config.epic_ids.contains(id));
-        self.manager_v2_resource_gate(&authority.config, epic, launch.provider, exclude)
+        // #1274: the acting principal's own resolved policy (a global seat's
+        // granted project policy), then every ancestor's caps.
+        self.manager_v2_resource_gate_with(
+            &authority.config,
+            (!authority.grant.revoked).then_some(&authority.grant.policy),
+            epic,
+            launch.provider,
+            exclude,
+            true,
+            // #1309: the acting principal originates this launch.
+            &[],
+        )
     }
 
     /// Lifetime-within-scope creation usage charged against
@@ -1284,9 +1487,11 @@ impl Store {
             return Ok(count);
         }
         // Root occurrences retain their creation charge across scope/appointment
-        // changes. They are not a recovery and are counted exactly once.
+        // changes. They are not a recovery and are counted exactly once. A
+        // blocked or revoked occurrence never created its candidate and is
+        // free, as its operation is (#1390).
         let retained: i64 = self.conn.query_row(
-            "SELECT count(*) FROM manager_root_successions WHERE project_id=?1 AND NOT (manager_session_id=?2 AND scope_version=?3)",
+            "SELECT count(*) FROM manager_root_successions r WHERE r.project_id=?1 AND NOT (r.manager_session_id=?2 AND r.scope_version=?3) AND NOT (r.state IN ('blocked','revoked') AND NOT EXISTS(SELECT 1 FROM sessions s WHERE s.id=r.candidate_session_id))",
             params![config.project_id.to_string(), config.manager_session_id.to_string(), config.row_version],
             |r| r.get(0),
         )?;
@@ -1322,8 +1527,10 @@ impl Store {
             result: None,
             deduplicated: false,
             operator_result: None,
+            sandbox_source: None,
         };
         let request = AgentManagerControlRequestV2 {
+            project_id: None,
             fence: ManagerFenceV2 {
                 scope_version: config.row_version,
                 policy_version: 1,
@@ -1355,6 +1562,7 @@ impl Store {
         if count >= i64::from(cap) {
             return Err(refused("manager_v2_creation_limit"));
         }
+        self.manager_ancestor_creation_budget(authority, container)?;
         if epic && !authority.config.has_dynamic_scope() {
             let pending: i64 = self.conn.query_row("SELECT count(*) FROM harness_manager_v2_operations WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3 AND kind=?4 AND state IN ('queued','running','uncertain') AND json_extract(payload_json,'$.request.operation.action')='create_container' AND json_extract(payload_json,'$.request.operation.kind')='Epic'", params![authority.config.project_id.to_string(),authority.config.manager_session_id.to_string(),authority.config.row_version,ACTION_KIND], |r|r.get(0))?;
             if authority.config.epic_ids.len() as i64 + pending >= 32 {
@@ -1364,12 +1572,141 @@ impl Store {
         Ok(())
     }
 
-    pub(super) fn manager_action_freeze_source(
+    /// #1235 rule (d), budgets are charged up the chain: an admission in a
+    /// project counts against the project-policy caps of the acting node and
+    /// of every ancestor covering the project (#1237: every depth). #1301,
+    /// plan §2.3(d): work is charged once, to the originating node and its
+    /// ancestors. A node's count is the charged creations in the project
+    /// since its authority epoch began whose origin is the node itself, a
+    /// node below it, or a principal under the whole chain (the project
+    /// manager, an area node, an Epic lead); never an ancestor's or a
+    /// sibling's. So a descendant's cap never limits an ancestor's own
+    /// admission, and an ancestor's own work never starves a descendant.
+    fn manager_ancestor_creation_budget(
         &self,
-        source: &Session,
-    ) -> Result<ManagerActionSourceV2> {
+        authority: &ManagerAuthorityV2,
+        container: bool,
+    ) -> Result<()> {
+        self.manager_ancestor_creation_allowance(&authority.config, container, 1, 0)
+    }
+
+    /// [`Self::manager_ancestor_creation_budget`] for `needed` new sessions
+    /// (or containers), of which `counted` are already charged (a relaunch of
+    /// a charged topology attempt). #1275: a session count includes the
+    /// session attempts of manager-requested topology executions in the
+    /// project (by the same origin rule), so no session-creating path escapes
+    /// an ancestor's allowance.
+    pub fn manager_ancestor_creation_allowance(
+        &self,
+        config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+        container: bool,
+        needed: i64,
+        counted: i64,
+    ) -> Result<()> {
+        let (ancestors, own) = self.portfolio_ancestors_of(config)?;
+        let charged: Vec<_> = ancestors
+            .iter()
+            .map(|head| (head, false))
+            .chain(own.iter().map(|head| (head, true)))
+            .collect();
+        let Some(since) = charged.iter().map(|(head, _)| head.started.as_str()).min() else {
+            return Ok(());
+        };
+        let charges = self.portfolio_creation_charges(config.project_id, container, since)?;
+        for (head, is_own) in charged {
+            let policy = &head.record.grant.project_policy;
+            let cap = if container {
+                policy.max_created_containers
+            } else {
+                policy.max_created_sessions
+            };
+            let count = charges
+                .iter()
+                .filter(|(created, lineage)| {
+                    created.as_str() >= head.started.as_str()
+                        && lineage
+                            .as_ref()
+                            .is_none_or(|lineage| lineage.contains(&head.node_id))
+                })
+                .count() as i64;
+            if (count - counted).saturating_add(needed) > i64::from(cap) {
+                return Err(refused(if is_own {
+                    "manager_v2_creation_limit"
+                } else {
+                    rsi_common::global_manager::MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// #1301: every charged creation in `project` since `since`, as its
+    /// `created_at` and its origin's lineage (the originating node and the
+    /// nodes above it), or `None` when no portfolio node originated it.
+    /// Lifecycle operations are attributed by their ledger principal, topology
+    /// session attempts and delegated appointments (sessions only) by their
+    /// requesting seat and scope, or their grantor node (#1314).
+    fn portfolio_creation_charges(
+        &self,
+        project: Uuid,
+        container: bool,
+        since: &str,
+    ) -> Result<Vec<(String, Option<Vec<Uuid>>)>> {
+        let actions = if container {
+            "[\"create_container\"]"
+        } else {
+            "[\"create_session\",\"replace_lead\",\"retry_lead\",\"succeed_manager\"]"
+        };
+        let mut statement = self.conn.prepare(&format!("SELECT o.created_at,o.manager_session_id,o.scope_version FROM harness_manager_v2_operations o WHERE o.project_id=?1 AND o.kind=?2 AND o.created_at>=?3 AND json_extract(o.payload_json,'$.request.operation.action') IN (SELECT value FROM json_each(?4)) AND NOT EXISTS(SELECT 1 FROM manager_review_assignments r WHERE r.action_operation_id=o.id) AND {CREATION_CHARGED}"))?; // sql-dynamic-ok: static CREATION_CHARGED clause
+        let mut rows: Vec<(String, Option<String>, Option<i64>)> = statement
+            .query_map(
+                params![project.to_string(), ACTION_KIND, since, actions],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !container {
+            rows.extend(
+                crate::store_support::topology_usage::topology_created_charges_since(
+                    &self.conn, project, since,
+                )?,
+            );
+        }
+        let mut origins: std::collections::HashMap<(String, i64), Option<Vec<Uuid>>> =
+            std::collections::HashMap::new();
+        let mut charges = Vec::with_capacity(rows.len());
+        for (created, session, version) in rows {
+            let lineage = match (session, version) {
+                (Some(session), Some(version)) => {
+                    let key = (session, version);
+                    if let Some(known) = origins.get(&key) {
+                        known.clone()
+                    } else {
+                        let lineage = self
+                            .portfolio_origin_node(&key.0, key.1)?
+                            .map(|node| self.portfolio_lineage(node))
+                            .transpose()?;
+                        origins.insert(key, lineage.clone());
+                        lineage
+                    }
+                }
+                _ => None,
+            };
+            charges.push((created, lineage));
+        }
+        if !container {
+            // #1314: a delegated appointment's seat is a session its
+            // grantor created, charged to the grantor and its ancestors.
+            for (created, node) in self.appointment_creation_charges(project, since)? {
+                charges.push((created, Some(self.portfolio_lineage(node)?)));
+            }
+        }
+        Ok(charges)
+    }
+
+    /// The authenticated directory a manager action forks `source` from.
+    fn manager_action_source_root(&self, source: &Session) -> Result<PathBuf> {
         use crate::sandbox::custody::{CustodyClassification, CustodyService};
-        let root = match CustodyService::classify(source)? {
+        Ok(match CustodyService::classify(source)? {
             CustodyClassification::OrdinaryUnsandboxed => {
                 CustodyService::authorize_ordinary(source)?;
                 source.working_dir.clone()
@@ -1383,7 +1720,14 @@ impl Store {
                     .clone()
                     .ok_or_else(|| refused("manager_v2_source_custody_changed"))?
             }
-        };
+        })
+    }
+
+    pub(super) fn manager_action_freeze_source(
+        &self,
+        source: &Session,
+    ) -> Result<ManagerActionSourceV2> {
+        let root = self.manager_action_source_root(source)?;
         let (clean, commit) = crate::sandbox::git_worktree::observe_clean_head_bounded(&root)?;
         if !clean {
             return Err(refused("manager_v2_source_worktree_dirty"));
@@ -1397,6 +1741,7 @@ impl Store {
             custody_generation: self.manager_action_custody_generation(source.id)?,
             historical_commit: false,
             branch,
+            sandbox_source: None,
         })
     }
 
@@ -1412,6 +1757,18 @@ impl Store {
                 .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
         {
             return Err(refused("manager_review_source_changed"));
+        }
+        if let Some(reclaimed) = self.manager_review_reclaimed_source(source)? {
+            return Ok(ManagerActionSourceV2 {
+                session_id: source.id,
+                working_dir: reclaimed.repository,
+                sandbox_root: None,
+                commit: expected_commit.to_string(),
+                custody_generation: Some(reclaimed.generation as i64),
+                historical_commit: true,
+                branch: None,
+                sandbox_source: None,
+            });
         }
         match CustodyService::classify(source)
             .map_err(|_| refused("manager_review_author_unavailable"))?
@@ -1435,6 +1792,7 @@ impl Store {
                 .map_err(|_| refused("manager_review_author_unavailable"))?,
             historical_commit: true,
             branch: None,
+            sandbox_source: None,
         })
     }
 
@@ -1518,7 +1876,17 @@ impl Store {
                             refused("manager_v2_source_unavailable")
                         }
                     })?;
-                    self.manager_action_freeze_source(source_session)?
+                    match &request.operation {
+                        // #1195: a new worker branches from published rolling
+                        // (or the named commit/worktree), never from whatever
+                        // the shared checkout happens to have checked out.
+                        CreateSession { sandbox_source, .. } => self
+                            .manager_action_selected_source(
+                                source_session,
+                                sandbox_source.as_ref(),
+                            )?,
+                        _ => self.manager_action_freeze_source(source_session)?,
+                    }
                 });
                 launch = Some(choice.clone());
                 id = allocate_target_identity.then(Uuid::new_v4);
@@ -1743,6 +2111,10 @@ impl Store {
             result: None,
             deduplicated: false,
             operator_result: None,
+            sandbox_source: admission
+                .source
+                .as_ref()
+                .and_then(sandbox_source::sandbox_source_receipt),
         };
         let stamp = now();
         let due = (Utc::now() + chrono::Duration::seconds(i64::from(admission.delay_seconds)))
@@ -1888,10 +2260,7 @@ impl Store {
         )?)
     }
 
-    pub fn manager_action_operation(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<ManagerActionOperationV2>> {
+    pub fn manager_action_operation(&self, id: Uuid) -> Result<Option<ManagerActionOperationV2>> {
         let raw:Option<(String,String,i64,String,String,Option<String>,Option<String>)>=self.conn.query_row(
             "SELECT o.project_id,o.manager_session_id,o.scope_version,o.outcome_json,c.payload_json,o.claim_boot_id,e.payload_json
              FROM harness_manager_v2_operations o JOIN harness_manager_v2_records c ON c.project_id=o.project_id AND c.manager_session_id=o.manager_session_id AND c.scope_version=o.scope_version AND c.kind=?2 AND c.record_key=o.id
@@ -1925,6 +2294,32 @@ impl Store {
         .transpose()
     }
 
+    /// Queued `create_session` actions that are due, oldest first (the order
+    /// the claim query releases them in): `(target session id, not_before)`.
+    /// Read-only; `AgentGetDaemonInfo` host-load admission lists them (#1417).
+    pub fn queued_manager_create_sessions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(Option<Uuid>, String)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT o.target_session_id,o.not_before FROM harness_manager_v2_operations o
+             WHERE o.kind=?1 AND o.state='queued' AND o.not_before<=?3
+               AND json_extract(o.payload_json,'$.request.operation.action')='create_session'
+               AND json_extract(o.payload_json,'$.issue_binding.continue_from') IS NULL
+             ORDER BY o.not_before,o.id LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![ACTION_KIND, i64::try_from(limit).unwrap_or(i64::MAX), now()],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        let mut queued = Vec::new();
+        for row in rows {
+            let (target, not_before) = row?;
+            queued.push((target.map(|id| parse_id(&id)).transpose()?, not_before));
+        }
+        Ok(queued)
+    }
+
     pub fn claim_manager_action(&self, boot_id: Uuid) -> Result<Option<ManagerActionClaimV2>> {
         self.claim_manager_action_holding(boot_id, false)
     }
@@ -1936,6 +2331,45 @@ impl Store {
         &self,
         boot_id: Uuid,
         hold_worker_starts: bool,
+    ) -> Result<Option<ManagerActionClaimV2>> {
+        self.claim_manager_action_holding_creates(boot_id, hold_worker_starts, false)
+    }
+
+    /// [`Self::claim_manager_action_holding`] plus `hold_creates` (#1417 host
+    /// load): leaves new queued `create_session` actions (Issue-worker launches and
+    /// reviews included) unclaimed while the host is too loaded for a new
+    /// worker. Lead recovery (`replace_lead`, `retry_lead`, `resume_lead`)
+    /// Issue worker continuations, and every other action still claim, so only
+    /// new work waits. The held
+    /// creates stay queued, so they keep their `(not_before, id)` place and
+    /// the claim query releases them oldest-first across projects.
+    pub fn claim_manager_action_holding_creates(
+        &self,
+        boot_id: Uuid,
+        hold_worker_starts: bool,
+        hold_creates: bool,
+    ) -> Result<Option<ManagerActionClaimV2>> {
+        self.claim_manager_action_with_admission(boot_id, hold_worker_starts, hold_creates, None)
+    }
+
+    /// Consult admission only for the oldest eligible new create. The callback
+    /// must be synchronous and must not access the store. A held create stays
+    /// queued; other actions, including continuations, can still claim.
+    pub fn claim_manager_action_with_create_admission(
+        &self,
+        boot_id: Uuid,
+        hold_worker_starts: bool,
+        admit: &dyn Fn(Uuid, chrono::DateTime<chrono::Utc>, Option<Uuid>) -> bool,
+    ) -> Result<Option<ManagerActionClaimV2>> {
+        self.claim_manager_action_with_admission(boot_id, hold_worker_starts, false, Some(admit))
+    }
+
+    fn claim_manager_action_with_admission(
+        &self,
+        boot_id: Uuid,
+        hold_worker_starts: bool,
+        hold_creates: bool,
+        admit: Option<&dyn Fn(Uuid, chrono::DateTime<chrono::Utc>, Option<Uuid>) -> bool>,
     ) -> Result<Option<ManagerActionClaimV2>> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         // One active command per project, even across independent daemon handles.
@@ -1950,13 +2384,15 @@ impl Store {
         // per-parent guard (`manager_create_parent_guard_key`).
         const CREATE_PAIR: &str =
             "json_extract(o.payload_json,'$.request.operation.action')='create_session'";
-        let id:Option<String>=self.conn.query_row(
+        let selected:Option<(String,String)>=self.conn.query_row(
             &format!("WITH eligible AS (
              SELECT o.id,o.project_id,o.not_before,
                     json_extract(o.payload_json,'$.origin.origin') AS origin,
                     json_extract(o.payload_json,'$.request.operation.action') AS action
                FROM harness_manager_v2_operations o WHERE o.kind=?1 AND o.state='queued' AND o.not_before<=?2
              AND (?3=0 OR json_extract(o.payload_json,'$.request.operation.action') NOT IN ('create_session','replace_lead','retry_lead','resume_lead'))
+             AND (?5=0 OR json_extract(o.payload_json,'$.request.operation.action')<>'create_session'
+                  OR json_extract(o.payload_json,'$.issue_binding.continue_from') IS NOT NULL)
              AND NOT EXISTS(SELECT 1 FROM harness_manager_v2_operations a WHERE a.project_id=o.project_id AND a.kind=?1
                 AND a.id IS NOT json_extract(o.payload_json,'$.request.operation.operation_id') AND ((a.state='running' AND NOT ({CREATE_PAIR} AND json_extract(a.payload_json,'$.request.operation.action')='create_session' AND json_extract(a.payload_json,'$.request.operation.parent_id') IS NOT json_extract(o.payload_json,'$.request.operation.parent_id'))) OR (a.state='uncertain' AND (a.target_session_id=o.target_session_id OR (json_extract(a.payload_json,'$.request.operation.epic_id')=json_extract(o.payload_json,'$.request.operation.epic_id') AND {UNCERTAINTY_CURRENT_AUTHORITY})))))
              AND (json_extract(o.payload_json,'$.request.operation.action')<>'create_session' OR (
@@ -1965,24 +2401,41 @@ impl Store {
                    OR NOT EXISTS(SELECT 1 FROM harness_manager_v2_operations q WHERE q.project_id=o.project_id AND q.kind=?1 AND q.state='queued'
                         AND json_extract(q.payload_json,'$.request.operation.action')<>'create_session' AND (q.not_before,q.id)<(o.not_before,o.id)))))
              AND NOT EXISTS(SELECT 1 FROM manager_root_successions r JOIN sessions p ON p.id=r.predecessor_session_id
-                WHERE r.operation_id=o.id AND r.state='reserved' AND p.status IN ('Starting','Running','WaitingApproval')
+                WHERE r.operation_id=o.id AND r.state='reserved'
+                  AND (p.status IN ('Starting','Running','WaitingApproval')
+                       OR EXISTS(SELECT 1 FROM daemon_settings d WHERE d.key='manager_operator_pause:'||p.id AND d.value<>'false'))
                   AND r.authority_epoch=(SELECT epoch FROM manager_authority_epochs WHERE project_id=r.project_id)
                   AND EXISTS(SELECT 1 FROM harness_manager_scopes h WHERE h.project_id=r.project_id AND h.row_version=r.scope_version))
              ), oldest AS (SELECT * FROM eligible ORDER BY not_before,id LIMIT 1)
-             SELECT e.id FROM eligible e CROSS JOIN oldest first
+             SELECT e.id,e.not_before FROM eligible e CROSS JOIN oldest first
               WHERE e.id=first.id OR (
                     first.origin='operating_intent'
                 AND first.action IN ('resume_lead','retry_lead','replace_lead')
                 AND e.project_id=first.project_id
                 AND e.origin='agent' AND e.action='create_session')
-              ORDER BY CASE WHEN e.id=first.id THEN 1 ELSE 0 END,e.not_before,e.id LIMIT 1"),params![ACTION_KIND,now(),i64::from(hold_worker_starts),MANAGER_CREATE_PARALLELISM],|r|r.get(0)).optional()?;
-        let Some(id) = id else {
+              ORDER BY CASE WHEN e.id=first.id THEN 1 ELSE 0 END,e.not_before,e.id LIMIT 1"),params![ACTION_KIND,now(),i64::from(hold_worker_starts),MANAGER_CREATE_PARALLELISM,i64::from(hold_creates)],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let Some((id, not_before)) = selected else {
             return Ok(None);
         };
         let id = parse_id(&id)?;
         let mut operation = self
             .manager_action_operation(id)?
             .ok_or_else(|| refused("manager_v2_action_unavailable"))?;
+        if operation.is_new_worker_create()
+            && let Some(admit) = admit
+        {
+            let since = chrono::DateTime::parse_from_rfc3339(&not_before)
+                .map_err(|_| refused("manager_v2_action_invalid_not_before"))?
+                .with_timezone(&chrono::Utc);
+            if !admit(id, since, operation.receipt.target_session_id) {
+                drop(tx);
+                return self.claim_manager_action_holding_creates(
+                    boot_id,
+                    hold_worker_starts,
+                    true,
+                );
+            }
+        }
         operation.receipt.state = ManagerActionStateV2::Running;
         operation.receipt.outcome = None;
         operation.receipt.row_version += 1;
@@ -2099,7 +2552,7 @@ impl Store {
         if effect {
             let op = self.manager_action_assert_claim(claim)?;
             let authority =
-                self.manager_action_authority(&op.context.origin, &op.context.request)?;
+                self.manager_stored_action_authority(&op.context.origin, &op.context.request)?;
             let key = claim.id().to_string();
             let prior = self.manager_v2_record(&authority.config, EXECUTION_KIND, &key)?;
             let mut payload = prior
@@ -2128,7 +2581,8 @@ impl Store {
         // #967: a DB review launch whose assignment already ended must not
         // start (or continue toward) a reviewer provider turn.
         self.require_manager_review_launch_live(&op)?;
-        let authority = self.manager_action_authority(&op.context.origin, &op.context.request)?;
+        let authority =
+            self.manager_stored_action_authority(&op.context.origin, &op.context.request)?;
         // An appointment rotation cannot make a stored daemon intent act under a
         // newer principal even if its numeric scope/policy versions coincide.
         if authority.config.project_id != op.project_id
@@ -2334,7 +2788,8 @@ impl Store {
     pub fn manager_action_accept_settled_fence(&self, claim: &ManagerActionClaimV2) -> Result<()> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let op = self.manager_action_assert_claim(claim)?;
-        let authority = self.manager_action_authority(&op.context.origin, &op.context.request)?;
+        let authority =
+            self.manager_stored_action_authority(&op.context.origin, &op.context.request)?;
         let epic = action_epic(claim.action())
             .ok_or_else(|| refused("manager_v2_invalid_settlement_witness"))?;
         self.manager_v2_require_epic(&authority, epic)?;
@@ -2411,6 +2866,13 @@ impl Store {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let receipt = self.finish_manager_action_on(claim, state, outcome)?;
         tx.commit()?;
+        // #1553: a launch that ends without its worker tells its Issue. Best
+        // effort: the receipt is already durable and is the record.
+        if let Err(error) =
+            self.note_issue_worker_launch_ended(&claim.operation, receipt.state, outcome)
+        {
+            tracing::warn!(operation_id = %claim.id(), %error, "issue worker launch note not appended");
+        }
         Ok(receipt)
     }
 

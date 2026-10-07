@@ -154,7 +154,11 @@ async fn picker_overlays_list_close_and_selection_keys() {
     assert_help(
         &mut app,
         OverlayHelpClass::ModelPicker,
-        &["Close model picker", "Next / previous provider"],
+        &[
+            "Close model picker",
+            "Next / previous provider",
+            "Filter models by name or ID",
+        ],
     );
 }
 
@@ -276,14 +280,6 @@ async fn browsers_and_modals_list_close_and_class_actions() {
         &mut app,
         OverlayHelpClass::QuestionInsert,
         &["Return to normal mode", "Submit answers"],
-    );
-
-    let mut app = test_app();
-    color_customizer::open_color_customizer(&mut app);
-    assert_help(
-        &mut app,
-        OverlayHelpClass::ColorCustomizer,
-        &["Esc / q", "Reset field to default"],
     );
 }
 

@@ -63,14 +63,22 @@ pub fn find_prompt_rect_by_marker(
         .checked_sub(1)
         .expect("prompt marker should be below a border row");
 
+    // Walk the top border out to its corners. Content behind the popup can
+    // touch a corner on the same row (the session-list scope header does), so
+    // a corner ends the walk as well as a blank cell.
     let area = buffer.area;
     let mut left = marker_x;
-    while left > area.x && !buffer[(left - 1, top_y)].symbol().trim().is_empty() {
+    while left > area.x
+        && !is_top_left_corner(buffer[(left, top_y)].symbol())
+        && !buffer[(left - 1, top_y)].symbol().trim().is_empty()
+    {
         left -= 1;
     }
 
     let mut right = marker_x;
-    while right + 1 < area.x + area.width && !buffer[(right + 1, top_y)].symbol().trim().is_empty()
+    while right + 1 < area.x + area.width
+        && !is_top_right_corner(buffer[(right, top_y)].symbol())
+        && !buffer[(right + 1, top_y)].symbol().trim().is_empty()
     {
         right += 1;
     }
@@ -106,6 +114,14 @@ fn find_text(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16
 
 fn is_horizontal_border(symbol: &str) -> bool {
     matches!(symbol, "─" | "═" | "━" | "╌" | "╍" | "┄" | "┅")
+}
+
+fn is_top_left_corner(symbol: &str) -> bool {
+    matches!(symbol, "┌" | "╭" | "┏" | "╔")
+}
+
+fn is_top_right_corner(symbol: &str) -> bool {
+    matches!(symbol, "┐" | "╮" | "┓" | "╗")
 }
 
 fn normalize_trailing_clock(line: &mut String) {

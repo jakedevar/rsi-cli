@@ -79,11 +79,12 @@ fn registered_normal_effect(
         ActionId::Open => RegisteredNormalEffect::Application(LcAction::EnterSession),
         ActionId::Refresh => RegisteredNormalEffect::Application(LcAction::RefreshNavigation),
         ActionId::OpenThemePicker => RegisteredNormalEffect::Application(LcAction::OpenThemePicker),
-        ActionId::OpenLegacyColors => {
-            RegisteredNormalEffect::Application(LcAction::OpenColorCustomizer)
-        }
         ActionId::OpenIssuesWorkspace => {
             RegisteredNormalEffect::Application(LcAction::OpenIssuesWorkspace)
+        }
+        ActionId::Fleet => RegisteredNormalEffect::Application(LcAction::OpenFleet),
+        ActionId::GlobalManagerWorkspace => {
+            RegisteredNormalEffect::Application(LcAction::OpenGlobalManagerWorkspace)
         }
         ActionId::ManagerPolicy => {
             RegisteredNormalEffect::Application(LcAction::EditHarnessManagerPolicy)
@@ -132,7 +133,6 @@ fn registered_normal_effect(
         ActionId::Alerts => RegisteredNormalEffect::Application(LcAction::ToggleNotifications),
         ActionId::Graph => RegisteredNormalEffect::Application(LcAction::OpenGraphReview),
         ActionId::Lead => RegisteredNormalEffect::Application(LcAction::SetEpicLead),
-        ActionId::Task => RegisteredNormalEffect::Application(LcAction::TaskRabbitPrompt),
         ActionId::Blank => RegisteredNormalEffect::Application(LcAction::BlankPrompt),
         ActionId::TabPrev => RegisteredNormalEffect::Application(LcAction::PrevTab),
         ActionId::TabNext => RegisteredNormalEffect::Application(LcAction::NextTab),
@@ -151,9 +151,6 @@ fn registered_normal_effect(
             RegisteredNormalEffect::Application(LcAction::PrevLabelBoundary)
         }
         ActionId::GoToMainZone => RegisteredNormalEffect::Application(LcAction::GoToSessionsZone),
-        ActionId::GoToTaskRabbitZone => {
-            RegisteredNormalEffect::Application(LcAction::GoToTaskRabbitZone)
-        }
         ActionId::GoToJobsZone => RegisteredNormalEffect::Application(LcAction::GoToJobsZone),
         ActionId::RecentCompletions => {
             RegisteredNormalEffect::Application(LcAction::OpenRecentCompletions)
@@ -197,6 +194,9 @@ fn registered_normal_effect(
         ActionId::ModelDropdown => {
             RegisteredNormalEffect::Application(LcAction::ToggleModelDropdown)
         }
+        ActionId::SwitchSessionModel => {
+            RegisteredNormalEffect::Application(LcAction::OpenModelSwitchPicker)
+        }
         ActionId::ReassignProject => {
             RegisteredNormalEffect::Application(LcAction::ReassignSessionProject)
         }
@@ -209,6 +209,7 @@ fn registered_normal_effect(
             RegisteredNormalEffect::Application(LcAction::OpenSessionInNewTab)
         }
         ActionId::GitPanel => RegisteredNormalEffect::Application(LcAction::ToggleGitPanel),
+        ActionId::Btop => RegisteredNormalEffect::Application(LcAction::OpenBtop),
         ActionId::FileExplorer => RegisteredNormalEffect::Application(LcAction::ToggleFileExplorer),
         ActionId::Telescope => RegisteredNormalEffect::Application(LcAction::OpenTelescope),
         ActionId::OpenRecentFile => {
@@ -536,7 +537,8 @@ mod tests {
             ("<Space>8", &[JumpAttentionN(8)]),
             ("<Space>9", &[JumpAttentionN(9)]),
             ("<Space>a", &[ArchiveSession]),
-            ("<Space>b", &[OpenColorCustomizer]),
+            ("<Space>b", &[]),
+            ("<Space>bb", &[OpenBtop]),
             ("<Space>c", &[QuickContinue]),
             ("<Space>C", &[ReassignSessionProject]),
             ("<Space>e", &[ToggleFileExplorer]),
@@ -552,10 +554,11 @@ mod tests {
             ("<Space>i", &[OpenIssuesWorkspace]),
             ("<Space>k", &[CancelRetry]),
             ("<Space>m", &[]),
+            ("<Space>mm", &[OpenModelSwitchPicker]),
             ("<Space>M", &[OpenMemorySearch]),
             ("<Space>n", &[ToggleNotifications]),
             ("<Space>N", &[BlankPrompt]),
-            ("<Space>o", &[TaskRabbitPrompt]),
+            ("<Space>o", &[]),
             ("<Space>p", &[OpenProjectPicker]),
             ("<Space>q", &[CloseFocusedPane]),
             ("<Space>r", &[ToggleRotationDisabled]),
@@ -656,7 +659,6 @@ mod tests {
             ),
             ("gs", None, vec![GoToSessionsZone], "zone navigation"),
             ("ga", None, vec![GoToArchiveZone], "zone navigation"),
-            ("gt", None, vec![GoToTaskRabbitZone], "zone navigation"),
             ("gj", None, vec![GoToJobsZone], "zone navigation"),
             (
                 "gr",
@@ -721,7 +723,12 @@ mod tests {
                 "recent-file navigation",
             ),
             ("gg", None, vec![], "vim jump-top motion"),
-            ("gm", None, vec![], "retired no-op"),
+            (
+                "gm",
+                None,
+                vec![OpenGlobalManagerWorkspace],
+                "global manager workspace (#1213)",
+            ),
             ("g?", None, vec![], "retired no-op"),
         ];
 
@@ -872,7 +879,7 @@ mod tests {
             ("p", Dispatch(TogglePromptPreview)),
             ("ga", Dispatch(GoToArchiveZone)),
             ("<Space>gX", Dispatch(GoToTrash)),
-            ("gt", Dispatch(GoToTaskRabbitZone)),
+            ("gt", Inert),
             ("gj", Dispatch(GoToJobsZone)),
             ("<Space>gq", Dispatch(OpenQuestionModal)),
             ("gr", Dispatch(OpenRecentCompletions)),
@@ -886,11 +893,11 @@ mod tests {
             ("<Space>", Prefix),
             ("<Space>gr", Inert),
             ("<Space>R", Inert),
-            ("gm", Inert),
+            ("gm", Dispatch(OpenGlobalManagerWorkspace)),
             ("g?", Inert),
             ("<Space>M", Dispatch(OpenMemorySearch)),
             ("<Space>K", Dispatch(OpenScheduleBrowser)),
-            ("<Space>o", Dispatch(TaskRabbitPrompt)),
+            ("<Space>o", Inert),
             ("Ctrl-N", Dispatch(BlankPrompt)),
             ("<Space>N", Dispatch(BlankPrompt)),
             ("<Space>r", Dispatch(ToggleRotationDisabled)),
@@ -1239,7 +1246,6 @@ mod tests {
         let retired: &[&[KeyCode]] = &[
             &[KeyCode::Char(' '), KeyCode::Char('g'), KeyCode::Char('r')],
             &[KeyCode::Char(' '), KeyCode::Char('R')],
-            &[KeyCode::Char('g'), KeyCode::Char('m')],
             &[KeyCode::Char('g'), KeyCode::Char('?')],
         ];
 
@@ -1310,6 +1316,18 @@ mod tests {
         );
         assert_eq!(
             application_actions_for(&[KeyCode::Char(' '), KeyCode::Char('g')]),
+            Vec::<LcAction>::new()
+        );
+    }
+
+    #[test]
+    fn space_b_is_a_prefix_and_space_bb_opens_btop() {
+        assert_eq!(
+            application_actions_for(&[KeyCode::Char(' '), KeyCode::Char('b'), KeyCode::Char('b'),]),
+            vec![LcAction::OpenBtop]
+        );
+        assert_eq!(
+            application_actions_for(&[KeyCode::Char(' '), KeyCode::Char('b')]),
             Vec::<LcAction>::new()
         );
     }

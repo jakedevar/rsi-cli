@@ -403,6 +403,31 @@ fn select_model_usage<'a>(
     usage_by_model.values().next()
 }
 
+/// Stable `stop_reason`/`terminal_reason` for a Claude Code exit that rejected
+/// the selected model (#1484).
+pub(crate) const PROVIDER_MODEL_UNRECOGNIZED_REASON: &str = "provider_model_unrecognized";
+
+/// Detect Claude Code's rejection of the selected model in stderr or result
+/// text and return the model name it names (empty when the text names none).
+pub(crate) fn unrecognized_model_in_text(text: &str) -> Option<String> {
+    if let Some(at) = text.find("[claude-code:unrecognized_model]") {
+        let model = text[at..]
+            .split("\"model\"")
+            .nth(1)
+            .and_then(|tail| tail.split('"').nth(1))
+            .unwrap_or_default();
+        return Some(model.to_string());
+    }
+    let marker = "issue with the selected model";
+    let at = text.to_ascii_lowercase().find(marker)?;
+    let model = text[at + marker.len()..]
+        .trim_start()
+        .strip_prefix('(')
+        .and_then(|r| r.split(')').next())
+        .unwrap_or_default();
+    Some(model.trim().to_string())
+}
+
 /// Extract session metadata from a "result" stream event.
 ///
 /// `session_model` is the session's configured model, used to pick the right
@@ -456,12 +481,24 @@ pub(crate) fn extract_result_metadata(
             (None, None)
         };
 
-    let stop_reason = stream_event
+    let rejected_model = stream_event
         .data
-        .get("subtype")
-        .and_then(|v| v.as_str())
-        .filter(|subtype| *subtype != "turn_completed")
-        .map(String::from);
+        .get("is_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        .then(|| stream_event.data.get("result").and_then(|v| v.as_str()))
+        .flatten()
+        .and_then(unrecognized_model_in_text);
+    let stop_reason = if rejected_model.is_some() {
+        Some(PROVIDER_MODEL_UNRECOGNIZED_REASON.to_string())
+    } else {
+        stream_event
+            .data
+            .get("subtype")
+            .and_then(|v| v.as_str())
+            .filter(|subtype| *subtype != "turn_completed")
+            .map(String::from)
+    };
 
     // V99/P1-C. `usage` is absent on some result subtypes, so every extraction
     // below tolerates its absence and yields `None` rather than a synthetic 0.
@@ -495,11 +532,15 @@ pub(crate) fn extract_result_metadata(
         .data
         .get("queued_turn_count")
         .and_then(|v| v.as_u64());
-    let terminal_reason = stream_event
-        .data
-        .get("terminal_reason")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let terminal_reason = if rejected_model.is_some() {
+        Some(PROVIDER_MODEL_UNRECOGNIZED_REASON.to_string())
+    } else {
+        stream_event
+            .data
+            .get("terminal_reason")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
 
     ResultMetadata {
         duration_ms,
@@ -807,6 +848,43 @@ mod tests {
         assert_eq!(meta.final_input_tokens, Some(15000));
         assert_eq!(meta.final_output_tokens, Some(1500));
         assert_eq!(meta.stop_reason, Some("success".to_string()));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn unrecognized_model_maps_to_provider_model_unrecognized() {
+        assert_eq!(
+            unrecognized_model_in_text(
+                "[claude-code:unrecognized_model] {\"model\":\"claude-haiku-5-5\"}"
+            )
+            .as_deref(),
+            Some("claude-haiku-5-5")
+        );
+        assert_eq!(
+            unrecognized_model_in_text(
+                "There's an issue with the selected model (claude-haiku-5-5). It may not exist"
+            )
+            .as_deref(),
+            Some("claude-haiku-5-5")
+        );
+        assert_eq!(unrecognized_model_in_text("all good"), None);
+        let event = StreamEvent {
+            event_type: "result".to_string(),
+            data: serde_json::json!({
+                "subtype": "success",
+                "is_error": true,
+                "result": "There's an issue with the selected model (claude-haiku-5-5). It may not exist or you may not have access to it."
+            }),
+        };
+        let meta = extract_result_metadata(&event, None);
+        assert_eq!(
+            meta.stop_reason.as_deref(),
+            Some("provider_model_unrecognized")
+        );
+        assert_eq!(
+            meta.terminal_reason.as_deref(),
+            Some("provider_model_unrecognized")
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]

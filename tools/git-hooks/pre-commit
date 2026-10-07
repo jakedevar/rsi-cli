@@ -173,6 +173,16 @@ if [ -n "$staged_rs" ] && [ -f tools/check_identity_assertions.py ]; then
   fi
 fi
 
+# Theme reads in tests must hold the shared pin across rendering/assertions.
+staged_theme_rs="$(git diff --cached --name-only --diff-filter=d -- 'crates/rsi/src/*.rs')"
+if [ -n "$staged_theme_rs" ] && [ -f tools/check_theme_test_guards.py ]; then
+  # shellcheck disable=SC2086
+  if ! python3 tools/check_theme_test_guards.py $staged_theme_rs; then
+    echo "pre-commit: theme-test guard failed (see above)." >&2
+    exit 1
+  fi
+fi
+
 # ── Personal-path guard ─────────────────────────────────────────────────────
 # Rejects staged files (outside thoughts/) that embed a personal home path or a
 # public IP literal (see scripts/check-personal-paths.sh, Issue #730).
@@ -181,6 +191,17 @@ if [ -n "$staged_all" ] && [ -f tools/check_personal_paths.py ]; then
   # shellcheck disable=SC2086
   if ! python3 tools/check_personal_paths.py $staged_all; then
     echo "pre-commit: personal-path guard failed (see above)." >&2
+    exit 1
+  fi
+fi
+
+# ── Operator-identifier guard (#1454) ───────────────────────────────────────
+# Rejects staged ADDED lines (thoughts/ included) that contain an identifier
+# from the operator's private list (~/.rsi/operator-identifiers). A no-op when
+# the list is absent. Findings never echo the identifier.
+if [ -f tools/check_operator_identifiers.py ]; then
+  if ! python3 tools/check_operator_identifiers.py --staged; then
+    echo "pre-commit: operator-identifier guard failed (see above)." >&2
     exit 1
   fi
 fi

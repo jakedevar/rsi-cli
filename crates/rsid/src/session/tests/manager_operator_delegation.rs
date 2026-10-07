@@ -469,6 +469,7 @@ async fn operator_call_archives_an_idle_project_leaf_logically_with_manager_attr
         .agent_manager_get_action(
             p.owner,
             AgentManagerGetActionRequestV2 {
+                project_id: None,
                 operation_id: queued.operation_id,
             },
         )
@@ -1050,6 +1051,7 @@ async fn lead_pause_allows_delegated_cleanup_and_keeps_continuations_stopped() {
             kind: SessionKind::Task,
             query: "new work".into(),
             launch: p.policy.allowed_launches[0].clone(),
+            sandbox_source: None,
         },
     )
     .await
@@ -1973,6 +1975,50 @@ async fn daemon_settings_default_bounds_are_none_so_every_key_is_refused() {
     }
 }
 
+/// #1254: the worker context cap is a curated key; a manager proposal inside
+/// the operator's bounds applies and persists, and one outside them, or in
+/// the gap between the percentage and token ranges, is refused.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn worker_context_cap_proposal_applies_inside_operator_bounds() {
+    let p = settings_pilot(&[("worker_context_cap_tokens", 40, 300_000)]).await;
+    let queued = control(
+        &p,
+        "worker-cap",
+        propose(
+            "worker_context_cap_tokens",
+            50,
+            "workers compact before 60%",
+        ),
+    )
+    .await
+    .unwrap();
+    p.execute().await.unwrap();
+    let receipt = p.receipt(queued.operation_id).await;
+    assert_eq!(receipt.state, ManagerActionStateV2::Succeeded);
+    assert_eq!(
+        p.manager.runtime_config.to_json()["worker_context_cap_tokens"],
+        50
+    );
+    assert_eq!(
+        persisted_setting(&p, "worker_context_cap_tokens").as_deref(),
+        Some("50")
+    );
+    for (key, value) in [
+        ("worker-cap-gap", 101),
+        ("worker-cap-high", 300_001),
+        ("worker-cap-low", 39),
+    ] {
+        refused_with(
+            &p,
+            key,
+            propose("worker_context_cap_tokens", value, "try"),
+            "manager_v2_daemon_setting_out_of_bounds",
+        )
+        .await;
+    }
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn daemon_settings_change_inside_bounds_is_applied_persisted_and_journaled() {
@@ -2237,12 +2283,15 @@ fn deploy_request(
     key: &str,
 ) -> rsi_common::agent_deploy::AgentRequestDeployRequestV1 {
     rsi_common::agent_deploy::AgentRequestDeployRequestV1 {
+        project_id: None,
         sha: DEPLOY_SHA.into(),
         binaries_dir: Some(dirs.source.to_string_lossy().into_owned()),
         build: None,
         idempotency_key: key.into(),
         max_wait_secs: None,
         peer_id: None,
+        cancel: None,
+        interrupt_workers: None,
     }
 }
 
@@ -2373,6 +2422,150 @@ async fn deploy_request_stages_verified_binaries_and_replays_by_key() {
         .to_string();
     assert!(error.contains("deploy_already_in_progress"), "{error}");
     assert_eq!(staged_leftovers(&dirs.install), 1);
+}
+
+/// #1461: `interrupt_workers` is accepted from the Deploy manager, echoed in the
+/// receipt and kept on replay; a replay cannot flip it (a different request,
+/// so a key conflict); a satellite deploy has no such option.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn deploy_request_interrupt_workers_is_recorded_replays_and_is_refused_for_a_peer() {
+    let dirs = deploy_dirs(true, DEPLOY_SHA, 999);
+    let p = grant_pilot(&[ManagerCapabilityV2::Deploy]).await;
+    let mut ask = deploy_request(&dirs, "interrupt");
+    ask.interrupt_workers = Some(true);
+
+    let first = request_deploy(&p, p.owner, &dirs, ask.clone())
+        .await
+        .unwrap();
+    assert!(!first.replayed);
+    assert!(first.interrupt_workers);
+    assert!(first.interrupted_workers.is_empty());
+
+    let replay = request_deploy(&p, p.owner, &dirs, ask).await.unwrap();
+    assert!(replay.replayed);
+    assert!(replay.interrupt_workers);
+    assert_eq!(replay.deploy_id, first.deploy_id);
+
+    let error = request_deploy(&p, p.owner, &dirs, deploy_request(&dirs, "interrupt"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("deploy_idempotency_key_conflict"), "{error}");
+
+    let mut peer = deploy_request(&dirs, "interrupt-peer");
+    peer.interrupt_workers = Some(true);
+    peer.peer_id = Some(rsi_common::satellite::SatelliteUuidV1(Uuid::new_v4()));
+    let error = request_deploy(&p, p.owner, &dirs, peer)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("deploy_invalid_request"), "{error}");
+}
+
+/// #1320/#1311: the deploying manager cancels its own waiting deploy. The hold
+/// on new launches ends at once, the staged copies go, nothing is installed,
+/// no outcome wake is due (the caller holds the answer) and a new deploy can
+/// be requested.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn deploy_owner_cancels_its_waiting_deploy_and_the_hold_ends_at_once() {
+    use rsi_common::agent_deploy::{DEPLOY_CANCELLED, DeployState};
+    let dirs = deploy_dirs(true, DEPLOY_SHA, 999);
+    let p = grant_pilot(&[ManagerCapabilityV2::Deploy]).await;
+    let staged = request_deploy(&p, p.owner, &dirs, deploy_request(&dirs, "cancel-me"))
+        .await
+        .unwrap();
+    let drain = p.manager.deploy_drain();
+    let live = p
+        .manager
+        .store()
+        .lock()
+        .await
+        .live_agent_deploy()
+        .unwrap()
+        .expect("live deploy");
+    drain.sync(Some(&live), true, chrono::Utc::now());
+    assert!(drain.is_draining(), "the runner engaged the hold");
+
+    let mut cancel = deploy_request(&dirs, "cancel-me");
+    cancel.binaries_dir = None;
+    cancel.cancel = Some(true);
+    let cancelled = request_deploy(&p, p.owner, &dirs, cancel.clone())
+        .await
+        .unwrap();
+    assert_eq!(cancelled.deploy_id, staged.deploy_id);
+    assert_eq!(cancelled.state, DeployState::Failed);
+    assert_eq!(cancelled.reason.as_deref(), Some(DEPLOY_CANCELLED));
+    assert!(!drain.is_draining(), "the hold ended with the cancel");
+    assert_eq!(staged_leftovers(&dirs.install), 0);
+    assert_eq!(
+        std::fs::read(dirs.install.join("rsid")).unwrap(),
+        b"old-rsid"
+    );
+    let wake = p
+        .manager
+        .store()
+        .lock()
+        .await
+        .list_scheduled_jobs()
+        .unwrap()
+        .into_iter()
+        .find(|job| job.name == format!("deploy-{}", staged.deploy_id))
+        .expect("the outcome wake row is recorded");
+    assert!(!wake.enabled, "a cancel does not resume its own caller");
+
+    // A replay returns the settled deploy; another key or sha finds nothing.
+    let again = request_deploy(&p, p.owner, &dirs, cancel.clone())
+        .await
+        .unwrap();
+    assert_eq!(again.deploy_id, staged.deploy_id);
+    assert_eq!(again.reason.as_deref(), Some(DEPLOY_CANCELLED));
+    let mut unknown = cancel.clone();
+    unknown.idempotency_key = "never-requested".into();
+    let error = request_deploy(&p, p.owner, &dirs, unknown)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("deploy_not_found"), "{error}");
+    let mut other_sha = cancel;
+    other_sha.sha = "f".repeat(40);
+    let error = request_deploy(&p, p.owner, &dirs, other_sha)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("deploy_not_found"), "{error}");
+
+    let next = request_deploy(&p, p.owner, &dirs, deploy_request(&dirs, "after-cancel"))
+        .await
+        .unwrap();
+    assert_eq!(next.state, DeployState::Staged);
+}
+
+/// A cancel after the restart began is refused: the swap may be under way.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn deploy_cancel_after_the_restart_began_is_too_late() {
+    let dirs = deploy_dirs(true, DEPLOY_SHA, 999);
+    let p = grant_pilot(&[ManagerCapabilityV2::Deploy]).await;
+    let staged = request_deploy(&p, p.owner, &dirs, deploy_request(&dirs, "late"))
+        .await
+        .unwrap();
+    assert!(
+        p.manager
+            .store()
+            .lock()
+            .await
+            .mark_agent_deploy_restarting(staged.deploy_id, chrono::Utc::now())
+            .unwrap()
+    );
+    let mut cancel = deploy_request(&dirs, "late");
+    cancel.cancel = Some(true);
+    let error = request_deploy(&p, p.owner, &dirs, cancel)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("deploy_cancel_too_late"), "{error}");
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -2567,6 +2760,9 @@ async fn fake_satellite(p: &Pilot, dispatch: bool, scoped: bool) -> FakeSatellit
                                         binaries: Vec::new(),
                                         skipped: Vec::new(),
                                         replayed: false,
+                                        reason: None,
+                                        interrupt_workers: false,
+                                        interrupted_workers: Vec::new(),
                                     };
                                 d.lock().unwrap().push(wire);
                                 rsi_common::rpc::RpcResponse::success(

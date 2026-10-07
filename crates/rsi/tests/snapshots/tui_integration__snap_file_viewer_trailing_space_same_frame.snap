@@ -2,7 +2,7 @@
 source: crates/rsi/tests/tui_integration.rs
 expression: snapshot
 ---
- ● 0
+ ● 0 running                                                             default ✻ Claude
 ┌ rsi-s-input.txt [+] -- INSERT -- ──────────────────────────────────────────────────────┐
 │    1 alpha·                                                                            │
 │                                                                                        │

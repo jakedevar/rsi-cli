@@ -105,31 +105,28 @@ fn validate_target(provider: SessionProvider, model: &str, effort: Option<&str>)
         ));
     }
 
-    let valid_effort = |allowed: &[&str]| {
-        effort.is_none_or(|value| {
-            allowed.contains(&value)
-                && rsi_common::model_utils::known_effort_ladder(model)
-                    .is_none_or(|ladder| ladder.contains(&value))
-        })
+    let Some(allowed) = rsi_common::model_utils::session_switch_effort_levels(provider) else {
+        return Err(DaemonError::InvalidParam(
+            "model/effort switching is not supported for this provider".into(),
+        ));
     };
-    let supported = match provider {
-        SessionProvider::Claude => valid_effort(&["low", "medium", "high", "xhigh", "max"]),
-        SessionProvider::Codex | SessionProvider::Pioneer => {
-            valid_effort(&["low", "medium", "high", "xhigh", "max", "ultra"])
-        }
-        SessionProvider::Antigravity => valid_effort(&["low", "medium", "high"]),
-        _ => {
-            return Err(DaemonError::InvalidParam(
-                "model/effort switching is not supported for this provider".into(),
-            ));
-        }
-    };
+    let supported = effort.is_none_or(|value| {
+        allowed.contains(&value)
+            && rsi_common::model_utils::known_effort_ladder(model)
+                .is_none_or(|ladder| ladder.contains(&value))
+    });
     if !supported {
         return Err(DaemonError::InvalidParam(format!(
             "effort is not supported by {provider:?} model '{model}'"
         )));
     }
     Ok(())
+}
+
+/// Providers whose next turn can run with a different model/effort while the
+/// provider keeps its own conversation (research matrix, Issue #681).
+fn provider_supports_model_switch(provider: SessionProvider) -> bool {
+    rsi_common::model_utils::session_switch_effort_levels(provider).is_some()
 }
 
 fn now() -> String {
@@ -323,6 +320,105 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(receipt)
+    }
+
+    /// What the session-detail picker needs to offer a model/effort switch
+    /// for `session_id`: the current tuple, the invocation fence, whether a
+    /// switch is possible and the queued tuple, if any. The operator
+    /// allowlist is runtime configuration, so the caller fills
+    /// `model_allowlist`.
+    pub fn session_model_switch_options(
+        &self,
+        session_id: Uuid,
+    ) -> Result<rsi_common::rpc::SessionModelSwitchOptions> {
+        let (provider, kind, status, model, effort, invocation): (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = self
+            .conn
+            .query_row(
+                "SELECT provider, session_kind, status, model, effort, model_invocation_id
+                   FROM sessions WHERE id = ?1",
+                params![session_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(DaemonError::SessionNotFound(session_id))?;
+        let provider = serde_json::from_str::<SessionProvider>(&serde_json::to_string(&provider)?)
+            .map_err(|error| DaemonError::Store(format!("invalid stored provider: {error}")))?;
+        let kind = serde_json::from_str::<SessionKind>(&serde_json::to_string(&kind)?)
+            .map_err(|error| DaemonError::Store(format!("invalid stored session kind: {error}")))?;
+        let status = serde_json::from_str::<SessionStatus>(&serde_json::to_string(&status)?)
+            .map_err(|error| {
+                DaemonError::Store(format!("invalid stored session status: {error}"))
+            })?;
+        let invocation = invocation.and_then(|raw| Uuid::parse_str(&raw).ok());
+        let pending = self
+            .conn
+            .query_row(
+                "SELECT new_model, new_effort FROM session_model_updates
+                  WHERE session_id = ?1 AND state = 'queued'",
+                params![session_id.to_string()],
+                |row| {
+                    Ok(rsi_common::rpc::PendingSessionModelUpdate {
+                        model: row.get(0)?,
+                        effort: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+
+        let unavailable_reason = if !rsi_common::is_leaf_kind(kind) {
+            Some("model/effort switching requires a spawnable leaf session".to_string())
+        } else if !provider_supports_model_switch(provider) {
+            Some(format!(
+                "model/effort switching is not supported for {provider:?} sessions"
+            ))
+        } else if !matches!(
+            status,
+            SessionStatus::Running
+                | SessionStatus::Completed
+                | SessionStatus::Interrupted
+                | SessionStatus::Failed
+        ) {
+            Some("model/effort switching requires a running or terminal session".to_string())
+        } else if invocation.is_none() {
+            Some("the session has no model invocation to fence a switch yet".to_string())
+        } else {
+            None
+        };
+        let keeps_context = unavailable_reason.is_none();
+        let context_note = if keeps_context {
+            "Keeps the conversation; applies from the next turn".to_string()
+        } else {
+            "Unavailable for this session".to_string()
+        };
+        Ok(rsi_common::rpc::SessionModelSwitchOptions {
+            session_id,
+            provider,
+            model,
+            effort,
+            model_invocation_id: invocation,
+            switchable: unavailable_reason.is_none(),
+            unavailable_reason,
+            keeps_context,
+            context_note,
+            model_allowlist: Vec::new(),
+            pending,
+        })
     }
 
     /// Apply the pending tuple atomically with the model-segment boundary.
@@ -548,6 +644,69 @@ mod tests {
             )
             .expect("count model segments");
         assert_eq!(segment_count, 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn switch_options_report_the_fence_current_tuple_and_queued_switch() {
+        let (_dir, mut store, session_id, invocation_id) = store_with_running_session();
+        let options = store
+            .session_model_switch_options(session_id)
+            .expect("switch options");
+        assert!(options.switchable, "{:?}", options.unavailable_reason);
+        assert!(options.keeps_context);
+        assert_eq!(options.provider, SessionProvider::Codex);
+        assert_eq!(options.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(options.model_invocation_id, Some(invocation_id));
+        assert_eq!(options.pending, None);
+
+        store
+            .queue_session_model_update(
+                session_id,
+                invocation_id,
+                "claude-opus-4-1",
+                Some("high"),
+                "switch-options",
+            )
+            .expect("queue model update");
+        let options = store
+            .session_model_switch_options(session_id)
+            .expect("switch options after queue");
+        assert_eq!(
+            options.pending,
+            Some(rsi_common::rpc::PendingSessionModelUpdate {
+                model: "claude-opus-4-1".into(),
+                effort: Some("high".into()),
+            })
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn switch_options_are_unavailable_without_a_fence_or_for_unsupported_providers() {
+        let (_dir, store, session_id, _invocation_id) = store_with_running_session();
+        store
+            .set_session_model_invocation(session_id, None)
+            .expect("clear invocation fence");
+        let options = store
+            .session_model_switch_options(session_id)
+            .expect("switch options");
+        assert!(!options.switchable);
+        assert!(!options.keeps_context);
+        assert!(options.unavailable_reason.is_some());
+
+        let (_dir, store, session_id, _invocation_id) =
+            store_with_running_provider(SessionProvider::Local);
+        let options = store
+            .session_model_switch_options(session_id)
+            .expect("local switch options");
+        assert!(!options.switchable);
+        assert!(
+            options
+                .unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not supported"))
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]

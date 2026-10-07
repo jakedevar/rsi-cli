@@ -166,6 +166,7 @@ fn test_health_status_response_format() {
         worker_slice_memory_pressure: None,
         process_memory: None,
         provider_credentials: None,
+        supervisor_mode: None,
     };
 
     let json = serde_json::to_value(&response).expect("serialize HealthStatusResponse");

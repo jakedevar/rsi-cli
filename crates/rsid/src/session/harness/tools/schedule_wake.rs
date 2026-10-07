@@ -194,6 +194,16 @@ impl ScheduleWakeTool {
                 ),
                 error_msg: None,
             },
+            Ok(ArmWatchOutcome::Rearmed(existing)) => ToolResult {
+                success: true,
+                output: format!(
+                    "terminal watch on session {watched} (job id={}) rearmed: its earlier \
+                     delivery was for a terminal state the session has since left, so it \
+                     fires on the next one",
+                    existing.id
+                ),
+                error_msg: None,
+            },
             Ok(ArmWatchOutcome::Deduplicated(existing)) => ToolResult {
                 success: true,
                 output: format!(

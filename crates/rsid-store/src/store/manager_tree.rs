@@ -4,7 +4,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use rsi_common::harness_manager::HarnessManagerScopeModeV1;
+use rsi_common::grant_narrowing::portfolio_effective_launches;
+use rsi_common::harness_manager::{HarnessManagerConfigV1, HarnessManagerScopeModeV1};
+use rsi_common::harness_manager_v2::ManagerLaunchChoiceV2;
 use rsi_common::manager_nodes::ManagerNodeSelectorV1;
 use rsi_common::manager_tree::{
     MANAGER_TREE_MAX_EPICS_PER_PROJECT, ManagerTreeGrantV1, ManagerTreeKindV1, ManagerTreeLoadV1,
@@ -86,7 +88,10 @@ impl Store {
     fn tree_escalations(&self, node: Uuid) -> Option<i64> {
         scalar(
             self,
-            "SELECT count(*) FROM manager_node_escalations WHERE target_node_id=?1 AND state='open'",
+            // #1238: an escalation held above the project root counts at the
+            // tier it waits on, not here.
+            "SELECT count(*) FROM manager_node_escalations e WHERE e.target_node_id=?1 AND e.state='open'
+               AND NOT EXISTS(SELECT 1 FROM manager_tier_escalations h WHERE h.escalation_id=e.id AND h.state='open')",
             [node.to_string()],
         )
     }
@@ -187,72 +192,167 @@ impl Store {
 
     /// Build the whole depth-first snapshot. Counts the daemon cannot read are
     /// `None` and rows it cannot list completely are `complete == false`.
+    ///
+    /// #1236: every active portfolio node is a `Portfolio` row (its tier label
+    /// is display only); a project sits under the deepest node covering it.
     pub fn manager_tree_snapshot(&self) -> Result<ManagerTreeSnapshot> {
-        let grant = self.active_global_grant()?;
-        let granted: Vec<Uuid> = grant.as_ref().map_or(Vec::new(), |g| g.project_ids.clone());
-        let (projects, projects_overflow) = self.tree_projects(&granted)?;
-        let mut rows = Vec::new();
-        let global_key = grant.as_ref().map(|_| "global".to_string());
-        let mut global_decisions = Some(0i64);
-        let mut global_escalations = Some(0i64);
-        let mut project_rows: Vec<Vec<ManagerTreeRowV1>> = Vec::new();
-        for project in projects {
-            let in_grant = granted.contains(&project);
-            let parent_key = in_grant.then(|| global_key.clone()).flatten();
-            let block = self.tree_project_block(
-                project,
-                parent_key.clone(),
-                u16::from(parent_key.is_some()),
-            )?;
-            global_decisions = global_decisions
-                .zip(block.0.load.pending_decisions)
-                .map(|(a, b)| a + b);
-            global_escalations = global_escalations
-                .zip(block.0.load.pending_escalations)
-                .map(|(a, b)| a + b);
-            let mut block_rows = vec![block.0];
-            block_rows.extend(block.1);
-            project_rows.push(block_rows);
-        }
-        let all_complete = project_rows.iter().flatten().all(|r| r.complete);
-        if let Some(grant) = &grant {
-            rows.push(ManagerTreeRowV1 {
-                key: "global".into(),
-                parent_key: None,
-                depth: 0,
-                kind: ManagerTreeKindV1::Global,
-                label: "global manager".into(),
-                project_id: None,
-                node_id: None,
-                epic_id: None,
-                scope: Some(format!("{} granted project(s)", grant.project_ids.len())),
-                seat: self.tree_seat(grant.seat_session_id),
-                focus_session_id: Some(grant.seat_session_id),
-                grant: None,
-                load: ManagerTreeLoadV1 {
-                    running_workers: None,
-                    direct_reports: Some(grant.project_ids.len() as i64),
-                    pending_escalations: global_escalations,
-                    pending_decisions: global_decisions,
-                },
-                complete: all_complete && !projects_overflow,
-            });
-        }
-        let mut granted_rows = Vec::new();
-        let mut other_rows = Vec::new();
-        for block in project_rows {
-            if block[0].parent_key.is_some() {
-                granted_rows.extend(block);
-            } else {
-                other_rows.extend(block);
+        let nodes = self.list_portfolio_nodes(false)?;
+        let index: HashMap<Uuid, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| (node.node_id, i))
+            .collect();
+        // Depth of each node from its parent chain (roots are 0).
+        let depth_of = |start: usize| -> u16 {
+            let mut depth = 0u16;
+            let mut cursor = nodes[start].parent_node_id;
+            while let Some(parent) = cursor.and_then(|id| index.get(&id)) {
+                depth += 1;
+                if usize::from(depth) > nodes.len() {
+                    break;
+                }
+                cursor = nodes[*parent].parent_node_id;
+            }
+            depth
+        };
+        let depths: Vec<u16> = (0..nodes.len()).map(depth_of).collect();
+        // Each project's owner: the deepest node whose grant covers it.
+        let mut owner: HashMap<Uuid, usize> = HashMap::new();
+        let mut granted: Vec<Uuid> = Vec::new();
+        for (i, node) in nodes.iter().enumerate() {
+            for project in &node.grant.project_ids {
+                if !granted.contains(project) {
+                    granted.push(*project);
+                }
+                let deeper = owner
+                    .get(project)
+                    .is_none_or(|held| depths[*held] < depths[i]);
+                if deeper {
+                    owner.insert(*project, i);
+                }
             }
         }
-        rows.extend(granted_rows);
+        let (projects, projects_overflow) = self.tree_projects(&granted)?;
+        let mut blocks: HashMap<usize, Vec<Vec<ManagerTreeRowV1>>> = HashMap::new();
+        let mut other_rows = Vec::new();
+        for project in projects {
+            let parent = owner.get(&project).copied();
+            let block = self.tree_project_block(
+                project,
+                parent.map(|i| format!("portfolio:{}", nodes[i].node_id)),
+                parent.map_or(0, |i| depths[i] + 1),
+            )?;
+            let mut block_rows = vec![block.0];
+            block_rows.extend(block.1);
+            match parent {
+                Some(i) => blocks.entry(i).or_default().push(block_rows),
+                None => other_rows.extend(block_rows),
+            }
+        }
+        // Depth-first over nodes: children in creation order under a parent.
+        let mut children: BTreeMap<Option<usize>, Vec<usize>> = BTreeMap::new();
+        for (i, node) in nodes.iter().enumerate() {
+            let parent = node.parent_node_id.and_then(|id| index.get(&id).copied());
+            children.entry(parent).or_default().push(i);
+        }
+        let mut order = Vec::with_capacity(nodes.len());
+        let mut pending: Vec<usize> = children.get(&None).cloned().unwrap_or_default();
+        pending.reverse();
+        while let Some(i) = pending.pop() {
+            order.push(i);
+            let mut kids = children.get(&Some(i)).cloned().unwrap_or_default();
+            kids.reverse();
+            pending.extend(kids);
+        }
+        let mut rows = Vec::new();
+        for i in order {
+            let node = &nodes[i];
+            let owned = blocks.remove(&i).unwrap_or_default();
+            let sum = |pick: fn(&ManagerTreeRowV1) -> Option<i64>| {
+                owned
+                    .iter()
+                    .map(|block| pick(&block[0]))
+                    .try_fold(0i64, |total, value| value.map(|v| total + v))
+            };
+            let pending_decisions = sum(|row| row.load.pending_decisions);
+            // #1238: the subtree's pending escalations plus the hops addressed
+            // to this node itself.
+            let pending_escalations = sum(|row| row.load.pending_escalations).and_then(|below| {
+                self.tier_open_hops_for_node(node.node_id)
+                    .map(|own| below + own)
+            });
+            let direct_children = children.get(&Some(i)).map_or(0, Vec::len);
+            let complete = owned.iter().flatten().all(|row| row.complete) && !projects_overflow;
+            let policy = &node.grant.project_policy;
+            rows.push(ManagerTreeRowV1 {
+                key: format!("portfolio:{}", node.node_id),
+                parent_key: node
+                    .parent_node_id
+                    .filter(|id| index.contains_key(id))
+                    .map(|id| format!("portfolio:{id}")),
+                depth: depths[i],
+                kind: ManagerTreeKindV1::Portfolio,
+                label: format!("{} manager", node.tier_label),
+                tier_label: Some(node.tier_label.clone()),
+                grantor: Some(node.grantor.clone()),
+                project_id: None,
+                node_id: Some(node.node_id),
+                epic_id: None,
+                scope: Some(format!(
+                    "{} granted project(s)",
+                    node.grant.project_ids.len()
+                )),
+                seat: self.tree_seat(node.grant.seat_session_id),
+                focus_session_id: Some(node.grant.seat_session_id),
+                grant: Some(ManagerTreeGrantV1 {
+                    grant_version: node.grant.grant_version,
+                    capabilities: policy.capabilities.clone(),
+                    max_active_sessions: policy.max_active_sessions,
+                    max_created_sessions: policy.max_created_sessions,
+                    max_created_containers: policy.max_created_containers,
+                    max_direct_reports: node.max_direct_reports,
+                    max_spend_usd: policy.max_spend_usd,
+                    reserved: Vec::new(),
+                }),
+                launches: portfolio_effective_launches(
+                    &node.grant.allowed_launches,
+                    &node.grant.project_policy,
+                ),
+                load: ManagerTreeLoadV1 {
+                    running_workers: None,
+                    direct_reports: Some((owned.len() + direct_children) as i64),
+                    pending_escalations,
+                    pending_decisions,
+                },
+                complete,
+            });
+            rows.extend(owned.into_iter().flatten());
+        }
         rows.extend(other_rows);
         Ok(ManagerTreeSnapshot {
             rows,
-            global_grant_version: grant.map(|g| g.grant_version),
+            global_grant_version: self
+                .active_global_grant()
+                .ok()
+                .flatten()
+                .map(|g| g.grant_version),
         })
+    }
+
+    /// #1412: the launches a project manager may make now: the live
+    /// intersection of every node above it (each one's grant list narrowed by
+    /// its project policy) with the manager's own list when that is non-empty.
+    /// Empty when nothing restricts it.
+    fn tree_pm_launches(
+        &self,
+        config: &HarnessManagerConfigV1,
+    ) -> Result<Vec<ManagerLaunchChoiceV2>> {
+        let own = self
+            .get_harness_manager_policy(config.project_id)?
+            .filter(|grant| !grant.revoked)
+            .map(|grant| grant.policy.allowed_launches)
+            .unwrap_or_default();
+        self.manager_effective_launches(config, &own)
     }
 
     /// One project row followed by its area nodes and led Epics. `depth` is the project row's depth.
@@ -299,6 +399,13 @@ impl Store {
             depth,
             kind: ManagerTreeKindV1::Project,
             label: name,
+            tier_label: None,
+            grantor: match live {
+                Some(config) => {
+                    Some(self.project_manager_grantor(project, config.manager_session_id)?)
+                }
+                None => None,
+            },
             project_id: Some(project),
             node_id: root.map(|n| n.id),
             epic_id: None,
@@ -306,6 +413,10 @@ impl Store {
             seat: seat_id.and_then(|id| self.tree_seat(id)),
             focus_session_id: seat_id,
             grant: None,
+            launches: match live {
+                Some(config) => self.tree_pm_launches(config)?,
+                None => Vec::new(),
+            },
             load: ManagerTreeLoadV1 {
                 running_workers: running,
                 direct_reports: root.map(|n| i64::from(n.direct_reports)),
@@ -366,6 +477,8 @@ impl Store {
                 parent_key: Some(parent_key.to_string()),
                 depth: d,
                 kind: ManagerTreeKindV1::Epic,
+                tier_label: None,
+                grantor: None,
                 label: if epic.title.is_empty() {
                     epic.id.to_string()
                 } else {
@@ -378,6 +491,7 @@ impl Store {
                 seat: epic.lead.and_then(|id| self.tree_seat(id)),
                 focus_session_id: epic.lead,
                 grant: None,
+                launches: Vec::new(),
                 load: ManagerTreeLoadV1 {
                     running_workers: Some(epic.running),
                     direct_reports: None,
@@ -412,6 +526,8 @@ impl Store {
                 }),
                 depth: *d,
                 kind: ManagerTreeKindV1::Area,
+                tier_label: None,
+                grantor: None,
                 label: format!(
                     "area {}{}",
                     &node.id.to_string()[..8],
@@ -433,6 +549,11 @@ impl Store {
                     max_spend_usd: g.allowance.max_spend_usd,
                     reserved: self.tree_reserved(node.id).unwrap_or_default(),
                 }),
+                launches: node
+                    .grant
+                    .as_ref()
+                    .map(|g| g.allowed_launches.clone())
+                    .unwrap_or_default(),
                 load: ManagerTreeLoadV1 {
                     running_workers,
                     direct_reports: Some(i64::from(node.direct_reports)),

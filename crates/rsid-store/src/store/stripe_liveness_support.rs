@@ -1,26 +1,26 @@
 //! Test support for #1172: a custody path must never hold the Store while it
-//! waits for a custody stripe. A maintenance proof (purge, archive cleanup,
-//! settlement) can hold a stripe for seconds; every other Store user, the
+//! waits for a custody root lock. A maintenance proof (purge, archive cleanup,
+//! settlement) can hold a root lock for seconds; every other Store user, the
 //! daemon's RPC handlers and the watchdog's Store probe included, must keep
 //! being served meanwhile, and the path itself must finish once the proof ends.
 //!
 //! [`run_behind_held_stripes`] starts a Store probe on a plain OS thread (so a
 //! starved runtime cannot hide an unanswered Store, and the probe is ready
-//! before the path starts), holds the stripes on another plain thread (a
+//! before the path starts), holds the root locks on another plain thread (a
 //! readiness handshake returns only once they are all held), then runs the path
-//! under test. The holder keeps the stripes until the path *acknowledges
-//! contention* (the `custody_lock_order` seam: it found a held stripe, dropped
+//! under test. The holder keeps the root locks until the path *acknowledges
+//! contention* (the `custody_lock_order` seam: it found a held root lock, dropped
 //! the Store and began to wait) and then for the full `hold` interval after
 //! that acknowledgement. The probe only counts samples taken inside that
 //! interval, so a path that spends the hold elsewhere (a slow sandbox
-//! allocation), or never needs a stripe at all, or blocks the runtime thread
+//! allocation), or never needs a root lock at all, or blocks the runtime thread
 //! under the Store instead of acknowledging, fails instead of passing
 //! vacuously (#1174, #1179).
 
 use super::Store;
 use super::custody_lock_order::admission_contention_signal_matching;
-use super::sandbox_custody::{custody_root_lock_shard, lock_custody_root};
-use std::collections::BTreeSet;
+use super::sandbox_custody::lock_custody_root;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,7 +29,7 @@ use tokio::sync::Mutex as StoreMutex;
 use uuid::Uuid;
 
 /// Worst acceptable wait for an unrelated Store acquisition while the path is
-/// blocked on a stripe. Far below the watchdog's 5 s probe deadline and the
+/// blocked on a root lock. Far below the watchdog's 5 s probe deadline and the
 /// 3 s hold, and far above scheduling noise on a loaded runner.
 pub const PROBE_BOUND: Duration = Duration::from_millis(1500);
 
@@ -42,11 +42,11 @@ pub const MIN_PROBE_SAMPLES: usize = 20;
 /// enough for a slow sandbox allocation ahead of the contended transition.
 pub const ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// What a held-stripe run observed.
+/// What a held-root lock run observed.
 pub struct StripeRun<T> {
     /// The path under test's own result.
     pub output: T,
-    /// Whether the path found a held stripe, dropped the Store and waited (the
+    /// Whether the path found a held root lock, dropped the Store and waited (the
     /// contention handshake). Without it the run proves nothing.
     pub contention_acknowledged: bool,
     /// The worst Store wait an unrelated probe saw inside the hold that
@@ -54,7 +54,7 @@ pub struct StripeRun<T> {
     pub worst_wait: Duration,
     /// How many probe samples were taken inside that hold.
     pub samples_while_held: usize,
-    /// Whether the path finished only after the stripes were released, i.e. it
+    /// Whether the path finished only after the root locks were released, i.e. it
     /// really waited behind them.
     pub finished_after_release: bool,
     /// What each extra caller-supplied probe (an outer registry the path might
@@ -74,8 +74,8 @@ pub struct ProbeReport {
 pub type ProbeFn = Box<dyn Fn() + Send + 'static>;
 
 impl<T> StripeRun<T> {
-    /// Assert the path really contended for a held stripe, the Store stayed
-    /// answerable meanwhile and the path waited behind the stripes, then hand
+    /// Assert the path really contended for a held root lock, the Store stayed
+    /// answerable meanwhile and the path waited behind the root locks, then hand
     /// back the path's result.
     #[track_caller]
     pub fn assert_store_stayed_free(self, what: &str) -> T {
@@ -116,14 +116,33 @@ impl<T> StripeRun<T> {
     }
 }
 
-/// `n` custody ids that cover every stripe, one per shard.
-fn one_id_per_stripe() -> Vec<Uuid> {
-    let mut ids: Vec<Option<Uuid>> = vec![None; 64];
-    while ids.iter().any(Option::is_none) {
-        let id = Uuid::new_v4();
-        ids[custody_root_lock_shard(id)].get_or_insert(id);
+// Scoped reservation lets fixtures hold a fresh root before allocation gives
+// it an identity. Each override belongs to one session and is consumed once.
+static FRESH_ROOTS: std::sync::LazyLock<std::sync::Mutex<HashMap<Uuid, Uuid>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+pub struct FreshRootReservation(Uuid);
+
+impl Drop for FreshRootReservation {
+    fn drop(&mut self) {
+        FRESH_ROOTS.lock().unwrap().remove(&self.0);
     }
-    ids.into_iter().flatten().collect()
+}
+
+pub fn reserve_fresh_root(session_id: Uuid) -> (Uuid, FreshRootReservation) {
+    let custody_id = Uuid::new_v4();
+    assert!(
+        FRESH_ROOTS
+            .lock()
+            .unwrap()
+            .insert(session_id, custody_id)
+            .is_none()
+    );
+    (custody_id, FreshRootReservation(session_id))
+}
+
+pub fn take_fresh_root(session_id: Uuid) -> Option<Uuid> {
+    FRESH_ROOTS.lock().unwrap().remove(&session_id)
 }
 
 /// Flags shared by the holder, the probe and the runner.
@@ -131,8 +150,8 @@ fn one_id_per_stripe() -> Vec<Uuid> {
 struct Shared {
     /// The path acknowledged contention; the hold interval is running.
     acknowledged: AtomicBool,
-    /// Set before the stripes drop: a path that finishes while this is still
-    /// false never waited on a held stripe.
+    /// Set before the root locks drop: a path that finishes while this is still
+    /// false never waited on a held root lock.
     released: AtomicBool,
     /// The path returned; a holder still waiting for an acknowledgement stops.
     path_done: AtomicBool,
@@ -144,7 +163,7 @@ struct Holder {
     thread: std::thread::JoinHandle<()>,
 }
 
-/// Hold the stripes of `ids` on a plain thread: from before the path starts
+/// Hold the root locks of `ids` on a plain thread: from before the path starts
 /// until `hold` after it acknowledges contention on one of them (or until the
 /// path ends / `ack_timeout` passes without an acknowledgement). Returns once
 /// all are held (the readiness handshake).
@@ -158,11 +177,11 @@ fn hold_stripes(
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let shared = Arc::clone(shared);
     let thread = std::thread::spawn(move || {
-        // Distinct ids can share a stripe; take each stripe once.
+        // Take each exact root once.
         let mut seen = BTreeSet::new();
         let guards: Vec<_> = ids
             .into_iter()
-            .filter(|id| seen.insert(custody_root_lock_shard(*id)))
+            .filter(|id| seen.insert(*id))
             .map(lock_custody_root)
             .collect();
         held_tx.send(()).expect("the test is waiting for readiness");
@@ -232,7 +251,7 @@ fn start_probe(
     (thread, ready_rx)
 }
 
-/// Run `path` while `ids`' stripes (every stripe when `None`) are held until
+/// Run `path` while the exact roots in `ids` are held until
 /// `hold` after the path acknowledges contention, with an unrelated Store probe
 /// running meanwhile. Call from a multi-thread runtime with at least two
 /// workers.
@@ -262,14 +281,10 @@ pub async fn run_behind_held_stripes_within<T, F>(
 where
     F: Future<Output = T>,
 {
-    let ids = ids.unwrap_or_else(one_id_per_stripe);
-    // Registered before the stripes are held or the path starts, so the
-    // acknowledgement cannot be missed. A busy stripe is contention for every
-    // custody id that hashes to it.
-    let shards: BTreeSet<usize> = ids.iter().copied().map(custody_root_lock_shard).collect();
-    let contended = admission_contention_signal_matching(move |custody_id| {
-        shards.contains(&custody_root_lock_shard(custody_id))
-    });
+    let ids = ids.expect("hold the fixture's exact custody roots");
+    let roots: BTreeSet<Uuid> = ids.iter().copied().collect();
+    let contended =
+        admission_contention_signal_matching(move |custody_id| roots.contains(&custody_id));
     let shared = Arc::new(Shared::default());
     // Probe readiness first: the path never starts before every probe sampled.
     let store_probe = Arc::clone(store);
@@ -322,7 +337,7 @@ mod tests {
         (dir, Arc::new(StoreMutex::new(store)))
     }
 
-    /// A path that never needs a stripe cannot pass: no acknowledgement, so the
+    /// A path that never needs a root lock cannot pass: no acknowledgement, so the
     /// assertion refuses it, however fast it finishes.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -353,7 +368,7 @@ mod tests {
     }
 
     /// The old blocking transition: the path blocks a runtime thread on the
-    /// stripe under the Store and never acknowledges. It is refused (after the
+    /// root lock under the Store and never acknowledges. It is refused (after the
     /// acknowledgement budget releases the holder), not passed.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -441,7 +456,7 @@ mod tests {
         );
     }
 
-    /// An extra probe (an outer registry the path might pin across its stripe
+    /// An extra probe (an outer registry the path might pin across its root lock
     /// wait) is held to the same bound as the Store probe.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -459,7 +474,7 @@ mod tests {
             ACKNOWLEDGEMENT_TIMEOUT,
             vec![("registry", Box::new(move || drop(probed.blocking_read())))],
             async move {
-                // The registry guard is held across the stripe wait, the Store
+                // The registry guard is held across the root lock wait, the Store
                 // is not: only the extra probe can see it.
                 let _registry = pinning.write().await;
                 let (_store, _root) = lock_store_then_root(&waiting_store, custody_id).await;

@@ -40,7 +40,13 @@ impl AgentControlHandle {
         service: &DaemonInfoService,
         satellite_root: &std::path::Path,
     ) -> Result<AgentGetDaemonInfoResultV1> {
-        let (schema_version, peers) = {
+        // Listing the held creates reads the store, so only while the hold is
+        // in force (#1417).
+        let list_held_creates = self
+            .host_load
+            .as_ref()
+            .is_some_and(|gate| gate.hold_now().is_some());
+        let (schema_version, peers, queued_creates) = {
             let store = self.store.lock().await;
             let projection = store
                 .agent_authority_projection(caller)
@@ -65,7 +71,12 @@ impl AgentControlHandle {
             } else {
                 Vec::new()
             };
-            (store.schema_user_version()?, peers)
+            let queued_creates = if list_held_creates {
+                store.queued_manager_create_sessions(crate::host_load::HELD_LIST_LIMIT)?
+            } else {
+                Vec::new()
+            };
+            (store.schema_user_version()?, peers, queued_creates)
         };
         // The store lock is released before hashing, statvfs, /proc reads or
         // any link I/O. Peers are read concurrently, each bounded by the link
@@ -81,6 +92,11 @@ impl AgentControlHandle {
                 .deploy_drain
                 .as_ref()
                 .map(|drain| drain.status())
+                .unwrap_or_default(),
+            host_load: self
+                .host_load
+                .as_ref()
+                .map(|gate| gate.status(&queued_creates))
                 .unwrap_or_default(),
         })
     }

@@ -220,6 +220,34 @@ class PrePushTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.remote_ref("refs/heads/feature"), bad)
 
+    def test_rolling_push_adding_an_operator_identifier_is_refused(self) -> None:
+        import shutil
+        from unittest import mock
+
+        tool = self.repo / "tools" / "check_operator_identifiers.py"
+        tool.parent.mkdir(exist_ok=True)
+        shutil.copy(HOOKS.parent / "check_operator_identifiers.py", tool)
+        self.assert_git(self.repo, "add", "tools")
+        self.assert_git(self.repo, "commit", "-q", "-m", "add guard")
+        self.assert_git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        base = self.remote_ref("refs/heads/rolling")
+        ids = self.root / "operator-identifiers"
+        ids.write_text("jane.doe" + "@example.invalid\n")
+        (self.repo / "note.md").write_text("contact jane.doe" + "@example.invalid\n")
+        self.assert_git(self.repo, "add", "note.md")
+        self.assert_git(self.repo, "commit", "-q", "-m", "leak")
+        with mock.patch.dict(os.environ, {"RSI_OPERATOR_IDENTIFIERS_FILE": str(ids)}):
+            refused = git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+            other = git(self.repo, "push", "publish", "HEAD:refs/heads/feature")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("note.md:1: operator identifier #1", refused.stderr)
+        self.assertNotIn("jane.doe" + "@example.invalid", refused.stderr)
+        self.assertEqual(self.remote_ref("refs/heads/rolling"), base)
+        self.assertEqual(other.returncode, 0, other.stderr)
+        # Without the list the same push goes through.
+        ok = git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

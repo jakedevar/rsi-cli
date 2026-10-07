@@ -71,8 +71,8 @@ fn sort_picker_renders_at_its_saved_geometry() {
     app.modal_geometries
         .insert("SortPicker".into(), geom.clone());
     let viewport = Rect::new(0, 0, 100, 30);
-    let base =
-        super::fixed_centered_rect(viewport, 45, crate::app::SortOrder::ALL.len() as u16 + 4);
+    let (width, height) = super::sort_picker::sort_picker_size();
+    let base = super::fixed_centered_rect(viewport, width, height);
     let expected = apply_geometry_deltas(base, &geom, viewport);
     let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
     terminal
@@ -80,7 +80,7 @@ fn sort_picker_renders_at_its_saved_geometry() {
         .unwrap();
     let buffer = terminal.backend().buffer();
     let top_row: String = (0..100).map(|x| buffer[(x, expected.y)].symbol()).collect();
-    assert_eq!(top_row.find("Sort Order"), Some(expected.x as usize + 4));
+    assert_eq!(top_row.find("Sort sessions"), Some(expected.x as usize + 4));
 
     app.modal_geometries.insert(
         "SortPicker".into(),
@@ -93,6 +93,53 @@ fn sort_picker_renders_at_its_saved_geometry() {
     terminal
         .draw(|frame| super::render_overlay(frame, frame.area(), &mut app))
         .unwrap();
+}
+
+/// Every order shows its full name beside its description, the current order
+/// carries the check mark, and the hint names the keys the picker really
+/// takes (it once advertised a retired hold-`S` gesture and clipped both).
+#[test]
+fn sort_picker_shows_every_order_in_full_with_a_working_hint() {
+    use crate::app::SortOrder;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = crate::app::app_test_helpers::with_session_list(0);
+    app.settings.sort_order = SortOrder::FreshestFirst;
+    app.overlay = crate::types::OverlayState::SortPicker { selected_index: 1 };
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal
+        .draw(|frame| super::render_overlay(frame, frame.area(), &mut app))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let rows: Vec<String> = (0..30)
+        .map(|y| (0..100).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect();
+
+    for order in SortOrder::ALL {
+        let row = rows
+            .iter()
+            .find(|row| row.contains(order.label()))
+            .unwrap_or_else(|| panic!("missing sort option {:?}:\n{}", order, rows.join("\n")));
+        assert!(
+            row.contains(order.description()),
+            "{order:?} keeps its description on its row: {row:?}"
+        );
+    }
+    let current = rows
+        .iter()
+        .find(|row| row.contains(SortOrder::FreshestFirst.label()))
+        .expect("current order row");
+    assert!(
+        current.contains(&format!("✓ {}", SortOrder::FreshestFirst.label())),
+        "the current order is checked: {current:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("j/k choose · Enter apply · Esc cancel")),
+        "hint names the picker's real keys:\n{}",
+        rows.join("\n")
+    );
 }
 
 #[test]

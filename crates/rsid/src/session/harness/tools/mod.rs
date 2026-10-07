@@ -1440,6 +1440,8 @@ mod tests {
                 "AgentGetDaemonInfo",
                 "AgentRequestDeploy",
                 "AgentGlobalAppointManager",
+                "AgentManagerAppointChild",
+                "AgentManagerRevokeChild",
                 // #1028 and #1042 landed both wake verbs as RPC-only by design.
                 "AgentCancelWake",
                 "AgentListWakes",

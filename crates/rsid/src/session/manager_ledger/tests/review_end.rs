@@ -445,6 +445,124 @@ async fn active_review_claims_exact_restart_owner_before_generic_recovery() {
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
+async fn codex_review_mid_turn_restart_preserves_assignment_and_resumes_exact_worker() {
+    use crate::session::launch::install_controller_candidate_test_process;
+    use std::sync::atomic::Ordering;
+
+    let f = fixture().await;
+    let assignment = request_and_activate_db_review(&f, "codex-restart").await;
+    {
+        let store = f.handle.store.lock().await;
+        bind_review_invocation(&store, &f, assignment);
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET provider='Codex',model='gpt-6.1-sol',
+             claude_session_id='codex-restart-thread',status='Running' WHERE id=?1",
+                [f.reviewer.to_string()],
+            )
+            .unwrap();
+        let boot = Uuid::new_v4();
+        assert!(store.record_restart_intent(f.reviewer, boot).unwrap());
+        store.mark_restart_interrupt_sent(f.reviewer, boot).unwrap();
+        // The real shutdown finalizer settles the invocation before the next
+        // review reconciliation pass, while its restart journal is pending.
+        store
+            .update_session_status(f.reviewer, SessionStatus::Interrupted)
+            .unwrap();
+        store.conn.execute(
+            "UPDATE model_invocations SET status='failed',error_class='interrupted' WHERE id=?1",
+            [f.invocation.to_string()],
+        ).unwrap();
+        assert!(!store.refresh_manager_review_assignment(assignment).unwrap());
+        let state: String = store
+            .conn
+            .query_row(
+                "SELECT state FROM manager_review_assignments WHERE assignment_id=?1",
+                [assignment.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "active");
+    }
+    let mut restarted = SessionManager::new(
+        Arc::new(EventBus::new(64)),
+        Store::open(&f.dir.path().join("rsi.db")).unwrap(),
+        false,
+        f.dir.path().join("restart.sock"),
+        None,
+        Vec::new(),
+        RuntimeConfig::from_config(&Config::from_env()),
+        f.dir.path().join("sandboxes"),
+    )
+    .unwrap();
+    let binary = std::env::current_exe().unwrap();
+    restarted.codex_client = Some(crate::codex::CodexClient::with_paths_for_test(
+        binary.clone(),
+        binary,
+        Arc::clone(&restarted.runtime_config),
+    ));
+    restarted.restore_sessions().await.unwrap();
+    // Script only the provider process. Exercise real restore, admission,
+    // journal binding, review rebinding, and same-UUID continuation.
+    let process = install_controller_candidate_test_process(f.reviewer);
+    let mut events = restarted.event_bus.subscribe();
+    restarted
+        .reconcile_restart_intents_at_startup()
+        .await
+        .unwrap();
+    // Continuation returns when the process is installed. Its monitor binds
+    // the durable invocation before publishing Starting; wait for that edge.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(event.as_ref(), crate::bus::DaemonEvent::SessionStatusChanged {
+                session_id, new_status: SessionStatus::Starting, ..
+            } if *session_id == f.reviewer)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        restarted.active.read().await[&f.reviewer].session.provider,
+        SessionProvider::Codex
+    );
+    {
+        let store = restarted.store.lock().await;
+        assert!(store.refresh_manager_review_assignment(assignment).unwrap());
+        let (state, bound): (String, String) = store.conn.query_row(
+            "SELECT state,reviewer_invocation_id FROM manager_review_assignments WHERE assignment_id=?1",
+            [assignment.to_string()], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).unwrap();
+        assert_eq!(state, "active");
+        assert_eq!(
+            Some(Uuid::parse_str(&bound).unwrap()),
+            store.session_model_invocation_id(f.reviewer).unwrap()
+        );
+        let state: String = store
+            .conn
+            .query_row(
+                "SELECT state FROM daemon_restart_intents WHERE session_id=?1",
+                [f.reviewer.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "delivered");
+    }
+    restarted
+        .reconcile_restart_intents_at_startup()
+        .await
+        .unwrap();
+    assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 1);
+    restarted.shutdown().await.unwrap();
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
 async fn exact_restart_origin_rebinds_active_review_and_accepts_reviewer_receipt() {
     let f = fixture().await;
     let assignment = request_and_activate_db_review(&f, "restart-rebind").await;

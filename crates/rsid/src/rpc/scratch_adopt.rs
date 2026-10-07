@@ -103,7 +103,7 @@ impl RpcServer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use crate::agent_scratch_reclaim::RootKind;

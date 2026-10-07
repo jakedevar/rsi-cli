@@ -6,6 +6,7 @@
 
 use super::SessionManager;
 
+mod abandon;
 mod recovery;
 
 #[cfg(all(
@@ -1239,6 +1240,32 @@ impl SessionManager {
             );
             &generated_rotation_id
         };
+        // #1176: custody is irreversible. Closing this request would strand
+        // its bound replacement and prevent both Continue and another abandon.
+        let bound_abandon = {
+            let store = store.lock().await;
+            match store.rotation_abandon_bound_successor(session_id, rotation_id) {
+                Ok(Some(successor)) => store
+                    .record_rotation_recovery_blocked(session_id, rotation_id, successor)
+                    .map(|_| Some(successor)),
+                other => other,
+            }
+        };
+        match bound_abandon {
+            Ok(Some(successor)) => {
+                Self::inject_session_system_event(
+                    successor,
+                    format!("Rotation remains open after {code}. Continue this custody holder or abandon it to a fresh replacement."),
+                    completed, event_bus, persistence,
+                ).await;
+                return;
+            }
+            Err(error) => {
+                tracing::error!(%session_id, %error, "Could not prove abandon custody; retaining open rotation");
+                return;
+            }
+            Ok(None) => {}
+        }
         if let Err(error) = persistence
             .log_rotation_event(
                 session_id,
@@ -1309,11 +1336,11 @@ impl SessionManager {
         let Some(reason) = refusal else {
             return false;
         };
-        tracing::warn!(%session_id, %reason, "context rotation refused by the launch-model allowlist");
+        tracing::warn!(%session_id, %reason, "context rotation refused by the launch-model allowlist or provider profile");
         Self::record_rotation_refusal(
             session_id,
             rotation_id,
-            rsi_common::launch_allowlist::LAUNCH_MODEL_NOT_ALLOWED,
+            rsi_common::provider_profile::launch_refusal_code(&reason),
             completed,
             event_bus,
             persistence,
@@ -2832,8 +2859,40 @@ impl SessionManager {
         let child_id = take_rotation_child_id_for_test(session_id).unwrap_or_else(Uuid::new_v4);
         #[cfg(not(test))]
         let child_id = Uuid::new_v4();
+        // #1176: an abandoned blocked rotation starts the replacement from the
+        // exact first prompt the never-started holder carried (the seat's
+        // handoff), with the operator's provider/model override.
+        let abandon_request = if predecessor_source == RotationPredecessorSource::BlockedHolder {
+            let request = {
+                let store_guard = store.lock().await;
+                rotation_id_for_log
+                    .as_deref()
+                    .map(|rid| store_guard.rotation_abandon_request_for(session_id, rid))
+                    .transpose()
+            };
+            match request {
+                Ok(Some(Some(request))) => Some(request),
+                Ok(_) => {
+                    completed.write().await.insert(session_id, parent_completed);
+                    refuse!("abandon_request_missing");
+                }
+                Err(error) => {
+                    tracing::warn!(%session_id, %error, "Abandon request lookup failed closed");
+                    completed.write().await.insert(session_id, parent_completed);
+                    refuse!("abandon_request_lookup_failed");
+                }
+            }
+        } else {
+            None
+        };
+        let blocked_holder_query = abandon_request
+            .as_ref()
+            .map(|_| parent_completed.session.query.clone())
+            .filter(|query| !query.trim().is_empty());
         // Slice 2 binds a detected path to the handoff turn before this choice.
-        let child_query = if let Some(ref path) = handoff_filepath {
+        let child_query = if let Some(query) = blocked_holder_query {
+            query
+        } else if let Some(ref path) = handoff_filepath {
             format!("/resume_handoff {}", path)
         } else {
             // #1005: a seat rotated at its coordinator context cap starts
@@ -2986,6 +3045,14 @@ impl SessionManager {
             terminal_reason: None,
         };
 
+        if let Some(request) = abandon_request.as_ref() {
+            if let Some(provider) = request.provider {
+                child_session.provider = provider;
+            }
+            if request.provider.is_some() || request.model.is_some() {
+                child_session.model = request.model.clone();
+            }
+        }
         if let Err(error) =
             crate::sandbox::custody::CustodyExecutionRuntime::apply_rotation_successor_tuple(
                 &rotation_candidate,
@@ -3146,14 +3213,14 @@ impl SessionManager {
             )
             .as_deref(),
         ) {
-            tracing::warn!(%parent_id, %reason, "rotation successor refused by the launch-model allowlist");
+            tracing::warn!(%parent_id, %reason, "rotation successor refused by the launch-model allowlist or provider profile");
             if let Some(parent) = parent_for_archival.take() {
                 completed.write().await.insert(parent_id, parent);
             }
             Self::record_rotation_refusal(
                 parent_id,
                 rotation_id_for_log.as_deref(),
-                rsi_common::launch_allowlist::LAUNCH_MODEL_NOT_ALLOWED,
+                rsi_common::provider_profile::launch_refusal_code(&reason),
                 &completed,
                 &event_bus,
                 &persistence,
@@ -3989,8 +4056,22 @@ impl SessionManager {
         #[cfg(test)]
         observe_rotation_config_for_test(child_id, &config);
 
+        // A crash during spawn is ambiguous. Journal the boundary before the
+        // provider can execute, and clear it only on a definite spawn error.
+        let spawn_metadata =
+            serde_json::json!({ "invocation_id": admission_permit.invocation_id() }).to_string();
+        let spawn_rotation_id = rotation_id_for_log.as_deref().unwrap_or("untracked");
+        let spawn_journal = store.lock().await.insert_rotation_event(
+            child_id,
+            spawn_rotation_id,
+            "launch",
+            "provider_spawn_attempt",
+            Some(&spawn_metadata),
+        );
         #[cfg(test)]
-        let launch_result = if take_rotation_provider_unavailable_for_test(child_id) {
+        let launch_result = if let Err(error) = spawn_journal {
+            Err(error)
+        } else if take_rotation_provider_unavailable_for_test(child_id) {
             Err(DaemonError::Store(
                 "rotation provider unavailable test seam".to_string(),
             ))
@@ -4009,16 +4090,28 @@ impl SessionManager {
             )
         };
         #[cfg(not(test))]
-        let launch_result = super::provider_spawn::spawn_provider_process(
-            provider,
-            &config,
-            &launcher,
-            &admission_permit,
-            &spawn_guard,
-        );
+        let launch_result = spawn_journal.and_then(|_| {
+            super::provider_spawn::spawn_provider_process(
+                provider,
+                &config,
+                &launcher,
+                &admission_permit,
+                &spawn_guard,
+            )
+        });
         let (mut process, event_rx) = match launch_result {
             Ok(pair) => pair,
             Err(e) => {
+                if let Err(error) = store.lock().await.insert_rotation_event(
+                    child_id,
+                    spawn_rotation_id,
+                    "launch",
+                    "provider_spawn_failed",
+                    Some(&spawn_metadata),
+                ) {
+                    tracing::error!(%child_id, %error, "Failed to persist definite provider spawn failure");
+                }
+
                 if let Err(settle_error) = complete_invocation(
                     &store,
                     &admission_permit,
@@ -4415,11 +4508,13 @@ impl SessionManager {
         let store_ref = Arc::clone(&store);
         let publish_rotation_id = publication_rotation_id.clone();
         let lead_transfer = tokio::task::spawn_blocking(move || {
-            let published = store_ref.blocking_lock().publish_rotation_successor(
-                &publication_guards,
-                &publish_rotation_id,
-                &publication_metadata,
-            );
+            let published = store_ref
+                .blocking_lock()
+                .publish_rotation_successor_with_chain(
+                    &publication_guards,
+                    &publish_rotation_id,
+                    &publication_metadata,
+                );
             drop(publication_guards);
             published
         })
@@ -4427,7 +4522,16 @@ impl SessionManager {
         .map_err(|error| DaemonError::Store(format!("rotation publication join failed: {error}")))
         .and_then(|result| result);
         let affected_epics = match lead_transfer {
-            Ok(affected_epics) => affected_epics,
+            Ok(publication) => {
+                // #1176: an abandon publication archived the blocked chain.
+                if !publication.archived.is_empty() {
+                    let mut completed_guard = completed.write().await;
+                    for archived in &publication.archived {
+                        completed_guard.remove(archived);
+                    }
+                }
+                publication.epics
+            }
             Err(error) => {
                 tracing::warn!(
                     %parent_id,
@@ -5367,15 +5471,7 @@ mod tests {
     pub(super) fn rotation_manager_with_context_rotation(
         context_rotation_enabled: bool,
     ) -> (SessionManager, tempfile::TempDir) {
-        // Live sandbox fixtures need a disk-backed root: execution scratch
-        // correctly rejects tmpfs. QA may check out the source under /tmp, so
-        // the process cwd is not a reliable place for these fixtures. Use the
-        // compiled test target, which the test runner provisions on disk.
-        let test_binary = std::env::current_exe().expect("test binary path");
-        let target_dir = test_binary.parent().expect("test binary directory");
-        let dir = tempfile::Builder::new()
-            .tempdir_in(target_dir)
-            .expect("disk-backed rotation fixture");
+        let dir = crate::test_support::disk_backed_tempdir("rotation");
         let manager = rotation_manager_on(dir.path(), context_rotation_enabled);
         (manager, dir)
     }
@@ -5544,6 +5640,7 @@ mod tests {
         child.provider = SessionProvider::Claude;
         child.working_dir = fixture.repo.clone();
         child.project_id = fixture.parent.project_id;
+        child.parent_id = fixture.parent.parent_id;
         child.continued_from = Some(fixture.parent.id);
         child.rotation_depth = 1;
         child.query = "bound rotation successor".into();
@@ -7253,7 +7350,7 @@ mod tests {
         Ok((project, assigned.idea, parent, parent_token))
     }
 
-    async fn d03_live_rotation_fixture(
+    pub(super) async fn d03_live_rotation_fixture(
         manager: &SessionManager,
         fixture_root: &std::path::Path,
         intent: &str,
@@ -8285,7 +8382,6 @@ mod tests {
         let child_id = Uuid::new_v4();
         let mut running = test_session(parent_id, SessionStatus::Running);
         running.working_dir = dir.path().to_path_buf();
-        running.session_kind = SessionKind::TaskRabbit;
         manager.store.lock().await.insert_session(&running)?;
         manager
             .store
@@ -8300,7 +8396,7 @@ mod tests {
             event_type: EventType::Message,
             role: Some(Role::Assistant),
             created_at: chrono::Utc::now(),
-            content: "escalate this rotation [TASKRABBIT_ESCALATE]".into(),
+            content: "finish this rotation".into(),
             tool_name: None,
             tool_input: None,
             offload_id: None,
@@ -8516,6 +8612,60 @@ mod tests {
         assert!(
             !refuse(&manager, parent_id).await,
             "an allowed model is admitted"
+        );
+        Ok(())
+    }
+
+    /// Issue #1407: the rotation preflight applies the operator provider
+    /// profile too: under `aws_only` a predecessor that is not Claude on a
+    /// Bedrock Claude model is refused; `all` admits it as before.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn rotation_preflight_refuses_a_non_bedrock_model_under_the_aws_only_profile()
+    -> anyhow::Result<()> {
+        let (manager, dir) = rotation_manager();
+        let mut parents = Vec::new();
+        for model in [
+            "rotation-model",
+            rsi_common::provider_profile::AWS_ONLY_DEFAULT_MODEL,
+        ] {
+            let parent_id = Uuid::new_v4();
+            let mut parent = test_session(parent_id, SessionStatus::Completed);
+            parent.working_dir = dir.path().to_path_buf();
+            parent.provider = SessionProvider::Claude;
+            parent.model = Some(model.to_string());
+            manager.store.lock().await.insert_session(&parent)?;
+            manager
+                .completed
+                .write()
+                .await
+                .insert(parent_id, CompletedSession::for_test(parent));
+            parents.push(parent_id);
+        }
+        async fn refuse(manager: &SessionManager, parent_id: Uuid) -> bool {
+            SessionManager::refuse_rotation_on_launch_allowlist(
+                parent_id,
+                Some("rotation-1"),
+                &manager.runtime_config,
+                &manager.completed,
+                &manager.event_bus,
+                &manager.persistence,
+                &manager.store,
+            )
+            .await
+        }
+        assert!(!refuse(&manager, parents[0]).await, "`all` admits it");
+        manager
+            .runtime_config
+            .update_field("provider_profile", &serde_json::json!("aws_only"))
+            .map_err(anyhow::Error::msg)?;
+        assert!(
+            refuse(&manager, parents[0]).await,
+            "a non-Bedrock model is refused"
+        );
+        assert!(
+            !refuse(&manager, parents[1]).await,
+            "Claude on a Bedrock Claude model is admitted"
         );
         Ok(())
     }

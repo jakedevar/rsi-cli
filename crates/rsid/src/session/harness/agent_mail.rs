@@ -7,8 +7,7 @@ use crate::session::harness::types::{ChatMessage, ChatRequest};
 use crate::store::Store;
 use crate::store::agent_coordination::NoEffectDisposition;
 use rsi_common::agent_coordination::{
-    BoundaryAdmissionV1, BoundaryCapabilityKindV1, BoundaryClassificationV1,
-    BoundaryProviderKindV1, MessageAttemptFenceV1,
+    BoundaryAdmissionV1, BoundaryClassificationV1, BoundaryProviderKindV1, MessageAttemptFenceV1,
 };
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -150,13 +149,18 @@ impl ClaimedHarnessMail {
         classification: BoundaryClassificationV1,
         error_class: Option<&'static str>,
     ) -> BoundaryAdmissionV1 {
+        let provider_kind = self
+            .grant
+            .as_deref()
+            .map(|grant| grant.request().provider_kind)
+            .unwrap_or(BoundaryProviderKindV1::Harness);
         BoundaryAdmissionV1 {
-            provider_kind: self
-                .grant
-                .as_deref()
-                .map(|grant| grant.request().provider_kind)
-                .unwrap_or(BoundaryProviderKindV1::Harness),
-            capability_kind: BoundaryCapabilityKindV1::HarnessToolBoundary,
+            provider_kind,
+            // #1183: the session's own matrix row. A Harness session is
+            // `harness_tool_boundary`; an OpenRouter or Bedrock session on this
+            // loop keeps its `codex_cli` row (`terminal_one_turn`), which is
+            // what its attempt was claimed with. Both persist identically.
+            capability_kind: provider_kind.capability_kind(),
             delivery_session_id: self.fence.delivery_session_id,
             session_generation: self.fence.delivery_session_generation,
             model_invocation_id: self.fence.delivery_model_invocation_id,
@@ -333,5 +337,167 @@ impl HarnessMailBoundary for TestHarnessMailBoundary {
         Ok(self.delivery.clone().map(|state| {
             Box::new(TestHarnessMailDeliveryHandle { state }) as Box<dyn HarnessMailDelivery>
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::agent_verbs::tests::test_session;
+    use rsi_common::agent_coordination::AgentSendMessageRequestV1;
+    use rsi_common::types::{SessionKind, SessionProvider, SessionStatus};
+
+    fn message_state(store: &Store, message_id: Uuid) -> String {
+        store
+            .conn
+            .query_row(
+                "SELECT state FROM agent_messages WHERE id=?1",
+                rusqlite::params![message_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("message state")
+    }
+
+    /// A running session of `provider` with a current turn invocation, a
+    /// manager sender, and one queued message for it.
+    fn running_with_mail(provider: SessionProvider) -> (Arc<Mutex<Store>>, Uuid, Uuid, Uuid) {
+        let store = Store::open_in_memory().expect("store");
+        store.set_delivery_boot_id(Uuid::new_v4()).expect("boot id");
+        let owner = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let mut owner_row = test_session(owner, std::path::PathBuf::from("/tmp"));
+        owner_row.session_kind = SessionKind::Task;
+        owner_row.status = SessionStatus::Running;
+        owner_row.agent_role = Some("manager".to_string());
+        store.insert_session(&owner_row).expect("owner");
+        let mut row = test_session(target, std::path::PathBuf::from("/tmp"));
+        row.session_kind = SessionKind::Task;
+        row.status = SessionStatus::Running;
+        row.provider = provider;
+        store.insert_session(&row).expect("target");
+        let invocation = Uuid::new_v4();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        store
+            .conn
+            .execute(
+                "INSERT INTO model_invocations (
+                     id, purpose, invocation_kind, foreground, paid_risk,
+                     admission_status, status, trigger_source, session_id,
+                     policy_snapshot_json, created_at, started_at
+                 ) VALUES (?1, 'session.harness.turn', 'model', 'foreground',
+                     'paid_capable', 'admitted', 'running', 'harness_mail_tests',
+                     ?2, '{}', ?3, ?3)",
+                rusqlite::params![invocation.to_string(), target.to_string(), now],
+            )
+            .expect("invocation");
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET model_invocation_id=?1 WHERE id=?2",
+                rusqlite::params![invocation.to_string(), target.to_string()],
+            )
+            .expect("bind invocation");
+        let message_id = store
+            .accept_agent_message(
+                owner,
+                None,
+                &AgentSendMessageRequestV1 {
+                    target_session_id: target,
+                    message: "rebase onto rolling before the gate".to_string(),
+                    idempotency_key: "k-1183".to_string(),
+                    expires_at: None,
+                },
+            )
+            .expect("accept")
+            .receipt()
+            .message_id;
+        (Arc::new(Mutex::new(store)), target, invocation, message_id)
+    }
+
+    fn chat_request() -> ChatRequest {
+        ChatRequest {
+            messages: Vec::new(),
+            model: "m".to_string(),
+            temperature: None,
+            max_tokens: None,
+            tools: Vec::new(),
+            stream: true,
+            reasoning_effort: None,
+            context_editing: false,
+        }
+    }
+
+    /// #1183: an OpenRouter (or Bedrock) session on the Harness tool loop takes
+    /// its mail at the next model-call boundary exactly like a Harness
+    /// session: appended once, recorded `injected`, never claimed again.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn a_harness_routed_openrouter_session_takes_mail_once_at_the_tool_boundary() {
+        for provider in [
+            SessionProvider::OpenRouter,
+            SessionProvider::Bedrock,
+            SessionProvider::Harness,
+        ] {
+            let (store, target, invocation, message_id) = running_with_mail(provider);
+            let arbiter = Arc::new(AgentMessageArbiter::new());
+            let boundary =
+                HarnessAgentMailBoundary::new(Arc::clone(&store), Arc::clone(&arbiter), target, 0);
+
+            let mut mail = boundary
+                .claim(invocation)
+                .await
+                .expect("claim")
+                .unwrap_or_else(|| panic!("{provider:?}: mail claimed at the boundary"));
+            let mut history = Vec::new();
+            let mut request = chat_request();
+            mail.append(&mut history, &mut request);
+            mail.append(&mut history, &mut request);
+            assert_eq!(history.len(), 1, "{provider:?}");
+            assert!(
+                request.messages[0]
+                    .content
+                    .contains("rebase onto rolling before the gate")
+            );
+            mail.record_effect_possible().await;
+            assert_eq!(
+                message_state(&*store.lock().await, message_id),
+                "injected",
+                "{provider:?}"
+            );
+
+            // At most once: the next boundary finds nothing.
+            assert!(
+                boundary.claim(invocation).await.expect("claim").is_none(),
+                "{provider:?}"
+            );
+            assert!(arbiter.roots_with_outstanding_grant().is_empty());
+        }
+    }
+
+    /// A delivery cancelled before the model call is put back, not lost: the
+    /// row is requeued and the next boundary delivers it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn a_boundary_delivery_rejected_before_dispatch_is_requeued_for_the_next_boundary() {
+        let (store, target, invocation, message_id) =
+            running_with_mail(SessionProvider::OpenRouter);
+        let arbiter = Arc::new(AgentMessageArbiter::new());
+        let boundary =
+            HarnessAgentMailBoundary::new(Arc::clone(&store), Arc::clone(&arbiter), target, 0);
+        let mut mail = boundary
+            .claim(invocation)
+            .await
+            .expect("claim")
+            .expect("mail");
+        mail.record_rejected("agent_message_cancelled_before_dispatch")
+            .await;
+        assert_eq!(message_state(&*store.lock().await, message_id), "queued");
+        let mut again = boundary
+            .claim(invocation)
+            .await
+            .expect("claim")
+            .expect("again");
+        again.record_effect_possible().await;
+        assert_eq!(message_state(&*store.lock().await, message_id), "injected");
     }
 }

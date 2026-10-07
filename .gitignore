@@ -43,6 +43,7 @@ cache/projects.json
 !rust-toolchain.toml
 !deny.toml
 !.config/nextest.toml
+!.rsi/jobs.toml
 !.gemini/commands/auto_build.toml
 !.gemini/commands/auto_implement.toml
 !.gemini/commands/auto_plan.toml

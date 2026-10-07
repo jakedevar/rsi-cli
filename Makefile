@@ -5,7 +5,7 @@ TEST_BENCHMARK_REPEAT ?= 3
 TEST_BENCHMARK_OUT ?= target/test-suite-benchmark/local-nextest-full.json
 
 .PHONY: help release release-install release-install-no-restart desktop desktop-install release-install-tui relink-release codex-prompts codex-prompts-check claude-commands claude-commands-check \
-	test-fast test-full test-serial test-benchmark \
+	check-mirrors test-fast test-full test-serial test-benchmark scoped-test scoped-test-tmpfs check-touched-shards \
 	recursive-dag-live-dogfood-setup recursive-dag-live-dogfood-env \
 	recursive-dag-live-dogfood-daemon recursive-dag-live-dogfood-gate \
 	recursive-dag-live-dogfood-tui recursive-dag-live-dogfood-claude-login \
@@ -133,16 +133,51 @@ manual-pdf:
 	mkdir -p target
 	pandoc docs/manual/rsi-manual.md -o target/rsi-manual.pdf
 
-test-fast:
+# Fails when a derived mirror (`.agents/skills/`, Codex prompts, Gemini
+# commands) drifts from its canonical source (`.claude/`). Fix with
+# `scripts/sync-agent-commands.sh`.
+check-mirrors:
+	./tools/check-command-mirrors.sh
+
+test-fast: check-mirrors
 	./scripts/run-rsid-test-shards.sh fast --jobs $(NEXTEST_JOBS)
 
-test-full:
+test-full: check-mirrors
 	python3 scripts/check-rsid-test-shards.py --require-gates
 	@status=0; \
 	./scripts/run-rsid-test-shards.sh full --jobs $(NEXTEST_JOBS) || status=$$?; \
 	cargo run -p rsid --bin rsi-model-control-validate --offline || status=$$?; \
 	cargo run -p rsid --bin rsi-provider-capability-validate --offline || status=$$?; \
 	exit $$status
+
+# Worker verification recipes declared in .rsi/jobs.toml (#1558, #1560). The job
+# runner already wraps `make` in cargo-slot, which marks its child with
+# RSI_CARGO_SLOT_HELD so these scripts do not take a second governor slot.
+# Budgets stay under the 20-minute recipe cap. Only BASE (a git rev) can be
+# overridden, and only a plain rev token is accepted.
+VERIFY_BASE ?= origin/rolling
+
+scoped-test:
+	@case '$(VERIFY_BASE)' in -*|*[!A-Za-z0-9._/~^-]*|'') echo 'invalid VERIFY_BASE' >&2; exit 2;; esac
+	./scripts/scoped-test --base '$(VERIFY_BASE)' --runtime-max-sec 1080 --total-max-sec 1140 --cpu-quota 200
+
+.PHONY: test-deploy-migration-backup
+# Focused regression gate for the store-open hook and both deploy rollbacks.
+test-deploy-migration-backup:
+	./scripts/scoped-test --tmpfs --base origin/rolling --runtime-max-sec 1080 --cpu-quota 200 \
+		--filter 'rsid=shard:store-01:test(store::migration_backup)' \
+		--filter 'rsid=shard:store-01:test(store_open_)' \
+		--filter 'rsid=shard:other-02:test(deploy)' \
+		--filter 'rsid=bin:rsid'
+
+scoped-test-tmpfs:
+	@case '$(VERIFY_BASE)' in -*|*[!A-Za-z0-9._/~^-]*|'') echo 'invalid VERIFY_BASE' >&2; exit 2;; esac
+	./scripts/scoped-test --tmpfs --base '$(VERIFY_BASE)' --runtime-max-sec 1080 --total-max-sec 1140 --cpu-quota 200
+
+check-touched-shards:
+	@test -z "$$RSI_SCOPED_TEST_FILTERS" || { echo 'check-touched-shards takes no focused filters (#1584); use the scoped-test recipe' >&2; exit 2; }
+	@case '$(VERIFY_BASE)' in -*|*[!A-Za-z0-9._/~^-]*|'') echo 'invalid VERIFY_BASE' >&2; exit 2;; esac
+	./scripts/check-touched-shards --base '$(VERIFY_BASE)'
 
 test-serial:
 	./scripts/run-rsid-test-shards.sh fast --jobs 1

@@ -49,19 +49,12 @@ pub(crate) enum OwnedLaunchRequest {
         base_url: String,
         api_key: String,
     },
-    CustomWithOptions {
-        options: LaunchOptions,
-        base_url: String,
-        api_key: String,
-    },
 }
 
 impl OwnedLaunchRequest {
     pub(crate) fn options(&self) -> &LaunchOptions {
         match self {
-            Self::Standard(options)
-            | Self::CustomSimple { options, .. }
-            | Self::CustomWithOptions { options, .. } => options,
+            Self::Standard(options) | Self::CustomSimple { options, .. } => options,
         }
     }
 
@@ -106,30 +99,6 @@ impl OwnedLaunchRequest {
                     &api_key,
                     options.workflow_id,
                     options.effort.as_deref(),
-                    &options.tags,
-                    options.workflow_id_override,
-                )
-                .await
-                .map_err(|error| error.to_string()),
-            Self::CustomWithOptions {
-                options,
-                base_url,
-                api_key,
-            } => client
-                .launch_session_with_opts_custom_provider_response(
-                    &options.query,
-                    options.title.as_deref(),
-                    options.working_dir.as_deref(),
-                    options.provider,
-                    options.model.as_deref(),
-                    options.system_prompt.as_deref(),
-                    options.session_kind,
-                    options.project_id,
-                    &base_url,
-                    &api_key,
-                    options.max_retries,
-                    options.effort.as_deref(),
-                    options.parent_id,
                     &options.tags,
                     options.workflow_id_override,
                 )
@@ -454,63 +423,6 @@ impl App {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn request_taskrabbit_launch(
-        &mut self,
-        query: &str,
-        working_dir: Option<&Path>,
-        model_override: Option<&str>,
-        provider_override: Option<SessionProvider>,
-        custom_provider_index: Option<usize>,
-        sandbox: Option<SandboxSpec>,
-        origin: InteractiveLaunchOrigin,
-        placement: LaunchPlacement,
-    ) -> bool {
-        let provider = provider_override.unwrap_or(self.selected_provider);
-        let model = model_override
-            .map(str::to_string)
-            .or_else(|| self.selected_model.clone());
-        let system_prompt = match self.settings.system_prompt_preset.content() {
-            Some(preset) => format!("{}\n\n{}", preset, super::TASKRABBIT_SYSTEM_PROMPT),
-            None => super::TASKRABBIT_SYSTEM_PROMPT.to_string(),
-        };
-        let mut options = LaunchOptions {
-            query: query.to_string(),
-            title: None,
-            working_dir: working_dir
-                .map(Path::to_path_buf)
-                .or_else(|| std::env::current_dir().ok()),
-            provider,
-            model,
-            system_prompt: Some(system_prompt),
-            session_kind: Some(SessionKind::TaskRabbit),
-            project_id: self.current_project_id,
-            max_retries: Some(3),
-            effort: self.selected_effort.clone(),
-            parent_id: None,
-            sandbox,
-            tags: vec![PHASE1_PLACEHOLDER_TAG.to_string()],
-            workflow_id: None,
-            workflow_id_override: None,
-        };
-        let request = if let Some(entry) =
-            self.custom_provider_for_modal_launch(provider_override, custom_provider_index)
-        {
-            if options.model.is_none() && !entry.default_model.is_empty() {
-                options.model = Some(entry.default_model.clone());
-            }
-            OwnedLaunchRequest::CustomWithOptions {
-                options,
-                base_url: entry.base_url.clone(),
-                api_key: entry.api_key.clone(),
-            }
-        } else {
-            OwnedLaunchRequest::Standard(options)
-        };
-        self.begin_interactive_launch(request, origin, placement)
-            .is_ok()
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn request_blank_launch(
         &mut self,
         query: &str,
@@ -800,7 +712,6 @@ impl App {
 
     fn clear_prompt_draft(&mut self, purpose: &crate::types::PromptPurpose) {
         match purpose {
-            crate::types::PromptPurpose::TaskRabbit => self.taskrabbit_draft.clear(),
             crate::types::PromptPurpose::Blank => self.blank_draft.clear(),
             _ => {}
         }
@@ -817,29 +728,6 @@ impl App {
             query,
             working_dir,
             workflow_id,
-            InteractiveLaunchOrigin::Detached,
-            LaunchPlacement::CurrentPane,
-        )
-    }
-
-    /// Launch a TaskRabbit one-shot session with system prompt injection.
-    /// When `model_override`/`provider_override` are provided (per-session overrides from
-    /// the prompt dropdown), they take precedence over the global defaults.
-    pub async fn launch_taskrabbit(
-        &mut self,
-        query: &str,
-        working_dir: Option<&std::path::Path>,
-        model_override: Option<&str>,
-        provider_override: Option<rsi_common::types::SessionProvider>,
-        sandbox: Option<rsi_common::types::SandboxSpec>,
-    ) -> bool {
-        self.request_taskrabbit_launch(
-            query,
-            working_dir,
-            model_override,
-            provider_override,
-            None,
-            sandbox,
             InteractiveLaunchOrigin::Detached,
             LaunchPlacement::CurrentPane,
         )
@@ -1006,6 +894,10 @@ impl App {
         }
         match self.client.continue_session(session_id, query).await {
             Ok(()) => {
+                // Explicit continuation clears the daemon's operator pause.
+                // Mirror it now rather than waiting for the per-row probe.
+                self.operator_pauses
+                    .insert(session_id, crate::client::OperatorPauseLevel::None);
                 self.push_notification(
                     crate::types::NotificationKind::SessionResuming,
                     crate::types::NotificationPriority::Low,
@@ -1484,6 +1376,66 @@ impl App {
         }
     }
 
+    fn confirm_rotation_abandon(
+        &mut self,
+        session_id: Uuid,
+        target: Option<String>,
+        now: std::time::Instant,
+    ) -> bool {
+        let confirmed =
+            self.abandon_rotation_confirmation
+                .as_ref()
+                .is_some_and(|(id, pending, at)| {
+                    *id == session_id
+                        && *pending == target
+                        && now.duration_since(*at) < std::time::Duration::from_secs(10)
+                });
+        self.abandon_rotation_confirmation = if confirmed {
+            None
+        } else {
+            Some((session_id, target, now))
+        };
+        confirmed
+    }
+
+    /// #1176: abandon the selected session's blocked rotation to a fresh
+    /// replacement. The first call asks for confirmation; the same command for
+    /// the same session within 10 seconds sends it.
+    pub async fn abandon_focused_rotation(&mut self, target: Option<String>) {
+        let session_id = match self.focused_pane().cloned() {
+            Some(Pane::SessionDetail { session_id }) => Some(session_id),
+            _ => self.selected_session_id(),
+        };
+        let Some(session_id) = session_id else {
+            self.notify("No session selected");
+            return;
+        };
+        let (provider, model) = match crate::commands::parse_abandon_target(target.as_deref()) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                self.notify_error(message);
+                return;
+            }
+        };
+        if !self.confirm_rotation_abandon(session_id, target, std::time::Instant::now()) {
+            self.notify("Abandon moves this blocked rotation's sandbox and seat to a fresh replacement session. Run the same :rotation-abandon again within 10 seconds to confirm.");
+            return;
+        }
+        let params = rsi_common::rpc::AbandonBlockedRotationParams {
+            session_id,
+            provider,
+            model,
+            idempotency_key: uuid::Uuid::new_v4().to_string(),
+        };
+        match self.client.abandon_blocked_rotation(params).await {
+            Ok(receipt) => self.notify(format!(
+                "Rotation {} abandoned: the replacement rotates from {}",
+                receipt.rotation_id, receipt.holder_id
+            )),
+            Err(error) => self.notify_error(format!("Abandon failed: {error}")),
+        }
+    }
+
     /// Interrupt the selected session, including the selected list row in detail view.
     pub async fn interrupt_focused_session(&mut self, hard: bool) {
         if let Some(session_id) = self.selected_session_id_for_lifecycle_action() {
@@ -1529,13 +1481,14 @@ impl App {
             self.notify("No session selected");
             return;
         };
-        let current = match self.client.get_operator_pause(session_id).await {
-            Ok(current) => current,
+        let info = match self.client.get_operator_pause_info(session_id).await {
+            Ok(info) => info,
             Err(error) => {
                 self.notify_error(format!("Pause read failed: {error}"));
                 return;
             }
         };
+        let current = info.pause_level;
         if current == crate::client::OperatorPauseLevel::None {
             self.notify("Selected session has no operator pause marker");
             return;
@@ -1546,9 +1499,29 @@ impl App {
             self.notify("Selected session is already SOFT paused");
             return;
         }
+        if level == crate::client::OperatorPauseLevel::None {
+            // Clearing releases a held hand-off, so ask once (like INTERRUPT NOW).
+            let confirmed = self.clear_pause_confirmation.is_some_and(|(id, at)| {
+                id == session_id && at.elapsed() < std::time::Duration::from_secs(5)
+            });
+            if !confirmed {
+                self.clear_pause_confirmation = Some((session_id, std::time::Instant::now()));
+                self.operator_pause_info.insert(session_id, info.clone());
+                self.notify(format!(
+                    "{}. Press the clear key again within 5 seconds to clear it.",
+                    info.describe(chrono::Utc::now())
+                ));
+                return;
+            }
+            self.clear_pause_confirmation = None;
+        }
         match self.client.set_operator_pause(session_id, level).await {
             Ok(updated) => {
                 self.operator_pauses.insert(session_id, updated);
+                self.operator_pause_info.insert(
+                    session_id,
+                    crate::client::OperatorPauseInfo::level_only(updated),
+                );
                 self.needs_redraw = true;
                 self.notify(match updated {
                     crate::client::OperatorPauseLevel::None => "Operator pause cleared",
@@ -1570,6 +1543,35 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::tempdir;
     use uuid::Uuid;
+
+    #[test]
+    fn abandon_confirmation_requires_the_same_session_command_within_ten_seconds() {
+        let mut app = App::new(DaemonClient::new(PathBuf::from("/tmp/rsi-test.sock")));
+        let session = Uuid::new_v4();
+        let target = Some("codex/gpt-6-astra".to_string());
+        let now = std::time::Instant::now();
+        assert!(!app.confirm_rotation_abandon(session, target.clone(), now));
+        assert!(!app.confirm_rotation_abandon(Uuid::new_v4(), target.clone(), now));
+        assert!(!app.confirm_rotation_abandon(session, target.clone(), now));
+        assert!(!app.confirm_rotation_abandon(session, None, now));
+        assert!(!app.confirm_rotation_abandon(session, target.clone(), now));
+        assert!(!app.confirm_rotation_abandon(
+            session,
+            target.clone(),
+            now + std::time::Duration::from_secs(10)
+        ));
+        assert!(app.confirm_rotation_abandon(
+            session,
+            target.clone(),
+            now + std::time::Duration::from_secs(19)
+        ));
+        assert!(app.abandon_rotation_confirmation.is_none());
+        assert!(!app.confirm_rotation_abandon(
+            session,
+            target,
+            now + std::time::Duration::from_secs(19)
+        ));
+    }
 
     #[test]
     fn modal_custom_provider_overrides_global_custom_provider() {

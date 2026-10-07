@@ -41,7 +41,6 @@ pub enum ActionId {
     SettingsPrevMatch,
     Refresh,
     OpenThemePicker,
-    OpenLegacyColors,
     OpenIssuesWorkspace,
     /// Harness manager views reached through the `<Space>g` leader subnamespace.
     ManagerPolicy,
@@ -110,6 +109,7 @@ pub enum ActionId {
     CopySessionUuid,
     DeleteSession,
     RotateSession,
+    AbandonRotation,
     Archives,
     Model,
     Sessions,
@@ -117,7 +117,6 @@ pub enum ActionId {
     Quit,
     Projects,
     Project,
-    Task,
     Blank,
     ProjectNew,
     ProjectEdit,
@@ -140,6 +139,20 @@ pub enum ActionId {
     ManagerAppoint,
     ManagerScope,
     ManagerClear,
+    /// #1213: the global manager workspace and the operator's global manager,
+    /// tree, node and restart commands, registered so they reach the `:`
+    /// command dropdown.
+    Fleet,
+    GlobalManagerWorkspace,
+    ManagerGlobal,
+    ManagerGlobalAppoint,
+    ManagerGlobalRevoke,
+    ManagerPortfolio,
+    ManagerEscalations,
+    ManagerFriction,
+    ManagerTree,
+    ManagerNode,
+    ManagerRestart,
     Rate,
     Split,
     VSplit,
@@ -157,7 +170,6 @@ pub enum ActionId {
     NextLabelGroup,
     PrevLabelGroup,
     GoToMainZone,
-    GoToTaskRabbitZone,
     GoToJobsZone,
     RecentCompletions,
     NavigateRight,
@@ -179,12 +191,14 @@ pub enum ActionId {
     SessionInfo,
     RenameSession,
     ModelDropdown,
+    SwitchSessionModel,
     ReassignProject,
     ToggleRotation,
     CancelRetry,
     CommitAndPush,
     OpenSessionInNewTab,
     GitPanel,
+    Btop,
     FileExplorer,
     Telescope,
     OpenRecentFile,
@@ -1158,8 +1172,10 @@ const SETTINGS_PREV_MATCH: &[ActionBinding] = &[binding("N", ActionRoute::Settin
 const NORMAL_SEARCH: &[ActionBinding] = &[binding("/", ActionRoute::Normal)];
 const NORMAL_REFRESH: &[ActionBinding] = &[binding("r", ActionRoute::Normal)];
 const NORMAL_THEME_PICKER: &[ActionBinding] = &[binding("T", ActionRoute::Normal)];
-const NORMAL_LEGACY_COLORS: &[ActionBinding] = &[binding("<Space>b", ActionRoute::Normal)];
 const NORMAL_ISSUES_WORKSPACE: &[ActionBinding] = &[binding("<Space>i", ActionRoute::Normal)];
+// #1213: `gm` (the g leader, then m) opens the global manager workspace; it was
+// a retired merge-queue no-op.
+const NORMAL_GLOBAL_MANAGER_WORKSPACE: &[ActionBinding] = &[binding("gm", ActionRoute::Normal)];
 // Manager views live under the `<Space>g` leader subnamespace (`<Space>gg` already
 // owns the Git panel, `gs`.. under the bare g leader are untouched) so the existing
 // two-key Space chords keep their muscle memory. Chords dispatch the same LcAction
@@ -1198,7 +1214,6 @@ const NORMAL_STOP_ALL: &[ActionBinding] = &[binding("<Space>X", ActionRoute::Nor
 const NORMAL_ALERTS: &[ActionBinding] = &[binding("<Space>n", ActionRoute::Normal)];
 const NORMAL_GRAPH: &[ActionBinding] = &[binding("<Space>v", ActionRoute::Normal)];
 const NORMAL_LEAD: &[ActionBinding] = &[binding("gL", ActionRoute::Normal)];
-const NORMAL_TASK: &[ActionBinding] = &[binding("<Space>o", ActionRoute::Normal)];
 const NORMAL_BLANK: &[ActionBinding] = &[
     binding("Ctrl-N", ActionRoute::Normal),
     binding("<Space>N", ActionRoute::Normal),
@@ -1224,7 +1239,6 @@ const NORMAL_JUMP_ATTENTION: &[ActionBinding] = &[
 const NORMAL_NEXT_LABEL_GROUP: &[ActionBinding] = &[binding("]g", ActionRoute::Normal)];
 const NORMAL_PREV_LABEL_GROUP: &[ActionBinding] = &[binding("[g", ActionRoute::Normal)];
 const NORMAL_GO_TO_MAIN_ZONE: &[ActionBinding] = &[binding("gs", ActionRoute::Normal)];
-const NORMAL_GO_TO_TASK_RABBIT_ZONE: &[ActionBinding] = &[binding("gt", ActionRoute::Normal)];
 const NORMAL_GO_TO_JOBS_ZONE: &[ActionBinding] = &[binding("gj", ActionRoute::Normal)];
 const NORMAL_RECENT_COMPLETIONS: &[ActionBinding] = &[binding("gr", ActionRoute::Normal)];
 const NORMAL_NAVIGATE_RIGHT: &[ActionBinding] = &[binding("l", ActionRoute::Normal)];
@@ -1251,6 +1265,7 @@ const NORMAL_TOGGLE_THINKING_EVENTS: &[ActionBinding] = &[binding("zt", ActionRo
 const NORMAL_SESSION_INFO: &[ActionBinding] = &[binding("F3", ActionRoute::Normal)];
 const NORMAL_RENAME_SESSION: &[ActionBinding] = &[binding("F2", ActionRoute::Normal)];
 const NORMAL_MODEL_DROPDOWN: &[ActionBinding] = &[binding("Ctrl-M", ActionRoute::Normal)];
+const NORMAL_SWITCH_SESSION_MODEL: &[ActionBinding] = &[binding("<Space>mm", ActionRoute::Normal)];
 const NORMAL_REASSIGN_PROJECT: &[ActionBinding] = &[binding("<Space>C", ActionRoute::Normal)];
 const NORMAL_TOGGLE_ROTATION: &[ActionBinding] = &[binding("<Space>r", ActionRoute::Normal)];
 const NORMAL_CANCEL_RETRY: &[ActionBinding] = &[binding("<Space>k", ActionRoute::Normal)];
@@ -1258,6 +1273,7 @@ const NORMAL_COMMIT_AND_PUSH: &[ActionBinding] = &[binding("<Space>x", ActionRou
 const NORMAL_OPEN_SESSION_IN_NEW_TAB: &[ActionBinding] =
     &[binding("<Space>T", ActionRoute::Normal)];
 const NORMAL_GIT_PANEL: &[ActionBinding] = &[binding("<Space>gg", ActionRoute::Normal)];
+const NORMAL_BTOP: &[ActionBinding] = &[binding("<Space>bb", ActionRoute::Normal)];
 const NORMAL_FILE_EXPLORER: &[ActionBinding] = &[binding("<Space>e", ActionRoute::Normal)];
 const NORMAL_TELESCOPE: &[ActionBinding] = &[binding("<Space><Space>", ActionRoute::Normal)];
 const NORMAL_OPEN_RECENT_FILE: &[ActionBinding] = &[
@@ -1434,7 +1450,11 @@ pub static NORMAL_KEY_RESERVATIONS: &[NormalKeyReservation] = &[
     inert("<Space>gr", "retired; the label picker is `:group`"),
     inert("<Space>R", "retired; the rating overlay is `:rate`"),
     inert("<Space>S", "retired emergency-stop chord; use <Space>X"),
-    inert("gm", "retired merge-queue chord"),
+    inert("gt", "retired TaskRabbit zone chord; use gs / gj / ga"),
+    inert(
+        "<Space>o",
+        "retired TaskRabbit launcher; use <Space>N or :blank",
+    ),
     inert("g?", "retired; the dialectic overlay is `:ask`"),
     inert("gX", RETIRED_LAUNCHER),
     inert("gq", RETIRED_LAUNCHER),
@@ -1573,17 +1593,6 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         show_in_help: true,
     },
     ActionDescriptor {
-        id: ActionId::OpenLegacyColors,
-        label: "Edit legacy message/editor colors",
-        summary: "Opens the legacy message and editor color customizer.",
-        category: "THEME & COLORS",
-        bindings: NORMAL_LEGACY_COLORS,
-        command_aliases: &[],
-        command_argument: CommandArgument::None,
-        availability: AvailabilitySelector::SessionList,
-        show_in_help: true,
-    },
-    ActionDescriptor {
         id: ActionId::OpenIssuesWorkspace,
         label: "Open or focus Issues workspace",
         summary: "Opens the Issues workspace pane for the current project, or focuses it if already open.",
@@ -1696,7 +1705,7 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
     ActionDescriptor {
         id: ActionId::ClearOperatorPause,
         label: "Clear operator pause",
-        summary: "Clears the selected session's SOFT or HARD marker.",
+        summary: "Clears the selected session's SOFT or HARD marker; a manager seat shows its age and any held succession, and the key must be pressed twice to confirm.",
         category: "SESSION",
         bindings: NORMAL_CLEAR_PAUSE,
         command_aliases: &["pause clear"],
@@ -2488,6 +2497,17 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         show_in_help: true,
     },
     ActionDescriptor {
+        id: ActionId::AbandonRotation,
+        label: "Abandon blocked rotation",
+        summary: "Moves the selected session's blocked rotation to a fresh replacement session that takes the sandbox and the seat; `:rotation-abandon <provider>[/<model>]` picks its launch. Run twice to confirm.",
+        category: "SESSION",
+        bindings: &[],
+        command_aliases: &["rotation-abandon"],
+        command_argument: CommandArgument::Optional,
+        availability: AvailabilitySelector::SessionList,
+        show_in_help: true,
+    },
+    ActionDescriptor {
         id: ActionId::Archives,
         label: "Open archives",
         summary: "Switches the session list to the Archive zone.",
@@ -2563,17 +2583,6 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         command_argument: CommandArgument::Optional,
         availability: AvailabilitySelector::Always,
         show_in_help: false,
-    },
-    ActionDescriptor {
-        id: ActionId::Task,
-        label: "Launch task session",
-        summary: "Opens the TaskRabbit one-shot prompt; `:task <text>` launches it directly.",
-        category: "SESSION",
-        bindings: NORMAL_TASK,
-        command_aliases: &["task", "ta"],
-        command_argument: CommandArgument::Optional,
-        availability: AvailabilitySelector::Always,
-        show_in_help: true,
     },
     ActionDescriptor {
         id: ActionId::Blank,
@@ -2818,6 +2827,127 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         show_in_help: false,
     },
     ActionDescriptor {
+        id: ActionId::Fleet,
+        label: "Open fleet workspace",
+        summary: "Shows active agents and usage rates across all projects.",
+        category: "MANAGER",
+        bindings: &[],
+        command_aliases: &["fleet"],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::GlobalManagerWorkspace,
+        label: "Open global manager workspace",
+        summary: "Opens the global manager workspace above all projects: the grant, the global seat and each granted project's PM health; Enter opens the seat or a PM session.",
+        category: "MANAGER",
+        bindings: NORMAL_GLOBAL_MANAGER_WORKSPACE,
+        command_aliases: &["global-manager", "gm", "manager workspace"],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ManagerGlobal,
+        label: "Show global manager grant",
+        summary: "Shows the active global manager grant; `:manager global set <active|sessions|containers|spend|groups> <value>` changes one per-project cap; `:manager global configure <JSON>` sends a full typed grant request.",
+        category: "MANAGER",
+        bindings: &[],
+        command_aliases: &["manager global"],
+        command_argument: CommandArgument::Optional,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ManagerGlobalAppoint,
+        label: "Appoint global manager",
+        summary: "Appoints the focused session as the global manager over the named projects (comma-separated; default: every project).",
+        category: "MANAGER",
+        bindings: &[],
+        command_aliases: &["manager global appoint"],
+        command_argument: CommandArgument::Optional,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ManagerGlobalRevoke,
+        label: "Revoke global manager",
+        summary: "Revokes the active global manager grant; the seat keeps its session but loses its authority.",
+        category: "MANAGER",
+        bindings: &[],
+        command_aliases: &["manager global revoke"],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ManagerPortfolio,
+        label: "Manager portfolio nodes",
+        summary: "Lists managers above project level (portfolio nodes of any tier); `:manager portfolio show <node>`, `appoint <label> [projects...]` (focused session as seat; `--adopt <node,...>` appoints it above existing nodes), `configure <JSON>` and `revoke <node>` inspect or change one.",
+        category: "MANAGER",
+        bindings: &[],
+        command_aliases: &["manager portfolio"],
+        command_argument: CommandArgument::Optional,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ManagerEscalations,
+        label: "Manager escalations",
+        summary: "Lists escalations that reached the top of their manager chain and top-of-chain reports; `:manager escalations rule <hop> <text>` rules one (the ruling returns down the chain to the source seat and never answers a human approval), `ack <notice>` marks a report read, `all` includes closed rows, failed or uncertain tier mail is listed with its reason and `undelivered [<cursor>]` pages it.",
+        category: "MANAGER",
+        bindings: &[],
+        command_aliases: &["manager escalations"],
+        command_argument: CommandArgument::Optional,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ManagerFriction,
+        label: "Manager friction",
+        summary: "Shows the friction rollup (the andon): refusals, deploy timeouts, superseded handoffs and lander refusals the daemon recorded, by signature, with the kaizen Issue filed for each repeating one; `:manager friction <hours>` widens the window (default 24, at most 720). The board's Inspect · Friction section shows one project's rows.",
+        category: "MANAGER",
+        bindings: &[],
+        command_aliases: &["manager friction"],
+        command_argument: CommandArgument::Optional,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ManagerTree,
+        label: "Open manager tree",
+        summary: "Opens the manager hierarchy tree: the global grant, project seats, area nodes and led Epics.",
+        category: "MANAGER",
+        bindings: &[],
+        command_aliases: &["manager tree"],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ManagerNode,
+        label: "Manager area nodes",
+        summary: "Lists manager area nodes; `:manager node get <UUID>`, `configure <JSON>` and `revoke <UUID> <epoch>` inspect or change one.",
+        category: "MANAGER",
+        bindings: &[],
+        command_aliases: &["manager node"],
+        command_argument: CommandArgument::Optional,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::ManagerRestart,
+        label: "Operator quiet-point restart",
+        summary: "Shows the pending quiet-point restart; `:manager restart now` forces it and `:manager restart cancel` cancels it.",
+        category: "MANAGER",
+        bindings: &[],
+        command_aliases: &["manager restart"],
+        command_argument: CommandArgument::Optional,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
         id: ActionId::Rate,
         label: "Rate selected session",
         summary: "Rates the selected session 1-10: `:rate <n>`, or opens the rating overlay (digits 1-9, 0 = 10).",
@@ -2999,17 +3129,6 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         summary: "Switches the session list to the Main zone.",
         category: "SESSION LIST",
         bindings: NORMAL_GO_TO_MAIN_ZONE,
-        command_aliases: &[],
-        command_argument: CommandArgument::None,
-        availability: AvailabilitySelector::Always,
-        show_in_help: true,
-    },
-    ActionDescriptor {
-        id: ActionId::GoToTaskRabbitZone,
-        label: "Go to TaskRabbit zone",
-        summary: "Switches the session list to the TaskRabbit zone of one-shot sessions.",
-        category: "SESSION LIST",
-        bindings: NORMAL_GO_TO_TASK_RABBIT_ZONE,
         command_aliases: &[],
         command_argument: CommandArgument::None,
         availability: AvailabilitySelector::Always,
@@ -3247,6 +3366,17 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         show_in_help: true,
     },
     ActionDescriptor {
+        id: ActionId::SwitchSessionModel,
+        label: "Switch session model / effort",
+        summary: "Opens a picker of the models and efforts this session's provider can switch to, within the operator launch-model allowlist. It shows the current and queued model and effort and whether the switch keeps the provider conversation; Enter queues it for the next turn, never interrupting a running turn.",
+        category: "SESSION",
+        bindings: NORMAL_SWITCH_SESSION_MODEL,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
         id: ActionId::ReassignProject,
         label: "Change session project",
         summary: "Moves the selected session to another project.",
@@ -3307,6 +3437,17 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         summary: "Suspends the TUI and runs lazygit in the session's working directory.",
         category: "FILES",
         bindings: NORMAL_GIT_PANEL,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::Btop,
+        label: "System monitor (btop)",
+        summary: "Suspends the TUI and runs btop when it is installed.",
+        category: "FILES",
+        bindings: NORMAL_BTOP,
         command_aliases: &[],
         command_argument: CommandArgument::None,
         availability: AvailabilitySelector::Always,
@@ -4228,7 +4369,6 @@ pub fn request_from_lc_action(action: &LcAction) -> Option<ActionRequest> {
         LcAction::EnterSearch => ActionId::Search,
         LcAction::RefreshNavigation => ActionId::Refresh,
         LcAction::OpenThemePicker => ActionId::OpenThemePicker,
-        LcAction::OpenColorCustomizer => ActionId::OpenLegacyColors,
         LcAction::OpenIssuesWorkspace => ActionId::OpenIssuesWorkspace,
         LcAction::InterruptSession => ActionId::InterruptSession,
         LcAction::HardInterruptSession => ActionId::HardInterruptSession,
@@ -4245,6 +4385,8 @@ pub fn request_from_lc_action(action: &LcAction) -> Option<ActionRequest> {
         LcAction::OpenHarnessManagerDecisions => ActionId::ManagerDecisions,
         LcAction::OpenHarnessManagerInbox => ActionId::ManagerInbox,
         LcAction::OpenHarnessManagerInspect => ActionId::ManagerInspect,
+        LcAction::OpenFleet => ActionId::Fleet,
+        LcAction::OpenGlobalManagerWorkspace => ActionId::GlobalManagerWorkspace,
         _ => return None,
     };
     Some(ActionRequest::plain(id))
@@ -4405,7 +4547,6 @@ pub enum OverlayHelpClass {
     BudgetPolicyForm,
     ScheduleForm,
     RenameSession,
-    ColorCustomizer,
     TextAreaBgEditor,
     PromptPreview,
     SkillPreview,
@@ -4423,6 +4564,13 @@ pub enum OverlayHelpClass {
     LaunchPrompt,
     LaunchSettings,
     ContinuePrompt,
+    /// Global manager workspace (`gm`, #1213).
+    GlobalManagerWorkspace,
+    Fleet,
+    FleetFilter,
+    FleetSort,
+    FleetGroups,
+    ModelSwitch,
 }
 
 impl OverlayHelpClass {
@@ -4470,7 +4618,6 @@ impl OverlayHelpClass {
         Self::BudgetPolicyForm,
         Self::ScheduleForm,
         Self::RenameSession,
-        Self::ColorCustomizer,
         Self::TextAreaBgEditor,
         Self::PromptPreview,
         Self::SkillPreview,
@@ -4488,6 +4635,12 @@ impl OverlayHelpClass {
         Self::LaunchPrompt,
         Self::LaunchSettings,
         Self::ContinuePrompt,
+        Self::GlobalManagerWorkspace,
+        Self::Fleet,
+        Self::FleetFilter,
+        Self::FleetSort,
+        Self::FleetGroups,
+        Self::ModelSwitch,
     ];
 
     /// Exhaustive position in `ALL` (guards `ALL` against omissions).
@@ -4536,24 +4689,29 @@ impl OverlayHelpClass {
             Self::BudgetPolicyForm => 39,
             Self::ScheduleForm => 40,
             Self::RenameSession => 41,
-            Self::ColorCustomizer => 42,
-            Self::TextAreaBgEditor => 43,
-            Self::PromptPreview => 44,
-            Self::SkillPreview => 45,
-            Self::Diagnostics => 46,
-            Self::SessionInfo => 47,
-            Self::Rating => 48,
-            Self::Terminal => 49,
-            Self::MemorySearch => 50,
-            Self::AiCommand => 51,
-            Self::AiChat => 52,
-            Self::CardEditor => 53,
-            Self::Dialectic => 54,
-            Self::InputModal => 55,
-            Self::ProviderCredentialForm => 56,
-            Self::LaunchPrompt => 57,
-            Self::LaunchSettings => 58,
-            Self::ContinuePrompt => 59,
+            Self::TextAreaBgEditor => 42,
+            Self::PromptPreview => 43,
+            Self::SkillPreview => 44,
+            Self::Diagnostics => 45,
+            Self::SessionInfo => 46,
+            Self::Rating => 47,
+            Self::Terminal => 48,
+            Self::MemorySearch => 49,
+            Self::AiCommand => 50,
+            Self::AiChat => 51,
+            Self::CardEditor => 52,
+            Self::Dialectic => 53,
+            Self::InputModal => 54,
+            Self::ProviderCredentialForm => 55,
+            Self::LaunchPrompt => 56,
+            Self::LaunchSettings => 57,
+            Self::ContinuePrompt => 58,
+            Self::GlobalManagerWorkspace => 59,
+            Self::Fleet => 60,
+            Self::FleetFilter => 61,
+            Self::FleetSort => 62,
+            Self::FleetGroups => 63,
+            Self::ModelSwitch => 64,
         }
     }
 }
@@ -4580,7 +4738,6 @@ const LIST_NAV: &[OverlayHelpEntry] = &[
 ];
 /// `overlay::handle_text_overlay_prompt_leader` for non-text overlays.
 const OVERLAY_LEADER: &[OverlayHelpEntry] = &[
-    act("Space o", "Close and open a TaskRabbit session prompt"),
     act("Space N", "Close and open a blank session prompt"),
     act("Space ;", "Open the command palette"),
 ];
@@ -4708,10 +4865,24 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
         groups: &[
             LIST_NAV,
             &[
+                edit("/", "Filter models by name or ID"),
+                nav(
+                    "Up / Down / Ctrl-N / Ctrl-P",
+                    "Navigate filtered models while typing a filter",
+                ),
+                nav("Home / End", "First / last filtered model"),
+                edit(
+                    "Backspace / Ctrl-W / Ctrl-U",
+                    "Delete filter character / word / whole query",
+                ),
                 nav("Tab / Shift-Tab", "Next / previous provider"),
-                act("1-9", "Select numbered model"),
+                act("1-9", "Select numbered model (not while typing a filter)"),
                 act("Enter", "Select model"),
-                close("Esc / q", "Close model picker"),
+                close(
+                    "Esc",
+                    "Stop typing a filter (keeps it); else close model picker",
+                ),
+                close("q", "Close model picker (not while typing a filter)"),
             ],
         ],
     },
@@ -4923,7 +5094,19 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
         groups: &[
             MANAGER_SECTIONS,
             LIST_NAV,
-            &[act("Enter / a", "Answer selected decision")],
+            &[
+                nav("h / l, Left / Right", "Highlight previous / next option"),
+                act(
+                    "Enter",
+                    "Answer the highlighted option (or write an answer)",
+                ),
+                act("y", "Accept the asker's recommendation"),
+                act("a", "Write your own answer"),
+                act(
+                    "X",
+                    "Archive stale decisions (asks to confirm the count; never deletes)",
+                ),
+            ],
             MANAGER_LEDGER,
         ],
     },
@@ -5111,6 +5294,93 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
         ],
     },
     OverlayHelpRoute {
+        class: OverlayHelpClass::Fleet,
+        title: "Fleet",
+        groups: &[
+            LIST_NAV,
+            &[
+                act("/", "Filter agents and usage groups"),
+                act("Tab", "Focus agents / usage groups"),
+                act("yy", "Copy selected session UUID"),
+                act("s", "Choose sort column"),
+                act("S", "Reverse sort"),
+                act("b", "Group usage by project / provider / model"),
+                act("w", "Rate window: 5 min / 1 h / 24 h"),
+                act("Enter", "Open selected session"),
+                act("r", "Refresh"),
+                act(":", "Commands"),
+                close("Esc / q", "Close fleet"),
+            ],
+        ],
+    },
+    OverlayHelpRoute {
+        class: OverlayHelpClass::FleetGroups,
+        title: "Fleet usage",
+        groups: &[
+            LIST_NAV,
+            &[
+                act("/", "Filter usage groups and agents"),
+                act("s", "Choose sort column"),
+                act("S", "Reverse sort"),
+                act("Tab / Enter", "Focus active agents"),
+                act("b", "Group by project / provider / model"),
+                act("w", "Rate window: 5 min / 1 h / 24 h"),
+                act("r", "Refresh"),
+                act(":", "Commands"),
+                close("Esc / q", "Close fleet"),
+            ],
+        ],
+    },
+    OverlayHelpRoute {
+        class: OverlayHelpClass::FleetFilter,
+        title: "Fleet filter",
+        groups: &[&[
+            act("Type / Backspace", "Edit filter"),
+            close("Enter / Esc", "Finish filter"),
+        ]],
+    },
+    OverlayHelpRoute {
+        class: OverlayHelpClass::FleetSort,
+        title: "Fleet sort",
+        groups: &[&[
+            act(
+                "1 / 2 / 3 / 4 / 5",
+                "Choose one of the five displayed sort columns",
+            ),
+            close("Esc", "Cancel sort"),
+        ]],
+    },
+    OverlayHelpRoute {
+        class: OverlayHelpClass::GlobalManagerWorkspace,
+        title: "Global Manager Workspace",
+        groups: &[
+            LIST_NAV,
+            &[
+                act("i", "Type to the selected seat's manager here"),
+                act("t", "Select the console's own seat and type to it"),
+                act("n", "Launch and appoint a manager (seat, launch, scope)"),
+                act(
+                    "Tab",
+                    "Focus the conversation: j/k, Ctrl-D/U scroll, g/G ends",
+                ),
+                act(
+                    "Enter / l",
+                    "Open the seat's session in its project tab, or a child node's console",
+                ),
+                act("Backspace", "Open the parent node's console"),
+                act("p", "Open the selected project's tab"),
+                act("T", "Open the manager tree"),
+                act("F", "Open the fleet workspace"),
+                act("r", "Refresh the snapshot"),
+                act(":", "Open the command palette"),
+                close(
+                    "Esc / q",
+                    "Close (Esc leaves typing or the conversation first)",
+                ),
+            ],
+        ],
+    },
+    OverlayHelpRoute {
         class: OverlayHelpClass::DagBrowser,
         title: "Recursive DAG Browser",
         groups: &[
@@ -5247,21 +5517,6 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
         ],
     },
     OverlayHelpRoute {
-        class: OverlayHelpClass::ColorCustomizer,
-        title: "Color Customizer",
-        groups: &[
-            &[
-                nav("Tab / j / Down", "Next field"),
-                nav("Shift-Tab / k / Up", "Previous field"),
-                edit("Type, Backspace", "Edit hex color"),
-                act("Enter", "Apply color"),
-                act("Delete", "Reset field to default"),
-                close("Esc / q", "Close"),
-            ],
-            OVERLAY_LEADER,
-        ],
-    },
-    OverlayHelpRoute {
         class: OverlayHelpClass::TextAreaBgEditor,
         title: "Text Area Background",
         groups: &[
@@ -5313,6 +5568,20 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
             &[
                 act("R", "Rate session"),
                 act("G", "Edit labels"),
+                close("Esc / q", "Close"),
+            ],
+            OVERLAY_LEADER,
+        ],
+    },
+    OverlayHelpRoute {
+        class: OverlayHelpClass::ModelSwitch,
+        title: "Switch Model / Effort",
+        groups: &[
+            &[
+                nav("j / k, Down / Up", "Pick model"),
+                nav("g / G", "First / last model"),
+                edit("h / l, Left / Right", "Lower / raise effort"),
+                act("Enter", "Queue switch for the next turn"),
                 close("Esc / q", "Close"),
             ],
             OVERLAY_LEADER,
@@ -5435,10 +5704,7 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
                 edit("Ctrl-B", "Toggle sandbox (isolated git worktree)"),
                 act("? (normal)", "Show this help"),
                 nav("Ctrl-J / Ctrl-K", "Focus next / previous stacked prompt"),
-                act(
-                    "Space o / Space N (normal)",
-                    "Stack a TaskRabbit / blank prompt",
-                ),
+                act("Space N (normal)", "Stack a blank prompt"),
                 close("Ctrl-Q", "Close and keep the draft"),
             ],
             PROMPT_TEXT_TOOLS,
@@ -5570,7 +5836,7 @@ pub enum OverlayHelpExemption {
     SatelliteBrowser,
     /// Operator RSI Remote settings page owns its device and project keys.
     RemoteSettings,
-    /// Read-only manager tree owns its navigation keys.
+    /// The manager tree owns its navigation and in-tree action keys.
     ManagerTree,
     /// Operator legacy-scratch adoption owns its select, adopt and refresh keys.
     LegacyScratchBrowser,
@@ -5651,7 +5917,7 @@ impl OverlayHelpExemption {
             }
             Self::SatelliteBrowser => "The browser owns its peer, link and cached session keys.",
             Self::RemoteSettings => "The page owns its enable, device and project keys.",
-            Self::ManagerTree => "The read-only tree owns its fold, paging and jump keys.",
+            Self::ManagerTree => "The tree owns its fold, paging, jump and in-tree action keys.",
             Self::LegacyScratchBrowser => "The browser owns its select, adopt and refresh keys.",
         }
     }
@@ -5815,6 +6081,16 @@ pub fn overlay_help_routing(app: &App, overlay: &OverlayState) -> HelpRouting {
         OverlayState::SatelliteRegistry(..) => Exempt(X::SatelliteBrowser),
         OverlayState::Remote(..) => Exempt(X::RemoteSettings),
         OverlayState::ManagerTree(..) => Exempt(X::ManagerTree),
+        OverlayState::Fleet(s) => Routed(if s.editing {
+            C::FleetFilter
+        } else if s.sorting {
+            C::FleetSort
+        } else if s.focus_groups {
+            C::FleetGroups
+        } else {
+            C::Fleet
+        }),
+        OverlayState::GlobalManagerWorkspace(..) => Routed(C::GlobalManagerWorkspace),
         OverlayState::GraphReview {
             dashboard_focused: true,
             ..
@@ -5835,13 +6111,13 @@ pub fn overlay_help_routing(app: &App, overlay: &OverlayState) -> HelpRouting {
         OverlayState::BudgetPolicyForm { .. } => Routed(C::BudgetPolicyForm),
         OverlayState::ScheduleForm { .. } => Routed(C::ScheduleForm),
         OverlayState::RenameSession { .. } => Routed(C::RenameSession),
-        OverlayState::ColorCustomizer { .. } => Routed(C::ColorCustomizer),
         OverlayState::TextAreaBgEditor { .. } => Routed(C::TextAreaBgEditor),
         OverlayState::PromptPreview { .. } => Routed(C::PromptPreview),
         OverlayState::SkillPreview { .. } => Routed(C::SkillPreview),
         OverlayState::Diagnostics => Routed(C::Diagnostics),
         OverlayState::SessionInfoPanel { .. } => Routed(C::SessionInfo),
         OverlayState::RatingOverlay { .. } => Routed(C::Rating),
+        OverlayState::ModelSwitch(..) => Routed(C::ModelSwitch),
         OverlayState::Terminal => Routed(C::Terminal),
         OverlayState::MemorySearch { .. } => Routed(C::MemorySearch),
         OverlayState::AiCommand { .. } => Routed(C::AiCommand),
@@ -7340,7 +7616,6 @@ mod tests {
                 ActionId::Search,
                 ActionId::Refresh,
                 ActionId::OpenThemePicker,
-                ActionId::OpenLegacyColors,
                 ActionId::OpenIssuesWorkspace,
                 ActionId::ManagerPolicy,
                 ActionId::ManagerBoard,
@@ -7351,12 +7626,12 @@ mod tests {
                 ActionId::Alerts,
                 ActionId::Quit,
                 ActionId::Projects,
-                ActionId::Task,
                 ActionId::Blank,
                 ActionId::SettingsCommand,
                 ActionId::StopAll,
                 ActionId::Graph,
                 ActionId::Lead,
+                ActionId::GlobalManagerWorkspace,
                 ActionId::ClosePane,
                 ActionId::TabNext,
                 ActionId::TabPrev,
@@ -7368,7 +7643,6 @@ mod tests {
                 ActionId::NextLabelGroup,
                 ActionId::PrevLabelGroup,
                 ActionId::GoToMainZone,
-                ActionId::GoToTaskRabbitZone,
                 ActionId::GoToJobsZone,
                 ActionId::RecentCompletions,
                 ActionId::NavigateRight,
@@ -7390,12 +7664,14 @@ mod tests {
                 ActionId::SessionInfo,
                 ActionId::RenameSession,
                 ActionId::ModelDropdown,
+                ActionId::SwitchSessionModel,
                 ActionId::ReassignProject,
                 ActionId::ToggleRotation,
                 ActionId::CancelRetry,
                 ActionId::CommitAndPush,
                 ActionId::OpenSessionInNewTab,
                 ActionId::GitPanel,
+                ActionId::Btop,
                 ActionId::FileExplorer,
                 ActionId::Telescope,
                 ActionId::PromptCreator,
@@ -7458,10 +7734,6 @@ mod tests {
             Some(ActionRequest::plain(ActionId::OpenThemePicker))
         );
         assert_eq!(
-            request_from_lc_action(&LcAction::OpenColorCustomizer),
-            Some(ActionRequest::plain(ActionId::OpenLegacyColors))
-        );
-        assert_eq!(
             request_from_lc_action(&LcAction::OpenIssuesWorkspace),
             Some(ActionRequest::plain(ActionId::OpenIssuesWorkspace))
         );
@@ -7490,7 +7762,6 @@ mod tests {
             OverlayState::HarnessManagerV2(..) => "HarnessManagerV2",
             OverlayState::ThemePicker { .. } => "ThemePicker",
             OverlayState::ThemeRoleEditor { .. } => "ThemeRoleEditor",
-            OverlayState::ColorCustomizer { .. } => "ColorCustomizer",
             OverlayState::TextAreaBgEditor { .. } => "TextAreaBgEditor",
             OverlayState::Prompt { .. } => "Prompt",
             OverlayState::ProjectPicker { .. } => "ProjectPicker",
@@ -7502,6 +7773,8 @@ mod tests {
             OverlayState::SatelliteRegistry(..) => "SatelliteRegistry",
             OverlayState::Remote(..) => "Remote",
             OverlayState::ManagerTree(..) => "ManagerTree",
+            OverlayState::Fleet(..) => "Fleet",
+            OverlayState::GlobalManagerWorkspace(..) => "GlobalManagerWorkspace",
             OverlayState::TrashBrowser { .. } => "TrashBrowser",
             OverlayState::NotificationBrowser { .. } => "NotificationBrowser",
             OverlayState::RecentCompletions { .. } => "RecentCompletions",
@@ -7535,6 +7808,7 @@ mod tests {
             OverlayState::ScheduleForm { .. } => "ScheduleForm",
             OverlayState::Terminal => "Terminal",
             OverlayState::RatingOverlay { .. } => "RatingOverlay",
+            OverlayState::ModelSwitch(..) => "ModelSwitch",
             OverlayState::SessionInfoPanel { .. } => "SessionInfoPanel",
             OverlayState::CreateEntityForm { .. } => "CreateEntityForm",
             OverlayState::ParentPicker { .. } => "ParentPicker",
@@ -7994,6 +8268,45 @@ mod tests {
             OverlayState::ManagerTree(Box::default()),
             Exempt(X::ManagerTree),
         );
+        push(
+            "Fleet",
+            &app,
+            OverlayState::Fleet(Box::default()),
+            Routed(C::Fleet),
+        );
+        push(
+            "Fleet groups",
+            &app,
+            OverlayState::Fleet(Box::new(crate::overlay::fleet::FleetState {
+                focus_groups: true,
+                ..Default::default()
+            })),
+            Routed(C::FleetGroups),
+        );
+        push(
+            "Fleet filter",
+            &app,
+            OverlayState::Fleet(Box::new(crate::overlay::fleet::FleetState {
+                editing: true,
+                ..Default::default()
+            })),
+            Routed(C::FleetFilter),
+        );
+        push(
+            "Fleet sort",
+            &app,
+            OverlayState::Fleet(Box::new(crate::overlay::fleet::FleetState {
+                sorting: true,
+                ..Default::default()
+            })),
+            Routed(C::FleetSort),
+        );
+        push(
+            "Global manager workspace",
+            &app,
+            OverlayState::GlobalManagerWorkspace(Box::default()),
+            Routed(C::GlobalManagerWorkspace),
+        );
     }
 
     #[inline(never)]
@@ -8334,12 +8647,6 @@ mod tests {
             fixtures.push(state_fixture(label, app, &overlay, expected));
         };
 
-        {
-            let mut app = fixture_app();
-            crate::overlay::color_customizer::open_color_customizer(&mut app);
-            let overlay = std::mem::replace(&mut app.overlay, OverlayState::None);
-            push("ColorCustomizer", &app, overlay, Routed(C::ColorCustomizer));
-        }
         push(
             "TextAreaBgEditor",
             &app,
@@ -8812,6 +9119,31 @@ mod tests {
             &app,
             OverlayState::SessionInfoPanel { session_id },
             Routed(C::SessionInfo),
+        );
+        push(
+            "ModelSwitch",
+            &app,
+            OverlayState::ModelSwitch(Box::new(crate::overlay::model_switch::ModelSwitchState {
+                session_id,
+                options: rsi_common::rpc::SessionModelSwitchOptions {
+                    session_id,
+                    provider: rsi_common::types::SessionProvider::Claude,
+                    model: None,
+                    effort: None,
+                    model_invocation_id: None,
+                    switchable: true,
+                    unavailable_reason: None,
+                    keeps_context: true,
+                    context_note: String::new(),
+                    model_allowlist: Vec::new(),
+                    pending: None,
+                },
+                models: Vec::new(),
+                model_index: 0,
+                efforts: Vec::new(),
+                effort_index: 0,
+            })),
+            Routed(C::ModelSwitch),
         );
         push(
             "ParentPicker",

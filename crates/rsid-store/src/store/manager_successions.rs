@@ -364,20 +364,12 @@ impl Store {
         if policy.mode != ManagerOperatingModeV2::Execute || policy.paused {
             return Err(refused("manager_v2_policy_paused"));
         }
-        if !policy.allowed_launches.is_empty()
-            && !policy.allowed_launches.iter().any(|c| {
-                c.provider == launch.provider
-                    && c.model == launch.model
-                    && c.effort == launch.effort
-            })
-        {
-            return Err(refused("manager_v2_launch_not_granted"));
-        }
+        self.manager_launch_policy_gate(&authority.config, &policy.allowed_launches, launch)?;
         let disabled: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM daemon_settings WHERE key='context_rotation_enabled' AND value<>'true')", [], |r| r.get(0))?;
         if disabled {
             return Err(refused("manager_succession_rotation_disabled"));
         }
-        self.manager_action_human_gate(predecessor)?;
+        self.manager_succession_human_gate(predecessor)?;
         for reason in [
             super::manager_actions::ManagerActionHoldReasonV2::Resources,
             super::manager_actions::ManagerActionHoldReasonV2::Decision,
@@ -514,6 +506,7 @@ impl Store {
             result: None,
             deduplicated: false,
             operator_result: None,
+            sandbox_source: None,
         };
         let stamp = now();
         self.conn.execute("INSERT INTO harness_manager_v2_operations(id,project_id,manager_session_id,scope_version,policy_version,actor_session_id,idempotency_key,fingerprint,kind,payload_json,state,row_version,target_session_id,outcome_json,not_before,created_at,updated_at)
@@ -540,6 +533,7 @@ impl Store {
                 custody_generation: expected.custody_generation,
                 historical_commit: false,
                 branch: None,
+                sandbox_source: None,
             }),
             launch: Some(launch.clone()),
             manager_pause_version: 0,
@@ -729,8 +723,7 @@ impl Store {
         {
             return Err(refused("manager_succession_predecessor_changed"));
         }
-        let active: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM model_invocations WHERE session_id=?1 AND status IN ('running','cancellation_requested'))", [current.id.to_string()], |r| r.get(0))?;
-        if active {
+        if self.manager_succession_predecessor_ledger_live(current.id)? {
             return Err(refused("manager_succession_predecessor_ledger_live"));
         }
         let evidence = self.manager_succession_settlement_snapshot(current.id)?;
@@ -738,6 +731,35 @@ impl Store {
         let result = self.refreshed_manager_succession_claim(claim)?;
         tx.commit()?;
         Ok(result)
+    }
+
+    /// #1390: a predecessor is live while it owns a running or cancelling
+    /// turn-bearing invocation. Background helpers (title refinement, summary,
+    /// memory extraction, classifiers) never own the session's conversation:
+    /// the lifecycle starts a `session.title` call about 20 ms after every turn
+    /// of an untitled session, and counting it refused every succession. They
+    /// do not hold the seat; a real turn still does.
+    fn manager_succession_predecessor_ledger_live(&self, predecessor: Uuid) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM model_invocations WHERE session_id=?1 AND status IN ('running','cancellation_requested') AND purpose NOT IN (SELECT value FROM json_each(?2)))",
+            params![
+                predecessor.to_string(),
+                rsi_common::model_control::ModelInvocationPurpose::background_helper_json_array()
+            ],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// #1390: true while a root succession that replaces `session_id` is
+    /// unresolved. Generated enrichment (title refinement) must not write the
+    /// predecessor row then: the settlement snapshot pins it, and a late title
+    /// would refuse the succession as `manager_succession_settlement_changed`.
+    pub fn session_has_unresolved_manager_succession(&self, session_id: Uuid) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM manager_root_successions WHERE predecessor_session_id=?1 AND state IN ('reserved','executing','established','cleanup_required'))",
+            [session_id.to_string()],
+            |r| r.get(0),
+        )?)
     }
 
     fn manager_succession_settlement_snapshot(&self, id: Uuid) -> Result<String> {
@@ -762,6 +784,15 @@ impl Store {
     ) -> Result<ManagerRootSuccession> {
         let root = self.manager_succession_assert_claim(claim)?;
         self.manager_succession_authority(&root)?;
+        // Reservation is permitted while paused, provider work is not. This
+        // gate covers admission, synchronous/deferred provider boundaries and
+        // publication, including a pause applied after the action was claimed.
+        // Check both sessions so succession cannot bypass a candidate's own hold.
+        if self.manager_action_operator_paused(root.predecessor_session_id)?
+            || self.manager_action_operator_paused(root.candidate_session_id)?
+        {
+            return Err(refused("manager_v2_human_or_recovery_owner"));
+        }
         let settled: Option<String> = self.conn.query_row(
             "SELECT settled_json FROM manager_root_successions WHERE operation_id=?1",
             [root.operation_id.to_string()],
@@ -775,8 +806,7 @@ impl Store {
         {
             return Err(refused("manager_succession_settlement_changed"));
         }
-        let live: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM model_invocations WHERE session_id=?1 AND status IN ('running','cancellation_requested'))",[root.predecessor_session_id.to_string()],|r|r.get(0))?;
-        if live {
+        if self.manager_succession_predecessor_ledger_live(root.predecessor_session_id)? {
             return Err(refused("manager_succession_predecessor_ledger_live"));
         }
         Ok(root)
@@ -949,7 +979,7 @@ impl Store {
         claim: &ManagerSuccessionClaim,
         proof: &ManagerSuccessionPublicationWitness,
     ) -> Result<ManagerActionReceiptV2> {
-        // Deterministic shard order; roots in the same shard acquire it once.
+        // Deterministic root order; acquire each exact custody ID once.
         let mut ids: Vec<Uuid> = claim
             .reservation
             .frozen
@@ -964,9 +994,9 @@ impl Store {
                     .map(|c| c.custody_id),
             )
             .collect();
-        ids.sort_by_key(|id| super::sandbox_custody::custody_root_lock_shard(*id));
-        ids.dedup_by_key(|id| super::sandbox_custody::custody_root_lock_shard(*id));
-        // Never wait for a stripe while the caller holds the Store: a busy shard
+        ids.sort_unstable();
+        ids.dedup();
+        // Never wait for a root while the caller holds the Store: a busy root
         // returns the typed retryable `root_busy` with nothing held and the
         // publication retries after an asynchronous back-off (#1166).
         let mut _guards = Vec::with_capacity(ids.len());
@@ -998,6 +1028,8 @@ impl Store {
             &json!({"candidate":proof.candidate_id,"invocation":proof.invocation_id,"attempt":proof.attempt_id,"boot":proof.boot_id}),
         )?;
         self.conn.execute("UPDATE manager_root_successions SET state='established',establishment_json=?2,row_version=row_version+1,updated_at=?3 WHERE operation_id=?1",params![root.operation_id.to_string(),evidence,now()])?;
+        // The effect gate above requires the operator to have cleared both
+        // pauses. Never overwrite either marker as part of succession.
         self.finalize_distinct_manager_predecessor_on(&tx, &root)?;
         // Prove the existing bounded resolver actually reaches the candidate.
         // A fork/limit refusal rolls back archival, receipt and epoch together.

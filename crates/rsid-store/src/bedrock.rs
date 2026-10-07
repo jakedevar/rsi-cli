@@ -85,7 +85,30 @@ fn token_python() -> std::path::PathBuf {
     rsi_common::identity::data_dir().join("bedrock-token-venv/bin/python")
 }
 
+/// The AWS region for Bedrock calls: the operator's `bedrock_region` daemon
+/// setting (Issue #1407), else `AWS_REGION`, `AWS_DEFAULT_REGION`, then
+/// `aws configure get region`.
+///
+/// # Errors
+///
+/// Returns a secret-free message when no valid region is configured.
 pub fn region() -> Result<String, String> {
+    region_from(&crate::vault::global())
+}
+
+/// [`region`] with the vault (and so the live settings) injected.
+///
+/// # Errors
+///
+/// Returns a secret-free message when no valid region is configured.
+pub fn region_from(vault: &crate::vault::VaultHandle) -> Result<String, String> {
+    if let Some(region) = vault.settings().bedrock_region() {
+        return Ok(region);
+    }
+    environment_region()
+}
+
+fn environment_region() -> Result<String, String> {
     let configured = std::env::var("AWS_REGION")
         .ok()
         .filter(|value| !value.is_empty())
@@ -118,11 +141,7 @@ pub fn region() -> Result<String, String> {
 }
 
 fn region_valid(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 32
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    rsi_common::provider_profile::bedrock_region_valid(value)
 }
 
 /// The runtime a new Bedrock launch runs on.

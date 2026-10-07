@@ -91,11 +91,7 @@ impl App {
         self.reconcile_all_session_list_selections(false);
 
         // Precompute values before taking mutable borrow of tabs
-        let fallback_session = if !self.filtered_session_order.is_empty() {
-            self.filtered_session_order.first().copied()
-        } else {
-            self.filtered_taskrabbit_order.first().copied()
-        };
+        let fallback_session = self.filtered_session_order.first().copied();
 
         for tab in &mut self.tabs {
             let ids: Vec<PaneId> = tab.layout.leaf_ids();
@@ -111,7 +107,6 @@ impl App {
                             selected_session: fallback_session,
                             scroll_offset: 0,
                             active_zone: Default::default(),
-                            taskrabbit_selected_index: 0,
                             archive_selected_index: 0,
                             jobs_selected_index: 0,
                         };

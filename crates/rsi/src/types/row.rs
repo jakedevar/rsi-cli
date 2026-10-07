@@ -1,7 +1,7 @@
 //! Shared session list row view model (SVR-004).
 //!
 //! Pure data contract that backs every session list row across the Main,
-//! TaskRabbit, Archive, and Jobs zones. SVR-005 (full list) and SVR-006
+//! Archive, and Jobs zones. SVR-005 (full list) and SVR-006
 //! (sidebar list) consume this directly.
 //!
 //! Cells use small sum types whose `Missing` / `Unassigned` variants encode
@@ -117,7 +117,7 @@ pub struct ContainerCounts {
 }
 
 /// Pure data contract backing one session list row across every zone
-/// (Main / TaskRabbit / Archive / Jobs — uniform shape).
+/// (Main / Archive / Jobs — uniform shape).
 ///
 /// Fields are grouped by display order: identity, status, title,
 /// metadata columns, expanded-only body, then flags. Renderers read each
@@ -137,6 +137,9 @@ pub struct SessionRowViewModel {
     pub status_color: Color,
     /// Persisted operator pause strength, read through GetOperatorPause.
     pub operator_pause: crate::client::OperatorPauseLevel,
+    /// Manager seats only (#1541): `HARD 7d HELD` style summary of the pause,
+    /// its age and any held succession. Empty when not a paused manager seat.
+    pub operator_pause_label: String,
     /// Independent one-cell navigator attention signal and inspector reasons.
     pub attention_glyph: &'static str,
     pub attention_reasons: Vec<String>,
@@ -212,6 +215,7 @@ impl SessionRowViewModel {
             status_icon: String::new(),
             status_color: theme::overlay0(),
             operator_pause: crate::client::OperatorPauseLevel::None,
+            operator_pause_label: String::new(),
             attention_glyph: "",
             attention_reasons: Vec::new(),
             display_title: String::new(),
@@ -333,7 +337,7 @@ pub fn compute_session_row_for_state_with_focus(
         matches!(session.session_kind, SessionKind::Group | SessionKind::Epic)
             && focus.is_some_and(|entry| entry.running_agent_count > 0);
     let status_icon_str = if contains_running_work {
-        "◉"
+        crate::ui::glyphs::CONTAINER_RUNNING
     } else {
         navigator_lifecycle_icon(session.status)
     }
@@ -580,6 +584,7 @@ pub fn compute_session_row_for_state_with_focus(
         status_icon: status_icon_str,
         status_color: status_color_value,
         operator_pause: crate::client::OperatorPauseLevel::None,
+        operator_pause_label: String::new(),
         attention_glyph,
         attention_reasons,
         display_title,
@@ -1199,6 +1204,7 @@ mod tests {
 
     #[test]
     fn group_counts_direct_running_or_starting_standard_leaf() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
         for leaf_status in [SessionStatus::Running, SessionStatus::Starting] {
             let (mut app, group_id) = one_session_app();
             mutate_session(&mut app, group_id, |s| {
@@ -1233,6 +1239,7 @@ mod tests {
 
     #[test]
     fn container_counts_include_active_work_in_nested_epics() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
         let (mut app, group_id) = one_session_app();
         mutate_session(&mut app, group_id, |s| {
             s.session_kind = SessionKind::Group;

@@ -559,7 +559,15 @@ impl PersistenceHandle {
     }
 
     pub(super) async fn insert_project(&self, project: Project) -> Result<()> {
-        self.send(StoreCommand::InsertProject { project }).await
+        // Project-scoped operations read the store immediately after creation.
+        // A queue receipt is insufficient: acknowledge the committed write.
+        let (tx, rx) = oneshot::channel();
+        self.send(StoreCommand::InsertProject {
+            project,
+            respond_to: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| DaemonError::ChannelClosed)?
     }
 
     pub(super) async fn update_project(&self, project: Project) -> Result<()> {
@@ -1148,13 +1156,13 @@ fn spawn_persistence_worker(
                     .await;
                     let _ = respond_to.send(res);
                 }
-                StoreCommand::InsertProject { project } => {
-                    let pid = project.id;
-                    if let Err(e) =
-                        run_store_op(store.clone(), move |s| s.insert_project(&project)).await
-                    {
-                        tracing::error!(project_id = %pid, error = %e, "Failed to insert project");
-                    }
+                StoreCommand::InsertProject {
+                    project,
+                    respond_to,
+                } => {
+                    let res =
+                        run_store_op(store.clone(), move |s| s.insert_project(&project)).await;
+                    let _ = respond_to.send(res);
                 }
                 StoreCommand::UpdateProjectRow { project } => {
                     let pid = project.id;
@@ -1600,6 +1608,55 @@ mod tests {
             .insert_session(&session)
             .expect("insert persistence test session");
         (store, dir, session)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn insert_project_waits_for_commit_and_reports_write_failure() {
+        let (store, _dir, _) = store_with_session().await;
+        let (tx, rx) = mpsc::channel(1);
+        let handle = PersistenceHandle {
+            tx,
+            pending: Arc::new(AtomicUsize::new(0)),
+            last_command_duration_ms: Arc::new(AtomicU64::new(0)),
+            capacity: 1,
+        };
+        let now = chrono::Utc::now();
+        let project = Project {
+            id: Uuid::new_v4(),
+            name: "Acknowledged project".to_string(),
+            path: None,
+            description: None,
+            color: Project::DEFAULT_COLOR.to_string(),
+            context_files: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let insert = handle.insert_project(project.clone());
+        tokio::pin!(insert);
+        // No worker exists yet: enqueueing cannot mean the row committed.
+        assert!(
+            futures::poll!(insert.as_mut()).is_pending(),
+            "project creation returned before the persistence worker committed it"
+        );
+        spawn_persistence_worker(
+            store.clone(),
+            rx,
+            handle.pending.clone(),
+            handle.last_command_duration_ms.clone(),
+        );
+        insert.await.expect("acknowledged project insert");
+        let persisted = store
+            .lock()
+            .await
+            .get_project(project.id)
+            .expect("read immediately after acknowledgement")
+            .expect("acknowledged project is committed");
+        assert_eq!(persisted.name, project.name);
+        handle
+            .insert_project(project)
+            .await
+            .expect_err("duplicate project insertion must report the store failure");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]

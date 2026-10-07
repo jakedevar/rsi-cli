@@ -10,8 +10,10 @@ use super::Store;
 use super::scheduled_jobs::insert_scheduled_job_conn;
 use crate::error::{DaemonError, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
+use rsi_common::agent_daemon_info::DEPLOY_DRAINING;
 use rsi_common::agent_jobs::{
-    AgentJobResultV1, AgentJobV1, JOB_KEY_CONFLICT, JobKind, JobParams, JobState, JobWake,
+    AgentJobResultV1, AgentJobV1, JOB_KEY_CONFLICT, JOB_QA_LANE_LIMIT, JOB_QA_LANE_MAX_RUNNING,
+    JobKind, JobParams, JobState, JobWake,
 };
 use rsi_common::types::{Recurrence, ScheduleSpec, ScheduledJob, WakeMode};
 use rusqlite::{OptionalExtension, Row, Transaction, TransactionBehavior, params};
@@ -80,6 +82,67 @@ fn stamp(now: DateTime<Utc>) -> String {
     now.to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
+/// Hand live jobs and rolling-queue outcomes to a proven successor of the same manager seat. Callers
+/// validate seat custody and hold the publication transaction; ordinary scope
+/// edits and uncommitted continuation rows never call this helper.
+pub(crate) fn transfer_manager_jobs_on(
+    conn: &rusqlite::Connection,
+    predecessor: Uuid,
+    successor: Uuid,
+) -> Result<usize> {
+    if conn.is_autocommit() {
+        return Err(DaemonError::Store(
+            "manager job transfer requires a transaction".into(),
+        ));
+    }
+    if predecessor == successor {
+        return Ok(0);
+    }
+    let old = predecessor.to_string();
+    let new = successor.to_string();
+    // Replay identity is (owner, key). Refuse the whole seat publication if
+    // transferring a live job would make a successor's key ambiguous.
+    let conflict: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_jobs live
+         JOIN agent_jobs prior ON prior.owner_session_id=?2
+           AND prior.idempotency_key=live.idempotency_key
+         WHERE live.owner_session_id=?1 AND live.state IN ('queued','running'))",
+        params![old, new],
+        |row| row.get(0),
+    )?;
+    if conflict {
+        return Err(DaemonError::InvalidParam(
+            "manager_job_transfer_key_conflict".into(),
+        ));
+    }
+    // Queue outcomes follow the same proven project/portfolio succession,
+    // even when the outgoing seat owns no live daemon job.
+    super::rolling_queue::transfer_manager_queue_wakes_on(conn, predecessor, successor)?;
+    let moved = conn.execute(
+        "UPDATE agent_jobs SET owner_session_id=?2,row_version=row_version+1
+         WHERE owner_session_id=?1 AND state IN ('queued','running')",
+        params![old, new],
+    )?;
+    if moved == 0 {
+        return Ok(0);
+    }
+    // Carry existing batch waits with their live jobs. Terminal members stay
+    // immutable under the predecessor; the already-authorized predicate can
+    // still evaluate them. Unrelated waits and continuation wakes stay put.
+    conn.execute(
+        "UPDATE scheduled_jobs SET wake_session_id=?2,updated_at=?3
+         WHERE enabled=1 AND wake_session_id=?1 AND json_valid(schedule_json)
+           AND EXISTS(SELECT 1 FROM json_each(schedule_json,'$.wake_when.predicate.jobs_terminal') ids
+             JOIN agent_jobs j ON j.id=ids.value
+             WHERE j.owner_session_id=?2 AND j.state IN ('queued','running'))
+           AND NOT EXISTS(SELECT 1 FROM json_each(schedule_json,'$.wake_when.predicate.jobs_terminal') ids
+             LEFT JOIN agent_jobs j ON j.id=ids.value
+             WHERE j.id IS NULL OR j.owner_session_id NOT IN (?1,?2))",
+        params![old, new, stamp(Utc::now())],
+    )?;
+    Ok(moved)
+}
+
 /// Everything the submit verb resolves before the store write.
 #[derive(Debug, Clone)]
 pub struct NewAgentJob {
@@ -105,7 +168,7 @@ pub struct AgentJobRow {
 }
 
 const COLUMNS: &str = "id, owner_session_id, kind, name, params_json, cwd, unit_name, log_path, \
-    status_path, state, exit_code, result_json, created_at, finished_at";
+    status_path, state, exit_code, result_json, created_at, finished_at, started_at";
 
 fn conversion(
     index: usize,
@@ -172,7 +235,9 @@ fn map_row(row: &Row<'_>) -> rusqlite::Result<AgentJobRow> {
             exit_code: row.get(10)?,
             result,
             created_at: row.get(12)?,
+            started_at: row.get(14)?,
             finished_at: row.get(13)?,
+            held: (state == JobState::Queued).then(|| DEPLOY_DRAINING.to_string()),
             wake,
         },
     })
@@ -238,6 +303,20 @@ pub fn wake_message(job: &AgentJobV1, state: JobState, result: &AgentJobResultV1
 }
 
 impl Store {
+    /// #1520: read an explicitly delegated, live Issue-launch binding for QA admission.
+    /// Job params, titles, Issue labels and rotation lineage grant nothing.
+    pub fn live_qa_lane_binding(&self, worker: Uuid) -> Result<Option<(Uuid, Uuid, Uuid)>> {
+        let Some(binding @ (_, _, operation)) =
+            Self::live_issue_binding_for_worker_on(&self.conn, worker)?
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .manager_action_issue_binding(operation)?
+            .filter(|grant| grant.qa_lane)
+            .map(|_| binding))
+    }
+
     /// Record a new `running` job. A replay of the same `(owner, key)` with the
     /// same kind, params and name returns the original job and `replayed=true`;
     /// a different request under the same key is refused.
@@ -246,6 +325,19 @@ impl Store {
         new: &NewAgentJob,
         now: DateTime<Utc>,
     ) -> Result<(AgentJobRow, bool)> {
+        self.insert_agent_job_in_state(new, now, JobState::Running)
+    }
+
+    /// [`Self::insert_agent_job`] with the initial state: `Running` (the unit
+    /// is launched next) or `Queued` (held by a deploy drain, #1566; no unit
+    /// until [`Self::start_queued_agent_job`]).
+    pub fn insert_agent_job_in_state(
+        &self,
+        new: &NewAgentJob,
+        now: DateTime<Utc>,
+        state: JobState,
+    ) -> Result<(AgentJobRow, bool)> {
+        debug_assert!(matches!(state, JobState::Queued | JobState::Running));
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let params_json =
             encode_params(&new.params, new.wake).map_err(|e| DaemonError::Store(e.to_string()))?;
@@ -271,10 +363,40 @@ impl Store {
                 };
             }
         }
+        // #1520: serialize QA capacity with the insertion, after replay so
+        // retries at capacity remain harmless. Ordinary jobs are unchanged.
+        if matches!(&new.params, JobParams::Test(test) if test.qa_lane.is_some()) {
+            let running: u32 = tx.query_row(
+                "SELECT count(*) FROM agent_jobs WHERE owner_session_id=?1
+                 AND state='running' AND kind='test'
+                 AND json_type(params_json,'$.qa_lane')='object'",
+                [new.owner_session_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if running >= JOB_QA_LANE_MAX_RUNNING {
+                return Err(DaemonError::PolicyDenied(JOB_QA_LANE_LIMIT.into()));
+            }
+        }
+        // Serialize job admission against target reclaim's Prepared gate.
+        // The reclaimer checks running jobs in its writer transaction; a
+        // later job waits until the old cache is detached or prepare abandoned.
+        let reclaim_prepared: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sandbox_target_reclaim_intents i
+             JOIN sandbox_custody_roots r ON r.custody_id=i.custody_id AND r.generation=i.generation
+             WHERE i.state='Prepared'
+               AND (r.owner_session_id=?1 OR r.sandbox_root=?2
+                    OR substr(?2,1,length(r.sandbox_root)+1)=r.sandbox_root || '/'))",
+            params![new.owner_session_id.to_string(), new.cwd],
+            |row| row.get(0),
+        )?;
+        if reclaim_prepared {
+            return Err(DaemonError::InvalidParam("sandbox_reclaim_prepared".into()));
+        }
         tx.execute(
             "INSERT INTO agent_jobs(id, owner_session_id, project_id, kind, name, params_json, \
              cwd, unit_name, log_path, status_path, state, idempotency_key, created_at, \
-             row_version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'running',?11,?12,1)",
+             started_at, row_version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?13,?11,?12,\
+             CASE ?13 WHEN 'running' THEN ?12 END,1)",
             params![
                 new.id.to_string(),
                 new.owner_session_id.to_string(),
@@ -288,6 +410,7 @@ impl Store {
                 new.status_path,
                 new.idempotency_key,
                 stamp(now),
+                state.as_str(),
             ],
         )?;
         let row = tx.query_row(
@@ -333,6 +456,28 @@ impl Store {
         Ok(rows)
     }
 
+    /// Every job still `queued` behind a deploy drain, oldest first.
+    pub fn list_queued_agent_jobs(&self) -> Result<Vec<AgentJobRow>> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM agent_jobs WHERE state='queued' ORDER BY sequence"
+        ))?;
+        let rows = statement
+            .query_map([], map_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// CAS `queued -> running` and stamp `started_at`. `false` when the job
+    /// was no longer queued (cancelled, or another poll started it first).
+    pub fn start_queued_agent_job(&self, id: Uuid, now: DateTime<Utc>) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE agent_jobs SET state='running', started_at=?2, \
+             row_version=row_version+1 WHERE id=?1 AND state='queued'",
+            params![id.to_string(), stamp(now)],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// CAS `running -> terminal`. With `wake`, insert the owner's single resume
     /// wake in the same transaction. Returns the wake id when one was written;
     /// `None` when the job was not `running` (already settled: nothing is
@@ -369,7 +514,9 @@ impl Store {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let Some(row) = tx
             .query_row(
-                &format!("SELECT {COLUMNS} FROM agent_jobs WHERE id=?1 AND state='running'"),
+                &format!(
+                    "SELECT {COLUMNS} FROM agent_jobs WHERE id=?1 AND state IN ('queued','running')"
+                ),
                 [id.to_string()],
                 map_row,
             )
@@ -382,7 +529,8 @@ impl Store {
             serde_json::to_string(result).map_err(|e| DaemonError::Store(e.to_string()))?;
         let changed = tx.execute(
             "UPDATE agent_jobs SET state=?2, exit_code=?3, result_json=?4, wake_job_id=?5, \
-             finished_at=?6, row_version=row_version+1 WHERE id=?1 AND state='running'",
+             finished_at=?6, row_version=row_version+1 \
+             WHERE id=?1 AND state IN ('queued','running')",
             params![
                 id.to_string(),
                 terminal.as_str(),
@@ -395,6 +543,7 @@ impl Store {
         if changed != 1 {
             return Ok(None);
         }
+        super::friction::note_agent_job_friction_in(&tx, &row.job, terminal, now);
         if let Some(wake_id) = wake_id {
             let job = row.job;
             let message = wake_message(&job, terminal, result);
@@ -462,6 +611,60 @@ mod tests {
             exit_code: Some(0),
             ..AgentJobResultV1::default()
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn qa_lane_admission_is_per_owner_replay_safe_and_releases_capacity() {
+        let store = store();
+        let owner = Uuid::new_v4();
+        let qa = |owner, key| {
+            let mut new = new_job(owner, Some(key));
+            new.params = rsi_common::agent_jobs::AgentSubmitJobRequestV1 {
+                kind: JobKind::Test,
+                params: serde_json::json!({"shard":"store-01",
+                    "qa_lane":{"sha":"a".repeat(40)},"timeout_minutes":90}),
+                name: None,
+                idempotency_key: None,
+                worktree: None,
+                wake: None,
+                project_id: None,
+                sandbox_session_id: None,
+            }
+            .typed_params()
+            .unwrap();
+            new
+        };
+        let first = qa(owner, "one");
+        store.insert_agent_job(&first, Utc::now()).unwrap();
+        store
+            .insert_agent_job(&qa(owner, "two"), Utc::now())
+            .unwrap();
+        assert!(
+            store
+                .insert_agent_job(&qa(owner, "three"), Utc::now())
+                .unwrap_err()
+                .to_string()
+                .contains("job_qa_lane_limit")
+        );
+        let (replay, replayed) = store
+            .insert_agent_job(&qa(owner, "one"), Utc::now())
+            .unwrap();
+        assert!(replayed);
+        assert_eq!(replay.job.id, first.id);
+        store
+            .insert_agent_job(&qa(Uuid::new_v4(), "other"), Utc::now())
+            .unwrap();
+        store
+            .insert_agent_job(&new_job(owner, None), Utc::now())
+            .unwrap();
+        store
+            .settle_agent_job(first.id, JobState::Succeeded, &done(), false, Utc::now())
+            .unwrap();
+        store
+            .insert_agent_job(&qa(owner, "three"), Utc::now())
+            .unwrap();
+        assert_eq!(store.list_running_agent_jobs().unwrap().len(), 4);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
@@ -561,6 +764,39 @@ mod tests {
                 .is_err()
         );
         assert!(store.conn.execute("DELETE FROM agent_jobs", []).is_err());
+    }
+
+    /// #1333: a lost job is friction; a failed build is ordinary iteration.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn lost_jobs_record_friction_and_failed_builds_do_not() {
+        let store = store();
+        let owner = Uuid::new_v4();
+        let (lost, failed) = (new_job(owner, None), new_job(owner, None));
+        store.insert_agent_job(&lost, Utc::now()).expect("insert");
+        store.insert_agent_job(&failed, Utc::now()).expect("insert");
+        store
+            .settle_agent_job(lost.id, JobState::Lost, &done(), true, Utc::now())
+            .expect("settle lost");
+        store
+            .settle_agent_job(failed.id, JobState::Failed, &done(), true, Utc::now())
+            .expect("settle failed");
+        let rows: Vec<(String, String, String)> = store
+            .conn
+            .prepare("SELECT signature, session_id, evidence_ref FROM friction_events")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                "agent_job:build:lost".to_string(),
+                owner.to_string(),
+                format!("job:{}", lost.id)
+            )]
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
@@ -672,12 +908,16 @@ mod tests {
                 release: false,
             }),
             JobParams::Test(TestJobParams {
+                recipe: None,
                 shard: None,
                 filterset: None,
                 package: Some("rsid".into()),
                 filters: vec!["agent_jobs".into()],
+                exact: false,
                 lib_only: true,
                 candidate_receipt: None,
+                qa_lane: None,
+                timeout_minutes: None,
             }),
             JobParams::Landing(landing.clone()),
             JobParams::CloudGate(landing),
@@ -799,5 +1039,128 @@ mod tests {
         let mut duplicate = new_job(owner, Some("key-0"));
         duplicate.name = Some("different".into());
         assert!(upgraded.insert_agent_job(&duplicate, Utc::now()).is_err());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn v159_keeps_legacy_jobs_results_wakes_and_sequence() {
+        let store = store();
+        let owner = Uuid::new_v4();
+        let mut expected = Vec::new();
+        for (index, state) in [
+            JobState::Running,
+            JobState::Succeeded,
+            JobState::Failed,
+            JobState::Lost,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let new = new_job(owner, Some(&format!("legacy-{index}")));
+            store.insert_agent_job(&new, Utc::now()).unwrap();
+            if state.is_terminal() {
+                store
+                    .settle_agent_job(new.id, state, &done(), true, Utc::now())
+                    .unwrap();
+            }
+            let mut row = store.get_agent_job(new.id).unwrap().unwrap().job;
+            row.started_at = None;
+            expected.push(row);
+        }
+        let wakes = store.list_scheduled_jobs().unwrap();
+        // A genuine V158 job table, without the V159 column or state CHECK.
+        crate::store::rebuild_agent_jobs(&store.conn, crate::store::AGENT_JOBS_CLOUD_SWEEP_TABLE)
+            .unwrap();
+        store.conn.pragma_update(None, "user_version", 158).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sqlite_sequence SET seq=100 WHERE name='agent_jobs'",
+                [],
+            )
+            .unwrap();
+
+        store.migrate_v159(158).unwrap();
+        for old in expected {
+            let restored = store.get_agent_job(old.id).unwrap().unwrap().job;
+            assert_eq!(
+                serde_json::to_value(restored).unwrap(),
+                serde_json::to_value(old).unwrap(),
+                "legacy timing falls back to created_at; all job data survives"
+            );
+        }
+        assert_eq!(store.list_scheduled_jobs().unwrap().len(), wakes.len());
+        let next = new_job(owner, Some("after-upgrade"));
+        store
+            .insert_agent_job_in_state(&next, Utc::now(), JobState::Queued)
+            .unwrap();
+        let sequence: i64 = store
+            .conn
+            .query_row(
+                "SELECT sequence FROM agent_jobs WHERE id=?1",
+                [next.id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sequence, 101);
+        assert!(
+            store
+                .conn
+                .execute("DELETE FROM agent_jobs WHERE id=?1", [next.id.to_string()])
+                .is_err()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn a_queued_job_starts_once_settles_from_queued_and_never_counts_as_running() {
+        let store = store();
+        let owner = Uuid::new_v4();
+        let (row, _) = store
+            .insert_agent_job_in_state(&new_job(owner, None), Utc::now(), JobState::Queued)
+            .unwrap();
+        assert_eq!(row.job.state, JobState::Queued);
+        assert_eq!(row.job.held.as_deref(), Some("deploy_draining"));
+        assert_eq!(row.job.started_at, None);
+        assert!(store.list_running_agent_jobs().unwrap().is_empty());
+        assert_eq!(store.list_queued_agent_jobs().unwrap().len(), 1);
+        assert!(!JobState::Queued.is_terminal());
+
+        assert!(
+            store
+                .start_queued_agent_job(row.job.id, Utc::now())
+                .unwrap()
+        );
+        assert!(
+            !store
+                .start_queued_agent_job(row.job.id, Utc::now())
+                .unwrap(),
+            "the start is a CAS"
+        );
+        let started = store.get_agent_job(row.job.id).unwrap().unwrap().job;
+        assert_eq!(started.state, JobState::Running);
+        assert_eq!(started.held, None);
+        assert!(started.started_at.is_some());
+        assert_eq!(store.list_running_agent_jobs().unwrap().len(), 1);
+
+        let (queued, _) = store
+            .insert_agent_job_in_state(&new_job(owner, None), Utc::now(), JobState::Queued)
+            .unwrap();
+        let settled = store
+            .settle_agent_job_outcome(
+                queued.job.id,
+                JobState::Failed,
+                &AgentJobResultV1::default(),
+                false,
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(settled.is_some(), "a queued job can be cancelled");
+        assert!(
+            !store
+                .start_queued_agent_job(queued.job.id, Utc::now())
+                .unwrap(),
+            "a settled job never starts"
+        );
     }
 }

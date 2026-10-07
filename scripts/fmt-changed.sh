@@ -2,8 +2,9 @@
 # Format only the Rust files this change touched (AGENTS.md rule 6).
 #
 # usage: scripts/fmt-changed.sh [BASE]
-#   no BASE: the .rs files that differ from HEAD (staged or not)
-#   BASE:    the .rs files that differ between BASE and the working tree
+#   no BASE: the .rs files that differ from HEAD (staged or not), plus untracked
+#   BASE:    the .rs files that differ between merge-base(BASE, HEAD) and the
+#            working tree, plus untracked files
 #            (for example an integration worktree: scripts/fmt-changed.sh origin/rolling)
 #
 # rustfmt also rewrites every out-of-line child module (`mod foo;`) of a file
@@ -15,8 +16,14 @@ set -euo pipefail
 base=${1:-HEAD}
 top=$(git rev-parse --show-toplevel)
 cd "$top"
+base=$(git merge-base "$base" HEAD)
 
-mapfile -t changed < <(git diff --name-only --diff-filter=d "$base" -- '*.rs')
+mapfile -t changed < <(
+    {
+        git diff --name-only --diff-filter=d "$base" -- '*.rs'
+        git ls-files --others --exclude-standard -- '*.rs'
+    } | sort -u
+)
 if [ "${#changed[@]}" -eq 0 ]; then
     exit 0
 fi

@@ -15,20 +15,27 @@ stranded on a branch.
   conflicts with the stated principle, change the code.
 - Read the code you change and follow its existing patterns. Keep diffs focused.
 - Make technical decisions yourself and note consequential ones in your commit
-  or handoff. Ask the operator only about `main` or releases, real spending,
-  credentials, deleting user data, or a genuine product choice.
+  or handoff. Send product choices to the portfolio manager. Escalate only
+  `main` or releases, real spending, credentials, or deleting user data to the
+  operator through the global manager.
 - If a process step (seal, review, lock, ledger bookkeeping) blocks a working
   fix and is not a hard rule below, take the reasonable path, say so in your
   handoff, and keep moving. Do not stall waiting for ceremony.
 - Tests: cover what you change. The landing gate is **no new failures relative
   to `rolling`**. Name baseline reds you hit; fix unrelated reds separately.
 - Preserve existing behaviour unless the task is to change it.
-- **Kaizen: improve the line, never stop it.** Any agent (worker, lead,
-  reviewer, manager) that notices a defect outside its task, friction, waste,
-  a repeated manual step or a better way files one Issue (`AgentCreateIssue`,
-  label `kaizen`, 3-6 lines: what, evidence, suggested change) and keeps
-  working. Do not fold the fix into the current task. Managers triage `kaizen`
-  Issues on every wake.
+- **Portability.** New code must build on Linux, macOS and Windows. Gate
+  Linux-only APIs (`/proc`, `statx`/`renameat2`, mountinfo, systemd, bwrap)
+  behind `cfg(target_os = "linux")` with a portable fallback or an explicit
+  unsupported error. macOS and Windows test lanes come later (#1229); do not
+  block on running them now.
+- **Kaizen: improve the line, never stop it.** Every agent improves RSI for
+  the operator and for every other agent: on a structural or process problem,
+  file one `kaizen` Issue and keep working ("Improve the line" in the
+  `AgentGetAuthorityCatalog` guidance says what, how and how to dedupe). Every
+  handoff ends with a `Friction:` line. Managers run a kaizen lane on every
+  wake. Stale or contradictory guidance is a defect: the fix edits the
+  canonical source and deletes the contradiction.
 
 ## Hard rules (the only ones)
 
@@ -47,8 +54,13 @@ stranded on a branch.
    migrations are immutable. Timestamps are RFC3339 with nanoseconds, UUIDs are
    lowercase, enum strings match serde exactly. Sandbox tombstones flip cleanup
    state and null the path/branch atomically.
-4. **Secrets.** Never write credentials or `$RSI_SESSION_TOKEN` into files,
-   logs, prompts or `--params`. The token is transport-only.
+4. **Secrets and operator data.** Never write credentials or
+   `$RSI_SESSION_TOKEN` into files, logs, prompts or `--params`. The token is
+   transport-only. Never put the operator's personal data (e-mail, phone,
+   address, names beyond the handle) into committed artifacts, handoffs or
+   Issue bodies: say "the operator's <purpose> contact (local config)". When
+   restating an operator instruction, paraphrase it without the personal value.
+   Committed history cannot be rewritten by agents (#1454).
 5. **Wakes.** A self-wake always uses `mode:"resume"`. Never `agent_fresh` on
    your own session: it puts a second writer in your tree.
 6. **Formatting.** Format only files you changed: `scripts/fmt-changed.sh`
@@ -75,7 +87,10 @@ stranded on a branch.
     a long test run, anything you check on a later wake) MUST be launched via
     `systemd-run --user --collect`; `setsid`, `nohup`, `disown` and bare `&`
     backgrounding do not survive the daemon reaping this session's process tree
-    on resume.
+    on resume. Stop only what you started: `systemctl --user stop <your-unit>`
+    or `kill <your-PID>`. Never `pkill`, `killall`, `kill -1` or a
+    `pgrep`-fed `kill`; every agent runs as one user, so a pattern kills other
+    agents' test units and landers (#1227; the agent shell hooks refuse them).
 
 ## Project map
 
@@ -99,9 +114,18 @@ diagnostics and repairs. Providers (`Session.provider`): `Claude`, `Codex`,
 make release-install      # build release binaries (plus the desktop UI if node/webkit2gtk exist), relink ~/.local/bin, restart rsid
 ./scripts/dev-daemon.sh   # dev daemon (must run before the TUI)
 ./scripts/dev-tui.sh
+scripts/scoped-test       # default worker verification: derived filters, bounded time and CPU
 make test-fast            # quick lanes; make test-full for everything
 ./tools/install-hooks.sh
 ```
+
+`scripts/scoped-test --base origin/rolling` verifies the committed diff to HEAD.
+Use `--dry-run` to inspect the plan without building; add `--head <rev>` to
+inspect another candidate. Execution requires the candidate to be this HEAD. It builds each selected package once and runs its matching tests under
+a per-package budget (build included): `--runtime-max-sec 1800 --cpu-quota 200`.
+Linux uses a foreground systemd user service; other platforms use a plain timeout
+and explicitly report that no CPU cap is available. Output is tee'd under
+`/tmp/rsi-scoped-test-*`; a timeout names the active test and exits nonzero.
 
 Rust is pinned by `rust-toolchain.toml`. Keybinding changes also update
 `docs/keybindings.md` via `make manual`.
@@ -118,6 +142,14 @@ Rust is pinned by `rust-toolchain.toml`. Keybinding changes also update
 
 ## Landing
 
+**Land one accepted change per gate, filtered to what it touches.** Derive the
+filters with `scripts/check-touched-shards --base origin/rolling` (worker
+contract); never guess shards. Combine sources into one gate only when they
+conflict and you have resolved the conflict, or when they are docs-only. A
+gate's cost must scale with the change: if its filters span more than a few
+rsid shards or any rsid-store module, split it. Batch waits (several jobs, one
+`mode:"when"` wake), never landings. Evidence: `docs/agents/reference.md`.
+
 Publish with `rsi-rolling-land --repo <sandbox> --remote origin --accepted <SHA>`.
 `make release-install` installs it on PATH next to `rsid` (the daemon merge queue spawns it from there).
 Add `--test-filter PACKAGE=FILTER` for the modules you touched: a filtered
@@ -128,8 +160,18 @@ are partitioned into 16 shards (`test-shard-*` features, `store-01..04`,
 that every package with tests in it declares, and `scripts/run-rsid-test-shards.sh`
 runs it across those packages (`scripts/check-rsid-test-shards.py
 --list-shard-packages`). Name one as `--test-filter rsid=shard:store-01:test(NAME)`
-whichever package holds the test; the store tests live in `crates/rsid-store` and
-a filter on that package's modules is gated as the full shard set. The lander's policy is mechanical and
+whichever package holds the test (the store tests live in `crates/rsid-store`).
+A focused `rsid`/`rsid-store` filter (`shard:S:test(NAME)` or a plain name) runs
+on one lib test build of both packages without shard features, so the name may
+sit in any shard; a filter on either package scopes both. An unfiltered change
+runs every library test that can observe it (the tests that name the changed
+items, transitively, plus the source scanners; every library test when that is
+uncertain or over 200 tests, #1280) and the tests of a changed bin or
+integration target, plus `cargo check`; only a crate root, manifest or
+build-script change runs all 16 shards. Another package's lib filters run in one
+libtest invocation, and a filter that selects no test is refused after the
+build (#1282). The gate runs
+the candidate first and builds the base only for a candidate failure (#1244). The lander's policy is mechanical and
 runs before any test: no Work binding, seal or hot-file claim is required, and a
 new migration must be the rolling tip's schema head + 1 (the highest
 `store/migrations/vNNN.rs`) as its own file with its `if version < N` block; one

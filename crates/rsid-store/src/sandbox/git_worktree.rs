@@ -155,6 +155,14 @@ pub struct QuarantineTreeProof {
     root_identity: FilesystemIdentity,
     tree_digest: String,
     identities: HashSet<FilesystemIdentity>,
+    /// Superblock devices that can serve tree entries: the root's `st_dev`
+    /// plus the `major:minor` of every mount whose mount point is the root or
+    /// an ancestor of it in the daemon's mount namespace. On btrfs a
+    /// subvolume's `st_dev` differs from the superblock device mountinfo
+    /// reports, so the ancestor mounts are included too. `None` when an
+    /// ancestor record's device could not be parsed: every mount then counts
+    /// as possibly serving the tree.
+    filesystem_devices: Option<HashSet<u64>>,
 }
 
 impl QuarantineTreeProof {
@@ -184,6 +192,21 @@ impl QuarantineTreeProof {
             .any(|identity| identity.device == device)
     }
 
+    /// Whether a mount whose mountinfo `major:minor` is given may expose a
+    /// tree entry. A mount of another superblock cannot: a bind mount of any
+    /// tree directory shares the tree's superblock and so its device (#1226).
+    /// Callers use this only to excuse a mount whose path could not be
+    /// resolved; it is never a reason to skip a resolvable identity check.
+    pub fn mount_device_may_hold_tree(&self, major: u64, minor: u64) -> bool {
+        let (Some(device), Some(devices)) = (
+            mountinfo_device_number(major, minor),
+            self.filesystem_devices.as_ref(),
+        ) else {
+            return true;
+        };
+        devices.contains(&device)
+    }
+
     #[cfg(any(test, feature = "test-seam"))]
     fn entry_count(&self) -> usize {
         self.identities.len()
@@ -207,6 +230,9 @@ struct QuarantineTreeDigestEntry {
     modified_nanoseconds: i64,
     changed_seconds: i64,
     changed_nanoseconds: i64,
+    /// Link count of a multiply-linked regular file; `None` for every other
+    /// entry, so trees without such files keep their v1 digest bytes.
+    multiple_links: Option<u64>,
 }
 
 impl QuarantineTreeDigestEntry {
@@ -220,6 +246,8 @@ impl QuarantineTreeDigestEntry {
             modified_nanoseconds: metadata.mtime_nsec(),
             changed_seconds: metadata.ctime(),
             changed_nanoseconds: metadata.ctime_nsec(),
+            multiple_links: (metadata.file_type().is_file() && metadata.nlink() != 1)
+                .then(|| metadata.nlink()),
         }
     }
 }
@@ -692,8 +720,11 @@ pub fn repair_moved_worktree_if_exact_locked(
 /// Walk a quarantined tree without following symlinks and produce the bounded
 /// pathname/metadata snapshot consumed by the process-holder proof.
 /// Cross-device and mounted subtrees, special files, and multiply-linked
-/// regular files are retained rather than handed to Git's recursive worktree
-/// removal. This is not an atomic filesystem transaction: the caller must
+/// regular files with any link outside the tree are retained rather than
+/// handed to Git's recursive worktree removal. A regular file whose every
+/// link is inside the tree (Cargo hard-links `target/` outputs) is accepted:
+/// the walk must find exactly `nlink` names for the inode, so no pathname
+/// outside the tree reaches it (#1226). This is not an atomic filesystem transaction: the caller must
 /// re-prove the digest immediately before removal, and the single-user threat
 /// boundary still excludes an adversarial same-UID pathname racer.
 pub fn prove_quarantine_tree_safe(root: &Path) -> Result<QuarantineTreeProof> {
@@ -729,14 +760,20 @@ fn prove_quarantine_tree_safe_at(
         ));
     }
     ensure_quarantine_tree_deadline(deadline)?;
-    reject_mounts_at_or_below(root, mountinfo_path)?;
+    let ancestor_mount_devices = reject_mounts_at_or_below(root, mountinfo_path)?;
     ensure_quarantine_tree_deadline(deadline)?;
     reject_extended_attributes(root)?;
     ensure_quarantine_tree_deadline(deadline)?;
 
     let root_identity = FilesystemIdentity::from_metadata(&metadata);
     let root_device = metadata.dev();
+    let filesystem_devices = ancestor_mount_devices.map(|mut devices| {
+        devices.insert(root_device);
+        devices
+    });
     let mut identities = HashSet::from([root_identity]);
+    // Multiply-linked regular files: identity -> (nlink, names found).
+    let mut multiply_linked: HashMap<FilesystemIdentity, (u64, u64)> = HashMap::new();
     let mut digest_entries = vec![QuarantineTreeDigestEntry::from_metadata(
         Vec::new(),
         &metadata,
@@ -820,13 +857,25 @@ fn prove_quarantine_tree_safe_at(
                     "settlement quarantine contains a special file".into(),
                 ));
             }
-            if file_type.is_file() && child_metadata.nlink() != 1 {
-                return Err(DaemonError::Process(
-                    "settlement quarantine contains a multiply-linked regular file".into(),
-                ));
-            }
             let identity = FilesystemIdentity::from_metadata(&child_metadata);
-            if !identities.insert(identity) {
+            if file_type.is_file() && child_metadata.nlink() != 1 {
+                // Only a regular file may repeat, and every repeat must agree
+                // on the link count; the total is checked after the walk.
+                let nlink = child_metadata.nlink();
+                let (expected, found) = multiply_linked.entry(identity).or_insert((nlink, 0));
+                *found += 1;
+                if *expected != nlink || *found > nlink {
+                    return Err(DaemonError::Process(
+                        "settlement quarantine multiply-linked regular file changed during proof"
+                            .into(),
+                    ));
+                }
+                if *found == 1 && !identities.insert(identity) {
+                    return Err(DaemonError::Process(
+                        "settlement quarantine contains a repeated filesystem identity".into(),
+                    ));
+                }
+            } else if !identities.insert(identity) {
                 return Err(DaemonError::Process(
                     "settlement quarantine contains a repeated filesystem identity".into(),
                 ));
@@ -839,6 +888,17 @@ fn prove_quarantine_tree_safe_at(
                 stack.push((child_path, depth + 1, relative_path));
             }
         }
+    }
+
+    // A link count above the names found means a link lives outside the
+    // tree: removing the tree would leave that inode reachable, so retain.
+    if multiply_linked
+        .values()
+        .any(|(nlink, found)| found != nlink)
+    {
+        return Err(DaemonError::Process(
+            "settlement quarantine contains a multiply-linked regular file".into(),
+        ));
     }
 
     digest_entries.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
@@ -855,6 +915,10 @@ fn prove_quarantine_tree_safe_at(
         tree_digest.update(entry.modified_nanoseconds.to_be_bytes());
         tree_digest.update(entry.changed_seconds.to_be_bytes());
         tree_digest.update(entry.changed_nanoseconds.to_be_bytes());
+        if let Some(links) = entry.multiple_links {
+            tree_digest.update(b"nlink\0");
+            tree_digest.update(links.to_be_bytes());
+        }
     }
 
     Ok(QuarantineTreeProof {
@@ -862,6 +926,7 @@ fn prove_quarantine_tree_safe_at(
         root_identity,
         tree_digest: format!("sha256:{:x}", tree_digest.finalize()),
         identities,
+        filesystem_devices,
     })
 }
 
@@ -1334,7 +1399,10 @@ fn reject_extended_attributes(_path: &Path) -> Result<()> {
     ))
 }
 
-fn reject_mounts_at_or_below(root: &Path, mountinfo_path: &Path) -> Result<()> {
+/// Refuse a mount at or below `root` and return the devices of the mounts at
+/// or above it (see `QuarantineTreeProof::filesystem_devices`); `None` when an
+/// ancestor record's device field cannot be parsed.
+fn reject_mounts_at_or_below(root: &Path, mountinfo_path: &Path) -> Result<Option<HashSet<u64>>> {
     let mut mountinfo = Vec::with_capacity(64 * 1024);
     std::fs::File::open(mountinfo_path)
         .and_then(|file| {
@@ -1350,6 +1418,7 @@ fn reject_mounts_at_or_below(root: &Path, mountinfo_path: &Path) -> Result<()> {
         ));
     }
     let mut records = 0_usize;
+    let mut ancestor_devices = Some(HashSet::new());
     for line in mountinfo.split(|byte| *byte == b'\n') {
         if line.is_empty() {
             continue;
@@ -1371,8 +1440,49 @@ fn reject_mounts_at_or_below(root: &Path, mountinfo_path: &Path) -> Result<()> {
                 "settlement quarantine contains a mount point".into(),
             ));
         }
+        if root.starts_with(&mount_point) {
+            let device = line
+                .split(|byte| *byte == b' ')
+                .nth(2)
+                .and_then(parse_mountinfo_device);
+            match (device, ancestor_devices.as_mut()) {
+                (Some(device), Some(devices)) => {
+                    devices.insert(device);
+                }
+                _ => ancestor_devices = None,
+            }
+        }
     }
-    Ok(())
+    Ok(ancestor_devices)
+}
+
+/// Parse a mountinfo `major:minor` field into the `st_dev` encoding.
+fn parse_mountinfo_device(field: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(field).ok()?;
+    let (major, minor) = text.split_once(':')?;
+    let digits = |value: &str| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+    if !digits(major) || !digits(minor) {
+        return None;
+    }
+    mountinfo_device_number(major.parse().ok()?, minor.parse().ok()?)
+}
+
+/// The `st_dev` value of a mountinfo `major:minor` pair. Mountinfo exists
+/// only on Linux; elsewhere no pair converts, so every mount stays a possible
+/// tree holder.
+fn mountinfo_device_number(major: u64, minor: u64) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(nix::libc::makedev(
+            u32::try_from(major).ok()?,
+            u32::try_from(minor).ok()?,
+        ))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (major, minor);
+        None
+    }
 }
 
 fn decode_mountinfo_path(encoded: &[u8]) -> Result<Vec<u8>> {
@@ -1745,6 +1855,7 @@ fn run_review_seal_git(root: &Path, args: &[&str]) -> Result<std::process::Outpu
         .current_dir(root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_LAZY_FETCH", "1")
         .env_remove("GIT_CONFIG_COUNT")
         .env_remove("GIT_CONFIG_PARAMETERS");
     for key in [
@@ -1800,6 +1911,60 @@ pub fn review_sealed_source_holds_bounded(root: &Path, commit: &str, head: &str)
         _ => return Err(DaemonError::InvalidParam("manager_v2_git_failed".into())),
     }
     Ok(())
+}
+
+/// An exact-source review may use the canonical repository after reclamation.
+/// Prove the recorded repository identity and local ref reachability, without
+/// fetching objects or using the canonical checkout's mutable HEAD as source.
+pub fn review_repository_source_holds_bounded(
+    root: &Path,
+    repository_identity: &str,
+    base: &str,
+    commit: &str,
+) -> Result<()> {
+    let changed = || DaemonError::InvalidParam("manager_v2_custody_repository_changed".into());
+    if std::fs::canonicalize(root).map_err(|_| changed())? != root {
+        return Err(changed());
+    }
+    let common = read_review_seal_git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common = String::from_utf8(common).map_err(|_| changed())?;
+    let expected = repository_identity
+        .strip_prefix("git-common-dir:")
+        .unwrap_or(repository_identity);
+    if std::fs::canonicalize(common.trim()).map_err(|_| changed())? != Path::new(expected) {
+        return Err(changed());
+    }
+    if !valid_object_id(commit)
+        || read_review_seal_git(root, &["cat-file", "-t", commit])? != b"commit\n"
+    {
+        return Err(DaemonError::InvalidParam(
+            "manager_review_source_changed".into(),
+        ));
+    }
+    let refs = read_review_seal_git(
+        root,
+        &[
+            "for-each-ref",
+            &format!("--contains={commit}"),
+            "--format=%(refname)",
+        ],
+    )?;
+    if refs.is_empty() {
+        return Err(DaemonError::InvalidParam(
+            "manager_review_source_changed".into(),
+        ));
+    }
+    let ancestor = run_review_seal_git(root, &["merge-base", "--is-ancestor", commit, base])?;
+    match ancestor.status.code() {
+        Some(1) => Ok(()),
+        Some(0) => Err(DaemonError::InvalidParam(
+            "manager_review_source_not_authored".into(),
+        )),
+        _ => Err(DaemonError::InvalidParam("manager_v2_git_failed".into())),
+    }
 }
 
 /// Authenticate the custody root before a DB review relaunch inspects its seal.
@@ -3686,6 +3851,31 @@ where
     }
 }
 
+/// Keep the synchronous child's ownership through unwinding too. A record
+/// consumer can panic while the child is running or after it was reaped.
+struct BoundedProcessChild {
+    child: std::process::Child,
+    pgid: nix::unistd::Pid,
+    /// Reaping has started, or ownership can no longer be proved.
+    leader_reaped: bool,
+}
+
+impl BoundedProcessChild {
+    fn reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.leader_reaped = true;
+        wait_child(&mut self.child)
+    }
+}
+
+impl Drop for BoundedProcessChild {
+    fn drop(&mut self) {
+        if !self.leader_reaped {
+            terminate_group_if_owned(self.pgid, false);
+            let _ = self.reap();
+        }
+    }
+}
+
 fn run_bounded_process(
     command: &mut Command,
     input: Option<&[u8]>,
@@ -3704,21 +3894,28 @@ fn run_bounded_process(
     } else {
         command.stdin(Stdio::null());
     }
-    let mut child = command
+    let child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|_| DaemonError::Process(format!("failed to invoke Git for {label}")))?;
     let pgid = nix::unistd::Pid::from_raw(child.id() as i32);
-    let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
-        terminate_process_group(pgid);
-        drop(child.stdin.take());
-        let _ = wait_child(&mut child);
+    let mut child = BoundedProcessChild {
+        child,
+        pgid,
+        leader_reaped: false,
+    };
+    let (Some(mut stdout), Some(mut stderr)) =
+        (child.child.stdout.take(), child.child.stderr.take())
+    else {
+        terminate_group_if_owned(pgid, child.leader_reaped);
+        drop(child.child.stdin.take());
+        let _ = child.reap();
         return Err(DaemonError::Process(format!(
             "Git {label} output pipes were unavailable"
         )));
     };
-    let mut stdin = child.stdin.take();
+    let mut stdin = child.child.stdin.take();
     if let Err(error) = set_nonblocking(&stdout, label, "stdout")
         .and_then(|()| set_nonblocking(&stderr, label, "stderr"))
         .and_then(|()| {
@@ -3727,11 +3924,11 @@ fn run_bounded_process(
                 .map_or(Ok(()), |pipe| set_nonblocking(pipe, label, "stdin"))
         })
     {
-        terminate_process_group(pgid);
+        terminate_group_if_owned(pgid, child.leader_reaped);
         drop(stdin);
         drop(stdout);
         drop(stderr);
-        let _ = wait_child(&mut child);
+        let _ = child.reap();
         return Err(error);
     }
     let mut failure = None;
@@ -3753,7 +3950,7 @@ fn run_bounded_process(
     let mut termination_started = false;
 
     if failure.is_some() {
-        terminate_process_group(pgid);
+        terminate_group_if_owned(pgid, child.leader_reaped);
         termination_started = true;
         shutdown_deadline = Some(Instant::now() + limits.post_exit_drain_timeout);
     }
@@ -3822,7 +4019,7 @@ fn run_bounded_process(
         }
 
         if failure.is_some() && !termination_started {
-            terminate_process_group(pgid);
+            terminate_group_if_owned(pgid, child.leader_reaped);
             termination_started = true;
             shutdown_deadline = Some(Instant::now() + limits.post_exit_drain_timeout);
         }
@@ -3842,9 +4039,9 @@ fn run_bounded_process(
                 ) {
                     Ok(WaitStatus::StillAlive) => {}
                     Ok(_) => {
-                        terminate_process_group(pgid);
+                        terminate_group_if_owned(pgid, child.leader_reaped);
                         termination_started = true;
-                        match wait_child(&mut child) {
+                        match child.reap() {
                             Ok(observed) => status = Some(observed),
                             Err(error) if failure.is_none() => {
                                 failure = Some(DaemonError::Process(format!(
@@ -3857,6 +4054,8 @@ fn run_bounded_process(
                             .get_or_insert(Instant::now() + limits.post_exit_drain_timeout);
                     }
                     Err(error) => {
+                        // ECHILD: something else reaped it.
+                        child.leader_reaped = true;
                         if failure.is_none() {
                             failure = Some(DaemonError::Process(format!(
                                 "Git {label} wait failed: {error}"
@@ -3871,21 +4070,24 @@ fn run_bounded_process(
                 target_os = "haiku",
                 all(target_os = "linux", not(target_env = "uclibc"))
             )))]
-            match child.try_wait() {
+            match child.child.try_wait() {
                 Ok(None) => {}
                 Ok(Some(observed)) => {
+                    // `try_wait` reaped the leader: its group id is no longer
+                    // provably ours, so the group is not signalled (#1259).
                     status = Some(observed);
-                    terminate_process_group(pgid);
+                    child.leader_reaped = true;
                     termination_started = true;
                     shutdown_deadline
                         .get_or_insert(Instant::now() + limits.post_exit_drain_timeout);
                 }
                 Err(error) if failure.is_none() => {
+                    child.leader_reaped = true;
                     failure = Some(DaemonError::Process(format!(
                         "Git {label} wait failed: {error}"
                     )));
                 }
-                Err(_) => {}
+                Err(_) => child.leader_reaped = true,
             }
         }
 
@@ -3894,7 +4096,7 @@ fn run_bounded_process(
             failure = Some(DaemonError::Process(format!(
                 "Git {label} execution timed out"
             )));
-            terminate_process_group(pgid);
+            terminate_group_if_owned(pgid, child.leader_reaped);
             termination_started = true;
             shutdown_deadline = Some(now + limits.post_exit_drain_timeout);
         }
@@ -3910,8 +4112,8 @@ fn run_bounded_process(
     drop(stdout);
     drop(stderr);
     if status.is_none() {
-        terminate_process_group(pgid);
-        status = Some(wait_child(&mut child).map_err(|error| {
+        terminate_group_if_owned(pgid, child.leader_reaped);
+        status = Some(child.reap().map_err(|error| {
             DaemonError::Process(format!("Git {label} final reap failed: {error}"))
         })?);
     }
@@ -3931,6 +4133,22 @@ fn run_bounded_process(
         status,
         stderr: stderr_sink.bytes,
     })
+}
+
+/// SIGKILL the leader's group unless the leader may already be reaped, when its
+/// numeric id could name an unrelated group (#1259).
+#[track_caller]
+fn terminate_group_if_owned(pgid: nix::unistd::Pid, leader_reaped: bool) {
+    if leader_reaped {
+        tracing::warn!(
+            target: "rsid::signal",
+            pgid = pgid.as_raw(),
+            caller = %std::panic::Location::caller(),
+            "group signal skipped: the leader was already reaped",
+        );
+        return;
+    }
+    terminate_process_group(pgid);
 }
 
 fn set_nonblocking(pipe: &impl std::os::fd::AsRawFd, label: &str, stream: &str) -> Result<()> {
@@ -4017,6 +4235,11 @@ pub(crate) enum RollingBaseFallbackReason {
 pub enum RollingBasePolicy {
     RemoteTip,
     FastForwardOnly,
+    /// #1195: manager-created workers branch from published `rolling` only.
+    /// The fetched tip wins even when the local checkout is ahead of it; when
+    /// the fetch fails the last fetched `refs/remotes/origin/rolling` is used,
+    /// and only without that the local source.
+    PublishedTip,
 }
 
 #[derive(Debug)]
@@ -4171,12 +4394,65 @@ pub fn fresh_rolling_base(
         (_, Some(reason)) => (local_source, Some(reason)),
         (None, None) => (local_source, Some(RollingBaseFallbackReason::FetchFailed)),
     };
+    let commit = match (policy, fallback_reason) {
+        (RollingBasePolicy::PublishedTip, Some(_)) => run_git_text(
+            origin,
+            &[
+                "rev-parse",
+                "--verify",
+                "refs/remotes/origin/rolling^{commit}",
+            ],
+            "resolve last fetched rolling sandbox base",
+        )
+        .ok()
+        .filter(|commit| valid_object_id(commit))
+        .unwrap_or(commit),
+        _ => commit,
+    };
     Ok(RollingBaseSelection {
         commit,
         fallback_reason,
         private_ref: Some(private_ref),
         origin: origin.to_path_buf(),
     })
+}
+
+/// #1195: resolve a manager-named worktree to its committed `HEAD`.
+///
+/// `None` unless `requested` canonicalizes to a live registered worktree root
+/// of `origin`'s repository (a symlink resolves to its target first; a path
+/// inside a worktree, another repository or an unregistered directory is not
+/// a root). Returns the commit and whether the worktree had uncommitted
+/// changes, which are never used.
+///
+/// # Errors
+/// The bounded Git worktree listing or the named worktree's `HEAD` cannot be
+/// read.
+pub fn resolve_registered_worktree_head(
+    origin: &Path,
+    requested: &Path,
+) -> Result<Option<(String, bool)>> {
+    if !requested.is_absolute() {
+        return Ok(None);
+    }
+    let Ok(canonical) = std::fs::canonicalize(requested) else {
+        return Ok(None);
+    };
+    // Match the one listed root first, so only it pays the per-root Git
+    // identity probe (a shared checkout can list hundreds of sandboxes).
+    let registered = list_worktrees_locked(origin)?.into_iter().any(|entry| {
+        !entry.prunable
+            && entry.root == canonical
+            && std::fs::canonicalize(&entry.root).is_ok_and(|root| root == entry.root)
+    });
+    if !registered
+        || !canonical.is_dir()
+        || repository_identity_path(&canonical).ok() != Some(repository_identity_path(origin)?)
+    {
+        return Ok(None);
+    }
+    let (clean, head) = observe_clean_head_bounded(&canonical)?;
+    Ok(Some((head, !clean)))
 }
 
 /// Adopt only the exact deterministic allocation left by an interrupted
@@ -4541,6 +4817,103 @@ mod tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
+
+    /// #1259: a leader that may already be reaped (the non-`waitid` fallback's
+    /// `try_wait`) never has its saved group id signalled; an unreaped one does.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn settlement_git_skips_group_signals_once_the_leader_is_reaped() {
+        use crate::process_control::recorded_group_signals::sent_to;
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        configure_std_process_group(&mut command, ProcessContainment::Group).expect("group");
+        let mut child = command.spawn().expect("spawn sleep");
+        let raw = i32::try_from(child.id()).expect("pid");
+        let pgid = nix::unistd::Pid::from_raw(raw);
+
+        terminate_group_if_owned(pgid, true);
+        assert_eq!(sent_to(raw), 0, "signalled a possibly reused group id");
+        assert!(child.try_wait().expect("try_wait").is_none());
+
+        terminate_group_if_owned(pgid, false);
+        assert_eq!(sent_to(raw), 1);
+        child.wait().expect("reap");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn settlement_git_reaps_the_owned_leader_when_a_record_consumer_panics() {
+        use crate::process_control::recorded_group_signals::sent_to;
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf '%s\\n' \"$$\"; exec sleep 30"]);
+        let mut pid = None;
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = run_bounded_records_with_limits(
+                &mut command,
+                None,
+                b'\n',
+                true,
+                "panicking record consumer",
+                short_process_limits(),
+                &mut |record| {
+                    pid = Some(
+                        std::str::from_utf8(record)
+                            .unwrap()
+                            .trim()
+                            .parse::<i32>()
+                            .unwrap(),
+                    );
+                    panic!("record consumer failed");
+                },
+            );
+        }));
+        assert!(unwound.is_err());
+        let pid = pid.expect("record consumer observed the leader");
+        assert_eq!(sent_to(pid), 1, "unwinding must stop the owned group");
+        assert_eq!(
+            nix::sys::wait::waitpid(
+                nix::unistd::Pid::from_raw(pid),
+                Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+            ),
+            Err(nix::errno::Errno::ECHILD),
+            "the panicking consumer must leave no unreaped leader"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn settlement_git_panic_after_reaping_sends_no_further_group_signal() {
+        use crate::process_control::recorded_group_signals::sent_to;
+        let mut command = Command::new("sh");
+        // An unterminated record reaches the consumer only in finish(), after
+        // the leader was reaped. Its old group id must never be signalled.
+        command.args(["-c", "printf '%s' \"$$\""]);
+        let mut observed = None;
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = run_bounded_records_with_limits(
+                &mut command,
+                None,
+                b'\n',
+                false,
+                "panicking final record consumer",
+                short_process_limits(),
+                &mut |record| {
+                    let pid = std::str::from_utf8(record).unwrap().parse::<i32>().unwrap();
+                    let reaped = nix::sys::wait::waitpid(
+                        nix::unistd::Pid::from_raw(pid),
+                        Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+                    );
+                    observed = Some((pid, sent_to(pid), reaped));
+                    panic!("final record consumer failed");
+                },
+            );
+        }));
+        assert!(unwound.is_err());
+        let (pid, signals_before_panic, reaped) =
+            observed.expect("final consumer observed the leader");
+        assert_eq!(reaped, Err(nix::errno::Errno::ECHILD));
+        assert_eq!(sent_to(pid), signals_before_panic);
+    }
 
     fn git(root: &Path, args: &[&str]) -> String {
         let mut command = git_command();
@@ -6369,6 +6742,135 @@ mod tests {
                 .is_err(),
             "tree work bounds must fail closed"
         );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn quarantine_tree_proof_accepts_only_hard_links_wholly_inside_the_tree() {
+        // #1226: Cargo hard-links `target/release/rsi` to
+        // `target/release/deps/rsi-<hash>`; such a tree must be purgeable,
+        // while any link reachable outside the tree still retains it.
+        let temp = tempfile::Builder::new()
+            .prefix("q")
+            .tempdir_in("/tmp")
+            .expect("quarantine tree fixture");
+        let root = temp.path().join("quarantine");
+        let deps = root.join("target/release/deps");
+        std::fs::create_dir_all(&deps).expect("cargo target fixture");
+        let mountinfo = temp.path().join("mountinfo");
+        std::fs::write(&mountinfo, "").expect("empty mount inventory");
+        let prove = || {
+            prove_quarantine_tree_safe_at(&root, &mountinfo, 64, 4_096, 16, Duration::from_secs(1))
+        };
+        let binary = root.join("target/release/rsi");
+        let hashed = deps.join("rsi-0123456789abcdef");
+        std::fs::write(&hashed, "binary bytes\n").expect("cargo deps output");
+        std::fs::hard_link(&hashed, &binary).expect("cargo uplifted hard link");
+        let inode = std::fs::metadata(&binary).expect("binary identity");
+        assert_eq!(inode.nlink(), 2);
+
+        let proof = prove().expect("hard links wholly inside the tree are safe");
+        assert!(proof.contains_identity(inode.dev(), inode.ino()));
+        // root, target, release, deps, the inode once: links share an identity.
+        assert_eq!(proof.entry_count(), 5);
+        assert_eq!(
+            reprove_quarantine_tree_unchanged(&proof)
+                .expect("stable hard-linked tree reproof")
+                .tree_digest(),
+            proof.tree_digest()
+        );
+
+        // A third in-tree link is still wholly inside.
+        let third = root.join("target/release/rsi-copy");
+        std::fs::hard_link(&hashed, &third).expect("third in-tree link");
+        let three = prove().expect("three in-tree links are safe");
+        assert_ne!(
+            three.tree_digest(),
+            proof.tree_digest(),
+            "a new link changes the digest"
+        );
+        std::fs::remove_file(&third).expect("remove third link");
+
+        // One link outside the tree keeps the inode reachable: retain.
+        let outside = temp.path().join("outside-link");
+        std::fs::hard_link(&hashed, &outside).expect("outside hard link");
+        let error = prove().expect_err("a link outside the tree retains it");
+        assert!(
+            error.to_string().contains("multiply-linked regular file"),
+            "{error}"
+        );
+        assert!(
+            reprove_quarantine_tree_unchanged(&proof).is_err(),
+            "a link added after the proof must fail the reproof"
+        );
+        // Outside link plus a single in-tree name also retains.
+        std::fs::remove_file(&binary).expect("drop the second in-tree name");
+        assert!(prove().is_err(), "one in-tree name of a two-link inode");
+        std::fs::remove_file(&outside).expect("remove outside link");
+        prove().expect("a single-link file is safe again");
+
+        // Symlinks are not followed: a symlink to an outside multiply-linked
+        // file and to an outside directory proves only the link itself.
+        let outside_file = temp.path().join("outside-file");
+        std::fs::write(&outside_file, "outside\n").expect("outside file");
+        std::fs::hard_link(&outside_file, temp.path().join("outside-file-2"))
+            .expect("outside multiply-linked file");
+        let outside_dir = temp.path().join("outside-dir");
+        std::fs::create_dir(&outside_dir).expect("outside directory");
+        std::fs::write(outside_dir.join("kept"), "kept\n").expect("outside directory entry");
+        std::os::unix::fs::symlink(&outside_file, root.join("file-link")).expect("file symlink");
+        std::os::unix::fs::symlink(&outside_dir, root.join("dir-link")).expect("dir symlink");
+        let linked = prove().expect("symlinks to outside entries are not followed");
+        let outside_identity = std::fs::metadata(&outside_file).expect("outside identity");
+        assert!(!linked.contains_identity(outside_identity.dev(), outside_identity.ino()));
+        let outside_dir_identity = std::fs::metadata(outside_dir.join("kept")).expect("kept");
+        assert!(!linked.contains_identity(outside_dir_identity.dev(), outside_dir_identity.ino()));
+        assert_eq!(linked.entry_count(), 7);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn quarantine_tree_proof_records_the_tree_superblock_devices() {
+        // #1226: a mount of another superblock cannot expose the tree, so the
+        // holder proof may excuse it when its path cannot be resolved.
+        let temp = tempfile::Builder::new()
+            .prefix("q")
+            .tempdir_in("/tmp")
+            .expect("quarantine tree fixture");
+        let root = temp.path().join("quarantine");
+        std::fs::create_dir(&root).expect("quarantine root");
+        let mountinfo = temp.path().join("mountinfo");
+        let device = std::fs::metadata(&root).expect("root identity").dev();
+        let (major, minor) = (
+            u64::from(nix::libc::major(device)),
+            u64::from(nix::libc::minor(device)),
+        );
+        // `/` is an ancestor mount; `/elsewhere` is not.
+        std::fs::write(
+            &mountinfo,
+            "1 0 7:3 / / rw - btrfs /dev/x rw\n2 1 7:4 / /elsewhere rw - ext4 /dev/y rw\n",
+        )
+        .expect("mount inventory");
+        let proof =
+            prove_quarantine_tree_safe_at(&root, &mountinfo, 16, 1_024, 16, Duration::from_secs(1))
+                .expect("tree proof");
+        assert!(
+            proof.mount_device_may_hold_tree(major, minor),
+            "root st_dev"
+        );
+        assert!(
+            proof.mount_device_may_hold_tree(7, 3),
+            "ancestor superblock"
+        );
+        assert!(!proof.mount_device_may_hold_tree(7, 4) || device == nix::libc::makedev(7, 4));
+        assert!(proof.mount_device_may_hold_tree(u64::MAX, 0), "unencodable");
+
+        // An unparseable ancestor device makes every mount a possible holder.
+        std::fs::write(&mountinfo, "1 0 bogus / / rw - ext4 /dev/x rw\n").expect("bad inventory");
+        let proof =
+            prove_quarantine_tree_safe_at(&root, &mountinfo, 16, 1_024, 16, Duration::from_secs(1))
+                .expect("tree proof");
+        assert!(proof.mount_device_may_hold_tree(7, 4));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]

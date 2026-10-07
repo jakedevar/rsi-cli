@@ -188,8 +188,10 @@ impl Store {
         )?)
     }
 
-    /// Record, once, that recovery of `rotation_id` is blocked on
+    /// Record, once per holder, that recovery of `rotation_id` is blocked on
     /// `successor`'s bound custody (a non-terminal `recovery_blocked` event).
+    /// The first one names the reserved successor; after an operator abandon
+    /// (#1176) a replacement that also never started is a new holder.
     /// Returns whether this call recorded it, so the escalation fires once.
     ///
     /// # Errors
@@ -204,12 +206,15 @@ impl Store {
             "INSERT INTO rotation_events (session_id, rotation_id, phase, event_type, metadata, created_at)
              SELECT ?1, ?2, 'reserved', 'recovery_blocked', ?3, ?4
              WHERE NOT EXISTS(SELECT 1 FROM rotation_events WHERE session_id=?1
-                 AND rotation_id=?2 AND event_type='recovery_blocked')",
+                 AND rotation_id=?2 AND event_type='recovery_blocked'
+                 AND json_valid(metadata)
+                 AND json_extract(metadata,'$.successor_id')=?5)",
             rusqlite::params![
                 predecessor.to_string(),
                 rotation_id,
                 serde_json::json!({ "successor_id": successor }).to_string(),
                 chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                successor.to_string(),
             ],
         )?;
         Ok(inserted == 1)
@@ -277,9 +282,28 @@ impl Store {
         let Some(predecessor) = predecessor else {
             return Ok(None);
         };
-        Ok(self
+        if let Some(blocked) = self
             .blocked_rotation_of(parse_uuid(&predecessor)?)?
-            .filter(|blocked| blocked.successor == successor))
+            .filter(|blocked| blocked.successor == successor)
+        {
+            return Ok(Some(blocked));
+        }
+        // #1176: after an abandon bind, the exact reservation is the
+        // replacement's hop from the failed holder. Continue it through the
+        // same operator-only bootstrap/publication path as the original S.
+        let Some(chain) = self.blocked_rotation_chain_of(successor)? else {
+            return Ok(None);
+        };
+        if chain.holder != successor || chain.holder_status != SessionStatus::Failed {
+            return Ok(None);
+        }
+        Ok(self
+            .rotation_abandon_hop_of(successor)?
+            .map(|(predecessor, rotation_id)| BlockedRotation {
+                predecessor,
+                rotation_id,
+                successor,
+            }))
     }
 
     /// The rotation whose blocked reservation the operator's Continue already
@@ -309,10 +333,18 @@ impl Store {
                       AND s.status='Failed'
                  WHERE c.event_type='completed' AND json_valid(c.metadata)
                    AND json_extract(c.metadata,'$.successor_id')=?1
-                   AND EXISTS(SELECT 1 FROM rotation_events b
+                   AND (EXISTS(SELECT 1 FROM rotation_events b
                        WHERE b.session_id=c.session_id AND b.rotation_id=c.rotation_id
                          AND b.event_type='recovery_blocked' AND json_valid(b.metadata)
                          AND json_extract(b.metadata,'$.successor_id')=?1)
+                       OR EXISTS(SELECT 1 FROM rotation_events a
+                           WHERE a.event_type='abandon_requested' AND json_valid(a.metadata)
+                             AND json_extract(a.metadata,'$.holder_id')=c.session_id
+                             AND json_extract(a.metadata,'$.abandon_rotation_id')=c.rotation_id
+                             AND EXISTS(SELECT 1 FROM rotation_events p
+                                 WHERE p.session_id=a.session_id AND p.rotation_id=a.rotation_id
+                                   AND p.event_type='completed' AND json_valid(p.metadata)
+                                   AND json_extract(p.metadata,'$.abandoned_to')=?1)))
                  ORDER BY c.id DESC LIMIT 1",
                 [successor.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?)),

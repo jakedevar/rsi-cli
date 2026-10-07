@@ -374,30 +374,7 @@ async fn run_command(app: &mut App, action: LcAction) -> Result<(), String> {
                 Some((id, _)) => id,
                 None => config.as_ref().ok_or(NO_MANAGER)?.manager_session_id,
             };
-            let mut candidates = Vec::new();
-            let mut after_id = None;
-            loop {
-                let page = app
-                    .client
-                    .list_harness_manager_scope(ListHarnessManagerScopeRequestV1 {
-                        project_id,
-                        after_id,
-                        limit: 64,
-                    })
-                    .await
-                    .map_err(|error| rpc_error(error, appointing))?;
-                candidates.extend(page.rows);
-                // Bound the draft without silently presenting a partial picker.
-                if candidates.len() > 4096 {
-                    return Err("Manager picker exceeds 4096 Groups/Epics. Configure project scope through the operator API.".into());
-                }
-                match page.next_after_id {
-                    Some(next) if after_id.is_none_or(|previous| next > previous) => after_id = Some(next),
-                    Some(_) => return Err("Manager scope discovery returned a nonadvancing cursor. Reopen :manager scope.".into()),
-                    None => break,
-                }
-            }
-            open_scope(app, project_id, manager_id, config, appointing, candidates).await;
+            open_scope_picker(app, project_id, manager_id, config, appointing).await?;
         }
         LcAction::ClearHarnessManagerScope => {
             let config = config.ok_or(NO_MANAGER)?;
@@ -421,6 +398,55 @@ async fn run_command(app: &mut App, action: LcAction) -> Result<(), String> {
         LcAction::OpenHarnessManager => open_manager(app, config.ok_or(NO_MANAGER)?).await?,
         _ => unreachable!("only manager actions are dispatched here"),
     }
+    Ok(())
+}
+
+/// Open the scope picker over `project_id`'s appointed manager. The manager
+/// tree's in-tree edit action (#1214) hands off here for project seats.
+pub(crate) async fn edit_scope_for_project(app: &mut App, project_id: Uuid) -> Result<(), String> {
+    let config = app
+        .client
+        .get_harness_manager(project_id)
+        .await
+        .map_err(|error| rpc_error(error, false))?;
+    let manager_id = config.as_ref().ok_or(NO_MANAGER)?.manager_session_id;
+    open_scope_picker(app, project_id, manager_id, config, false).await
+}
+
+async fn open_scope_picker(
+    app: &mut App,
+    project_id: Uuid,
+    manager_id: Uuid,
+    config: Option<HarnessManagerConfigV1>,
+    appointing: bool,
+) -> Result<(), String> {
+    let mut candidates = Vec::new();
+    let mut after_id = None;
+    loop {
+        let page = app
+            .client
+            .list_harness_manager_scope(ListHarnessManagerScopeRequestV1 {
+                project_id,
+                after_id,
+                limit: 64,
+            })
+            .await
+            .map_err(|error| rpc_error(error, appointing))?;
+        candidates.extend(page.rows);
+        // Bound the draft without silently presenting a partial picker.
+        if candidates.len() > 4096 {
+            return Err("Manager picker exceeds 4096 Groups/Epics. Configure project scope through the operator API.".into());
+        }
+        match page.next_after_id {
+            Some(next) if after_id.is_none_or(|previous| next > previous) => after_id = Some(next),
+            Some(_) => return Err(
+                "Manager scope discovery returned a nonadvancing cursor. Reopen :manager scope."
+                    .into(),
+            ),
+            None => break,
+        }
+    }
+    open_scope(app, project_id, manager_id, config, appointing, candidates).await;
     Ok(())
 }
 

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rsi_common::agent_contract::{PipelineStatusV2, parse_pipeline_handoff_v2};
 use rsi_common::types::{
     CatalogOp, EdgeWhen, FailurePolicy, GraphExecutionUpdate, SessionStatus, TopologyStep,
@@ -105,14 +105,30 @@ pub(crate) trait NodeEffects: Send + Sync + 'static {
     fn poll_command(&self, attempt_id: Uuid) -> Option<CommandPoll>;
     fn cancel_command(&self, attempt_id: Uuid);
     fn forget_command(&self, attempt_id: Uuid);
-    /// Kill a process group left by an earlier incarnation (plan §2.4).
-    fn kill_stale_group(&self, pgid: i32);
+    /// Kill a process group left by an earlier incarnation (plan §2.4), only
+    /// once it is proven to still run inside the attempt's `sandbox` (#1227).
+    fn kill_stale_group(&self, pgid: i32, sandbox: Option<&std::path::Path>);
     /// Operator setting `topology_max_concurrent_build_nodes`.
     fn build_node_cap(&self) -> u32;
     /// Suspension point between a resolution's key pre-check and its
     /// recording transaction. Production: no-op; tests force a key race.
     fn before_resolution_record(&self, _execution_id: Uuid) -> impl Future<Output = ()> + Send {
         async {}
+    }
+    /// Host-load admission (#1417): `true` while the daemon holds this
+    /// attempt's launch because the host is too loaded for a manager's new
+    /// worker. The attempt stays `Reserved`, nothing is written and the driver
+    /// asks again on its next tick. `agent_requested` is false for an operator
+    /// execution, which is never held; `since` (the execution's age) orders
+    /// held launches oldest-first. Production forwards to the host-load gate;
+    /// the default never holds.
+    fn launch_held(
+        &self,
+        _agent_requested: bool,
+        _since: DateTime<Utc>,
+        _attempt: &AttemptRow,
+    ) -> bool {
+        false
     }
 }
 
@@ -1205,6 +1221,19 @@ impl<E: NodeEffects> Executor<E> {
                 )
                 .await?;
                 return Ok(true);
+            }
+            // Retries and recovery of a launch already in progress continue
+            // admitted work. Check spent invocation keys before consulting the
+            // hold, so a lost launch can settle even while the host is busy.
+            if attempt.attempt_no == 1
+                && attempt.status == AttemptStatus::Reserved
+                && self.effects.launch_held(
+                    execution.agent_requested(),
+                    execution.created_at,
+                    attempt,
+                )
+            {
+                return Ok(false);
             }
             // #633 (plan §5.3): an agent-requested launch re-checks live
             // manager policy and charges `max_created_sessions`; a refusal

@@ -85,23 +85,26 @@ impl SortOrder {
         SortOrder::ByLabel,
     ];
 
+    /// Operator-facing name, shown in the sort picker and the session-list
+    /// scope header. Variant names stay as they are: they are the persisted
+    /// serde values.
     pub fn label(self) -> &'static str {
         match self {
-            SortOrder::StalestFirst => "Stalest first",
-            SortOrder::FreshestFirst => "Freshest first",
-            SortOrder::OldestCreated => "Oldest created",
-            SortOrder::NewestCreated => "Newest created",
-            SortOrder::ByLabel => "By label",
+            SortOrder::StalestFirst => "Longest idle",
+            SortOrder::FreshestFirst => "Recently active",
+            SortOrder::OldestCreated => "Oldest first",
+            SortOrder::NewestCreated => "Newest first",
+            SortOrder::ByLabel => "Grouped by label",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
-            SortOrder::StalestFirst => "Sessions neglected longest at top",
-            SortOrder::FreshestFirst => "Most recently active sessions at top",
-            SortOrder::OldestCreated => "Earliest created sessions at top",
-            SortOrder::NewestCreated => "Most recently created sessions at top",
-            SortOrder::ByLabel => "Sessions grouped by their assigned label",
+            SortOrder::StalestFirst => "Idle the longest at the top",
+            SortOrder::FreshestFirst => "Latest activity at the top",
+            SortOrder::OldestCreated => "Earliest created at the top",
+            SortOrder::NewestCreated => "Most recently created at the top",
+            SortOrder::ByLabel => "Gathered under each label",
         }
     }
 }
@@ -189,6 +192,19 @@ pub const ANTIGRAVITY_MODELS: &[(&str, &str)] = &[
 ];
 
 pub(crate) fn models_for_provider(provider: SessionProvider) -> Vec<(String, String)> {
+    // #1407: under the `aws_only` provider profile the pickers offer only
+    // Bedrock Claude models, on the providers that run them as Claude Code.
+    if crate::provider_profile_view::current()
+        == rsi_common::provider_profile::ProviderProfile::AwsOnly
+    {
+        if !crate::provider_profile_view::provider_offered(provider) {
+            return Vec::new();
+        }
+        return rsi_common::provider_profile::AWS_ONLY_MODELS
+            .iter()
+            .map(|(id, name)| ((*id).to_string(), (*name).to_string()))
+            .collect();
+    }
     let src = match provider {
         SessionProvider::Claude => CLAUDE_MODELS,
         SessionProvider::Codex | SessionProvider::CodexAppServer => CODEX_MODELS,
@@ -208,9 +224,6 @@ pub(crate) fn models_for_provider(provider: SessionProvider) -> Vec<(String, Str
         .map(|(id, name)| (id.to_string(), name.to_string()))
         .collect()
 }
-
-/// System prompt for TaskRabbit one-shot task executor.
-pub(crate) const TASKRABBIT_SYSTEM_PROMPT: &str = "You are a one-shot task executor inside rsi, a TUI for managing Claude sessions. Complete the following task concisely and completely. Do not ask follow-up questions \u{2014} work with what you have. If you encounter a blocking error that prevents completion, output exactly `[TASKRABBIT_ESCALATE]` as the very last line of your response so the system can escalate to an interactive session.";
 
 /// Maximum number of conversations fetched per RPC batch.
 pub(crate) const CONVERSATION_BATCH_SIZE: usize = 4;
@@ -396,6 +409,7 @@ pub enum NavDirection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalRequest {
     Lazygit(std::path::PathBuf),
+    Btop,
     Pager(std::path::PathBuf),
 }
 
@@ -414,9 +428,15 @@ pub struct App {
     pub session_order: Vec<Uuid>,
     /// Persisted operator pause markers read separately from Session snapshots.
     pub operator_pauses: HashMap<Uuid, crate::client::OperatorPauseLevel>,
+    /// Age/setter/held-succession detail behind `operator_pauses` (#1541).
+    pub operator_pause_info: HashMap<Uuid, crate::client::OperatorPauseInfo>,
+    /// Pending `<Space>hc` confirmation (session, when).
+    pub(crate) clear_pause_confirmation: Option<(Uuid, std::time::Instant)>,
     pub(crate) operator_pause_probe_cursor: usize,
     pub operator_messages: HashMap<Uuid, Vec<crate::client::OperatorMessageView>>,
     pub(crate) interrupt_now_confirmation: Option<(Uuid, std::time::Instant)>,
+    /// #1176: the pending `:rotation-abandon` confirmation (session, target, when).
+    pub(crate) abandon_rotation_confirmation: Option<(Uuid, Option<String>, std::time::Instant)>,
 
     /// Index from `parent_id` -> ordered list of direct children. Key `None`
     /// means top-level sessions (no parent); key `Some(uuid)` means children
@@ -462,6 +482,10 @@ pub struct App {
     pub needs_redraw: bool,
     /// When true, the main loop should kick off background model discovery.
     pub needs_model_refresh: bool,
+    /// Model/effort switches the operator queued from session detail that the
+    /// daemon has not applied yet (Issue #681). The status line shows the
+    /// queued tuple until the session's effective model and effort match it.
+    pub pending_model_switches: HashMap<Uuid, rsi_common::rpc::PendingSessionModelUpdate>,
     /// Optional one-shot provider target for prompt-local model discovery.
     pub model_refresh_provider: Option<SessionProvider>,
     /// Receiver for background model discovery results.
@@ -539,6 +563,8 @@ pub struct App {
     /// Last bounded recursive DAG browser state. This is render-only cache
     /// populated by the explicit `:dag` load path; it is not polled.
     pub recursive_dag_cache: Option<crate::types::RecursiveDagBrowserState>,
+    /// `:manager tree` (#1214): selection and folds kept across close/reopen.
+    pub manager_tree_memory: Option<crate::overlay::manager_tree::TreeMemory>,
 
     /// Input buffers
     pub input_buffer: String,
@@ -570,6 +596,8 @@ pub struct App {
     /// When set, the input bar bypasses its own normal-mode handling so leader sequences
     /// (like Space+g) pass through to the vim machine.
     pub vim_machine_pending: bool,
+    /// Initial leader key, retained through nested sequences such as Space+g.
+    pub vim_machine_prefix: Option<char>,
 
     /// Active overlay (popup, prompt, etc.). Captures all input when not None.
     pub overlay: OverlayState,
@@ -580,7 +608,7 @@ pub struct App {
     /// Whether an overlay was visible on the previous frame (for cleanup clears).
     pub overlay_visible_last_frame: bool,
 
-    /// Simultaneously visible input overlays (Blank/TaskRabbit prompts), oldest first.
+    /// Simultaneously visible input overlays (Blank prompts), oldest first.
     /// These render as a vertical stack and are navigable with Ctrl+J/Ctrl+K.
     pub input_overlays: Vec<OverlayState>,
     /// Index of the focused input overlay in `input_overlays` (receives key input).
@@ -625,6 +653,11 @@ pub struct App {
     /// Dynamically discovered models (model_id, display_name) for selected provider.
     /// Falls back to provider-specific static model lists if discovery fails.
     pub available_models: Vec<(String, String)>,
+    /// #1407: the first-run AWS setup prompt was shown this process.
+    pub(crate) aws_setup_prompted: bool,
+    /// #1407: `:aws-setup` opened the Bedrock credential form; verify the
+    /// setup once that credential is stored.
+    pub(crate) aws_setup_verify_pending: bool,
     /// Live effort metadata keyed by provider; discovery replaces that provider's catalog.
     pub model_effort_capabilities:
         HashMap<SessionProvider, Vec<rsi_common::model_utils::ModelEffortCapabilities>>,
@@ -655,10 +688,6 @@ pub struct App {
     /// Filtered session order (subset of session_order matching current_project_id).
     /// Recalculated when project filter or sessions change.
     pub filtered_session_order: Vec<Uuid>,
-
-    /// Filtered TaskRabbit sessions: last 2 hours or 10 most recent.
-    /// Pinned TaskRabbit sessions always included.
-    pub filtered_taskrabbit_order: Vec<Uuid>,
 
     /// Archived sessions loaded from daemon for the Archive zone.
     pub filtered_archived_order: Vec<Uuid>,
@@ -693,9 +722,6 @@ pub struct App {
     /// Last-used modal dropdown values (P2.4). Restored from `PersistedState`
     /// at startup; rewritten on every successful modal submit.
     pub modal_defaults: crate::state::ModalDefaults,
-
-    /// Draft text preserved across TaskRabbit popup open/close cycles.
-    pub taskrabbit_draft: Vec<String>,
 
     /// Draft text preserved across Blank popup open/close cycles.
     pub blank_draft: Vec<String>,
@@ -945,7 +971,6 @@ fn sanitize_node(node: &mut SplitNode) {
                     selected_session: None,
                     scroll_offset: 0,
                     active_zone: Default::default(),
-                    taskrabbit_selected_index: 0,
                     archive_selected_index: 0,
                     jobs_selected_index: 0,
                 };
@@ -1021,6 +1046,19 @@ impl Drop for App {
 }
 
 impl App {
+    /// Track global dispatch without confusing a nested key with its leader.
+    pub fn update_vim_machine_pending(&mut self, key: crossterm::event::KeyEvent, pending: bool) {
+        if !pending {
+            self.vim_machine_prefix = None;
+        } else if self.vim_machine_prefix.is_none() {
+            self.vim_machine_prefix = match key.code {
+                crossterm::event::KeyCode::Char(prefix @ (' ' | 'g' | 'G')) => Some(prefix),
+                _ => None,
+            };
+        }
+        self.vim_machine_pending = pending;
+    }
+
     pub fn new(client: DaemonClient) -> Self {
         let initial_pane_id = PaneId(0);
         let list_pane = Pane::SessionList {
@@ -1028,7 +1066,6 @@ impl App {
             selected_session: None,
             scroll_offset: 0,
             active_zone: Default::default(),
-            taskrabbit_selected_index: 0,
             archive_selected_index: 0,
             jobs_selected_index: 0,
         };
@@ -1212,9 +1249,12 @@ impl App {
             sessions: HashMap::new(),
             session_order: Vec::new(),
             operator_pauses: HashMap::new(),
+            operator_pause_info: HashMap::new(),
+            clear_pause_confirmation: None,
             operator_pause_probe_cursor: 0,
             operator_messages: HashMap::new(),
             interrupt_now_confirmation: None,
+            abandon_rotation_confirmation: None,
             workflows: HashMap::new(),
             recursive_graphs: Vec::new(),
             schedule_include_history: false,
@@ -1230,6 +1270,7 @@ impl App {
             quit: false,
             needs_redraw: true, // Draw on first frame
             needs_model_refresh: false,
+            pending_model_switches: HashMap::new(),
             model_refresh_provider: None,
             model_discovery_rx: None,
             settings_model_discovery_rx: None,
@@ -1250,6 +1291,7 @@ impl App {
             dialectic_rx: None,
             recursive_dag_rx: None,
             recursive_dag_cache: None,
+            manager_tree_memory: None,
             input_buffer: String::new(),
             command_buffer: String::new(),
             search_query: String::new(),
@@ -1262,6 +1304,7 @@ impl App {
             notification_history: Vec::new(),
             key_manager: build_key_manager(),
             vim_machine_pending: false,
+            vim_machine_prefix: None,
             overlay: OverlayState::None,
             overlay_stack: Vec::new(),
             overlay_leader_pending: false,
@@ -1281,6 +1324,8 @@ impl App {
             worker_pressure_next_refresh_at: std::time::Instant::now(),
             daemon_resources: None,
             available_models: models_for_provider(selected_provider),
+            aws_setup_prompted: false,
+            aws_setup_verify_pending: false,
             model_effort_capabilities: HashMap::new(),
             local_models: models_for_provider(SessionProvider::Local),
             model_dropdown: crate::types::ModelDropdownState::default(),
@@ -1292,7 +1337,6 @@ impl App {
             labels: Vec::new(),
             current_project_id,
             filtered_session_order: Vec::new(),
-            filtered_taskrabbit_order: Vec::new(),
             filtered_archived_order: Vec::new(),
             filtered_jobs_order: Vec::new(),
             last_viewed_session,
@@ -1304,7 +1348,6 @@ impl App {
             modal_geometries: persisted.modal_geometries.clone(),
             file_explorer_width: persisted.file_explorer_width,
             modal_defaults: persisted.modal_defaults.clone(),
-            taskrabbit_draft: Vec::new(),
             blank_draft: Vec::new(),
             create_entity_draft: restored_create_entity_draft,
             create_entity_form_pending: None,
@@ -1395,7 +1438,6 @@ impl App {
         theme::apply_startup_theme_state(
             theme_name.as_deref(),
             &persisted.theme_role_overrides.registered(),
-            &persisted.border_color_overrides.as_array(),
         );
 
         app
@@ -1905,7 +1947,6 @@ impl App {
         Some(match overlay {
             OverlayState::ThemePicker { .. } => "ThemePicker",
             OverlayState::ThemeRoleEditor { .. } => "ThemeRoleEditor",
-            OverlayState::ColorCustomizer { .. } => "ColorCustomizer",
             OverlayState::TextAreaBgEditor { .. } => "TextAreaBgEditor",
             OverlayState::ProjectPicker { .. } => "ProjectPicker",
             OverlayState::KeybindingsHelp { .. } => "KeybindingsHelp",
@@ -1916,6 +1957,8 @@ impl App {
             OverlayState::SatelliteRegistry(..) => "SatelliteRegistry",
             OverlayState::Remote(..) => "Remote",
             OverlayState::ManagerTree(..) => "ManagerTree",
+            OverlayState::Fleet(..) => "Fleet",
+            OverlayState::GlobalManagerWorkspace(..) => "GlobalManagerWorkspace",
             OverlayState::HarnessManagerV2(..) => "HarnessManagerV2",
             OverlayState::HarnessManagerScope(..) => "HarnessManagerScope",
             OverlayState::TrashBrowser { .. } => "TrashBrowser",
@@ -1950,6 +1993,7 @@ impl App {
             OverlayState::Terminal => "Terminal",
             OverlayState::RatingOverlay { .. } => "RatingOverlay",
             OverlayState::SessionInfoPanel { .. } => "SessionInfoPanel",
+            OverlayState::ModelSwitch(..) => "ModelSwitch",
             OverlayState::CreateEntityForm { .. } => "CreateEntityForm",
             OverlayState::ParentPicker { .. } => "ParentPicker",
             OverlayState::None
@@ -1964,7 +2008,6 @@ impl App {
     pub fn geometry_key_for_purpose(purpose: &crate::types::PromptPurpose) -> String {
         match purpose {
             crate::types::PromptPurpose::Blank => "Blank".to_string(),
-            crate::types::PromptPurpose::TaskRabbit => "TaskRabbit".to_string(),
             crate::types::PromptPurpose::ContinueSession(_) => "ContinueSession".to_string(),
             // Phase 4: typed-leaf prompts share a geometry slot per kind so
             // window position is stable across creations of the same kind.

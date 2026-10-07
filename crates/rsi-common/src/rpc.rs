@@ -238,6 +238,39 @@ pub struct UpdateActiveTaskParams {
     pub active_task: Option<String>,
 }
 
+/// #1176 operator-only `AbandonBlockedRotation`: move a blocked rotation's
+/// seat to a fresh replacement session. `session_id` names the blocked seat or
+/// any session of its blocked chain. `provider`/`model` override the
+/// replacement's launch (the holder's when absent). `idempotency_key` makes a
+/// replay return the first request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbandonBlockedRotationParams {
+    pub session_id: Uuid,
+    #[serde(default)]
+    pub provider: Option<crate::types::SessionProvider>,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub idempotency_key: String,
+}
+
+/// The receipt of `AbandonBlockedRotation`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbandonBlockedRotationResult {
+    /// The blocked seat.
+    pub predecessor_id: Uuid,
+    /// The blocked rotation of the seat.
+    pub rotation_id: String,
+    /// The custody holder the replacement rotates from.
+    pub holder_id: Uuid,
+    /// The holder's rotation to the replacement.
+    pub abandon_rotation_id: String,
+    /// The replacement, once reserved.
+    #[serde(default)]
+    pub replacement_id: Option<Uuid>,
+    /// `dispatched` for a new request, `replayed` for a repeated key.
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RotateSessionParams {
     pub session_id: Uuid,
@@ -259,6 +292,46 @@ pub struct QueueSessionModelUpdateParams {
     #[serde(default)]
     pub new_effort: Option<String>,
     pub idempotency_key: String,
+}
+
+/// A model/effort tuple an operator queued for a session's next turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingSessionModelUpdate {
+    pub model: String,
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+/// What the session-detail model/effort picker needs from the daemon
+/// (`GetSessionModelSwitchOptions`): the current effective tuple, the fence
+/// `QueueSessionModelUpdate` requires, whether a switch is possible, whether it
+/// keeps the provider's own conversation, the operator launch-model allowlist
+/// and any switch already queued.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionModelSwitchOptions {
+    pub session_id: Uuid,
+    pub provider: crate::types::SessionProvider,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Fence to pass as `expected_model_invocation_id`; `None` when the
+    /// session has no model invocation yet (a switch is then unavailable).
+    #[serde(default)]
+    pub model_invocation_id: Option<Uuid>,
+    pub switchable: bool,
+    /// Why a switch is unavailable (set exactly when `switchable` is false).
+    #[serde(default)]
+    pub unavailable_reason: Option<String>,
+    /// Whether the switch continues the provider's own conversation in place.
+    pub keeps_context: bool,
+    /// One line for the picker: what carries over and when the switch applies.
+    pub context_note: String,
+    /// Operator launch-model allowlist; empty means unrestricted.
+    #[serde(default)]
+    pub model_allowlist: Vec<String>,
+    #[serde(default)]
+    pub pending: Option<PendingSessionModelUpdate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1274,6 +1347,11 @@ pub struct HealthStatusResponse {
     /// daemon responses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_credentials: Option<ProviderCredentialHealthSummary>,
+    /// `rsid-supervisor.sh` or `none` (#1217): whether the daemon runs under
+    /// the supervisor that managed deploys need. Absent when the platform
+    /// cannot tell, and from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_mode: Option<String>,
 }
 
 /// One credential slot's resolved state and its accepted environment names.
@@ -2482,6 +2560,21 @@ pub struct AgentCreateIssueParams {
     #[serde(default)]
     pub assignee: Option<String>,
     pub idempotency_key: String,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
+    /// #1389: file this Issue in the RSI harness project instead of the
+    /// caller's own, for a defect in RSI itself found while working in another
+    /// project. The daemon resolves the harness project and appends the source
+    /// project and session to the body. Cannot be combined with `project_id`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub harness: bool,
+    /// #1389: with `harness`, the display number of the Issue in the caller's
+    /// own project this one mirrors; recorded in the provenance line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_issue: Option<u32>,
 }
 
 /// Result envelope shared by tokened RPC and native agent transports.
@@ -2513,6 +2606,11 @@ pub struct AgentListIssuesRequestV1 {
     /// Optional case-insensitive substring filter over the Issue title.
     #[serde(default)]
     pub title_contains: Option<String>,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 /// Maximum accepted length (bytes) of `AgentListIssuesRequestV1::title_contains`.
@@ -2530,6 +2628,7 @@ pub enum IssueListOrderV1 {
 impl Default for AgentListIssuesRequestV1 {
     fn default() -> Self {
         Self {
+            project_id: None,
             status: None,
             archive: IssueArchiveFilterV1::Active,
             cursor: None,
@@ -2575,6 +2674,11 @@ pub struct AgentGetIssueRequestV1 {
     pub issue_id: Option<Uuid>,
     #[serde(default)]
     pub display_number: Option<i64>,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl AgentGetIssueRequestV1 {
@@ -2609,6 +2713,11 @@ pub struct AgentUpdateIssueRequestV1 {
     pub assignee: Option<String>,
     #[serde(default)]
     pub clear_assignee: bool,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl AgentUpdateIssueRequestV1 {
@@ -2663,6 +2772,11 @@ pub struct AgentUpdateIssueStatusRequestV1 {
     pub status: IssueStatus,
     pub expected_row_version: i64,
     pub idempotency_key: String,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl AgentUpdateIssueStatusRequestV1 {
@@ -2698,6 +2812,11 @@ pub struct AgentArchiveIssueRequestV1 {
     pub issue_id: Uuid,
     pub expected_row_version: i64,
     pub idempotency_key: String,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl AgentArchiveIssueRequestV1 {
@@ -2724,6 +2843,11 @@ pub struct AgentRestoreIssueRequestV1 {
     pub issue_id: Uuid,
     pub expected_row_version: i64,
     pub idempotency_key: String,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl AgentRestoreIssueRequestV1 {
@@ -2765,6 +2889,20 @@ pub enum AgentIssueErrorCodeV1 {
     Archived,
     NotArchived,
     StorageFailure,
+    /// #1235: the named `project_id` is outside every manager arm of the
+    /// caller (its own project's lead or manager, or the global grant).
+    ManagerProjectNotInScope,
+    /// #1545: an Issue-bound worker (#1284) whose binding is no longer live:
+    /// its worker ended, or a later launch of the Issue superseded it.
+    BoundIssueBindingNotLive,
+    /// #1545: a bound worker named an Issue (or project) other than its own.
+    BoundIssueWrongIssue,
+    /// #1545: a bound worker sent more than a body append; `validation.field`
+    /// names the first disallowed field.
+    BoundIssueFieldNotAllowed,
+    /// #1545: a bound worker's `body` does not start with the current body
+    /// byte for byte.
+    BoundIssueNotAppendOnly,
 }
 
 impl AgentIssueErrorCodeV1 {
@@ -2781,6 +2919,11 @@ impl AgentIssueErrorCodeV1 {
             Self::Archived => "archived",
             Self::NotArchived => "not_archived",
             Self::StorageFailure => "storage_failure",
+            Self::ManagerProjectNotInScope => crate::global_manager::MANAGER_PROJECT_NOT_IN_SCOPE,
+            Self::BoundIssueBindingNotLive => "bound_issue_binding_not_live",
+            Self::BoundIssueWrongIssue => "bound_issue_wrong_issue",
+            Self::BoundIssueFieldNotAllowed => "bound_issue_field_not_allowed",
+            Self::BoundIssueNotAppendOnly => "bound_issue_not_append_only",
         }
     }
 }
@@ -2818,6 +2961,8 @@ pub enum AgentIssueValidationFieldV1 {
     DisplayNumber,
     Order,
     TitleContains,
+    /// #1235: the optional target project of a global manager seat.
+    ProjectId,
 }
 
 /// One bounded, allowlisted hint for a malformed guarded Issue request.
@@ -4345,7 +4490,7 @@ mod tests {
         }));
         invalid.push(serde_json::json!({
             "issue_id": issue_id, "expected_row_version": 1,
-            "idempotency_key": "k", "title": "x", "project_id": Uuid::new_v4()
+            "idempotency_key": "k", "title": "x", "actor_session_id": Uuid::new_v4()
         }));
         invalid.push(serde_json::json!({
             "issue_id": issue_id, "expected_row_version": 1,
@@ -4362,14 +4507,21 @@ mod tests {
             }
         }
 
-        for field in ["project_id", "actor_session_id", "owning_epic_id", "token"] {
+        // #1235: project_id is the global seat's optional target project.
+        let project = Uuid::new_v4();
+        let targeted: AgentGetIssueRequestV1 = serde_json::from_value(
+            serde_json::json!({"issue_id": issue_id, "project_id": project}),
+        )
+        .unwrap();
+        assert_eq!(targeted.project_id, Some(project));
+        for field in ["actor_session_id", "owning_epic_id", "token"] {
             let mut value = serde_json::json!({"issue_id": issue_id});
             value[field] = serde_json::json!(Uuid::new_v4());
             assert!(serde_json::from_value::<AgentGetIssueRequestV1>(value).is_err());
         }
         assert!(
             serde_json::from_value::<AgentListIssuesRequestV1>(serde_json::json!({
-                "ready":true,"project_id":Uuid::new_v4()
+                "ready":true,"caller_session_id":Uuid::new_v4()
             }))
             .is_err()
         );
@@ -4413,6 +4565,10 @@ mod tests {
             AgentIssueErrorCodeV1::Archived,
             AgentIssueErrorCodeV1::NotArchived,
             AgentIssueErrorCodeV1::StorageFailure,
+            AgentIssueErrorCodeV1::BoundIssueBindingNotLive,
+            AgentIssueErrorCodeV1::BoundIssueWrongIssue,
+            AgentIssueErrorCodeV1::BoundIssueFieldNotAllowed,
+            AgentIssueErrorCodeV1::BoundIssueNotAppendOnly,
         ] {
             let error = AgentIssueErrorV1 {
                 code,
@@ -4515,10 +4671,12 @@ mod tests {
                 }],
                 missing: Vec::new(),
             }),
+            supervisor_mode: Some("none".to_string()),
         };
 
         let parsed: HealthStatusResponse =
             serde_json::from_value(serde_json::to_value(&response).unwrap()).unwrap();
+        assert_eq!(parsed.supervisor_mode.as_deref(), Some("none"));
         assert_eq!(
             serde_json::to_value(&parsed).unwrap(),
             serde_json::to_value(&response).unwrap()

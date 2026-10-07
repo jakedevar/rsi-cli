@@ -1,8 +1,10 @@
 //! Unit tests for session module.
 
+mod deploy_interrupt_resume;
 mod harness_idle_wake;
 mod harness_manager;
 mod manager_actions;
+mod restart_recovery;
 mod terminal_cause;
 mod terminal_watch_owner;
 mod transient_heal;
@@ -1937,6 +1939,132 @@ async fn newer_lifecycle_intent_replaces_stale_handoff_failure_reason() {
             _ => unreachable!("fixed intent matrix"),
         }
     }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn final_handoff_records_only_unfiled_friction_without_text() {
+    for (content, expected) in [
+        ("Friction: none", 0),
+        ("Friction: #1338", 0),
+        ("Friction: private issue details", 1),
+        ("Friction: private issue details\nFriction: none", 0),
+        ("Friction: none\nFriction: private issue details", 1),
+        ("All done", 0),
+    ] {
+        let (manager, _dir) = manager();
+        let session_id = Uuid::new_v4();
+        let mut session = bare_session(session_id);
+        session.status = SessionStatus::Running;
+        insert_row(&manager, &session).await;
+        let mut tracked = TrackedSession::new_for_test(session);
+        tracked.events.push(ConversationEvent {
+            id: 0,
+            offload_id: None,
+            session_id,
+            sequence: 1,
+            event_type: EventType::Message,
+            role: Some(Role::Assistant),
+            content: format!("PIPELINE HANDOFF — IMPLEMENTATION:\n{content}"),
+            tool_name: None,
+            tool_input: None,
+            created_at: chrono::Utc::now(),
+            tool_use_id: None,
+            metadata: None,
+        });
+        manager.active.write().await.insert(session_id, tracked);
+        let decision = TerminalFinalizeDecision {
+            status: SessionStatus::Completed,
+            c5_failure_cause: None,
+        };
+        let finalize = || {
+            SessionManager::finalize_session(
+                session_id,
+                0,
+                decision,
+                manager.active.clone(),
+                manager.completed.clone(),
+                manager.event_bus.clone(),
+                manager.store.clone(),
+                manager.persistence.clone(),
+                None,
+                manager.runtime_config.clone(),
+                None,
+            )
+        };
+        assert_eq!(finalize().await.unwrap().status, SessionStatus::Completed);
+        assert!(finalize().await.is_none());
+        let rows = manager
+            .store
+            .lock()
+            .await
+            .friction_rollup(&Default::default(), chrono::Utc::now())
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), expected, "{content}");
+        if expected == 1 {
+            assert_eq!(rows[0].signature, "handoff:friction_unfiled");
+            assert_eq!(rows[0].occurrences, 1);
+            assert_eq!(rows[0].evidence_refs, vec![format!("session:{session_id}")]);
+            assert!(
+                !serde_json::to_string(&rows)
+                    .unwrap()
+                    .contains("private issue details")
+            );
+        }
+    }
+}
+
+/// #1333 andon: a session finalized Failed because a tool call superseded
+/// its valid handoff records `terminal:terminal_handoff_superseded_by_tool`
+/// friction once, with the session as evidence.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn superseded_handoff_failure_records_terminal_friction() {
+    let (manager, _dir) = manager();
+    let session_id = Uuid::new_v4();
+    let mut session = bare_session(session_id);
+    session.status = SessionStatus::Running;
+    insert_row(&manager, &session).await;
+    let mut tracked = TrackedSession::new_for_test(session);
+    tracked.session.stop_reason = Some("terminal_handoff_superseded_by_tool".to_string());
+    manager.active.write().await.insert(session_id, tracked);
+
+    let finalized = SessionManager::finalize_session(
+        session_id,
+        0,
+        TerminalFinalizeDecision {
+            status: SessionStatus::Failed,
+            c5_failure_cause: None,
+        },
+        manager.active.clone(),
+        manager.completed.clone(),
+        manager.event_bus.clone(),
+        manager.store.clone(),
+        manager.persistence.clone(),
+        None,
+        manager.runtime_config.clone(),
+        None,
+    )
+    .await
+    .expect("durable finalization");
+    assert_eq!(finalized.status, SessionStatus::Failed);
+    let rollup = manager
+        .store
+        .lock()
+        .await
+        .friction_rollup(
+            &rsi_common::friction::ListFrictionRollupRequestV1::default(),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    let row = rollup
+        .rows
+        .iter()
+        .find(|row| row.signature == "terminal:terminal_handoff_superseded_by_tool")
+        .expect("terminal handoff friction recorded");
+    assert_eq!((row.occurrences, row.sessions), (1, 1));
+    assert_eq!(row.evidence_refs, vec![format!("session:{session_id}")]);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -3911,6 +4039,15 @@ async fn terminal_provider_errors_with_prior_history_fail_after_drain() {
                 "provider_event_type": "turn.failed",
             }),
             Some(crate::codex::CODEX_USAGE_LIMIT_STOP_REASON),
+        ),
+        (
+            "codex startup auth rejection",
+            serde_json::json!({
+                "error": "workspace routing discovery unauthorized (401): invalidated oauth token",
+                "source": "codex_event",
+                "provider_event_type": "turn.failed",
+            }),
+            Some(crate::store_support::provider_defaults::PROVIDER_AUTH_INVALID_STOP_REASON),
         ),
         (
             "local normalized error",

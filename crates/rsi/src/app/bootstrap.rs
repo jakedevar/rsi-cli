@@ -825,9 +825,33 @@ impl App {
         }
     }
 
+    /// #1407: mirror the daemon's provider profile into the pickers.
+    pub(crate) fn sync_provider_profile(&mut self) {
+        if crate::provider_profile_view::sync_from_features(&self.daemon_features) {
+            self.available_models = crate::app::models_for_provider(self.selected_provider);
+        }
+    }
+
+    /// #1407: on the first `aws_only` config with no Bedrock region set,
+    /// prompt the first-run AWS setup once per TUI process.
+    fn prompt_first_run_aws_setup(&mut self, json: &Value) {
+        let aws_only = crate::provider_profile_view::current()
+            == rsi_common::provider_profile::ProviderProfile::AwsOnly;
+        let region_missing = json
+            .get(rsi_common::provider_profile::BEDROCK_REGION_FIELD)
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty);
+        if aws_only && region_missing && !self.aws_setup_prompted {
+            self.aws_setup_prompted = true;
+            self.notify(crate::action_handler::aws_setup::FIRST_RUN_PROMPT);
+        }
+    }
+
     pub(crate) fn apply_authoritative_daemon_config(&mut self, json: &Value) {
         let recovered = !self.authoritative_config_ready();
         crate::settings::DaemonFeatureEntry::update_from_json(&mut self.daemon_features, json);
+        self.sync_provider_profile();
+        self.prompt_first_run_aws_setup(json);
         if !self.settings.memory_owner_migrated {
             if let Some(message) = reconcile_memory_owner(&mut self.settings, json) {
                 self.notify(message);

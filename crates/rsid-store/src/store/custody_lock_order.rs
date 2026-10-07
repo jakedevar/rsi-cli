@@ -4,37 +4,36 @@
 //! settlement, archived-sandbox purge, adoption, retry and rotation:
 //!
 //! 1. **Store** (`Arc<tokio::sync::Mutex<Store>>`, the single SQLite writer),
-//! 2. a **custody stripe** (`lock_custody_root`, one of 64 `std` mutexes
-//!    selected by custody id; distinct roots can collide), and
+//! 2. a **custody root lock** (`lock_custody_root`, keyed by exact custody id), and
 //! 3. the **repository mutex** (`git_worktree::with_repository_mutation`, one
 //!    per repository identity, so two roots of one repository share it).
 //!
-//! The blocking order is `Store -> custody stripe -> repository mutex`.
+//! The blocking order is `Store -> custody root lock -> repository mutex`.
 //! Effect admission, retry and rotation binds, `Store` methods that take a
-//! stripe internally and adoption all acquire in that order.
+//! root lock internally and adoption all acquire in that order.
 //!
 //! Maintenance passes (archive cleanup, cohort settlement, purge) do long
-//! filesystem and Git proofs while holding a stripe and/or the repository
+//! filesystem and Git proofs while holding a root lock and/or the repository
 //! mutex, and they need the Store to persist their phase between steps.
 //! They cannot hold the Store for the whole proof (that would pin every
 //! unrelated RPC), so they cannot follow the order. Instead the rule is:
 //!
-//! * a thread that holds a stripe or the repository mutex never *blocks* on
+//! * a thread that holds a root lock or the repository mutex never *blocks* on
 //!   the Store: it uses [`BlockingStoreLockExt::blocking_lock_checked`], a
 //!   bounded `try_lock` loop that fails with the typed, retryable
 //!   `root_busy` custody error instead of waiting;
 //! * a thread that already holds the repository mutex never blocks on a
-//!   stripe: it uses [`lock_custody_root_under_repository`], bounded the
-//!   same way; and where a pass can take the stripe first it does, so its
-//!   blocking order is `stripe -> repository mutex`;
-//! * async effect admission never waits on a stripe while holding the Store:
+//!   root lock: it uses [`lock_custody_root_under_repository`], bounded the
+//!   same way; and where a pass can take the root lock first it does, so its
+//!   blocking order is `root lock -> repository mutex`;
+//! * async effect admission never waits on a root lock while holding the Store:
 //!   [`lock_store_then_root`] and [`lock_store_then_session_root`] try the
-//!   stripe, and when it is busy they drop the Store, wait for the stripe to
+//!   root lock, and when it is busy they drop the Store, wait for the root lock to
 //!   quiesce, and retry. A paused maintenance proof therefore delays only the
 //!   admission that needs its root, never an unrelated Store RPC.
 //!
-//! No blocking wait edge ever points from a stripe/repository-mutex holder to
-//! the Store, or from a repository-mutex holder to a stripe, so no cycle
+//! No blocking wait edge ever points from a root lock/repository-mutex holder to
+//! the Store, or from a repository-mutex holder to a root lock, so no cycle
 //! among the three lock kinds can form. Held-state is tracked per thread by
 //! [`HeldScope`]: both guards are `!Send`, so a thread-local count is exact.
 
@@ -52,15 +51,15 @@ use tokio::sync::{Mutex as StoreMutex, MutexGuard as StoreGuard};
 use uuid::Uuid;
 
 /// Upper bound a maintenance thread waits for the Store (or, under the
-/// repository mutex, for a stripe) before surrendering with `root_busy`.
+/// repository mutex, for a root lock) before surrendering with `root_busy`.
 const BOUNDED_WAIT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Budget for effect admission (`CustodyService::begin_effect`) to win its
-/// custody stripe. Brief contention (an unrelated root's proof on a shared
-/// stripe) is waited out; a longer hold (a purge's git push) surrenders with
+/// custody root lock. Brief contention on that root is waited out; a longer
+/// hold (a purge's git push) surrenders with
 /// the typed retryable `root_busy` so the scheduler re-arms the wake and keeps
-/// serving other jobs instead of stalling behind the stripe (#1157).
+/// serving other jobs instead of stalling behind the root lock (#1157).
 pub(crate) const ADMISSION_WAIT: Duration = Duration::from_secs(5);
 
 thread_local! {
@@ -83,7 +82,7 @@ fn counter(kind: HeldKind) -> &'static std::thread::LocalKey<Cell<usize>> {
     }
 }
 
-/// Marks the current thread as holding a stripe or the repository mutex for
+/// Marks the current thread as holding a root lock or the repository mutex for
 /// as long as it lives. `!Send`: it must drop on the thread that created it.
 pub(crate) struct HeldScope {
     kind: HeldKind,
@@ -158,11 +157,11 @@ pub fn is_lock_order_busy_error(error: &DaemonError) -> bool {
     )
 }
 
-/// Blocking Store acquisition that is safe under a stripe or the repository
+/// Blocking Store acquisition that is safe under a root lock or the repository
 /// mutex. With neither held it is exactly `blocking_lock`; with either held
 /// it is a bounded `try_lock` loop that fails with [`lock_order_busy_error`]
 /// instead of risking a deadlock against a Store holder that is waiting for
-/// the same stripe or repository.
+/// the same root lock or repository.
 pub trait BlockingStoreLockExt {
     fn blocking_lock_checked(&self) -> Result<StoreGuard<'_, Store>>;
 }
@@ -185,9 +184,9 @@ impl BlockingStoreLockExt for StoreMutex<Store> {
     }
 }
 
-/// Take a stripe from a thread that holds the repository mutex. The blocking
-/// order is stripe-before-repository, so waiting here could deadlock against
-/// an effect path holding the stripe and waiting for the repository: bound
+/// Take a root lock from a thread that holds the repository mutex. The blocking
+/// order is root lock-before-repository, so waiting here could deadlock against
+/// an effect path holding the root lock and waiting for the repository: bound
 /// the wait and surrender with [`lock_order_busy_error`].
 pub fn lock_custody_root_under_repository(custody_id: Uuid) -> Result<CustodyRootGuard> {
     if !holds_repository() {
@@ -224,13 +223,13 @@ type ContentionObserver = (
 );
 
 /// Test handshake: registered observers, signalled each time an async
-/// admission found a matching stripe busy, dropped the Store, and is about to
+/// admission found a matching root lock busy, dropped the Store, and is about to
 /// wait.
 #[cfg(any(test, feature = "test-seam"))]
 static ADMISSION_CONTENTION: std::sync::Mutex<Vec<ContentionObserver>> =
     std::sync::Mutex::new(Vec::new());
 
-/// Ask to be told when an admission contends on `custody_id`'s stripe.
+/// Ask to be told when an admission contends on `custody_id`'s root lock.
 #[cfg(any(test, feature = "test-seam"))]
 pub fn admission_contention_signal(custody_id: Uuid) -> std::sync::mpsc::Receiver<()> {
     admission_contention_signal_matching(move |contended| contended == custody_id)
@@ -258,7 +257,7 @@ pub(crate) fn signal_admission_contention(custody_id: Uuid) {
         .retain(|(matches, sender)| !matches(custody_id) || sender.send(()).is_ok());
 }
 
-/// Wait, without holding the Store, until the stripe is momentarily free.
+/// Wait, without holding the Store, until the root lock is momentarily free.
 async fn wait_root_quiescent(custody_id: Uuid) {
     let mut delay = POLL_INTERVAL;
     loop {
@@ -270,10 +269,10 @@ async fn wait_root_quiescent(custody_id: Uuid) {
     }
 }
 
-/// Acquire the Store and then the stripe for `custody_id` without ever
-/// waiting for the stripe while holding the Store. A busy stripe drops the
-/// Store, waits for the stripe to quiesce, and retries, so a paused
-/// maintenance proof on the same (or a colliding) stripe cannot pin the Store.
+/// Acquire the Store and then the root lock for `custody_id` without ever
+/// waiting for the root lock while holding the Store. A busy root lock drops the
+/// Store, waits for the root lock to quiesce, and retries, so a paused
+/// maintenance proof on the same (or a colliding) root lock cannot pin the Store.
 pub async fn lock_store_then_root(
     store: &StoreMutex<Store>,
     custody_id: Uuid,
@@ -290,8 +289,8 @@ pub async fn lock_store_then_root(
     }
 }
 
-/// Wait, without holding the Store, until the stripe is momentarily free or
-/// `deadline` passes. `false` means the deadline passed with the stripe busy.
+/// Wait, without holding the Store, until the root lock is momentarily free or
+/// `deadline` passes. `false` means the deadline passed with the root lock busy.
 async fn wait_root_quiescent_until(custody_id: Uuid, deadline: tokio::time::Instant) -> bool {
     let mut delay = POLL_INTERVAL;
     loop {
@@ -308,7 +307,7 @@ async fn wait_root_quiescent_until(custody_id: Uuid, deadline: tokio::time::Inst
 }
 
 /// [`lock_store_then_root`] with a finite `budget` covering both the Store and
-/// the stripe wait. `None` means the budget expired with the stripe (or the
+/// the root lock wait. `None` means the budget expired with the root lock (or the
 /// Store) still busy; nothing is held and no durable state changed, so the
 /// caller surrenders with a typed retryable `root_busy`.
 pub async fn lock_store_then_root_within(
@@ -331,11 +330,11 @@ pub async fn lock_store_then_root_within(
     }
 }
 
-/// The Store plus the stripe of `binding`'s custody root (none for an
+/// The Store plus the root lock of `binding`'s custody root (none for an
 /// `Ordinary` binding), acquired in the contract order without ever blocking a
-/// runtime thread on the stripe: the launch path binds its session through a
-/// Store method that needs the new root's stripe, and a long maintenance proof
-/// on a colliding stripe must delay only that launch, never the Store (#1166).
+/// runtime thread on the root lock: the launch path binds its session through a
+/// Store method that needs the new root's root lock, and a long maintenance proof
+/// on a colliding root lock must delay only that launch, never the Store (#1166).
 pub async fn lock_store_then_binding_root<'a>(
     store: &'a StoreMutex<Store>,
     binding: &super::sandbox_custody::SessionCustodyBinding,
@@ -346,7 +345,7 @@ pub async fn lock_store_then_binding_root<'a>(
 /// [`lock_store_then_root`] for a custody id that may be absent (an ordinary,
 /// unsandboxed bind has no exclusive root): the Store alone when `None`. The
 /// rotation, retry, restore and settlement paths know their root from the bind
-/// or bound identity, and must not wait for its stripe while holding the Store
+/// or bound identity, and must not wait for its root lock while holding the Store
 /// (#1172).
 pub async fn lock_store_then_optional_root(
     store: &StoreMutex<Store>,
@@ -379,7 +378,7 @@ pub async fn lock_store_then_session_root(
 
 /// [`lock_store_then_root`] for callers that learn the custody id from the
 /// Store through `resolve`, which runs under the Store guard on every attempt
-/// (a busy stripe drops the Store, so the answer is re-read). `None` returns the
+/// (a busy root lock drops the Store, so the answer is re-read). `None` returns the
 /// Store alone: the caller's own fence then refuses as before.
 pub async fn lock_store_then_resolved_root<F>(
     store: &StoreMutex<Store>,
@@ -436,7 +435,7 @@ mod tests {
         }
     }
 
-    /// A custody id on a different stripe than `other`.
+    /// A custody id in a different registry bucket than `other`.
     fn id_on_other_stripe(other: Uuid) -> Uuid {
         let shard = crate::store::sandbox_custody::custody_root_lock_shard(other);
         loop {
@@ -447,7 +446,7 @@ mod tests {
         }
     }
 
-    /// A distinct custody id that collides with `other` on one of the 64 stripes.
+    /// A distinct custody id that collides with `other` on one of the 64 registry buckets.
     fn id_colliding_with(other: Uuid) -> Uuid {
         let shard = crate::store::sandbox_custody::custody_root_lock_shard(other);
         loop {
@@ -458,6 +457,28 @@ mod tests {
                 return candidate;
             }
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn colliding_root_ids_lock_independently_and_release_on_unwind() {
+        let first = Uuid::new_v4();
+        let second = id_colliding_with(first);
+        let first_guard = lock_custody_root(first);
+        let second_guard = try_lock_custody_root(second).expect("another root is independent");
+        assert!(try_lock_custody_root(first).is_none());
+        assert!(try_lock_custody_root(second).is_none());
+        drop(second_guard);
+        std::thread::spawn(move || {
+            let _guard = lock_custody_root(second);
+            panic!("effect fault");
+        })
+        .join()
+        .expect_err("injected panic");
+        let _second_guard = try_lock_custody_root(second).expect("unwind releases the root");
+        assert!(try_lock_custody_root(first).is_none());
+        drop(first_guard);
+        let _first_guard = try_lock_custody_root(first).expect("drop releases the root");
     }
 
     fn finish<T: Send + 'static>(
@@ -498,7 +519,7 @@ mod tests {
         });
         held_rx.recv_timeout(WATCHDOG).expect("store pinned");
 
-        // Holding a stripe: the Store wait is bounded and typed retryable.
+        // Holding a root lock: the Store wait is bounded and typed retryable.
         {
             let _root = lock_custody_root(custody_id);
             let error = f.store.blocking_lock_checked().err().expect("surrenders");
@@ -511,7 +532,7 @@ mod tests {
             Ok(())
         })
         .expect("repository mutation");
-        // A held stripe elsewhere must not be mistaken for ours after release.
+        // A held root lock elsewhere must not be mistaken for ours after release.
         assert!(!holds_stripe_or_repository());
 
         // Holding neither, the wait is the ordinary blocking wait: it outlasts
@@ -557,15 +578,11 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        for collide in [false, true] {
+        for _ in 0..2 {
             let f = fixture();
             let proof_custody = Uuid::new_v4();
-            let admission_custody = if collide {
-                id_colliding_with(proof_custody)
-            } else {
-                proof_custody
-            };
-            // The "proof": a maintenance pass paused while holding its stripe.
+            let admission_custody = proof_custody;
+            // The "proof": a maintenance pass paused while holding its root lock.
             let (held_tx, held_rx) = mpsc::channel();
             let (release_tx, release_rx) = mpsc::channel::<()>();
             let proof = finish("paused-proof", move || {
@@ -578,7 +595,7 @@ mod tests {
                 .expect("proof holds its stripe");
 
             // A contended effect admission on the same shard; the handshake
-            // proves it reached the busy stripe (and let go of the Store).
+            // proves it reached the busy root lock (and let go of the Store).
             let contended = admission_contention_signal(admission_custody);
             let store = Arc::clone(&f.store);
             let mut admission = runtime.spawn(async move {
@@ -620,8 +637,8 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn two_roots_of_one_repository_settlement_vs_effect_admission_cannot_deadlock() {
-        // Effect path: Store -> stripe(A) -> repository mutex. Settlement
-        // shape: repository mutex -> stripe(A) / Store. Before the global
+        // Effect path: Store -> root lock(A) -> repository mutex. Settlement
+        // shape: repository mutex -> root lock(A) / Store. Before the global
         // order each waited on the other's lock; now settlement surrenders.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -645,7 +662,7 @@ mod tests {
                     settle_in_repo_rx
                         .recv_timeout(WATCHDOG)
                         .expect("settlement entered");
-                    // Store+stripe held; now needs the repository mutex.
+                    // Store+root lock held; now needs the repository mutex.
                     with_repository_mutation(&repository, || Ok(())).expect("repository");
                 });
             });
@@ -679,8 +696,8 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn two_roots_of_one_repository_cleanup_vs_purge_cannot_deadlock() {
-        // Cleanup holds stripe(A) then the repository mutex, and needs the
-        // Store; purge holds stripe(B) and then needs the same repository
+        // Cleanup holds root lock(A) then the repository mutex, and needs the
+        // Store; purge holds root lock(B) and then needs the same repository
         // mutex. Another thread pins the Store meanwhile. Every wait is
         // bounded or ordered, so all three finish.
         let f = fixture();
@@ -718,7 +735,7 @@ mod tests {
         let repository = f.repository.clone();
         let purge = finish("purge", move || {
             let _root = lock_custody_root(root_b);
-            // Blocks on the repository mutex held by cleanup: stripe(B) ->
+            // Blocks on the repository mutex held by cleanup: root lock(B) ->
             // repository is the ordered direction, so this waits, not cycles.
             with_repository_mutation(&repository, || Ok(()))
         });

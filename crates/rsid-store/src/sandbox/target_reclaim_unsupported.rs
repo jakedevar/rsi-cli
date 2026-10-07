@@ -7,6 +7,7 @@
 //! pathname-based fallback would weaken that boundary.
 
 use rsi_common::sandbox_storage::SandboxBuildCacheReclaimSkipReason as SkipReason;
+use rsi_common::sandbox_storage::SandboxReclaimCheck;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +17,7 @@ use uuid::Uuid;
 const UNSUPPORTED_PASS_STORE_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ReclaimWorkLimits {
+pub struct ReclaimWorkLimits {
     pub recovery_entries: u64,
     pub filesystem_entries: u64,
     pub allocated_bytes: u64,
@@ -37,14 +38,14 @@ impl Default for ReclaimWorkLimits {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct ReclaimPassState;
+pub struct ReclaimPassState;
 
 impl ReclaimPassState {
-    pub(crate) fn new() -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         Arc::new(Self)
     }
 
-    pub(crate) fn checkpoint(&self, _depth: u32) -> Result<(), SkipReason> {
+    pub fn checkpoint(&self, _depth: u32) -> Result<(), SkipReason> {
         Ok(())
     }
 
@@ -52,11 +53,11 @@ impl ReclaimPassState {
     /// elapsed budget (every reclaim refuses with `Openat2Unavailable`), so it
     /// reports the Linux per-pass cap: callers still reach the refusal path
     /// instead of a spurious `DurationBudget` stop, and never wait unbounded.
-    pub(crate) fn remaining_duration(&self) -> Duration {
+    pub fn remaining_duration(&self) -> Duration {
         UNSUPPORTED_PASS_STORE_WAIT
     }
 
-    pub(crate) fn reclaimable_summary(&self) -> (u64, u32) {
+    pub fn reclaimable_summary(&self) -> (u64, u32) {
         (0, 0)
     }
 
@@ -65,7 +66,7 @@ impl ReclaimPassState {
     }
 
     #[cfg(any(test, feature = "test-seam"))]
-    pub(crate) fn for_test(_limits: ReclaimWorkLimits) -> Arc<Self> {
+    pub fn for_test(_limits: ReclaimWorkLimits) -> Arc<Self> {
         Self::new()
     }
 
@@ -73,7 +74,7 @@ impl ReclaimPassState {
     pub(crate) fn set_elapsed_for_test(&self, _elapsed: Duration) {}
 }
 
-pub(crate) fn with_reclaim_pass_state<T>(
+pub fn with_reclaim_pass_state<T>(
     _state: &Arc<ReclaimPassState>,
     operation: impl FnOnce() -> T,
 ) -> T {
@@ -81,7 +82,7 @@ pub(crate) fn with_reclaim_pass_state<T>(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TargetReclaimKind {
+pub enum TargetReclaimKind {
     Inspected,
     StagedRemoved,
     StagedPending,
@@ -91,7 +92,7 @@ pub(crate) enum TargetReclaimKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TargetReclaimOutcome {
+pub struct TargetReclaimOutcome {
     pub kind: TargetReclaimKind,
     pub bytes: u64,
     pub reason: Option<SkipReason>,
@@ -99,7 +100,7 @@ pub(crate) struct TargetReclaimOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RegisteredTargetIntent {
+pub struct RegisteredTargetIntent {
     pub custody_id: Uuid,
     pub generation: u64,
     pub allocation_id: Uuid,
@@ -110,7 +111,7 @@ pub(crate) struct RegisteredTargetIntent {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RegisteredNamespaceState {
+pub enum RegisteredNamespaceState {
     Absent,
     Expected,
     Different,
@@ -131,7 +132,7 @@ pub struct RegisteredTargetIdentity {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct TargetRecoverySweepEvidence {
+pub struct TargetRecoverySweepEvidence {
     pub cycle_before: u64,
     pub cycle_after: u64,
     pub cursor_before: Option<String>,
@@ -151,7 +152,7 @@ pub struct TargetRecoveryRun {
 }
 
 impl TargetReclaimOutcome {
-    pub(crate) fn refused(reason: SkipReason) -> Self {
+    pub fn refused(reason: SkipReason) -> Self {
         Self {
             kind: TargetReclaimKind::Refused,
             bytes: 0,
@@ -162,50 +163,65 @@ impl TargetReclaimOutcome {
 }
 
 #[derive(Debug)]
-pub(crate) struct PinnedSandboxRoot {
+pub struct PinnedSandboxRoot {
     root_path: PathBuf,
 }
 
 impl PinnedSandboxRoot {
-    pub(crate) fn open(
+    pub(crate) fn ensure_idle_cargo_target(&self) -> Result<(), SkipReason> {
+        Err(SkipReason::Openat2Unavailable)
+    }
+    pub(crate) fn ensure_idle_cargo_target_checked(
+        &self,
+    ) -> Result<(), (SkipReason, SandboxReclaimCheck)> {
+        Err((
+            SkipReason::Openat2Unavailable,
+            SandboxReclaimCheck::new("openat2_unavailable"),
+        ))
+    }
+    pub fn open(
         _sandbox_base: &Path,
         _sandbox_root: &Path,
         _allocation_id: Uuid,
     ) -> Result<Self, SkipReason> {
         Err(SkipReason::Openat2Unavailable)
     }
+    pub fn open_checked(
+        _sandbox_base: &Path,
+        _sandbox_root: &Path,
+        _allocation_id: Uuid,
+    ) -> Result<Self, (SkipReason, SandboxReclaimCheck)> {
+        Err((
+            SkipReason::Openat2Unavailable,
+            SandboxReclaimCheck::new("openat2_unavailable"),
+        ))
+    }
 
     pub(crate) fn root_path(&self) -> &Path {
         &self.root_path
     }
 
-    pub(crate) fn inspect_target(&self) -> TargetReclaimOutcome {
+    pub fn inspect_target(&self) -> TargetReclaimOutcome {
         TargetReclaimOutcome::refused(SkipReason::Openat2Unavailable)
     }
 
-    pub(crate) fn registered_target_identity(
-        &self,
-    ) -> Result<RegisteredTargetIdentity, SkipReason> {
+    pub fn registered_target_identity(&self) -> Result<RegisteredTargetIdentity, SkipReason> {
         Err(SkipReason::Openat2Unavailable)
     }
 
-    pub(crate) fn stage_registered_target(
+    pub fn stage_registered_target(
         &self,
         _intent: &RegisteredTargetIntent,
     ) -> TargetReclaimOutcome {
         TargetReclaimOutcome::refused(SkipReason::Openat2Unavailable)
     }
 
-    pub(crate) fn reclaim_target(
-        &self,
-        _custody_id: Uuid,
-        _generation: u64,
-    ) -> TargetReclaimOutcome {
+    pub fn reclaim_target(&self, _custody_id: Uuid, _generation: u64) -> TargetReclaimOutcome {
         TargetReclaimOutcome::refused(SkipReason::Openat2Unavailable)
     }
 }
 
-pub(crate) fn probe_registered_target(
+pub fn probe_registered_target(
     _base: &Path,
     _intent: &RegisteredTargetIntent,
 ) -> RegisteredTargetProbe {
@@ -215,7 +231,7 @@ pub(crate) fn probe_registered_target(
     }
 }
 
-pub(crate) fn delete_registered_target(
+pub fn delete_registered_target(
     _base: &Path,
     _intent: &RegisteredTargetIntent,
     _dry_run: bool,
@@ -223,14 +239,14 @@ pub(crate) fn delete_registered_target(
     TargetReclaimOutcome::refused(SkipReason::Openat2Unavailable)
 }
 
-pub(crate) fn replay_registered_publication(
+pub fn replay_registered_publication(
     _base: &Path,
     _intent: &RegisteredTargetIntent,
 ) -> Result<(), SkipReason> {
     Err(SkipReason::Openat2Unavailable)
 }
 
-pub(crate) fn sync_registered_target_absence(
+pub fn sync_registered_target_absence(
     _base: &Path,
     _intent: &RegisteredTargetIntent,
 ) -> Result<bool, SkipReason> {
@@ -249,7 +265,7 @@ pub(crate) fn recover_staged_targets_with_state(
     recover_staged_targets(base, dry_run)
 }
 
-pub(crate) fn recover_staged_targets_run_with_state(
+pub fn recover_staged_targets_run_with_state(
     base: &Path,
     dry_run: bool,
     state: &Arc<ReclaimPassState>,

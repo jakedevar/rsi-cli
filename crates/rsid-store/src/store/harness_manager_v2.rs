@@ -17,7 +17,14 @@ use super::Store;
 use crate::error::{DaemonError, Result};
 
 #[path = "manager_node_authority.rs"]
-mod manager_node_authority;
+pub(crate) mod manager_node_authority;
+
+#[path = "global_manager_authority.rs"]
+mod global_manager_authority;
+pub use global_manager_authority::ManagerCallerV1;
+pub(crate) use global_manager_authority::{
+    PortfolioHead, global_issue_authority_on, uncovered_is_none,
+};
 
 pub fn refused(code: &str) -> DaemonError {
     DaemonError::InvalidParam(code.into())
@@ -250,6 +257,12 @@ impl Store {
         if !rsi_common::is_leaf_kind(scope.target.session_kind) {
             return Err(refused("manager_v2_leaf_required"));
         }
+        // #1235 rule (c): reads go by coverage, mutations flow down only.
+        if self.manager_target_owned_by_ancestor(&scope.config, scope.target.id)? {
+            return Err(refused(
+                rsi_common::global_manager::MANAGER_TARGET_OWNED_BY_ANCESTOR,
+            ));
+        }
         let grant = self.manager_policy_for_config(&scope.config)?;
         let Some(grant) = grant.filter(|grant| {
             !grant.revoked
@@ -270,7 +283,7 @@ impl Store {
         Ok(Some(scope))
     }
 
-    fn manager_session_control_human_gate(
+    pub(crate) fn manager_session_control_human_gate(
         &self,
         target: Uuid,
         allow_soft_restart: bool,
@@ -355,6 +368,26 @@ impl Store {
             return Err(refused("manager_v2_invalid_policy_request"));
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let result = self.configure_harness_manager_policy_in_tx(&tx, request)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// [`Self::configure_harness_manager_policy`] inside the caller's
+    /// IMMEDIATE transaction (#1239). Nothing commits here.
+    pub(crate) fn configure_harness_manager_policy_in_tx(
+        &self,
+        tx: &Transaction<'_>,
+        request: &ConfigureHarnessManagerPolicyRequestV2,
+    ) -> Result<HarnessManagerPolicyConfigV2> {
+        request.policy.validate().map_err(refused)?;
+        text(&request.idempotency_key, 128).map_err(refused)?;
+        if request.project_id.is_nil()
+            || request.expected_scope_version <= 0
+            || request.expected_policy_version < 0
+        {
+            return Err(refused("manager_v2_invalid_policy_request"));
+        }
         let config = self
             .get_harness_manager(request.project_id)?
             .ok_or_else(|| refused("manager_not_configured"))?;
@@ -367,7 +400,6 @@ impl Store {
         {
             let mut result: HarnessManagerPolicyConfigV2 = serde_json::from_value(receipt)?;
             result.revoked = config.row_version != result.scope_version;
-            tx.commit()?;
             return Ok(result);
         }
         for group_id in &request.policy.group_ids {
@@ -436,13 +468,23 @@ impl Store {
             &payload,
             &serde_json::to_value(&result)?,
         )?;
-        self.sync_legacy_manager_root_on(&tx, config.project_id)?;
-        tx.commit()?;
+        self.sync_legacy_manager_root_on(tx, config.project_id)?;
         Ok(result)
     }
 
     /// Current scope/lineage is always resolved before a mutation replay.
+    /// The caller's own project; the global seat is served too (#1235).
     pub fn manager_v2_authorize(
+        &self,
+        caller: Uuid,
+        fence: &ManagerFenceV2,
+        capability: Option<ManagerCapabilityV2>,
+    ) -> Result<ManagerAuthorityV2> {
+        self.manager_v2_authorize_in(caller, None, fence, capability)
+    }
+
+    /// The legacy and area arms for the caller's own project, unchanged.
+    fn manager_v2_authorize_own(
         &self,
         caller: Uuid,
         fence: &ManagerFenceV2,
@@ -903,6 +945,7 @@ impl Store {
             result: None,
             deduplicated: false,
             operator_result: None,
+            sandbox_source: None,
         };
         let stamp = now();
         let actor = match &origin {
@@ -972,7 +1015,8 @@ impl Store {
     ) -> Result<()> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let op = self.manager_action_assert_claim(claim)?;
-        let authority = self.manager_action_authority(&op.context.origin, &op.context.request)?;
+        let authority =
+            self.manager_stored_action_authority(&op.context.origin, &op.context.request)?;
         if authority.config.project_id != op.project_id
             || authority.config.manager_session_id != op.manager_session_id
             || authority.config.row_version != op.scope_version
@@ -1109,7 +1153,8 @@ impl Store {
     ) -> Result<()> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let op = self.manager_action_assert_claim(claim)?;
-        let authority = self.manager_action_authority(&op.context.origin, &op.context.request)?;
+        let authority =
+            self.manager_stored_action_authority(&op.context.origin, &op.context.request)?;
         let key = claim.id().to_string();
         let prior =
             self.manager_v2_record(&authority.config, Self::INTEGRATE_EXECUTION_KIND, &key)?;
@@ -1138,7 +1183,8 @@ impl Store {
     ) -> Result<()> {
         let op = self.manager_action_assert_claim(claim)?;
         let key = claim.id().to_string();
-        let authority = self.manager_action_authority(&op.context.origin, &op.context.request)?;
+        let authority =
+            self.manager_stored_action_authority(&op.context.origin, &op.context.request)?;
         let prior =
             self.manager_v2_record(&authority.config, Self::INTEGRATE_EXECUTION_KIND, &key)?;
         let payload = prior
@@ -1241,6 +1287,7 @@ impl Store {
                 .then(|| ManagerActionResultV2::SourceIntegrated),
             deduplicated: false,
             operator_result: None,
+            sandbox_source: None,
         };
         let changed = self.conn.execute(
             "UPDATE harness_manager_v2_operations
@@ -1808,6 +1855,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let (_project, manager, epic, node, seat) = area_node_fixture(&store, None);
         let request = AgentManagerUpdateRequestV2 {
+            project_id: None,
             fence: ManagerFenceV2 {
                 scope_version: 1,
                 policy_version: 1,
@@ -2372,6 +2420,7 @@ mod tests {
         idempotency_key: &str,
     ) -> AgentManagerControlRequestV2 {
         AgentManagerControlRequestV2 {
+            project_id: None,
             fence: ManagerFenceV2 {
                 scope_version,
                 policy_version,

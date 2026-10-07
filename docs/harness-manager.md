@@ -68,6 +68,13 @@ its selection. Scope edits revoke old mail and fence the old policy/actions. Reo
 retains a revoked grant's exact saved values and labels it revoked. Opening grants
 nothing; explicitly saving regrants the displayed draft under the current scope.
 
+When an appointment changes the project's manager anchor, terminal watches and
+pending deploy outcomes follow the displaced seat's proven same-project lineage.
+A live deploy also transfers to the new owner. If that owner already used its
+deploy key, the save refuses `manager_deploy_transfer_key_conflict` and leaves the
+appointment and wakes unchanged. Cancel or settle the retained seat's live deploy
+before retrying the appointment (#1571; deploy identity follow-up #1572).
+
 ## Area manager nodes
 
 The operator can inspect the current project's nodes with `:manager node list`
@@ -81,8 +88,14 @@ existing leaf area node when `node_id` is set. The operator supplies a selected
 Group/Epic scope, a grant and matching policy, observed parent grant/policy/epoch
 versions, the observed child grant version (zero for a new node), and an
 idempotency key. `:manager node configure <JSON>` sends the same typed request.
-The daemon requires strictly narrower scope, capabilities and finite allowances;
-it rejects sibling overlap and aggregate capacity excess. An Epic move that would
+The daemon applies the one narrowing rule every manager edge uses
+(`grant_narrows`, #1237): a strictly narrower scope; capabilities and launches
+within the parent's, where equal capabilities are allowed so the PM verb set
+survives any depth; each finite allowance strictly lower, so the parent keeps at
+least one unit; `max_direct_reports` and spend no higher than the parent's. A
+widened dimension is refused with a typed code: `manager_scope_widened`,
+`manager_capability_widened` or `manager_allowance_exceeded`. It also rejects
+sibling overlap and aggregate capacity excess. An Epic move that would
 create sibling overlap is refused. An edit bumps the node grant version and epoch.
 An active manager can use `AgentManagerDelegateNode` to create or replace a
 direct child grant. Its request has the same grant and version fields but no
@@ -118,7 +131,7 @@ manager rulings never answer an operator approval.
 
 The global manager (#872 Slice B) is one operator-appointed session that keeps a
 healthy project manager (PM) in each granted project, routes requests to them
-and reports back; its playbook is `.claude/skills/rsi-global-manager/SKILL.md`.
+and reports back; its playbook is `.claude/skills/rsi-portfolio-manager/SKILL.md` (tier-generic, #1237).
 The operator grants it an explicit project list, a launch allowlist for the PMs
 it appoints, and the V2 policy it saves for them. The seat cannot widen any of
 them, and every call is daemon-checked against the active grant.
@@ -130,21 +143,109 @@ them, and every call is daemon-checked against the active grant.
   and the PM policy to the Execute preset. A new appoint replaces the previous
   seat in one transaction.
 - `:manager global revoke` revokes the active grant.
+- `:manager global set <field> <value> [confirm]` changes one cap of the
+  per-project policy and keeps the rest of the grant (#1401). Fields: `active`
+  (max active sessions per project, 1-100), `sessions` (max created sessions,
+  0-1024), `containers` (max created containers, 0-64), `spend` (USD, or
+  `none`) and `groups` (`on`/`off`; needs the Topology capability). It reads
+  the active grant, sends `ConfigureGlobalManager` fenced on that version, and
+  lowering a cap a project already exceeds is refused with a preview until the
+  command is repeated with `confirm`. In `:manager tree`, `e` on the Global or
+  a portfolio row edits the same caps beside the project list (`j`/`k` to a cap
+  row, `h`/`l` or `-`/`+` adjust, `H`/`L` step by 10, Enter reviews).
 - `:manager global configure <JSON>` sends a full `ConfigureGlobalManager`
   request (`session_id`, `project_ids`, `allowed_launches`, `project_policy`,
   `expected_grant_version`, `idempotency_key`).
 
-The operator-only RPCs are `ConfigureGlobalManager`, `GetGlobalManager` and
-`RevokeGlobalManager`. The seat uses `AgentGlobalOverview`, `AgentGlobalSend`
+The operator-only RPCs are `ConfigureGlobalManager`, `GetGlobalManager`,
+`RevokeGlobalManager` and `GetGlobalManagerWorkspace` (#1213: the snapshot
+behind the TUI's global manager workspace, `gm` or `:global-manager`). The seat uses `AgentGlobalOverview`, `AgentGlobalSend`
 and `AgentGlobalAppointManager`, and may read status and session events and arm
 `on_terminal` watches on each granted PM seat. A PM of a granted project reports
 up with `AgentReportToGlobal`. Messages in both directions are durable one-shot
 resume wakes, so they reach an idle recipient. A queued message is retired undelivered
 when the grant is replaced or revoked, or when its PM is displaced or cleared.
+Since #1238 every manager seat (area, PM, portfolio node of any tier) reports
+one level up with `AgentReportUp` and mails any descendant node with
+`AgentSendDown`; `AgentReportToGlobal` and `AgentGlobalSend` remain as aliases
+for one release. A report from a root, and an escalation forwarded past the
+last portfolio node, reach the operator queue (`:manager escalations`).
 Authority belongs to the exact appointed seat: a rotated or replaced seat has
 none until the operator re-appoints. `AgentGlobalAppointManager`
 launches, appoints and saves the policy in one call, so the policy is not left
-revoked after a re-appoint. Grants are retained; only their state changes.
+revoked after a re-appoint. Since #1239 it is the project-target alias of
+`AgentManagerAppointChild`, which any portfolio seat may also use to create,
+re-seat or (with `AgentManagerRevokeChild`) retire a child portfolio node. Grants are retained; only their state changes.
+Since #1240 every manager seat reads its own node with `AgentManagerOverview`
+(children as bounded digests, the projects it manages directly, pending
+escalations and a fleet rollup of its coverage; `AgentGlobalOverview` is its
+v0 alias), and the operator reads any node with `GetManagerNodeWorkspace`:
+Enter on a Portfolio, Project or Area row of the manager tree opens that
+node's console, and `gm` still opens the global.
+
+### PM-level capability inside the grant (#1235)
+
+The seat also holds the project-manager verb set in every granted project,
+under the grant's `project_policy` (plan
+`thoughts/shared/plans/2026-10-05-fractal-manager-hierarchy.md` §2.3). The
+project-bound verbs take an optional `project_id` target (omitted means the
+caller's own project): the eight Issue verbs, `AgentManagerLaunchIssueWorker`,
+`AgentManagerControl`, `AgentManagerPrepareControl`,
+`AgentManagerCommitPreparedControl`, `AgentManagerGetAction`,
+`AgentManagerProgress` (its result carries the `fence` for that project),
+`AgentManagerInspect`, `AgentManagerUpdate`, `AgentTopologyUpsert`,
+`AgentTopologyList`, `AgentTopologyExecute`, `AgentTopologyGetExecution`,
+`AgentTopologyInterrupt` (execution-keyed verbs, including
+`AgentTopologyResolveAttempt`, act in the execution's own project) and
+`AgentRequestDeploy` (needs `Deploy` in an executing project policy).
+`AgentEnqueueLandingSource` takes `source_session_id`: the repo is that
+in-reach session's sandbox. The `landing` and `cloud_gate` kinds of
+`AgentSubmitJob` take `sandbox_session_id`, which must name a terminal
+in-reach session (`job_sandbox_session_live` otherwise). A topology execution
+the global requested launches its nodes only under the global grant. The target-session verbs
+(status, events, send, halt, continue, `on_terminal` watch) reach sessions
+under the live Epics of granted projects. Every other caller and every project
+outside the grant is refused `manager_project_not_in_scope`; a PM naming
+another project is refused too.
+
+The resolver tries, in order, the project's legacy PM, an area node, then the
+global seat. The global arm's V2 ledger principal in project `p` is
+`(p, seat root, authority epoch)`: the epoch is the newest grant version at or
+before the active one that is not a `context-cap:` transfer, and the seat root
+is that grant's seat. A context-cap rotation therefore keeps the ledger (the
+successor controls its predecessor's workers; the predecessor's token is
+refused `manager_node_custody_changed`), while an operator re-grant or revoke
+starts a new epoch. Fences are `{scope_version: epoch, policy_version:
+grant_version}` and are re-resolved at every effect, so a revoke or
+replacement between `PrepareControl` and `CommitPreparedControl` refuses the
+commit.
+
+With a PM live in the same project:
+- at most one live Issue-bound worker per Issue (`manager_issue_worker_already_live`;
+  an exact replay still deduplicates);
+- mutations flow down: a PM or area node may not halt, continue, send to or
+  archive the global seat or a session the global launched, nor run a lead
+  action on an Epic whose lead (or AssignLead candidate) is one, at admission
+  or at effect (`manager_target_owned_by_ancestor`), while the global may act
+  on the PM's workers; reads go by coverage;
+- the grant policy's creation caps count the launches in the project since
+  the epoch began that the node itself, a node below it or a principal under
+  the whole chain (PM, area node, Epic lead) originated, lifecycle actions and
+  manager-requested topology session launches alike
+  (`manager_ancestor_allowance_exceeded`); #1301: an ancestor's own launches
+  are never charged to a descendant;
+- resource caps (pause, `max_active_sessions`, provider limits,
+  `max_spend_usd`) are those of the acting principal (the global's own grant
+  policy for its launches) plus every node above it, each counted over the
+  whole project's live Epics. They apply at admission, at effect and at every
+  model call, also in a project with no PM.
+
+The S1 global arm withholds root succession, Git effects (`integrate`) and
+delegated operator calls, and does not drive review or migration allocation
+updates. The authority catalog lists only what the policy grants: Execute mode
+lists the PM controls, Status mode lists reads only, and the seat gets the
+`portfolio_manager` guidance. Approval-answer and other operator methods stay
+default-denied.
 
 ## Policy (`:manager policy`)
 
@@ -226,7 +327,7 @@ Budgets section.
 | Grant OperatorDelegation | Permit `AgentManagerControl` `operator_call` (Execute mode, not paused) to invoke one method from the closed, versioned `DELEGABLE_OPERATOR_METHODS` allowlist against a leaf in the manager's own project. See Operator delegation below. |
 | Grant DaemonSettings | Permit the current appointed manager to change the operator-allowlisted daemon settings (maximum sandbox roots, sandbox minimum free GiB, the reclaim watermarks) through `AgentManagerControl` `operator_call` `ProposeDaemonSetting`, only inside the per-key bounds the operator sets under "Daemon settings · manager bounds" (Execute mode, not paused). Off by default; granted by Full project control (since 2026-09-30), not by Execute; needs no other grant. Spend, credentials, appointment and scope stay operator-only. See Operator delegation below. |
 | Grant StorageControl | Permit the current appointed manager to read sandbox storage status and run the bounded build-cache reclaim (preview or real pass) through `AgentManagerControl` `operator_call` (Execute mode, not paused). Off by default; granted by Full project control (since 2026-09-30), not by Execute; `OperatorDelegation` is not required and does not imply it. Daemon storage settings stay operator-only. See Operator delegation below and `docs/sandbox-storage.md`. |
-| Grant Deploy | Permit the current appointed manager to call `AgentRequestDeploy` (#1045): stage already-built binaries from a `binaries_dir`, wait for a quiet point (no lander or job running, no scoped worker mid-turn; bounded by `max_wait_secs`, default 900, at most 3600), then have the daemon swap them in and restart under `rsid-supervisor.sh` (exit 75, provider environment intact) and wake the caller once with the outcome. Needs Execute mode and no pause at call time. Off by default; granted by Full project control (since 2026-09-30), not by Execute; it is not a daemon setting. Refused `deploy_needs_supervisor` when the daemon is not run by the supervisor script, and `deploy_restart_budget` after two deploy restarts in an hour. Cut-off workers follow the normal restart recovery rules. |
+| Grant Deploy | Permit the current appointed manager to call `AgentRequestDeploy` (#1045): stage already-built binaries from a `binaries_dir`, wait for a quiet point (no lander or job running, no scoped worker mid-turn; bounded by `max_wait_secs`, default 900, at most 3600), then have the daemon swap them in and restart under `rsid-supervisor.sh` (exit 75, provider environment intact) and wake the caller once with the outcome. Needs Execute mode and no pause at call time. Off by default; granted by Full project control (since 2026-09-30), not by Execute; it is not a daemon setting. Refused `deploy_needs_supervisor` when the daemon is not run by the supervisor script, and `deploy_restart_budget` after two deploy restarts in an hour. Cut-off workers follow the normal restart recovery rules. Optional `interrupt_workers: true` (#1461) lets a worker mid-turn stop blocking the quiet point once `deploy_drain_hold_secs` is over (landings and local jobs still block); the interrupted workers are named in the outcome and filed as `deploy_interrupt` friction events. |
 | Grant Automation | Permit the current appointed manager to author, execute, interrupt and resolve deterministic topologies on in-scope Epics through the six `AgentTopology*` verbs (#633). Every session node's explicit provider/model/effort must equal an `allowed_launches` entry (empty fails closed); manager-requested node launches charge the created-session quota; effects need Execute mode and no pause. Distinct from `Topology` (containers). Discarding preserved work is manager-only and needs the exact preserved commit. |
 | Grant Group / Grant Group by ID | Select existing project Groups (at most 32). Enter an ID if it is not cached in the session list. |
 | Allow root Group creation | Separate root-creation opt-in; also requires Topology. |
@@ -590,7 +691,7 @@ including inside nested operations. Daemon checks remain authoritative.
 | `AgentManagerControl` | `rsi_control_manager_control` | `fence`, `idempotency_key`, tagged `operation` |
 | `AgentManagerPrepareControl` | `rsi_control_manager_prepare_control` | semantic `operation` (the six lead-lifecycle actions only: `resume_lead`, `pause_lead`, `retry_lead`, `replace_lead`, `create_session`, `assign_lead`); daemon derives live fences and returns a prepared ID/digest without queueing an effect |
 | `AgentManagerCommitPreparedControl` | `rsi_control_manager_commit_prepared_control` | exact `prepared_id`, `target_digest`, `idempotency_key`; daemon atomically rechecks and queues the prepared action |
-| `AgentManagerGetAction` | `rsi_control_manager_get_action` | `operation_id`; reads one durable action receipt in the current manager scope |
+| `AgentManagerGetAction` | `rsi_control_manager_get_action` | `operation_id`; reads one durable action receipt in the current manager scope, or, for an active project manager, a proven retired appointment's action in that project. Global/node epochs do not confer access to another principal's actions (#1553, #1571) |
 | `AgentManagerLaunchIssueWorker` | `rsi_control_manager_launch_issue_worker` | `{issue, brief, launch, parent_epic_id?, idempotency_key}`; one call launches an Issue-bound worker (create_session + Issue note + InProgress + caller's terminal watch, #1100); needs `SessionCreate` and `IssueCoordinate` |
 | `AgentManagerWorkView` | `rsi_control_manager_work_view` | `{}` or `work_key`/`after_work_key`, `limit` (1–32, default 32); read-only projection for a session the current manager created: live work, active ownership, pause, unanswered-request delivery state (no bodies); follow `next_after_work_key` until null |
 

@@ -71,14 +71,14 @@ pub static MANUAL_CHAPTERS: &[ManualChapter] = &[
     ManualChapter {
         id: "getting-started",
         title: "Getting started",
-        intro: "rsi is a keyboard-driven TUI over the rsid daemon, which runs and persists every agent session. Start `rsi`; on Linux and macOS it starts `rsid` if no daemon is accepting connections and the daemon binary is available. Press `?` for help on the focused view, `:` or `<Space>;` for the command palette, and `<Space>` as the leader for most commands. This manual is generated from the running build's registries, so what it lists is what the build does.",
+        intro: "rsi is a keyboard-driven TUI over the rsid daemon, which runs and persists every agent session. Start `rsi`; on Linux and macOS it starts `rsid` if no daemon is accepting connections and the daemon binary is available. Press `?` for help on the focused view, then `s` for the searchable symbol legend. Inside help, `Tab` and `Shift-Tab` cycle contextual keys, all commands and symbols. Press `:` or `<Space>;` for the command palette, and `<Space>` as the leader for most commands. This manual is generated from the running build's registries, so what it lists is what the build does.",
         categories: &["DISCOVERY"],
         only_when_nonempty: false,
     },
     ManualChapter {
         id: "navigating",
         title: "Reading and navigating sessions",
-        intro: "The session list has four zones (Main, TaskRabbit, Jobs, Archive), an attention queue for sessions waiting on you, a jumplist, tabs and splits, and in-place descent into Groups and Epics.",
+        intro: "The session list has three zones (Main, Jobs, Archive), an attention queue for sessions waiting on you, a jumplist, tabs and splits, and in-place descent into Groups and Epics.",
         categories: &["NAVIGATION", "SESSION LIST"],
         only_when_nonempty: false,
     },
@@ -141,7 +141,7 @@ pub static MANUAL_CHAPTERS: &[ManualChapter] = &[
     ManualChapter {
         id: "theming",
         title: "Theming",
-        intro: "Pick a built-in theme, override individual color roles, and edit the legacy message and editor colors.",
+        intro: "Pick a built-in theme and override individual color roles.",
         categories: &["THEME & COLORS", "THEME ROLE"],
         only_when_nonempty: false,
     },
@@ -203,10 +203,16 @@ pub const fn chapter_for_overlay_class(class: OverlayHelpClass) -> &'static str 
         | C::ManagerBoard
         | C::ManagerDecisions
         | C::ManagerPolicy
-        | C::ManagerTextEntry => "manager",
+        | C::ManagerTextEntry
+        | C::GlobalManagerWorkspace
+        | C::Fleet
+        | C::FleetFilter
+        | C::FleetSort
+        | C::FleetGroups => "manager",
         C::ScheduleForm => "issues-and-scheduling",
         C::RenameSession
         | C::Rating
+        | C::ModelSwitch
         | C::SessionInfo
         | C::QuestionNormal
         | C::QuestionInsert
@@ -229,7 +235,7 @@ pub const fn chapter_for_overlay_class(class: OverlayHelpClass) -> &'static str 
         | C::Diagnostics
         | C::MemorySearch
         | C::Dialectic => "tools",
-        C::ThemePicker | C::ColorCustomizer | C::TextAreaBgEditor => "theming",
+        C::ThemePicker | C::TextAreaBgEditor => "theming",
         C::ProviderForm
         | C::ProviderCredentialForm
         | C::MessageBridgeForm

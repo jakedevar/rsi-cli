@@ -200,6 +200,21 @@ fn codex_model_slug(model_id: &str) -> &str {
         .unwrap_or(model_id)
 }
 
+/// Effort levels an operator may queue for a session's next turn on
+/// `provider` (Issue #681), or `None` when the provider cannot switch model or
+/// effort in place. The daemon validates a queued switch against this list and
+/// the session-detail picker offers only these levels.
+pub fn session_switch_effort_levels(provider: SessionProvider) -> Option<&'static [&'static str]> {
+    match provider {
+        SessionProvider::Claude => Some(&["low", "medium", "high", "xhigh", "max"]),
+        SessionProvider::Codex | SessionProvider::Pioneer => {
+            Some(&["low", "medium", "high", "xhigh", "max", "ultra"])
+        }
+        SessionProvider::Antigravity => Some(&["low", "medium", "high"]),
+        _ => None,
+    }
+}
+
 /// Returns the ordered effort levels the model supports for `--effort`.
 pub fn effort_ladder(model_id: &str) -> &'static [&'static str] {
     if is_codex_reasoning_model(model_id) {

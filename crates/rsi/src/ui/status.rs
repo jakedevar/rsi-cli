@@ -13,11 +13,7 @@ pub(crate) fn render_session_meta_segment_for(
     let session_state = app.sessions.get(&session_id)?;
     let session = &session_state.session;
     let mut spans: Vec<Span<'static>> = Vec::new();
-    let time_style = Style::default().fg(if theme::uses_terminal_default_backgrounds() {
-        theme::time_text()
-    } else {
-        theme::metadata_text()
-    });
+    let time_style = Style::default().fg(theme::time_text());
     let metadata_style = Style::default().fg(theme::metadata_text());
 
     // Provider label
@@ -35,11 +31,7 @@ pub(crate) fn render_session_meta_segment_for(
     };
     spans.push(Span::styled(
         provider_label,
-        metadata_style.fg(if theme::uses_terminal_default_backgrounds() {
-            super::glyphs::provider_color(session.provider)
-        } else {
-            theme::metadata_text()
-        }),
+        metadata_style.fg(super::glyphs::provider_color(session.provider)),
     ));
 
     // Show active segment model (if model was switched), else session-level model
@@ -54,11 +46,7 @@ pub(crate) fn render_session_meta_segment_for(
         spans.push(Span::styled("  \u{00B7}  ", metadata_style));
         spans.push(Span::styled(
             crate::ui::session::abbreviate_model_name(model),
-            metadata_style.fg(if theme::uses_terminal_default_backgrounds() {
-                theme::model_text()
-            } else {
-                theme::metadata_text()
-            }),
+            metadata_style.fg(theme::model_text()),
         ));
         if let Some(effort) = session
             .effort
@@ -74,6 +62,23 @@ pub(crate) fn render_session_meta_segment_for(
                 Style::default().fg(theme::effort_text()),
             ));
         }
+    }
+    // A model/effort switch the operator queued but the daemon has not applied
+    // yet: show where the next turn is headed until the effective tuple
+    // catches up (Issue #681).
+    if let Some(pending) = app
+        .pending_model_switches
+        .get(&session_id)
+        .filter(|pending| {
+            current_model != Some(pending.model.as_str())
+                || session.effort.as_deref() != pending.effort.as_deref()
+        })
+    {
+        spans.push(Span::styled("  \u{2192}  ", metadata_style));
+        spans.push(Span::styled(
+            crate::overlay::model_switch::tuple_label(&pending.model, pending.effort.as_deref()),
+            metadata_style.fg(theme::model_text()),
+        ));
     }
     if matches!(
         session.status,
@@ -399,6 +404,42 @@ mod tests {
         assert!(text.contains("Sonnet 5"), "got: {text:?}");
         assert!(text.contains("1h2m"), "got: {text:?}");
         assert!(!text.contains("created"), "got: {text:?}");
+    }
+
+    #[test]
+    fn queued_switch_shows_its_target_until_the_effective_tuple_matches() {
+        let mut app = test_app();
+        let mut session = make_test_session(rsi_common::types::ContextUsageConfidence::Full);
+        session.model = Some("claude-sonnet-5".to_string());
+        session.effort = Some("high".to_string());
+        let id = install_session(&mut app, crate::types::SessionState::new(session));
+        app.pending_model_switches.insert(
+            id,
+            rsi_common::rpc::PendingSessionModelUpdate {
+                model: "claude-opus-5".to_string(),
+                effort: Some("xhigh".to_string()),
+            },
+        );
+
+        let queued = spans_text(&render_session_meta_segment_for(&app, id).unwrap());
+        assert!(queued.contains("Sonnet 5"), "got: {queued:?}");
+        let target = crate::overlay::model_switch::tuple_label("claude-opus-5", Some("xhigh"));
+        assert!(
+            queued.contains(&format!("\u{2192}  {target}")),
+            "got: {queued:?}"
+        );
+
+        // The daemon applied the switch: the session now reports the target.
+        let state = app.sessions.get_mut(&id).unwrap();
+        state.session.model = Some("claude-opus-5".to_string());
+        state.session.effort = Some("xhigh".to_string());
+        let applied = spans_text(&render_session_meta_segment_for(&app, id).unwrap());
+        assert!(applied.contains("Opus 5"), "got: {applied:?}");
+        assert!(applied.contains("xhigh"), "got: {applied:?}");
+        assert!(
+            !applied.contains('\u{2192}'),
+            "an applied switch is no longer pending: {applied:?}"
+        );
     }
 
     #[test]

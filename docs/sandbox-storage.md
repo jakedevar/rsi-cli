@@ -125,6 +125,37 @@ newer operator action or its post-action result. These states and observation
 times are not persisted and introduce no daemon cache or wire contract. Every
 `GetSandboxStorageStatus` remains a fresh dry-run preview.
 
+### Refusals are named (#1575)
+
+Every refused candidate is counted under a skip reason in `skip_counts`, and the
+V2 report carries a bounded sample (`refusals`: at most 24 per pass, 4 per
+reason) that names the session, its custody and the exact check that failed, so
+a manager can read why from `GetSandboxStorageStatus` without daemon logs. The
+pass-completed log line carries the same sample (`refusal_samples`). Checks
+include `git_toplevel_mismatch`, `git_branch_mismatch`, `source_commit_not_ancestor`,
+`git_common_dir_mismatch`, `worktree_not_registered`, `sandbox_root_path_mismatch`,
+`target_entry_unrecognized:<entry>`, `live_consumer:<kind>` (`enabled_wake`,
+`restart_intent`, `manager_seat`, `running_job`, `manager_current_session`),
+`process_uses_sandbox:<pid>` and `process_scan_unreadable:<pid>`. A reason with
+no finer check reports its own name (`target_absent`).
+
+A candidate withheld by a live consumer is counted too (`live_consumer`): it
+spent page budget like any other row.
+
+### What a reclaimable `target/` may hold
+
+The whole-target staging protocol moves the tree, so it runs only on a tree of
+Cargo output and RSI scratch: `debug`, `release`, `doc`, `package`, `tmp`,
+`cargo-timings`, `criterion`, `dhat`, `.rustc_info.json`, `CACHEDIR.TAG`,
+`.cargo-lock`, `.future-incompat-report.json`; the daemon's execution scratch
+(`.rsi-tmp`, the sandbox `TMPDIR`, present in every sandbox target); and the
+repository's test-runner output (`rsid-test-shards`, `.rsid-test-shards.lock`
+and any `*-fixtures` directory). Entry types are exact: a symlink or special
+file never matches. Any other top-level entry may be a manager's or operator's
+state, so the whole tree is retained and reported as
+`target_unrecognized_content` with the entry's name (#1429). Keep such state
+outside `target/`.
+
 `Preview cache reclaim` performs the same custody, Git, generation, active
 owner, path, device, and target authentication as an actual pass without
 staging new data. The pass keeps one device/inode deletion ledger, re-walks
@@ -364,7 +395,31 @@ a top-level directory is deleted only when all of these hold.
   directory, or a filesystem with no birth time never binds and is retained
   (`kept_unrecorded`). Trust boundary: the registry is writable only by the
   daemon user, so this defends against accidents and everything but a process
-  running as that user that sets out to forge it.
+  running as that user that sets out to forge it. Registry growth (#1171): a reclaim
+  that finishes an allocation makes its deletions durable (it syncs the scratch
+  directory, removes the directory, checks that the allocation's own inode has
+  no links left, syncs its parent), then writes a `<nonce>.reclaimed`
+  tombstone, removes the entry and manifest, syncs the registry, and last
+  removes the tombstone; each pass finishes any removal that was interrupted.
+  Only tombstoned allocations are pruned, and only when the entry still present
+  (if any) is readable and agrees with the tombstone on device, inode and birth
+  time. No filesystem is inspected to decide that, and a prune never touches a
+  scratch tree. A nonce with a tombstone is not registered again (a tombstone
+  that appears between that check and the create withdraws the new entry;
+  what remains is a UUID collision plus a sub-second window, a documented
+  residual). Accepted leaks, each a few hundred bytes of registry and never
+  data: a directory removed by hand or by another tool keeps its entry; a crash
+  or sync failure after the files are deleted but before the tombstone keeps the
+  entry and manifest; a directory kept because late contents arrived, or
+  because its name was swapped or the allocation moved before the removal (the
+  link-count check: a filesystem that does not report 0 for a removed
+  directory also retains, tmpfs and ext4 do), is never tombstoned, so its entry
+  stays, and because its record was already deleted it is left as an
+  unrecorded directory that normal passes do not reclaim again; a registry too
+  large for one pass's scan budget loses the partial listing and starts over
+  each pass, so an unchanged oversized registry can leak its tombstones
+  indefinitely. Residual that needs a same-user process: forging or racing
+  registry files is inside the registry's trust boundary.
 - **It is where we think it is.** The root is opened one component at a time
   with `O_NOFOLLOW`; every ancestor is owned by root or the daemon user and
   closed to group and other writes (or sticky); a symlink or an open ancestor

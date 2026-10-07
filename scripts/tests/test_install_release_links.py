@@ -91,6 +91,24 @@ class InstallReleaseLinksTest(unittest.TestCase):
         self.install()
         self.assertIn("fake-rsid-v2", (installed / "rsid").read_text())
 
+    def test_cargo_slot_is_installed_and_atomically_refreshed(self):
+        source = self.root / "scripts" / "cargo-slot"
+        installed = self.home / ".rsi" / "bin" / "cargo-slot"
+        self.install()
+        self.assertEqual(installed.read_bytes(), source.read_bytes())
+        self.assertEqual(installed.stat().st_mode & 0o777, 0o755)
+
+        # An open reader keeps the old contents while the path gets a new copy.
+        original = installed.read_bytes()
+        with installed.open("rb") as old_copy:
+            source.write_bytes(original + b"\n# updated release\n")
+            source.chmod(0o600)
+            self.install()
+            self.assertEqual(old_copy.read(), original)
+        self.assertEqual(installed.read_bytes(), source.read_bytes())
+        self.assertEqual(installed.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(list(installed.parent.glob(".cargo-slot.*")), [])
+
     def test_linked_rsi_spill_runs_from_another_cwd_via_path_rsi_rpc(self):
         self.install()
         elsewhere = self.base / "elsewhere"

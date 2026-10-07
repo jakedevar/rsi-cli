@@ -168,6 +168,7 @@ impl RpcServer {
                     .load(std::sync::atomic::Ordering::Relaxed),
                 batch_size: load(&self.runtime_config.rolling_queue_batch_size),
                 speculation_depth: load(&self.runtime_config.rolling_queue_speculation_depth),
+                gate_timeout_mins: load(&self.runtime_config.rolling_queue_gate_timeout_mins),
                 entries: entries.into_iter().map(|(entry, _)| entry).collect(),
             },
         )?)

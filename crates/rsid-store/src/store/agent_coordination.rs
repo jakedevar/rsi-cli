@@ -3456,6 +3456,128 @@ impl Store {
         Ok(())
     }
 
+    /// #1183: a tool-boundary hook was handed this attempt's text but never
+    /// confirmed it printed it (the reply could not be written, the hook died,
+    /// or the confirmation deadline passed). The model may or may not have
+    /// seen the message, so it settles `claimed -> uncertain`: visible, never
+    /// re-sent, and never `injected`, so no later assistant event can
+    /// acknowledge it.
+    ///
+    /// The live dispatcher authors this edge about ITS OWN delivery, so it is
+    /// fenced to the exact attempt (claim token and the live boot id) still
+    /// `dispatching` with no admission evidence. Returns `false` (and writes
+    /// nothing) when the fence no longer holds, e.g. the hook confirmed first.
+    ///
+    /// # Errors
+    ///
+    /// Propagates SQLite failures and a CAS that matched other than one row.
+    pub fn mark_unconfirmed_boundary_delivery_uncertain_v1(
+        &self,
+        fence: &MessageAttemptFenceV1,
+        authority_id: Uuid,
+    ) -> Result<bool> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let state_version: Option<i64> = tx
+            .query_row(
+                "SELECT m.state_version
+                   FROM agent_messages m
+                   JOIN agent_message_delivery_attempts a
+                     ON a.message_id=m.id AND a.attempt_number=m.current_attempt_number
+                  WHERE m.id=?1 AND a.attempt_number=?2 AND a.claim_token=?3
+                    AND a.delivery_boot_id=?4 AND a.delivery_session_id=?5
+                    AND m.state='claimed' AND a.attempt_state='dispatching'
+                    AND a.admission_classification IS NULL
+                    AND a.effect_classification IS NULL",
+                params![
+                    fence.message_id.to_string(),
+                    i64::from(fence.attempt_number),
+                    fence.claim_token.to_string(),
+                    fence.delivery_boot_id.to_string(),
+                    fence.delivery_session_id.to_string(),
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(state_version) = state_version else {
+            return Ok(false);
+        };
+        let next_state_version = state_version
+            .checked_add(1)
+            .ok_or_else(|| DaemonError::Store("agent message state version overflow".into()))?;
+        let now_string = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+
+        // The text left the daemon, so effect cannot be excluded: the same
+        // conservative effect-possible fill the crash and spawn-settlement
+        // writers use, never a no-effect proof.
+        let filled = tx.execute(
+            "UPDATE agent_message_delivery_attempts
+                SET admission_classification='admitted_effect_possible',
+                    effect_classification='effect_possible',
+                    attempt_state='effect_possible',
+                    admission_recorded_at=COALESCE(admission_recorded_at,?3),
+                    effect_possible_at=COALESCE(effect_possible_at,?3),
+                    updated_at=?3
+              WHERE message_id=?1 AND attempt_number=?2 AND claim_token=?4
+                AND admission_classification IS NULL
+                AND effect_classification IS NULL
+                AND attempt_state='dispatching'",
+            params![
+                fence.message_id.to_string(),
+                i64::from(fence.attempt_number),
+                now_string,
+                fence.claim_token.to_string(),
+            ],
+        )?;
+        exactly_one_row("unconfirmed boundary delivery effect-possible fill", filled)?;
+
+        let evidence_digest = agent_message_digest(
+            "boundary_delivery_unconfirmed_uncertain",
+            &[
+                fence.message_id.as_bytes(),
+                &fence.attempt_number.to_be_bytes(),
+                fence.claim_token.as_bytes(),
+            ],
+        );
+        let transition_rows = tx.execute(
+            "INSERT INTO agent_message_state_transitions (
+                 message_id, state_version, from_state, to_state, attempt_number,
+                 authority_kind, authority_id, evidence_digest, created_at)
+             VALUES (?1,?2,'claimed','uncertain',?3,'dispatcher',?4,?5,?6)",
+            params![
+                fence.message_id.to_string(),
+                next_state_version,
+                i64::from(fence.attempt_number),
+                authority_id.to_string(),
+                evidence_digest,
+                now_string,
+            ],
+        )?;
+        exactly_one_row(
+            "unconfirmed boundary delivery uncertain transition",
+            transition_rows,
+        )?;
+
+        let aggregate_rows = tx.execute(
+            "UPDATE agent_messages
+                SET state='uncertain', state_version=?2, uncertain_at=?3, updated_at=?3
+              WHERE id=?1 AND state='claimed' AND state_version=?4
+                AND current_attempt_number=?5",
+            params![
+                fence.message_id.to_string(),
+                next_state_version,
+                now_string,
+                state_version,
+                i64::from(fence.attempt_number),
+            ],
+        )?;
+        exactly_one_row(
+            "unconfirmed boundary delivery uncertain aggregate CAS",
+            aggregate_rows,
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// P2-06b / C-P2-09: the `expiry_reconciler`'s ONE edge — `queued → expired`
     /// with a NULL attempt.
     ///
@@ -5980,6 +6102,9 @@ impl AgentMessageAcceptanceRecord {
             deduplicated: self.deduplicated,
             created_at: self.created_at,
             expires_at: self.expires_at,
+            // The daemon adds the provider hint (#1183); the store has no
+            // provider-capability view.
+            delivery_boundary: None,
         }
     }
 }

@@ -227,7 +227,7 @@ impl RpcServer {
         let result = self
             .session_manager
             .agent_control()
-            .agent_manager_get_action(caller, params)
+            .agent_manager_get_action_view(caller, params)
             .await?;
         Ok(serde_json::to_value(result)?)
     }
@@ -272,6 +272,9 @@ impl RpcServer {
         let params: rsi_common::harness_manager_v2::ConfigureHarnessManagerPolicyRequestV2 =
             rsi_common::harness_manager::decode_manager_request(request.params.clone())
                 .map_err(|_| DaemonError::InvalidParam("manager_invalid_request".into()))?;
+        self.session_manager
+            .validate_manager_launch_models(&params.policy.allowed_launches)
+            .await?;
         let store = self.session_manager.store();
         let result = store
             .lock()
@@ -306,6 +309,49 @@ impl RpcServer {
             .session_manager
             .answer_harness_manager_decision(params)
             .await?;
+        Ok(serde_json::to_value(result)?)
+    }
+
+    /// #1415 (operator-only): pending decision records that are stale.
+    pub(super) async fn handle_list_stale_manager_decisions(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let params: rsi_common::harness_manager_v2::ListStaleManagerDecisionsRequestV2 =
+            rsi_common::harness_manager::decode_manager_request(request.params.clone())
+                .map_err(|_| DaemonError::InvalidParam("manager_invalid_request".into()))?;
+        let result = self
+            .session_manager
+            .store()
+            .lock()
+            .await
+            .manager_v2_list_stale_decisions(&params)?;
+        Ok(serde_json::to_value(result)?)
+    }
+
+    /// #1415 (operator-only): archive stale decision records, never delete.
+    pub(super) async fn handle_archive_stale_manager_decisions(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let params: rsi_common::harness_manager_v2::ArchiveStaleManagerDecisionsRequestV2 =
+            rsi_common::harness_manager::decode_manager_request(request.params.clone())
+                .map_err(|_| DaemonError::InvalidParam("manager_invalid_request".into()))?;
+        let result = self
+            .session_manager
+            .store()
+            .lock()
+            .await
+            .manager_v2_archive_stale_decisions(&params)?;
+        let archived = result.archived.len();
+        if archived > 0 {
+            self.session_manager
+                .event_bus
+                .publish(crate::bus::DaemonEvent::SystemMessage {
+                    level: "info".into(),
+                    message: format!("Harness manager decisions: {archived} stale record(s) archived by the operator."),
+                });
+        }
         Ok(serde_json::to_value(result)?)
     }
 
@@ -483,6 +529,11 @@ impl RpcServer {
         params
             .validate()
             .map_err(|error| DaemonError::InvalidParam(error.into()))?;
+        let mut launches = params.grant.allowed_launches.clone();
+        launches.extend(params.policy.allowed_launches.iter().cloned());
+        self.session_manager
+            .validate_manager_launch_models(&launches)
+            .await?;
         let store = self.session_manager.store();
         let result = store.lock().await.appoint_area_node(&AppointAreaNode {
             idempotency_key: Some(params.idempotency_key),
@@ -514,6 +565,11 @@ impl RpcServer {
         params
             .validate()
             .map_err(|error| DaemonError::InvalidParam(error.into()))?;
+        let mut launches = params.grant.allowed_launches.clone();
+        launches.extend(params.policy.allowed_launches.iter().cloned());
+        self.session_manager
+            .validate_manager_launch_models(&launches)
+            .await?;
         let store = self.session_manager.store();
         let store = store.lock().await;
         let project_id = store
@@ -572,6 +628,16 @@ impl RpcServer {
                 .map_err(|_| DaemonError::InvalidParam("manager_node_invalid_escalation".into()))?;
         let store = self.session_manager.store();
         let store = store.lock().await;
+        // #1238: a portfolio seat lists the escalation hops addressed to it
+        // (plus its in-project ones when it also holds a seat there).
+        if let Some(mut escalations) = store.tier_escalations_for_seat(caller)? {
+            if let Some(project) = store.get_session(caller)?.and_then(|s| s.project_id)
+                && let Ok(local) = store.list_manager_node_escalations(caller, project)
+            {
+                escalations.extend(local);
+            }
+            return Ok(serde_json::to_value(escalations)?);
+        }
         let project = store
             .get_session(caller)?
             .and_then(|session| session.project_id)

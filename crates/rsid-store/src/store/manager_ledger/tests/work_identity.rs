@@ -15,6 +15,7 @@ fn fenced(
     policy: i64,
 ) -> AgentManagerUpdateRequestV2 {
     AgentManagerUpdateRequestV2 {
+        project_id: None,
         fence: ManagerFenceV2 {
             scope_version: config.row_version,
             policy_version: policy,

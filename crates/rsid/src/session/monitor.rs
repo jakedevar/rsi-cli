@@ -1179,24 +1179,32 @@ fn automatic_threshold_gate(
 /// #1005: a coordinating seat whose measured live context reaches the
 /// operator's hard cap gets one durable cap rotation; the idle-boundary pass
 /// (`rotate_capped_coordinators`) rotates it with a daemon-written handoff.
-/// Workers and operator sessions hold no seat and are never capped.
+/// #1254: any other session with a launcher is told once to pass the baton
+/// when it crosses the worker cap; its turn is never interrupted.
 async fn advance_coordinator_context_cap(
     tracked: &TrackedSession,
     session_id: Uuid,
     runtime_config: &crate::config::RuntimeConfig,
     store: &Arc<tokio::sync::Mutex<Store>>,
 ) {
-    if !tracked.rotation.is_enabled()
-        || !runtime_config
+    let rotation_on = tracked.rotation.is_enabled()
+        && runtime_config
             .context_rotation_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        return;
-    }
-    let cap = runtime_config
-        .coordinator_context_cap(tracked.session.provider, tracked.session.model.as_deref());
-    let (measured_tokens, ..) = live_context_state(tracked);
-    if cap.is_none_or(|cap| measured_tokens < cap) {
+            .load(std::sync::atomic::Ordering::Relaxed);
+    let cap = rotation_on
+        .then(|| {
+            runtime_config
+                .coordinator_context_cap(tracked.session.provider, tracked.session.model.as_deref())
+        })
+        .flatten();
+    let (measured_tokens, _, _, _, context_window) = live_context_state(tracked);
+    let worker_cap = runtime_config.worker_context_cap(
+        tracked.session.provider,
+        tracked.session.model.as_deref(),
+        context_window,
+    );
+    let crosses = |cap: Option<u64>| cap.is_some_and(|cap| measured_tokens >= cap);
+    if !crosses(cap) && !crosses(worker_cap) {
         return;
     }
     let crossing = super::context_cap::evaluate_cap_crossing(
@@ -1204,6 +1212,7 @@ async fn advance_coordinator_context_cap(
         &tracked.session,
         measured_tokens,
         cap,
+        worker_cap,
         chrono::Utc::now(),
     );
     match crossing {
@@ -1213,12 +1222,18 @@ async fn advance_coordinator_context_cap(
             cap,
             "Coordinator context cap reached; the seat rotates at its next idle boundary"
         ),
+        Ok(super::context_cap::CapCrossing::WorkerBaton(true)) => tracing::info!(
+            %session_id,
+            measured_tokens,
+            worker_cap,
+            "Worker context cap reached; the worker was told to pass the baton and its launcher was notified"
+        ),
         Ok(super::context_cap::CapCrossing::Deferred(reason)) => {
             tracing::info!(%session_id, reason, "Coordinator context cap rotation deferred");
         }
         Ok(_) => {}
         Err(error) => {
-            tracing::warn!(%session_id, %error, "Coordinator context cap check failed");
+            tracing::warn!(%session_id, %error, "Context cap check failed");
         }
     }
 }
@@ -1490,6 +1505,16 @@ fn terminal_provider_stop_reason(stream_event: &StreamEvent) -> Option<Cow<'stat
     if !is_terminal_provider_error(stream_event) {
         return None;
     }
+    if data
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(crate::store_support::provider_defaults::is_provider_auth_failure_text)
+    {
+        // An auth rejection is a credential fault, not a task fault (#1610).
+        return Some(Cow::Borrowed(
+            crate::store_support::provider_defaults::PROVIDER_AUTH_INVALID_STOP_REASON,
+        ));
+    }
     if data.get("source").and_then(serde_json::Value::as_str) == Some("codex_event")
         && let Some(detail) = data
             .get("error")
@@ -1614,52 +1639,40 @@ fn provider_launch_failure_stop_reason(
 }
 
 /// A malformed handoff attempt still becomes stale after later tool activity,
-/// but only a contract-valid handoff can correct it.
-fn uncorrected_post_handoff_tool(events: &[ConversationEvent]) -> bool {
-    let mut saw_handoff = false;
-    let mut later_tool = false;
-    for event in events {
-        if event.event_type == EventType::Message && event.role == Some(Role::User) {
-            saw_handoff = false;
-            later_tool = false;
-        } else if event.event_type == EventType::Message && event.role == Some(Role::Assistant) {
-            if let Some(first_line) = event.content.lines().find(|line| !line.trim().is_empty()) {
-                let looks_like_handoff = first_line
-                    .trim_start_matches(|ch: char| ch == '#' || ch.is_whitespace())
-                    .starts_with("PIPELINE HANDOFF — ");
-                if looks_like_handoff
-                    && (!saw_handoff || rsi_common::validate_first_line(first_line).is_ok())
-                {
-                    saw_handoff = true;
-                    later_tool = false;
-                }
-            }
-        } else if saw_handoff
-            && matches!(event.event_type, EventType::ToolUse | EventType::ToolResult)
-        {
-            later_tool = true;
-        }
-    }
-    saw_handoff && later_tool
-}
-
+/// but only a contract-valid handoff can correct it. #1331: read-only tool
+/// calls after the handoff (a `git status`, a `git diff`) leave it standing,
+/// and so does a sandbox that is clean at the commit the handoff names
+/// (`tree_clean_at_handoff`, probed before the active lock is taken).
 fn guard_terminal_handoff_order(
     decision: TerminalFinalizeDecision,
     evidence: TerminalEvidence,
     events: &[ConversationEvent],
+    tree_clean_at_handoff: bool,
 ) -> TerminalFinalizeDecision {
     if decision.status == SessionStatus::Completed
         && !evidence.pending_archive
         && evidence.rotation_action == TerminalRotationAction::None
         && !matches!(evidence.break_reason, MonitorBreakReason::Rotation)
-        && uncorrected_post_handoff_tool(events)
     {
-        // This is a known handoff-contract failure, not a fresh daemon crash
-        // to auto-file for every affected worker.
-        return TerminalFinalizeDecision {
-            status: SessionStatus::Failed,
-            c5_failure_cause: None,
-        };
+        match super::post_handoff::classify(events) {
+            super::post_handoff::PostHandoffTools::None => {}
+            super::post_handoff::PostHandoffTools::ReadOnly => {
+                tracing::info!("Handoff stands: only read-only tool calls followed it (#1331)");
+            }
+            super::post_handoff::PostHandoffTools::Mutating if tree_clean_at_handoff => {
+                tracing::info!(
+                    "Handoff stands: the sandbox is clean at the commit it names (#1331)"
+                );
+            }
+            super::post_handoff::PostHandoffTools::Mutating => {
+                // This is a known handoff-contract failure, not a fresh daemon
+                // crash to auto-file for every affected worker.
+                return TerminalFinalizeDecision {
+                    status: SessionStatus::Failed,
+                    c5_failure_cause: None,
+                };
+            }
+        }
     }
     decision
 }
@@ -1668,8 +1681,10 @@ fn apply_terminal_handoff_order(
     decision: TerminalFinalizeDecision,
     evidence: TerminalEvidence,
     tracked: &mut TrackedSession,
+    tree_clean_at_handoff: bool,
 ) -> TerminalFinalizeDecision {
-    let guarded = guard_terminal_handoff_order(decision, evidence, &tracked.events);
+    let guarded =
+        guard_terminal_handoff_order(decision, evidence, &tracked.events, tree_clean_at_handoff);
     if guarded.status == SessionStatus::Failed && decision.status == SessionStatus::Completed {
         tracked.session.stop_reason = Some("terminal_handoff_superseded_by_tool".to_string());
     }
@@ -1916,6 +1931,9 @@ impl SessionManager {
         };
         let mut memory_flush_attempted_compaction_count: Option<u32> = None;
         let mut terminal_reason: Option<MonitorBreakReason> = None;
+        // #1484: set when Claude Code rejects the selected model on stderr, so
+        // the later `result` frame cannot relabel the exit as `success`.
+        let mut rejected_model_notice: Option<String> = None;
         let mut current_result = TerminalResult::None;
         // AppServer enqueue is not provider receipt. Keep the effect-possible
         // row open until this monitor observes the next turn's result frame.
@@ -2492,6 +2510,24 @@ impl SessionManager {
                                     } else {
                                         "Process Error (provider)".to_string()
                                     };
+                                    if source == "stderr"
+                                        && rejected_model_notice.is_none()
+                                        && let Some(model) =
+                                            monitor::unrecognized_model_in_text(&error_text)
+                                    {
+                                        let model = if model.is_empty() {
+                                            "(unnamed)".to_string()
+                                        } else {
+                                            model
+                                        };
+                                        event_bus.publish(DaemonEvent::SystemMessage {
+                                            level: "error".into(),
+                                            message: format!(
+                                                "Claude Code does not recognize model `{model}` (session {session_id}); the launch policy allows a model this provider rejects"
+                                            ),
+                                        });
+                                        rejected_model_notice = Some(model);
+                                    }
                                     if source == "stderr" {
                                         tracing::error!(session_id = %session_id, error = %error_text, "CLI process wrote to stderr");
                                     } else if terminal_provider_error {
@@ -3961,6 +3997,12 @@ impl SessionManager {
                                         if let Some(reason) = meta.stop_reason {
                                             tracked.session.stop_reason = Some(reason);
                                         }
+                                        if rejected_model_notice.is_some() {
+                                            tracked.session.stop_reason = Some(
+                                                monitor::PROVIDER_MODEL_UNRECOGNIZED_REASON
+                                                    .to_string(),
+                                            );
+                                        }
                                         // V99/P1-C: richer usage capture. Each
                                         // field is applied only when the result
                                         // actually reported it, so an absent
@@ -3989,6 +4031,12 @@ impl SessionManager {
                                         }
                                         if let Some(reason) = meta.terminal_reason {
                                             tracked.session.terminal_reason = Some(reason);
+                                        }
+                                        if rejected_model_notice.is_some() {
+                                            tracked.session.terminal_reason = Some(
+                                                monitor::PROVIDER_MODEL_UNRECOGNIZED_REASON
+                                                    .to_string(),
+                                            );
                                         }
                                         wd = Some(tracked.session.working_dir.clone());
                                     }
@@ -4560,6 +4608,10 @@ impl SessionManager {
                     owned_children_at_result,
                 )
                 .await;
+                // #1331: git probe for a handoff followed by possibly-mutating
+                // tool calls, out of line and before the write lock.
+                let tree_clean_at_handoff = decision.status == SessionStatus::Completed
+                    && super::post_handoff::tree_unchanged_proof_boxed(&active, session_id).await;
                 let mut active_guard = active.write().await;
                 let Some(tracked) = active_guard.get_mut(&session_id) else {
                     return;
@@ -4567,7 +4619,12 @@ impl SessionManager {
                 if tracked.spawn_generation != expected_generation {
                     return;
                 }
-                let decision = apply_terminal_handoff_order(decision, evidence, tracked);
+                let decision = apply_terminal_handoff_order(
+                    decision,
+                    evidence,
+                    tracked,
+                    tree_clean_at_handoff,
+                );
                 if no_result_verdict == super::worker_result_guard::NoResultVerdict::SecondMiss
                     && decision.status == SessionStatus::Completed
                 {
@@ -5833,7 +5890,7 @@ mod terminal_decision_tests {
             ),
         ];
         let completed = TerminalFinalizeDecision::completed();
-        let failed = guard_terminal_handoff_order(completed, evidence(), &events);
+        let failed = guard_terminal_handoff_order(completed, evidence(), &events, false);
         assert_eq!(failed.status, SessionStatus::Failed);
         assert_eq!(failed.c5_failure_cause, None);
 
@@ -5848,7 +5905,7 @@ mod terminal_decision_tests {
         );
         tracked.events = events.clone();
         assert_eq!(
-            apply_terminal_handoff_order(completed, evidence(), &mut tracked).status,
+            apply_terminal_handoff_order(completed, evidence(), &mut tracked, false).status,
             SessionStatus::Failed,
         );
         assert_eq!(
@@ -5867,28 +5924,28 @@ mod terminal_decision_tests {
             transcript_event(109, EventType::ToolResult, None, "apply_patch failed"),
         ];
         assert_eq!(
-            guard_terminal_handoff_order(completed, evidence(), &mail_child_events).status,
+            guard_terminal_handoff_order(completed, evidence(), &mail_child_events, false).status,
             SessionStatus::Failed,
         );
 
         let mut archive = evidence();
         archive.pending_archive = true;
         assert_eq!(
-            guard_terminal_handoff_order(completed, archive, &events),
+            guard_terminal_handoff_order(completed, archive, &events, false),
             completed,
         );
 
         let mut post_finalize = evidence();
         post_finalize.rotation_action = TerminalRotationAction::PostFinalize;
         assert_eq!(
-            guard_terminal_handoff_order(completed, post_finalize, &events),
+            guard_terminal_handoff_order(completed, post_finalize, &events, false),
             completed,
         );
 
         let mut rotation = evidence();
         rotation.break_reason = MonitorBreakReason::Rotation;
         assert_eq!(
-            guard_terminal_handoff_order(completed, rotation, &events),
+            guard_terminal_handoff_order(completed, rotation, &events, false),
             completed
         );
 
@@ -5899,7 +5956,7 @@ mod terminal_decision_tests {
             "## PIPELINE HANDOFF — FIX:\nstatus: partial; patch failed",
         ));
         assert_eq!(
-            guard_terminal_handoff_order(completed, evidence(), &events).status,
+            guard_terminal_handoff_order(completed, evidence(), &events, false).status,
             SessionStatus::Failed,
             "a malformed handoff cannot correct post-handoff tool activity",
         );
@@ -5911,7 +5968,7 @@ mod terminal_decision_tests {
             "PIPELINE HANDOFF — FIX:\nstatus: partial; patch failed",
         ));
         assert_eq!(
-            guard_terminal_handoff_order(completed, evidence(), &events),
+            guard_terminal_handoff_order(completed, evidence(), &events, false),
             completed
         );
 
@@ -5923,7 +5980,7 @@ mod terminal_decision_tests {
         ));
         events.push(transcript_event(176, EventType::ToolUse, None, ""));
         assert_eq!(
-            guard_terminal_handoff_order(completed, evidence(), &events),
+            guard_terminal_handoff_order(completed, evidence(), &events, false),
             completed
         );
 
@@ -5937,7 +5994,7 @@ mod terminal_decision_tests {
             transcript_event(178, EventType::ToolUse, None, ""),
         ];
         assert_eq!(
-            guard_terminal_handoff_order(completed, evidence(), &late_marker).status,
+            guard_terminal_handoff_order(completed, evidence(), &late_marker, false).status,
             SessionStatus::Failed,
         );
 
@@ -5952,11 +6009,75 @@ mod terminal_decision_tests {
                 transcript_event(180, EventType::ToolUse, None, ""),
             ];
             assert_eq!(
-                guard_terminal_handoff_order(completed, evidence(), &events),
+                guard_terminal_handoff_order(completed, evidence(), &events, false),
                 completed,
                 "a malformed first nonblank line is not a worker handoff",
             );
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn issue_1331_read_only_call_after_handoff_ends_completed() {
+        let tool = |event_type, name: &str, command: &str| {
+            let mut event = transcript_event(0, event_type, None, "");
+            event.tool_name = Some(name.to_string());
+            event.tool_input = Some(serde_json::json!({ "command": command }).into());
+            event.tool_use_id = Some(format!("{name}-{command}"));
+            event
+        };
+        let handoff = transcript_event(
+            40,
+            EventType::Message,
+            Some(Role::Assistant),
+            "PIPELINE HANDOFF — IMPLEMENTATION:\nRESULT commit=07e501d9f status=green",
+        );
+        let completed = TerminalFinalizeDecision::completed();
+        let read_only = vec![
+            handoff.clone(),
+            tool(EventType::ToolUse, "Bash", "git status --short"),
+            tool(EventType::ToolResult, "Bash", "git status --short"),
+        ];
+        let mut tracked = super::live_context_state_tests::build_tracked(
+            SessionProvider::Claude,
+            0,
+            0,
+            0,
+            0,
+            ContextUsageConfidence::Missing,
+            None,
+        );
+        tracked.events = read_only;
+        assert_eq!(
+            apply_terminal_handoff_order(completed, evidence(), &mut tracked, false),
+            completed,
+        );
+        assert_eq!(tracked.session.stop_reason, None);
+
+        // A mutating call after the handoff still supersedes it ...
+        let mutating = vec![
+            handoff,
+            tool(EventType::ToolUse, "Bash", "git commit --amend --no-edit"),
+            tool(
+                EventType::ToolResult,
+                "Bash",
+                "git commit --amend --no-edit",
+            ),
+        ];
+        tracked.events = mutating.clone();
+        assert_eq!(
+            apply_terminal_handoff_order(completed, evidence(), &mut tracked, false).status,
+            SessionStatus::Failed,
+        );
+        assert_eq!(
+            tracked.session.stop_reason.as_deref(),
+            Some("terminal_handoff_superseded_by_tool"),
+        );
+        // ... unless the sandbox is proven clean at the commit it names.
+        assert_eq!(
+            guard_terminal_handoff_order(completed, evidence(), &mutating, true),
+            completed,
+        );
     }
 
     fn evidence() -> TerminalEvidence {

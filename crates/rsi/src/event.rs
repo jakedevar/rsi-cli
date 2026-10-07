@@ -381,7 +381,7 @@ async fn step_once_with_clock<C: EventClock>(
                         // (key was consumed but produced no action yet).
                         // When pending, the input bar bypasses its normal-mode
                         // handling so leader sequences (Space+g) pass through.
-                        app.vim_machine_pending = actions.is_empty();
+                        app.update_vim_machine_pending(key, actions.is_empty());
 
                         for action in actions {
                             crate::action_handler::dispatch_action(app, action).await;
@@ -460,10 +460,6 @@ pub async fn run_event_loop(
     // Periodic save of PersistedState for crash resilience (every 30 seconds)
     let mut persist_interval = tokio::time::interval(Duration::from_secs(30));
     persist_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    // Periodic TaskRabbit visibility recalculation (every 60 seconds) for 2-hour window freshness
-    let mut taskrabbit_recalc_interval = tokio::time::interval(Duration::from_secs(60));
-    taskrabbit_recalc_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Defensive repaint every second. Covers missed SIGWINCH/resize events (Ghostty + i3
     // can drop the CEvent::Resize delivery). Ratatui queries backend.size() at draw time,
@@ -899,27 +895,18 @@ pub async fn run_event_loop(
                         }
                         // Sync to global model dropdown widget if open and provider matches
                         if app.model_dropdown.open && app.model_dropdown.provider == provider {
-                            app.model_dropdown.models = models.clone();
-                            if app.model_dropdown.selected_index >= app.model_dropdown.models.len() {
-                                app.model_dropdown.selected_index = 0;
-                            }
+                            app.model_dropdown.replace_models(models.clone());
                         }
                         // Sync to per-prompt dropdowns (app.overlay and input_overlays)
                         if let crate::types::OverlayState::Prompt { model_dropdown, .. } = &mut app.overlay {
                             if model_dropdown.open && model_dropdown.provider == provider {
-                                model_dropdown.models = models.clone();
-                                if model_dropdown.selected_index >= model_dropdown.models.len() {
-                                    model_dropdown.selected_index = 0;
-                                }
+                                model_dropdown.replace_models(models.clone());
                             }
                         }
                         for input_overlay in &mut app.input_overlays {
                             if let crate::types::OverlayState::Prompt { model_dropdown, .. } = input_overlay {
                                 if model_dropdown.open && model_dropdown.provider == provider {
-                                    model_dropdown.models = models.clone();
-                                    if model_dropdown.selected_index >= model_dropdown.models.len() {
-                                        model_dropdown.selected_index = 0;
-                                    }
+                                    model_dropdown.replace_models(models.clone());
                                 }
                             }
                         }
@@ -927,22 +914,14 @@ pub async fn run_event_loop(
                         // Story/Task/Bug creation) if open and provider matches.
                         if let crate::types::OverlayState::CreateEntityForm { model_dropdown: Some(model_dropdown), .. } = &mut app.overlay {
                             if model_dropdown.provider == provider {
-                                model_dropdown.models = models.clone();
-                                if model_dropdown.selected_index >= model_dropdown.models.len() {
-                                    model_dropdown.selected_index = 0;
-                                }
+                                model_dropdown.replace_models(models.clone());
                             }
                         }
                         // Sync to settings dropdown if open and provider matches
                         if app.settings_state.model_dropdown.open
                             && app.settings_state.model_dropdown.provider == provider
                         {
-                            app.settings_state.model_dropdown.models = models;
-                            if app.settings_state.model_dropdown.selected_index
-                                >= app.settings_state.model_dropdown.models.len()
-                            {
-                                app.settings_state.model_dropdown.selected_index = 0;
-                            }
+                            app.settings_state.model_dropdown.replace_models(models);
                         }
                     }
                 }
@@ -978,10 +957,12 @@ pub async fn run_event_loop(
                             _ => None,
                         };
                         let dropdown = &mut app.settings_state.model_dropdown;
-                        dropdown.models = result.models;
-                        dropdown.selected_index = current_model
-                            .and_then(|cm| dropdown.models.iter().position(|(id, _)| id == cm))
-                            .unwrap_or(0);
+                        dropdown.replace_models(result.models);
+                        if !dropdown.filter_editing && dropdown.filter_query.is_empty() {
+                            dropdown.selected_index = current_model
+                                .and_then(|cm| dropdown.models.iter().position(|(id, _)| id == cm))
+                                .unwrap_or(0);
+                        }
                     }
                 }
                 app.mark_dirty();
@@ -1032,17 +1013,20 @@ pub async fn run_event_loop(
                                 Some(4) => Some(app.settings.dream_model.clone()),
                                 _ => None,
                             };
-                            app.settings_state.model_dropdown.models = app.local_models.clone();
-                            // Re-anchor selection to current model; fall back to 0.
-                            app.settings_state.model_dropdown.selected_index = current
-                                .and_then(|cm| {
-                                    app.settings_state
-                                        .model_dropdown
-                                        .models
-                                        .iter()
-                                        .position(|(id, _)| id == &cm)
-                                })
-                                .unwrap_or(0);
+                            app.settings_state.model_dropdown.replace_models(app.local_models.clone());
+                            // Re-anchor only before the user starts searching.
+                            if !app.settings_state.model_dropdown.filter_editing
+                                && app.settings_state.model_dropdown.filter_query.is_empty() {
+                                app.settings_state.model_dropdown.selected_index = current
+                                    .and_then(|cm| {
+                                        app.settings_state
+                                            .model_dropdown
+                                            .models
+                                            .iter()
+                                            .position(|(id, _)| id == &cm)
+                                    })
+                                    .unwrap_or(0);
+                            }
                         }
                         app.mark_dirty();
                     }
@@ -1291,15 +1275,6 @@ pub async fn run_event_loop(
                 crate::state::PersistedState::capture(app).save();
             }
 
-            // TASKRABBIT RECALCULATION: refresh 2-hour visibility window every 60s
-            _ = taskrabbit_recalc_interval.tick() => {
-                app.recalculate_filtered_order();
-                // Fix up selections after potential removal due to age-out
-                app.reconcile_restored_selections();
-                // State may have visibly changed (session order, selections) — redraw
-                app.mark_dirty();
-            }
-
             // DEFENSIVE REPAINT: covers missed SIGWINCH events from Ghostty/i3 resize.
             // Ratatui auto-queries terminal size at draw time, so this is sufficient to
             // correct any stale layout without a terminal.clear().
@@ -1316,6 +1291,8 @@ pub async fn run_event_loop(
 
         app.poll_worker_pressure_refresh().await;
         app.poll_manager_roster_refresh().await;
+        crate::overlay::global_manager_workspace::tick(app).await;
+        crate::overlay::fleet::tick(app).await;
 
         if let Some(mode) = app.pending_manual.take() {
             crate::manual::open::open_manual(app, mode);
@@ -1325,6 +1302,14 @@ pub async fn run_event_loop(
             let (program, args, cwd) = match request {
                 crate::app::ExternalRequest::Lazygit(directory) => {
                     ("lazygit".to_string(), Vec::new(), directory)
+                }
+                crate::app::ExternalRequest::Btop => {
+                    // btop ignores its working directory; any existing one works.
+                    let cwd = std::env::current_dir()
+                        .ok()
+                        .filter(|path| path.is_dir())
+                        .unwrap_or_else(std::env::temp_dir);
+                    ("btop".to_string(), Vec::new(), cwd)
                 }
                 crate::app::ExternalRequest::Pager(path) => {
                     let (program, args) = crate::manual::open::pager_command(&path);
@@ -1977,7 +1962,6 @@ fn handle_session_list_click(app: &mut crate::app::App, col: u16, row: u16) {
         {
             let zr = match current_zone {
                 crate::types::SessionListZone::Main => &rs.main,
-                crate::types::SessionListZone::TaskRabbit => &rs.taskrabbit,
                 crate::types::SessionListZone::Archive => &rs.archive,
                 crate::types::SessionListZone::Jobs => &rs.jobs,
             };
@@ -1985,14 +1969,12 @@ fn handle_session_list_click(app: &mut crate::app::App, col: u16, row: u16) {
             if let Some(card_idx) = session_card_index_at(zr, content_y) {
                 let order = match current_zone {
                     crate::types::SessionListZone::Main => &app.filtered_session_order,
-                    crate::types::SessionListZone::TaskRabbit => &app.filtered_taskrabbit_order,
                     crate::types::SessionListZone::Archive => &app.filtered_archived_order,
                     crate::types::SessionListZone::Jobs => &app.filtered_jobs_order,
                 };
                 if let Some(Pane::SessionList {
                     selected_index,
                     selected_session,
-                    taskrabbit_selected_index,
                     archive_selected_index,
                     jobs_selected_index,
                     ..
@@ -2001,9 +1983,6 @@ fn handle_session_list_click(app: &mut crate::app::App, col: u16, row: u16) {
                     match current_zone {
                         crate::types::SessionListZone::Main => {
                             *selected_index = card_idx;
-                        }
-                        crate::types::SessionListZone::TaskRabbit => {
-                            *taskrabbit_selected_index = card_idx;
                         }
                         crate::types::SessionListZone::Archive => {
                             *archive_selected_index = card_idx;
@@ -2165,7 +2144,18 @@ fn handle_detail_scroll_key(app: &mut crate::app::App, key: KeyEvent) -> bool {
     };
 
     const ARROW_SCROLL_LINES: usize = 3;
+    scroll_detail_lines(state, direction, ARROW_SCROLL_LINES);
+    true
+}
 
+/// Scroll one session's transcript by `lines` (`direction` < 0 is up),
+/// leaving follow-tail and keeping the event cursor inside the viewport.
+/// Shared by the detail pane and the global manager workspace (#1231).
+pub(crate) fn scroll_detail_lines(
+    state: &mut crate::types::SessionState,
+    direction: i32,
+    lines: usize,
+) {
     // Capture whether we're disengaging follow_tail on this scroll.
     // When unlocking from the tail by scrolling up, we need to actively
     // move the selection rather than using lazy tracking — otherwise the
@@ -2178,7 +2168,7 @@ fn handle_detail_scroll_key(app: &mut crate::app::App, key: KeyEvent) -> bool {
     state.follow_tail_hold = false;
 
     // Scroll
-    for _ in 0..ARROW_SCROLL_LINES {
+    for _ in 0..lines {
         if direction > 0 {
             state.scroll_offset = state.scroll_offset.saturating_add(1);
         } else {
@@ -2226,8 +2216,6 @@ fn handle_detail_scroll_key(app: &mut crate::app::App, key: KeyEvent) -> bool {
             }
         }
     }
-
-    true
 }
 
 /// Check if the focused pane is a SessionDetail with its input bar in Insert mode.
@@ -3238,10 +3226,10 @@ mod tests {
 
     /// Regression pin for the Ctrl+Left / Ctrl+Right zone-cycle removal.
     ///
-    /// These chords used to cycle the session list zone (Main -> TaskRabbit ->
-    /// Jobs -> Archive) from any pane. They now move pane focus by direction,
+    /// These chords used to cycle the session list zone (Main -> Jobs ->
+    /// Archive) from any pane. They now move pane focus by direction,
     /// matching the `Ctrl+h` / `Ctrl+l` focus fallback. Zone jumps remain the
-    /// explicit `gs` / `gt` / `gj` / `ga` chords.
+    /// explicit `gs` / `gj` / `ga` chords.
     #[tokio::test]
     async fn ctrl_arrows_move_focus_without_cycling_the_zone() {
         use crate::types::SplitDirection;
@@ -3969,7 +3957,7 @@ mod tests {
             ("list", "Ctrl-O", "-"),
             ("list", "Ctrl-I", "-"),
             ("list", "Ctrl-H", "notes=1; panes=list[Archive#0]"),
-            ("list", "Ctrl-L", "panes=list[TaskRabbit#0]"),
+            ("list", "Ctrl-L", "panes=list[Jobs#0]"),
             ("list", "Ctrl-Shift-Up", "-"),
             ("list", "Ctrl-Shift-Down", "-"),
             ("list", "Ctrl-Shift-Left", "sidebar=38"),
@@ -4035,7 +4023,7 @@ mod tests {
             ("jumplist", "Ctrl-O", "focus=SessionDetail; panes=detail[Some(1) scroll=Some(0) cursor=None tail=Some(true)]"),
             ("jumplist", "Ctrl-I", "focus=SessionDetail; jump=2; panes=detail[Some(2) scroll=Some(0) cursor=None tail=Some(true)]"),
             ("jumplist", "Ctrl-H", "notes=1; panes=list[Archive#0]"),
-            ("jumplist", "Ctrl-L", "panes=list[TaskRabbit#0]"),
+            ("jumplist", "Ctrl-L", "panes=list[Jobs#0]"),
             ("jumplist", "Ctrl-Shift-Up", "-"),
             ("jumplist", "Ctrl-Shift-Down", "-"),
             ("jumplist", "Ctrl-Shift-Left", "sidebar=38"),

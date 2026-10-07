@@ -255,10 +255,10 @@ impl Store {
             let Some(author) = self.get_session(author_id)? else {
                 continue;
             };
-            if self.manager_v2_descendant_epic(&config, author_id)? != work.epic_id {
-                continue;
-            }
-            let holder = match self.manager_review_source_holder(&config, work.epic_id, &author) {
+            // #1493: the author may sit under another Epic of the same
+            // manager scope; `descendant_epic` still refuses out-of-scope ones.
+            self.manager_v2_descendant_epic(&config, author_id)?;
+            let holder = match self.manager_review_source_holder(&config, &author) {
                 Ok(holder) => holder,
                 Err(error)
                     if author_id == session_id
@@ -419,7 +419,7 @@ fn terminal_allocation_failure(error: &crate::error::DaemonError) -> Option<&'st
     let crate::error::DaemonError::InvalidParam(code) = error else {
         return None;
     };
-    match code.as_str() {
+    match code.split(':').next().unwrap_or(code) {
         "manager_review_scope_changed"
         | "manager_review_work_changed"
         | "manager_review_author_unavailable"
@@ -460,6 +460,7 @@ fn review_allocation_request(
         &query,
     );
     AgentManagerControlRequestV2 {
+        project_id: None,
         fence: assignment.request.fence.clone(),
         idempotency_key: format!(
             "{}{assignment_id}",
@@ -470,6 +471,7 @@ fn review_allocation_request(
             kind: SessionKind::Research,
             query: prompt,
             launch: assignment.request.launch.clone(),
+            sandbox_source: None,
         },
     }
 }
@@ -836,7 +838,7 @@ impl Store {
         let Some(author) = self.get_session(author)? else {
             return Ok(false);
         };
-        let Ok(holder) = self.manager_review_source_holder(config, epic, &author) else {
+        let Ok(holder) = self.manager_review_source_holder(config, &author) else {
             return Ok(false);
         };
         // Callers reach here only when the source is not the author, so a
@@ -998,14 +1000,28 @@ impl Store {
             }
             self.manager_v2_require_epic(&authority, work.epic_id)?;
         }
-        if work.source_commit.as_ref() != Some(source_commit)
+        // #1493: a delta round may carry a revised commit. The ledger
+        // observation already proved it sealed in the author's custody and
+        // authored after the base; it replaces the Work's recorded source below
+        // (old and new SHAs are recorded on the events).
+        let previous_source = match work.source_commit.as_ref() {
+            Some(current) if current != source_commit && delta_of.is_some() => {
+                Some(current.clone())
+            }
+            _ => None,
+        };
+        if (previous_source.is_none() && work.source_commit.as_ref() != Some(source_commit))
             || observed.source_commit.as_ref() != Some(source_commit)
             || !canonical_sha(source_commit)
         {
             return Err(refused("manager_review_source_changed"));
         }
         if *expected_row_version != work_row_version {
-            return Err(refused("manager_review_work_version_changed"));
+            // Name the current version so a retry needs no second read; the
+            // same row is listed by AgentManagerInspect `section:"work"`.
+            return Err(refused(&format!(
+                "manager_review_work_version_changed: current_row_version={work_row_version}"
+            )));
         }
         if work.risk_tier == ManagerWorkRiskTierV2::Tier2 {
             let policy = self
@@ -1023,9 +1039,10 @@ impl Store {
         let author = work
             .source_session_id
             .ok_or_else(|| refused("manager_review_author_missing"))?;
-        if self.manager_v2_descendant_epic(config, author)? != work.epic_id {
-            return Err(refused("manager_review_author_out_of_scope"));
-        }
+        // #1493: any Epic of this manager scope; out-of-scope authors are
+        // refused by `descendant_epic` itself.
+        self.manager_v2_descendant_epic(config, author)
+            .map_err(|_| refused("manager_review_author_out_of_scope"))?;
         let total_count: i64 = self.conn.query_row(
             "SELECT count(*) FROM manager_review_assignments
               WHERE project_id=?1 AND epic_id=?2 AND work_key=?3 AND spec_revision=?4",
@@ -1126,6 +1143,33 @@ impl Store {
             override_key.as_deref(),
             review_model_family(launch.provider, Some(launch.model.as_str())),
         )?;
+        if previous_source.is_some() {
+            let mut rebound = work.clone();
+            rebound.source_commit = Some(source_commit.clone());
+            rebound.acceptance = None;
+            rebound.integration = None;
+            rebound.pending_acceptance = None;
+            for stage in &mut rebound.stages {
+                stage.admission = None;
+            }
+            let value = serde_json::to_value(&rebound)?;
+            let row = self.manager_v2_put_record(
+                config,
+                "work",
+                &work.key,
+                Some(work.epic_id),
+                work_row_version,
+                &value,
+            )?;
+            self.manager_v2_event(
+                config,
+                Some(caller),
+                "work",
+                &work.key,
+                row.row_version,
+                &value,
+            )?;
+        }
         if let Some((prior_id, prior_version)) = prior {
             self.conn.execute(
                 "UPDATE manager_review_assignments
@@ -1183,7 +1227,7 @@ impl Store {
                 "review_assignment",
                 &assignment_id.to_string(),
                 1,
-                &json!({"assignment_id":assignment_id,"work_key":work.key,"spec_revision":work.spec_revision,"source_commit":source_commit,"state":"reserved"}),
+                &json!({"assignment_id":assignment_id,"work_key":work.key,"spec_revision":work.spec_revision,"source_commit":source_commit,"previous_source_commit":previous_source,"state":"reserved"}),
             )?,
             key: assignment_id.to_string(),
             row_version: 1,
@@ -1287,7 +1331,7 @@ impl Store {
         // #599 S1: the author remains the review identity; a rotation tip
         // may hold the live source custody used for the reviewer fork.
         let holder = self
-            .manager_review_source_holder(&config, assignment.epic_id, &author)
+            .manager_review_source_holder(&config, &author)
             .map_err(|_| refused("manager_review_author_unavailable"))?;
         let control = review_allocation_request(assignment_id, &assignment);
         let action = self.enqueue_manager_review_session_on(
@@ -1521,41 +1565,46 @@ impl Store {
         let Some(source) = self.get_session(assignment.author_session_id)? else {
             return Ok(Some("manager_review_infra_relaunch_refused".into()));
         };
-        let Ok(holder) = self.manager_review_source_holder(config, assignment.epic_id, &source)
-        else {
+        let Ok(holder) = self.manager_review_source_holder(config, &source) else {
             return Ok(Some("manager_review_infra_relaunch_refused".into()));
         };
-        let Ok(custody) = self.live_custody_for_session(holder.id) else {
-            return Ok(Some("manager_review_infra_relaunch_refused".into()));
-        };
-        let root = std::path::Path::new(&custody.sandbox_root);
-        if crate::sandbox::git_worktree::review_source_custody_holds_bounded(
-            root,
-            &custody.sandbox_branch,
-            &custody.repository_identity,
-        )
-        .is_err()
-        {
-            return Ok(Some("manager_review_infra_relaunch_refused".into()));
-        }
-        // #599 A1: the reviewer forks the sealed commit object, so a dirty
-        // author tree cannot change what the retry reviews.
-        let Ok(head) = crate::sandbox::git_worktree::observe_head_bounded(root) else {
-            return Ok(Some("manager_review_infra_relaunch_refused".into()));
-        };
-        if let Err(error) = crate::sandbox::git_worktree::review_sealed_source_holds_bounded(
-            root,
-            &assignment.source_sha,
-            &head,
-        ) {
-            return Ok(Some(match error {
-                crate::error::DaemonError::InvalidParam(code)
-                    if code.starts_with("manager_review_source_changed") =>
-                {
-                    code
-                }
-                _ => "manager_review_infra_relaunch_refused".into(),
-            }));
+        if let Some(reclaimed) = self.manager_review_reclaimed_source(&holder)? {
+            if reclaimed.verify(&assignment.source_sha).is_err() {
+                return Ok(Some("manager_review_infra_relaunch_refused".into()));
+            }
+        } else {
+            let Ok(custody) = self.live_custody_for_session(holder.id) else {
+                return Ok(Some("manager_review_infra_relaunch_refused".into()));
+            };
+            let root = std::path::Path::new(&custody.sandbox_root);
+            if crate::sandbox::git_worktree::review_source_custody_holds_bounded(
+                root,
+                &custody.sandbox_branch,
+                &custody.repository_identity,
+            )
+            .is_err()
+            {
+                return Ok(Some("manager_review_infra_relaunch_refused".into()));
+            }
+            // #599 A1: the reviewer forks the sealed commit object, so a dirty
+            // author tree cannot change what the retry reviews.
+            let Ok(head) = crate::sandbox::git_worktree::observe_head_bounded(root) else {
+                return Ok(Some("manager_review_infra_relaunch_refused".into()));
+            };
+            if let Err(error) = crate::sandbox::git_worktree::review_sealed_source_holds_bounded(
+                root,
+                &assignment.source_sha,
+                &head,
+            ) {
+                return Ok(Some(match error {
+                    crate::error::DaemonError::InvalidParam(code)
+                        if code.starts_with("manager_review_source_changed") =>
+                    {
+                        code
+                    }
+                    _ => "manager_review_infra_relaunch_refused".into(),
+                }));
+            }
         }
         let count: i64 = self.conn.query_row(
             "SELECT count(*) FROM manager_review_assignments
@@ -1958,6 +2007,16 @@ impl Store {
                 tx.commit()?;
                 return Ok(changed);
             }
+        }
+        // A graceful restart owns this exact interrupted turn. Keep its
+        // active assignment so startup can claim and rebind the continuation,
+        // rather than racing it with an infrastructure retry (#1504).
+        if session.status == SessionStatus::Interrupted
+            && current_invocation == Some(invocation)
+            && self.restart_intent_owns_session(reviewer)?
+        {
+            tx.commit()?;
+            return Ok(false);
         }
         if let Some(code) = receipt_missing_failure_code(
             &invocation_state,
@@ -2497,6 +2556,17 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    fn launch_refusal_details_keep_review_allocation_terminal() {
+        assert_eq!(
+            terminal_allocation_failure(&refused(
+                "manager_v2_launch_not_granted: allowed_launches=[]"
+            )),
+            Some("manager_review_allocation_invalidated")
+        );
+    }
     use rsi_common::types::SessionProvider;
 
     fn attempt_row(state: &str, launched: bool, has_receipt: bool) -> ReviewAttemptRow {

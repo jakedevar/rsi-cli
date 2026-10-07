@@ -83,6 +83,43 @@ class FmtChangedTest(unittest.TestCase):
         self.assertEqual(self.run_script(), "")
         self.assertEqual(self.read("src/child.rs"), UNFORMATTED_CHILD)
 
+    def test_moving_base_formats_only_worker_changes(self):
+        base = self.git("rev-parse", "HEAD").strip()
+        self.write("src/child.rs", "pub fn child( ) -> u8 {  2 }\n")
+        self.git("commit", "-q", "-am", "upstream change")
+        self.git("update-ref", "refs/remotes/origin/rolling", "HEAD")
+        # Build the worker's divergent history in this disposable fixture.
+        self.git("reset", "--hard", base)
+        self.write("src/lib.rs", "mod child;\npub fn parent( ) -> u8 { child::child() + 1 }\n")
+        self.git("commit", "-q", "-am", "worker change")
+
+        printed = self.run_script("origin/rolling")
+
+        self.assertEqual(printed.splitlines(), ["src/lib.rs"])
+        self.assertEqual(self.read("src/child.rs"), UNFORMATTED_CHILD)
+        self.assertEqual(
+            self.read("src/lib.rs"),
+            "mod child;\npub fn parent() -> u8 {\n    child::child() + 1\n}\n",
+        )
+
+    def test_includes_staged_unstaged_and_untracked_rust_files(self):
+        for args in [(), ("HEAD",)]:
+            with self.subTest(args=args):
+                self.write("src/staged.rs", "pub fn staged( ) { }\n")
+                self.git("add", "src/staged.rs")
+                self.write("src/child.rs", "pub fn child( ) -> u8 {  2 }\n")
+                self.write("src/untracked.rs", "pub fn untracked( ) { }\n")
+
+                printed = self.run_script(*args)
+
+                self.assertEqual(
+                    printed.splitlines(),
+                    ["src/child.rs", "src/staged.rs", "src/untracked.rs"],
+                )
+                self.assertEqual(self.read("src/child.rs"), "pub fn child() -> u8 {\n    2\n}\n")
+                self.assertEqual(self.read("src/staged.rs"), "pub fn staged() {}\n")
+                self.assertEqual(self.read("src/untracked.rs"), "pub fn untracked() {}\n")
+
 
 if __name__ == "__main__":
     unittest.main()

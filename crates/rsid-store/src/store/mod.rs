@@ -31,6 +31,7 @@ pub mod harness_manager_v2;
 pub mod ideas;
 pub mod manager_coordinator;
 mod manager_decision_history;
+mod manager_decision_rulings;
 pub mod manager_decisions;
 pub mod pending_approvals;
 pub mod session_retention;
@@ -46,6 +47,9 @@ pub mod child_autonomy;
 pub mod custody_lock_order;
 pub mod daemon_info;
 mod failure_signatures;
+mod fleet;
+pub mod friction;
+pub use fleet::FleetScope;
 pub mod global_manager;
 mod issues;
 mod labels;
@@ -53,6 +57,7 @@ mod lineage_convergence;
 pub mod manager_actions;
 pub mod manager_intent;
 pub mod manager_ledger;
+pub mod manager_node_workspace;
 pub mod manager_nodes;
 mod manager_notices;
 mod manager_prepared_actions;
@@ -60,10 +65,12 @@ pub mod manager_resources;
 pub mod manager_review_v121;
 pub mod manager_reviews;
 pub mod manager_successions;
+pub mod manager_tier_routing;
 pub mod manager_tree;
 pub mod manager_watch_settlement;
 mod metrics;
 pub(crate) mod migration_allocation;
+pub mod migration_backup;
 mod model_control;
 mod observations;
 mod offload;
@@ -71,6 +78,7 @@ pub(crate) mod operator_messages;
 pub mod origin_authority;
 pub mod pending_questions;
 mod permissions;
+pub mod portfolio_nodes;
 pub mod program_runs;
 mod projects;
 pub mod provider_exhaustion;
@@ -80,11 +88,14 @@ mod rate_limits;
 pub mod recursive_dag;
 pub mod restart_intents;
 pub mod rolling_queue;
+pub mod rotation_abandon;
 mod rotation_events;
 #[cfg(any(test, feature = "test-seam"))]
 pub mod stripe_liveness_support;
 pub use rotation_events::{BlockedRotation, COMPLETED_TRIGGER_PHASE, RotationRequestSuccessor};
+pub mod portable_bundle; // #1406 clean export/import of durable state.
 pub mod row_mappers;
+pub mod runaway_process; // #1337 CPU-time andon notice to the owning manager.
 pub mod sandbox_custody;
 #[allow(clippy::redundant_pub_crate)]
 pub mod sandbox_reclaim;
@@ -113,6 +124,7 @@ pub mod topology_agent_audit; // #633 agent topology request ledger.
 pub mod topology_v129; // #634 durable topology executor tables.
 pub mod transient_heal;
 mod usage; // T8 — read-only lifetime usage aggregate for Settings -> Stats.
+pub mod worker_baton; // #1254 worker context cap baton.
 pub mod worker_no_result;
 mod workflows;
 
@@ -1699,6 +1711,17 @@ impl Store {
         Ok(())
     }
 
+    /// Filesystem database path; in-memory fixtures have no recovery target.
+    pub fn database_path(&self) -> Option<&str> {
+        self.conn.path().filter(|path| !path.is_empty())
+    }
+
+    pub fn schema_version(&self) -> Result<i32> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?)
+    }
+
     /// Open or create database at the given path.
     /// Runs schema initialization on open.
     pub fn open(path: &Path) -> Result<Self> {
@@ -1707,6 +1730,7 @@ impl Store {
         // can rewrite the file header) or any DDL/DML.
         Self::refuse_newer_schema(&conn)?;
         Self::register_sql_functions(&conn)?;
+        migration_backup::before_migration(&conn, path)?;
 
         // Enable WAL mode for better concurrent read performance
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;

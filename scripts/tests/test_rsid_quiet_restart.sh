@@ -144,4 +144,21 @@ cp "$REL/rsid" "$DEST"
 [[ "$(cat "$DEST.prev")" == OLD-rsid ]]
 [[ "$(cat "$BIN/rsid")" == NEW-rsid ]]
 
+# #1217: the supervisor script is installed next to the installed rsid, atomic
+# and executable, and a later install replaces it.
+SUP_DIR="$TEMP_DIR/supervisor-install"
+install_supervisor_script "$SUP_DIR"
+[[ -x "$SUP_DIR/rsid-supervisor.sh" ]]
+cmp -s "$SUP_DIR/rsid-supervisor.sh" "$(dirname "${BASH_SOURCE[0]}")/../rsid-supervisor.sh"
+printf 'stale' >"$SUP_DIR/rsid-supervisor.sh"
+install_supervisor_script "$SUP_DIR"
+cmp -s "$SUP_DIR/rsid-supervisor.sh" "$(dirname "${BASH_SOURCE[0]}")/../rsid-supervisor.sh"
+
+# #1592: packaging into the release directory carries the supervisor along
+# with the binaries through a direct install, too.
+install_supervisor_script "$REL"
+install_built_binaries "$REL" "$SUP_DIR"
+[[ -x "$SUP_DIR/rsid-supervisor.sh" ]]
+cmp -s "$SUP_DIR/rsid-supervisor.sh" "$REL/rsid-supervisor.sh"
+
 echo 'rsid quiet restart request passed'

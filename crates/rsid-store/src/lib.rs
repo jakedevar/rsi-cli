@@ -25,6 +25,7 @@
 //! ```
 
 pub mod bedrock;
+pub mod bedrock_setup;
 pub mod bus;
 pub mod config;
 pub use rsid_core::{

@@ -7,12 +7,13 @@ use super::agent_verbs::AgentControlHandle;
 use crate::deploy::{DeployService, remove_staged};
 use crate::error::{DaemonError, Result};
 use crate::store::Store;
-use crate::store::agent_deploys::{DeployRow, NewDeploy};
+use crate::store::agent_deploys::{DeployInterrupt, DeployRow, NewDeploy};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rsi_common::agent_control_schema::AgentControlVerbV1;
 use rsi_common::agent_deploy::{
-    AgentRequestDeployReceiptV1, AgentRequestDeployRequestV1, DEPLOY_CAPABILITY_REQUIRED,
-    DEPLOY_EXECUTE_REQUIRED, DEPLOY_NEEDS_SUPERVISOR, DEPLOY_NOT_AUTHORIZED, skipped_binaries,
+    AgentRequestDeployReceiptV1, AgentRequestDeployRequestV1, DEPLOY_CANCELLED,
+    DEPLOY_CAPABILITY_REQUIRED, DEPLOY_EXECUTE_REQUIRED, DEPLOY_NEEDS_SUPERVISOR,
+    DEPLOY_NOT_AUTHORIZED, skipped_binaries,
 };
 use rsi_common::harness_manager_v2::ManagerCapabilityV2;
 use rsi_common::satellite::{SATELLITE_WIRE_VERSION_V1, SatelliteUuidV1};
@@ -21,8 +22,14 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-fn receipt(row: &DeployRow, replayed: bool) -> AgentRequestDeployReceiptV1 {
+fn receipt(
+    row: &DeployRow,
+    interrupt: DeployInterrupt,
+    replayed: bool,
+) -> AgentRequestDeployReceiptV1 {
     AgentRequestDeployReceiptV1 {
+        interrupt_workers: interrupt.requested,
+        interrupted_workers: interrupt.interrupted,
         deploy_id: row.id,
         state: row.state,
         sha: row.sha.clone(),
@@ -30,6 +37,7 @@ fn receipt(row: &DeployRow, replayed: bool) -> AgentRequestDeployReceiptV1 {
         binaries: row.manifest.clone(),
         skipped: skipped_binaries(&row.manifest),
         replayed,
+        reason: row.reason.clone(),
     }
 }
 
@@ -67,24 +75,61 @@ impl AgentControlHandle {
         now: DateTime<Utc>,
         satellite_root: &std::path::Path,
     ) -> Result<AgentRequestDeployReceiptV1> {
-        {
+        let admitted = {
             let store = self.store.lock().await;
-            let projection = store
-                .agent_authority_projection(caller)
-                .map_err(|_| DaemonError::PolicyDenied(DEPLOY_NOT_AUTHORIZED.into()))?;
-            if !projection
-                .verbs
-                .contains(&AgentControlVerbV1::RequestDeploy)
-            {
-                return Err(DaemonError::PolicyDenied(diagnose(&store, caller).into()));
-            }
+            authorize_deploy(&store, caller, request.project_id)?
+        };
+        if request.is_cancel() {
+            return self.cancel_owned_deploy(caller, &request, now).await;
         }
         if let Some(peer) = request.peer_id {
             return self
                 .request_satellite_deploy(caller, &request, peer.0, satellite_root)
                 .await;
         }
-        stage_owned_deploy(&self.store, caller, None, request, service, now).await
+        let authority = DeployAuthority {
+            caller,
+            project_id: request.project_id,
+            fence: admitted,
+        };
+        stage_owned_deploy(
+            &self.store,
+            caller,
+            None,
+            request,
+            service,
+            now,
+            Some(&authority),
+        )
+        .await
+    }
+
+    /// #1320/#1311: cancel the caller's own waiting deploy. It settles
+    /// `failed` with `deploy_cancelled`, its staged copies are removed and its
+    /// hold on new launches ends at once.
+    async fn cancel_owned_deploy(
+        &self,
+        caller: Uuid,
+        request: &AgentRequestDeployRequestV1,
+        now: DateTime<Utc>,
+    ) -> Result<AgentRequestDeployReceiptV1> {
+        request
+            .validate()
+            .map_err(|code| DaemonError::InvalidParam(code.into()))?;
+        let (row, interrupt) = {
+            let store = self.store.lock().await;
+            let row =
+                store.cancel_agent_deploy(caller, &request.idempotency_key, &request.sha, now)?;
+            let interrupt = store.agent_deploy_interrupt(row.id)?;
+            (row, interrupt)
+        };
+        if row.reason.as_deref() == Some(DEPLOY_CANCELLED) {
+            remove_staged(&row.manifest, row.id);
+            if let Some(drain) = &self.deploy_drain {
+                drain.release(row.id);
+            }
+        }
+        Ok(receipt(&row, interrupt, false))
     }
 
     /// #1017 slice 2: ask the paired satellite to run its own deploy flow over
@@ -162,13 +207,16 @@ pub(crate) async fn stage_owned_deploy(
     request: AgentRequestDeployRequestV1,
     service: &DeployService,
     now: DateTime<Utc>,
+    authority: Option<&DeployAuthority>,
 ) -> Result<AgentRequestDeployReceiptV1> {
     let live_schema = store.lock().await.schema_user_version()?;
     request
         .validate()
         .map_err(|code| DaemonError::InvalidParam(code.into()))?;
     let dir = request.binaries_dir.clone().unwrap_or_default();
-    let fingerprint = DeployService::fingerprint(&request.sha, &dir, request.wait_secs());
+    let interrupt_workers = request.interrupts_workers();
+    let fingerprint =
+        DeployService::fingerprint(&request.sha, &dir, request.wait_secs(), interrupt_workers);
     {
         let store = store.lock().await;
         let scoped = match &scope {
@@ -185,7 +233,8 @@ pub(crate) async fn stage_owned_deploy(
             None => store.replay_agent_deploy(owner, &request.idempotency_key, &fingerprint)?,
         };
         if let Some(row) = replay {
-            return Ok(receipt(&row, true));
+            let interrupt = store.agent_deploy_interrupt(row.id)?;
+            return Ok(receipt(&row, interrupt, true));
         }
         if !service.is_supervised() {
             return Err(DaemonError::PolicyDenied(DEPLOY_NEEDS_SUPERVISOR.into()));
@@ -203,7 +252,28 @@ pub(crate) async fn stage_owned_deploy(
             .await
             .map_err(|error| DaemonError::Store(error.to_string()))??
     };
+    #[cfg(test)]
+    if let Some(authority) = authority {
+        super::effect_fence::seam::run(store, authority.caller, "stage_deploy").await;
+    }
     let store = store.lock().await;
+    // #1279: staging ran without the lock. Re-resolve the manager or global
+    // deploy authority under the lock that stays held through the insert, and
+    // refuse (removing what was staged) if it changed.
+    if let Some(authority) = authority {
+        let rechecked =
+            authorize_deploy(&store, authority.caller, authority.project_id).and_then(|current| {
+                super::effect_fence::require_unchanged(
+                    &authority.fence,
+                    &current,
+                    DEPLOY_NOT_AUTHORIZED,
+                )
+            });
+        if let Err(error) = rechecked {
+            remove_staged(&staged, id);
+            return Err(error);
+        }
+    }
     let inserted = store.insert_agent_deploy_scoped(
         &NewDeploy {
             id,
@@ -213,16 +283,89 @@ pub(crate) async fn stage_owned_deploy(
             fingerprint,
             manifest: &staged,
             max_wait_secs: request.wait_secs(),
+            interrupt_workers,
         },
         scope.as_ref().map(|scope| scope.record),
         now,
     );
     match inserted {
-        Ok(row) => Ok(receipt(&row, false)),
+        Ok(row) => Ok(receipt(
+            &row,
+            DeployInterrupt {
+                requested: interrupt_workers,
+                interrupted: Vec::new(),
+            },
+            false,
+        )),
         Err(error) => {
             remove_staged(&staged, id);
             Err(error)
         }
+    }
+}
+
+/// The authority a hub deploy was admitted under, replayed at the insert.
+pub(crate) struct DeployAuthority {
+    pub(crate) caller: Uuid,
+    pub(crate) project_id: Option<Uuid>,
+    pub(crate) fence: String,
+}
+
+/// Admission of one hub deploy (the manager arm or the global seat's arm) and
+/// the authority fence it was resolved under. Run again at the effect.
+fn authorize_deploy(store: &Store, caller: Uuid, project_id: Option<Uuid>) -> Result<String> {
+    let projection = store
+        .agent_authority_projection(caller)
+        .map_err(|_| DaemonError::PolicyDenied(DEPLOY_NOT_AUTHORIZED.into()))?;
+    let own = store
+        .get_session(caller)?
+        .and_then(|session| session.project_id);
+    let own_target = project_id.is_none_or(|project| Some(project) == own);
+    let manager_deploy = projection.is_manager
+        && own_target
+        && projection
+            .verbs
+            .contains(&AgentControlVerbV1::RequestDeploy);
+    if !manager_deploy {
+        global_deploy_authorized(store, caller, project_id, &projection)?;
+    }
+    store
+        .agent_authority_fence(caller, None)
+        .map_err(|_| DaemonError::PolicyDenied(DEPLOY_NOT_AUTHORIZED.into()))
+}
+
+/// #1235: the global seat deploys for a granted project whose project policy
+/// holds `Deploy` in Execute mode, unpaused. Any other caller keeps the
+/// manager diagnosis; a project outside every arm is
+/// `manager_project_not_in_scope`.
+fn global_deploy_authorized(
+    store: &crate::store::Store,
+    caller: Uuid,
+    project: Option<Uuid>,
+    projection: &crate::store::agent_authority::AgentAuthorityProjection,
+) -> Result<()> {
+    use crate::store::harness_manager_v2::ManagerCallerV1;
+    use rsi_common::harness_manager_v2::ManagerOperatingModeV2;
+    if !projection.is_global_manager && project.is_none() {
+        return Err(DaemonError::PolicyDenied(diagnose(store, caller).into()));
+    }
+    match store.resolve_manager_caller(caller, project) {
+        Ok(ManagerCallerV1::Global(authority)) => {
+            let policy = &authority.grant.policy;
+            if !policy.capabilities.contains(&ManagerCapabilityV2::Deploy) {
+                Err(DaemonError::PolicyDenied(DEPLOY_CAPABILITY_REQUIRED.into()))
+            } else if policy.mode != ManagerOperatingModeV2::Execute || policy.paused {
+                Err(DaemonError::PolicyDenied(DEPLOY_EXECUTE_REQUIRED.into()))
+            } else {
+                Ok(())
+            }
+        }
+        Err(DaemonError::InvalidParam(code))
+            if code == rsi_common::global_manager::MANAGER_PROJECT_NOT_IN_SCOPE =>
+        {
+            Err(DaemonError::InvalidParam(code))
+        }
+        _ => Err(DaemonError::PolicyDenied(diagnose(store, caller).into())),
     }
 }
 

@@ -147,6 +147,9 @@ impl Drop for PinnedCodexBinary {
 pub struct CodexClient {
     binary_path: PathBuf,
     agent_mcp_path: PathBuf,
+    /// Daemon-installed `rsi-rpc` sibling the boundary-mail hook runs
+    /// (#1183). `None` installs no hook.
+    boundary_mail_hook_path: Option<PathBuf>,
     runtime_config: Arc<RuntimeConfig>,
     #[cfg(test)]
     skip_resume_history_validation_for_test: bool,
@@ -174,6 +177,7 @@ impl CodexClient {
                 .ok_or_else(|| {
                     DaemonError::Process("rsid executable has no parent directory".to_string())
                 })?,
+            boundary_mail_hook_path: crate::claude::daemon_sibling_rsi_rpc_path(),
             runtime_config,
             #[cfg(test)]
             skip_resume_history_validation_for_test: false,
@@ -196,9 +200,17 @@ impl CodexClient {
         Self {
             binary_path,
             agent_mcp_path,
+            boundary_mail_hook_path: None,
             runtime_config,
             skip_resume_history_validation_for_test: false,
         }
+    }
+
+    /// Point the boundary-mail hook at a caller-chosen `rsi-rpc` (#1183).
+    #[cfg(test)]
+    pub(crate) fn with_boundary_mail_hook_path_for_test(mut self, path: Option<PathBuf>) -> Self {
+        self.boundary_mail_hook_path = path;
+        self
     }
 
     /// Launch-boundary fixtures use a dummy thread token and a no-op binary.
@@ -539,6 +551,24 @@ impl CodexClient {
                 rsi_common::identity::ENV_SESSION_TOKEN,
                 rsi_common::identity::ENV_SOCKET
             ));
+            // #1183: claim this session's mail at each tool boundary, as the
+            // Claude PostToolUse hook does (#1049). The hook is a session-flag
+            // override (never a user or project hooks file); Codex runs it
+            // outside the shell sandbox with this process's environment, so it
+            // reaches the daemon with the session's own token. Codex runs a
+            // hook only once it is trusted, so this launch trusts exactly this
+            // one hook (its key and content hash) through the session-flag
+            // hook state, and every other hook keeps Codex's review. With no
+            // installed `rsi-rpc` sibling there is no hook at all.
+            if let Some(command) = crate::claude::boundary_mail_hook_command(
+                self.boundary_mail_hook_path.as_deref(),
+                &[rsi_common::boundary_mail_hook::MAIL_ONLY_FLAG],
+            ) {
+                cmd.arg("-c")
+                    .arg(codex_boundary_mail_hook_override(&command))
+                    .arg("-c")
+                    .arg(codex_boundary_mail_hook_trust_override(&command));
+            }
         }
 
         if config.provider == Some(rsi_common::types::SessionProvider::Pioneer) {
@@ -950,6 +980,92 @@ fn codex_home_dir() -> Option<PathBuf> {
 
 fn codex_sessions_dir() -> Option<PathBuf> {
     codex_home_dir().map(|home| home.join("sessions"))
+}
+
+/// Codex's trust key for the first handler of the first session-flag
+/// `PostToolUse` group: `hook_key(<synthetic session-flags path>,
+/// post_tool_use, 0, 0)` in codex-rs `hooks`. The boundary-mail hook is the
+/// only session-flag hook rsid installs, so it is always this key.
+pub(crate) const CODEX_BOUNDARY_MAIL_HOOK_KEY: &str =
+    "/<session-flags>/config.toml:post_tool_use:0:0";
+
+/// Codex's trust hash for the boundary-mail hook running `command`: the
+/// SHA-256 of the canonical (sorted-key, compact) JSON of its normalized
+/// identity, as codex-rs `hook_hash` / `version_for_toml` compute it. Pinned
+/// against hashes codex-cli 0.159.1 reported (`hooks/list`). If a future Codex
+/// hashes differently the hook is merely untrusted and does not run: mail then
+/// waits for turn end, it is never run unreviewed.
+pub(crate) fn codex_boundary_mail_hook_trust_hash(command: &str) -> String {
+    use sha2::Digest as _;
+    fn canonical(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let sorted: std::collections::BTreeMap<_, _> = map
+                    .iter()
+                    .map(|(key, value)| (key.clone(), canonical(value)))
+                    .collect();
+                serde_json::Value::Object(sorted.into_iter().collect())
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(canonical).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    let identity = serde_json::json!({
+        "event_name": "post_tool_use",
+        "matcher": "*",
+        "hooks": [{
+            "type": "command",
+            "command": command,
+            "timeout": rsi_common::boundary_mail_hook::CLAUDE_HOOK_TIMEOUT_SECS,
+            "async": false,
+            "additionalContextLimit": 0,
+        }],
+    });
+    let bytes = serde_json::to_vec(&canonical(&identity)).unwrap_or_default();
+    let digest = sha2::Sha256::digest(bytes);
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("sha256:{hex}")
+}
+
+/// The `-c` override trusting exactly the boundary-mail hook for `command`
+/// (#1183 review): Codex reads hook trust from the user and session-flag
+/// layers only, keyed by hook key and content hash, so this trusts no other
+/// hook and no other command.
+pub(crate) fn codex_boundary_mail_hook_trust_override(command: &str) -> String {
+    format!(
+        "hooks.state={{\"{CODEX_BOUNDARY_MAIL_HOOK_KEY}\"={{trusted_hash=\"{}\"}}}}",
+        codex_boundary_mail_hook_trust_hash(command)
+    )
+}
+
+/// The `-c` override installing `command` as a Codex `PostToolUse` hook for
+/// every tool (#1183). Rendered through `toml` so any path is quoted exactly.
+pub(crate) fn codex_boundary_mail_hook_override(command: &str) -> String {
+    let mut handler = toml::map::Map::new();
+    handler.insert("type".into(), toml::Value::String("command".into()));
+    handler.insert("command".into(), toml::Value::String(command.into()));
+    handler.insert(
+        "timeout".into(),
+        toml::Value::Integer(
+            i64::try_from(rsi_common::boundary_mail_hook::CLAUDE_HOOK_TIMEOUT_SECS)
+                .unwrap_or(i64::MAX),
+        ),
+    );
+    // #1183: never spill the mail to a side file; the daemon proves delivery
+    // by finding the whole block in the rollout transcript.
+    handler.insert("additionalContextLimit".into(), toml::Value::Integer(0));
+    let mut group = toml::map::Map::new();
+    group.insert("matcher".into(), toml::Value::String("*".into()));
+    group.insert(
+        "hooks".into(),
+        toml::Value::Array(vec![toml::Value::Table(handler)]),
+    );
+    format!(
+        "hooks.PostToolUse={}",
+        toml::Value::Array(vec![toml::Value::Table(group)])
+    )
 }
 
 pub(crate) fn validate_codex_configured_context_window(tokens: u64) -> Result<()> {
@@ -2056,6 +2172,7 @@ fn filter_correlated_codex_stderr(
 
 pub(crate) fn codex_fallback_models() -> Vec<(String, String)> {
     vec![
+        ("gpt-6.1-sol".to_string(), "GPT-6.1 Sol".to_string()),
         ("gpt-6-sol".to_string(), "GPT-6-Sol".to_string()),
         ("gpt-6-luna".to_string(), "GPT-6-Luna".to_string()),
         ("gpt-6-astra".to_string(), "GPT-6-Astra".to_string()),
@@ -2069,6 +2186,7 @@ pub(crate) fn codex_fallback_models() -> Vec<(String, String)> {
 /// the newest models immediately.
 fn prioritize_codex_models(models: Vec<(String, String)>) -> Vec<(String, String)> {
     let preferred = [
+        ("gpt-6.1-sol", "GPT-6.1 Sol"),
         ("gpt-6-sol", "GPT-6-Sol"),
         ("gpt-6-luna", "GPT-6-Luna"),
         ("gpt-6-astra", "GPT-6-Astra"),
@@ -2670,6 +2788,113 @@ mod tests {
         );
     }
 
+    /// #1183: every rsid-launched Codex CLI turn (fresh and resumed) installs
+    /// the boundary-mail hook as a session-flag `PostToolUse` override running
+    /// the trusted absolute `rsi-rpc`, and trusts exactly that hook (its key
+    /// and content hash). It never bypasses hook review for other hooks.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn session_launch_trusts_only_its_own_mail_only_boundary_hook() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let rsi_rpc = tmp.path().join("rsi-rpc");
+        std::fs::write(&rsi_rpc, b"").expect("fake rsi-rpc");
+        let client = codex_client_for_test(runtime_config_with_sandbox_mode("workspace-write"))
+            .with_boundary_mail_hook_path_for_test(Some(rsi_rpc.clone()));
+        let expected_command = format!("'{}' boundary-mail-hook --mail-only", rsi_rpc.display());
+        for resume in [None, Some("thread-1183".to_string())] {
+            let mut config = launch_config_minimal(resume.clone());
+            config.rsi_session_id = Some(uuid::Uuid::new_v4());
+            let args = cmd_args(&client.build_cmd(&config).unwrap());
+            let overrides: Vec<toml::Table> = args
+                .windows(2)
+                .filter(|pair| pair[0] == "-c" && pair[1].starts_with("hooks."))
+                .map(|pair| toml::from_str(&pair[1]).expect("valid TOML override"))
+                .collect();
+            assert_eq!(overrides.len(), 2, "{resume:?}: {args:?}");
+            let group = &overrides[0]["hooks"]["PostToolUse"][0];
+            assert_eq!(group["matcher"].as_str(), Some("*"));
+            let handler = &group["hooks"][0];
+            assert_eq!(handler["type"].as_str(), Some("command"));
+            assert_eq!(
+                handler["timeout"].as_integer(),
+                Some(rsi_common::boundary_mail_hook::CLAUDE_HOOK_TIMEOUT_SECS as i64)
+            );
+            assert_eq!(handler["command"].as_str(), Some(expected_command.as_str()));
+            assert_eq!(handler["additionalContextLimit"].as_integer(), Some(0));
+            let state = overrides[1]["hooks"]["state"]
+                .as_table()
+                .expect("hook state");
+            assert_eq!(state.len(), 1, "exactly one hook is trusted");
+            assert_eq!(
+                state[CODEX_BOUNDARY_MAIL_HOOK_KEY]["trusted_hash"].as_str(),
+                Some(codex_boundary_mail_hook_trust_hash(&expected_command).as_str())
+            );
+            assert!(
+                args.iter().all(|arg| !arg.contains("bypass-hook-trust")),
+                "{args:?}"
+            );
+        }
+
+        let args = cmd_args(&client.build_cmd(&launch_config_minimal(None)).unwrap());
+        assert!(args.iter().all(|arg| !arg.starts_with("hooks.")));
+    }
+
+    /// #1183 review: with no installed `rsi-rpc` sibling (or a relative path)
+    /// there is no hook and no trust override: mail waits for turn end rather
+    /// than running a `PATH`-resolved binary with the session token.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn session_launch_without_a_trusted_rsi_rpc_installs_no_hook() {
+        for path in [
+            None,
+            Some(PathBuf::from("rsi-rpc")),
+            Some(PathBuf::from("/nonexistent/rsi-rpc")),
+        ] {
+            let client = codex_client_for_test(runtime_config_with_sandbox_mode("workspace-write"))
+                .with_boundary_mail_hook_path_for_test(path.clone());
+            let mut config = launch_config_minimal(None);
+            config.rsi_session_id = Some(uuid::Uuid::new_v4());
+            let args = cmd_args(&client.build_cmd(&config).unwrap());
+            assert!(
+                args.iter().all(|arg| !arg.starts_with("hooks.")),
+                "{path:?}: {args:?}"
+            );
+            assert!(
+                args.iter()
+                    .any(|arg| arg.contains("mcp_servers.rsi-agent.command"))
+            );
+        }
+    }
+
+    /// The trust hash equals what codex-cli 0.159.1 itself reported
+    /// (`hooks/list` `currentHash`) for this exact session-flag hook
+    /// (`timeout = 10`, `additionalContextLimit = 0`).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn the_trust_hash_matches_the_hash_codex_computes() {
+        assert_eq!(rsi_common::boundary_mail_hook::CLAUDE_HOOK_TIMEOUT_SECS, 10);
+        assert_eq!(
+            codex_boundary_mail_hook_trust_hash("/bin/echo hi"),
+            "sha256:68887d938d07c955146cd377b4e1e72c701f790181e908fd481f40e2feea9381"
+        );
+        assert_ne!(
+            codex_boundary_mail_hook_trust_hash("'/a/rsi-rpc' boundary-mail-hook --mail-only"),
+            codex_boundary_mail_hook_trust_hash("'/b/rsi-rpc' boundary-mail-hook --mail-only")
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn a_hook_command_path_with_quotes_and_backslashes_round_trips_through_toml() {
+        let command = r#"'/opt/odd "dir"\x/rsi-rpc' boundary-mail-hook --mail-only"#;
+        let parsed: toml::Table =
+            toml::from_str(&codex_boundary_mail_hook_override(command)).expect("valid TOML");
+        assert_eq!(
+            parsed["hooks"]["PostToolUse"][0]["hooks"][0]["command"].as_str(),
+            Some(command)
+        );
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
     fn bedrock_fresh_and_resume_commands_route_to_runtime() {
@@ -3054,6 +3279,7 @@ mod tests {
         assert_eq!(
             codex_fallback_models(),
             vec![
+                ("gpt-6.1-sol".to_string(), "GPT-6.1 Sol".to_string()),
                 ("gpt-6-sol".to_string(), "GPT-6-Sol".to_string()),
                 ("gpt-6-luna".to_string(), "GPT-6-Luna".to_string()),
                 ("gpt-6-astra".to_string(), "GPT-6-Astra".to_string()),
@@ -3074,6 +3300,7 @@ mod tests {
         assert_eq!(
             models,
             vec![
+                ("gpt-6.1-sol".to_string(), "GPT-6.1 Sol".to_string()),
                 ("gpt-6-sol".to_string(), "GPT-6-Sol".to_string()),
                 ("gpt-6-luna".to_string(), "GPT-6-Luna".to_string()),
                 ("gpt-6-astra".to_string(), "GPT-6-Astra".to_string()),

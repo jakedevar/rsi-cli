@@ -366,6 +366,107 @@ async fn test_model_dropdown_navigate_and_select() {
 }
 
 #[tokio::test]
+async fn model_dropdown_global_search_selects_filtered_result() {
+    let mut app = test_app();
+    app.model_dropdown = crate::types::ModelDropdownState::new(
+        app.selected_provider,
+        vec![
+            ("first".into(), "First".into()),
+            ("needle-2".into(), "Needle Two".into()),
+        ],
+        None,
+    );
+    for c in "/needle-2".chars() {
+        assert!(handle_overlay_key(&mut app, key(KeyCode::Char(c))).await);
+    }
+    assert_eq!(app.model_dropdown.filter_query, "needle-2");
+    assert!(handle_overlay_key(&mut app, key(KeyCode::Enter)).await);
+    assert_eq!(app.selected_model.as_deref(), Some("needle-2"));
+    assert!(!app.model_dropdown.open);
+}
+
+#[tokio::test]
+async fn model_dropdown_prompt_search_owns_text_in_both_slots() {
+    for stacked in [false, true] {
+        let mut app = test_app();
+        prompt::open_typed_prompt(&mut app, rsi_common::types::SessionKind::Task, None);
+        let dropdown = crate::types::ModelDropdownState::new(
+            app.selected_provider,
+            vec![
+                ("first".into(), "First".into()),
+                ("query-2".into(), "Query Two".into()),
+            ],
+            None,
+        );
+        if !stacked {
+            app.overlay = app.input_overlays.pop().unwrap();
+        }
+        let overlay = if stacked {
+            &mut app.input_overlays[app.focused_input_idx]
+        } else {
+            &mut app.overlay
+        };
+        if let OverlayState::Prompt {
+            model_dropdown,
+            surface,
+            ..
+        } = overlay
+        {
+            *model_dropdown = dropdown;
+            // Normal mode is where Space would otherwise start a leader.
+            surface.mode = crate::types::PopupMode::Normal;
+        } else {
+            panic!("typed prompt");
+        }
+        for c in "/query 2".chars() {
+            assert!(handle_overlay_key(&mut app, key(KeyCode::Char(c))).await);
+        }
+        assert!(!app.overlay_leader_pending, "Space typed into the filter");
+        assert!(handle_overlay_key(&mut app, key(KeyCode::Enter)).await);
+        let overlay = if stacked {
+            &app.input_overlays[app.focused_input_idx]
+        } else {
+            &app.overlay
+        };
+        if let OverlayState::Prompt {
+            model_override,
+            model_dropdown,
+            surface,
+            ..
+        } = overlay
+        {
+            assert_eq!(model_override.as_deref(), Some("query-2"));
+            assert!(!model_dropdown.open);
+            assert_eq!(surface.content(), "");
+        } else {
+            panic!("prompt remains open");
+        }
+    }
+}
+
+#[test]
+fn model_dropdown_settings_search_precedes_settings_query() {
+    let mut app = test_app();
+    app.settings_state.model_dropdown = crate::types::ModelDropdownState::new(
+        app.selected_provider,
+        vec![
+            ("first".into(), "First".into()),
+            ("query-2".into(), "Query Two".into()),
+        ],
+        None,
+    );
+    for c in "/query-2".chars() {
+        assert!(crate::settings_keys::handle_settings_key(
+            &mut app,
+            key(KeyCode::Char(c))
+        ));
+    }
+    assert_eq!(app.settings_state.model_dropdown.filter_query, "query-2");
+    assert_eq!(app.settings_state.model_dropdown.selected_index, 1);
+    assert!(!app.settings_state.query_active);
+}
+
+#[tokio::test]
 async fn pioneer_model_selection_preserves_provider_for_overlapping_model_prefixes() {
     let mut app = test_app();
     app.selected_provider = rsi_common::types::SessionProvider::Pioneer;
@@ -638,33 +739,202 @@ async fn main_model_selection_clears_unsupported_effort() {
 
 #[tokio::test]
 async fn main_provider_cycle_reaches_codex_app_server_before_empty_harness_catalog() {
+    use rsi_common::types::SessionProvider;
     let mut app = test_app();
-    app.selected_provider = rsi_common::types::SessionProvider::Antigravity;
+    app.selected_provider = SessionProvider::Antigravity;
     app.selected_model = Some("gpt-6-astra".to_string());
     app.selected_effort = Some("ultra".to_string());
     app.model_dropdown = crate::types::ModelDropdownState::new(
-        rsi_common::types::SessionProvider::Antigravity,
-        crate::app::models_for_provider(rsi_common::types::SessionProvider::Antigravity),
+        SessionProvider::Antigravity,
+        crate::app::models_for_provider(SessionProvider::Antigravity),
         None,
     );
 
     handle_overlay_key(&mut app, key(KeyCode::Tab)).await;
 
+    // Tab previews the next provider's catalog and asks for its live list.
+    assert_eq!(app.model_dropdown.provider, SessionProvider::CodexAppServer);
     assert_eq!(
-        app.selected_provider,
-        rsi_common::types::SessionProvider::CodexAppServer
+        app.model_dropdown.models.first().map(|(id, _)| id.as_str()),
+        Some("gpt-6-sol")
     );
-    assert_eq!(app.selected_model.as_deref(), Some("gpt-6-sol"));
-    assert_eq!(app.selected_effort.as_deref(), Some("ultra"));
+    assert_eq!(
+        app.model_refresh_provider,
+        Some(SessionProvider::CodexAppServer)
+    );
+    assert!(app.needs_model_refresh);
 
     handle_overlay_key(&mut app, key(KeyCode::Tab)).await;
 
-    assert_eq!(
-        app.selected_provider,
-        rsi_common::types::SessionProvider::Harness
+    assert_eq!(app.model_dropdown.provider, SessionProvider::Harness);
+    // Harness's catalog is empty until discovery: Enter has nothing to pick.
+    handle_overlay_key(&mut app, key(KeyCode::Enter)).await;
+    assert!(app.model_dropdown.open);
+
+    // Browsing alone never moved the launch default.
+    assert_eq!(app.selected_provider, SessionProvider::Antigravity);
+    assert_eq!(app.selected_model.as_deref(), Some("gpt-6-astra"));
+    assert_eq!(app.selected_effort.as_deref(), Some("ultra"));
+}
+
+#[tokio::test]
+async fn main_model_picker_esc_after_browsing_keeps_the_default() {
+    use rsi_common::types::SessionProvider;
+    let mut app = test_app();
+    app.selected_provider = SessionProvider::Claude;
+    app.selected_model = Some("claude-opus-5-5".to_string());
+    app.selected_effort = Some("max".to_string());
+    app.model_dropdown = crate::types::ModelDropdownState::new(
+        SessionProvider::Claude,
+        crate::app::models_for_provider(SessionProvider::Claude),
+        app.selected_model.as_deref(),
     );
-    assert_eq!(app.selected_model, None);
-    assert_eq!(app.selected_effort, None);
+
+    handle_overlay_key(&mut app, key(KeyCode::Tab)).await;
+    assert_eq!(app.model_dropdown.provider, SessionProvider::Codex);
+    handle_overlay_key(&mut app, key(KeyCode::Esc)).await;
+
+    assert!(!app.model_dropdown.open);
+    assert_eq!(app.selected_provider, SessionProvider::Claude);
+    assert_eq!(app.selected_model.as_deref(), Some("claude-opus-5-5"));
+    assert_eq!(app.selected_effort.as_deref(), Some("max"));
+}
+
+/// Every way of leaving the global picker without Enter keeps the launch
+/// default exactly as it was, however far the operator browsed first.
+#[tokio::test]
+async fn main_model_picker_cancel_keys_keep_the_default_after_any_browsing() {
+    use rsi_common::types::SessionProvider;
+    let browse: [&[KeyCode]; 4] = [
+        &[KeyCode::Tab, KeyCode::Tab, KeyCode::Char('j')],
+        &[KeyCode::BackTab, KeyCode::Char('G')],
+        &[KeyCode::Tab, KeyCode::Char('/'), KeyCode::Char('x')],
+        &[KeyCode::Char('/'), KeyCode::Char('c'), KeyCode::Tab],
+    ];
+    for cancel in [KeyCode::Esc, KeyCode::Char('q')] {
+        for keys in browse {
+            let mut app = test_app();
+            app.selected_provider = SessionProvider::Claude;
+            app.selected_model = Some("claude-opus-5-5".to_string());
+            app.selected_effort = Some("max".to_string());
+            let models_before = app.available_models.clone();
+            app.model_dropdown = crate::types::ModelDropdownState::new(
+                SessionProvider::Claude,
+                crate::app::models_for_provider(SessionProvider::Claude),
+                app.selected_model.as_deref(),
+            );
+
+            for code in keys {
+                handle_overlay_key(&mut app, key(*code)).await;
+            }
+            let ctx = format!("browse {keys:?} then {cancel:?}");
+            // `/` opens the filter, which owns `q`; Esc first stops typing
+            // (the picker stays open) and changes nothing.
+            if app.model_dropdown.filter_editing {
+                handle_overlay_key(&mut app, key(KeyCode::Esc)).await;
+                assert!(app.model_dropdown.open, "{ctx}");
+                assert!(!app.model_dropdown.filter_editing, "{ctx}");
+                assert_eq!(
+                    app.selected_model.as_deref(),
+                    Some("claude-opus-5-5"),
+                    "{ctx}"
+                );
+            }
+            handle_overlay_key(&mut app, key(cancel)).await;
+
+            assert!(!app.model_dropdown.open, "{ctx}");
+            assert_eq!(app.selected_provider, SessionProvider::Claude, "{ctx}");
+            assert_eq!(app.custom_provider_index, None, "{ctx}");
+            assert_eq!(
+                app.selected_model.as_deref(),
+                Some("claude-opus-5-5"),
+                "{ctx}"
+            );
+            assert_eq!(app.selected_effort.as_deref(), Some("max"), "{ctx}");
+            assert_eq!(app.available_models, models_before, "{ctx}");
+        }
+    }
+}
+
+/// The new-session modal's own picker is tentative too: browsing providers
+/// then Esc sets no per-launch override and leaves the global default alone.
+#[tokio::test]
+async fn prompt_modal_picker_esc_after_browsing_sets_no_override_or_default() {
+    use rsi_common::types::SessionProvider;
+    let mut app = test_app();
+    app.selected_provider = SessionProvider::Claude;
+    app.selected_model = Some("claude-opus-5-5".to_string());
+    app.selected_effort = Some("max".to_string());
+    prompt::open_blank_popup(&mut app);
+    if let Some(OverlayState::Prompt { model_dropdown, .. }) = app.input_overlays.last_mut() {
+        *model_dropdown = crate::types::ModelDropdownState::new(
+            SessionProvider::Claude,
+            crate::app::models_for_provider(SessionProvider::Claude),
+            app.selected_model.as_deref(),
+        );
+    }
+    // Normal mode so the dropdown keys are not typed into the prompt.
+    handle_overlay_key(&mut app, key(KeyCode::Tab)).await;
+    handle_overlay_key(&mut app, key(KeyCode::Tab)).await;
+    handle_overlay_key(&mut app, key(KeyCode::Esc)).await;
+
+    let Some(OverlayState::Prompt {
+        model_dropdown,
+        model_override,
+        provider_override,
+        ..
+    }) = app.input_overlays.last()
+    else {
+        panic!("prompt modal stays open after the picker closes");
+    };
+    assert!(!model_dropdown.open);
+    assert_eq!(*model_override, None);
+    assert_eq!(*provider_override, None);
+    assert_eq!(app.selected_provider, SessionProvider::Claude);
+    assert_eq!(app.selected_model.as_deref(), Some("claude-opus-5-5"));
+    assert_eq!(app.selected_effort.as_deref(), Some("max"));
+}
+
+#[tokio::test]
+async fn main_model_picker_pick_commits_the_browsed_provider_and_announces_it() {
+    use rsi_common::types::SessionProvider;
+    let mut app = test_app();
+    app.selected_provider = SessionProvider::Claude;
+    app.selected_model = Some("claude-opus-5-5".to_string());
+    app.model_dropdown = crate::types::ModelDropdownState::new(
+        SessionProvider::Claude,
+        crate::app::models_for_provider(SessionProvider::Claude),
+        app.selected_model.as_deref(),
+    );
+
+    handle_overlay_key(&mut app, key(KeyCode::Tab)).await;
+    let codex_catalog = app.model_dropdown.models.clone();
+    let first_codex = codex_catalog
+        .first()
+        .expect("codex fallback catalog")
+        .0
+        .clone();
+    handle_overlay_key(&mut app, key(KeyCode::Enter)).await;
+
+    assert!(!app.model_dropdown.open);
+    assert_eq!(app.selected_provider, SessionProvider::Codex);
+    assert_eq!(app.selected_model.as_deref(), Some(first_codex.as_str()));
+    assert_eq!(app.available_models, codex_catalog);
+    let toast = format!(
+        "Default model {} {}",
+        crate::ui::glyphs::provider_glyph(SessionProvider::Codex),
+        crate::ui::glyphs::list_model_label(&first_codex)
+    );
+    assert!(
+        app.notifications
+            .iter()
+            .any(|notification| notification.message.starts_with(&toast)),
+        "a changed default is confirmed with {toast:?}: {:?}",
+        app.notifications
+            .iter()
+            .map(|notification| notification.message.as_str())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]
@@ -731,45 +1001,38 @@ async fn overlay_prompt_provider_cycle_targets_discovery_without_changing_global
 }
 
 #[tokio::test]
-async fn input_prompt_picker_reconciles_blank_and_taskrabbit_submission_effort() {
+async fn input_prompt_picker_reconciles_blank_submission_effort() {
     let mut app = test_app();
-    for open_prompt in [
-        prompt::open_blank_popup as fn(&mut App),
-        prompt::open_taskrabbit_popup,
-    ] {
-        app.selected_provider = rsi_common::types::SessionProvider::Codex;
-        app.selected_model = Some("gpt-6-astra".to_string());
-        app.selected_effort = Some("ultra".to_string());
-        open_prompt(&mut app);
+    app.selected_provider = rsi_common::types::SessionProvider::Codex;
+    app.selected_model = Some("gpt-6-astra".to_string());
+    app.selected_effort = Some("ultra".to_string());
+    prompt::open_blank_popup(&mut app);
 
-        if let Some(OverlayState::Prompt { model_dropdown, .. }) = app.input_overlays.last_mut() {
-            *model_dropdown = crate::types::ModelDropdownState::new(
-                rsi_common::types::SessionProvider::Codex,
-                vec![("gpt-5.5".to_string(), "GPT-5.5".to_string())],
-                None,
+    if let Some(OverlayState::Prompt { model_dropdown, .. }) = app.input_overlays.last_mut() {
+        *model_dropdown = crate::types::ModelDropdownState::new(
+            rsi_common::types::SessionProvider::Codex,
+            vec![("gpt-5.5".to_string(), "GPT-5.5".to_string())],
+            None,
+        );
+    }
+    handle_overlay_key(&mut app, key(KeyCode::Enter)).await;
+
+    match app.focused_input_overlay() {
+        Some(OverlayState::Prompt {
+            purpose: crate::types::PromptPurpose::Blank,
+            model_override,
+            provider_override,
+            ..
+        }) => {
+            assert_eq!(model_override.as_deref(), Some("gpt-5.5"));
+            assert_eq!(
+                *provider_override,
+                Some(rsi_common::types::SessionProvider::Codex)
             );
         }
-        handle_overlay_key(&mut app, key(KeyCode::Enter)).await;
-
-        match app.focused_input_overlay() {
-            Some(OverlayState::Prompt {
-                purpose:
-                    crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit,
-                model_override,
-                provider_override,
-                ..
-            }) => {
-                assert_eq!(model_override.as_deref(), Some("gpt-5.5"));
-                assert_eq!(
-                    *provider_override,
-                    Some(rsi_common::types::SessionProvider::Codex)
-                );
-            }
-            _ => panic!("expected new-session prompt overlay"),
-        }
-        assert_eq!(app.selected_effort, None);
-        app.input_overlays.clear();
+        _ => panic!("expected new-session prompt overlay"),
     }
+    assert_eq!(app.selected_effort, None);
 }
 
 #[tokio::test]
@@ -1574,7 +1837,7 @@ async fn semantic_rejection_and_retry_bind_ctrl_placement_to_exact_stacked_launc
 }
 
 #[tokio::test]
-async fn taskrabbit_and_typed_prompts_survive_semantic_launch_rejection() {
+async fn blank_and_typed_prompts_survive_semantic_launch_rejection() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     for typed in [false, true] {
@@ -1595,7 +1858,7 @@ async fn taskrabbit_and_typed_prompts_survive_semantic_launch_rejection() {
             assert_eq!(request["method"], "LaunchSession");
             assert_eq!(
                 request["params"]["session_kind"],
-                if typed { "Task" } else { "TaskRabbit" }
+                if typed { "Task" } else { "Standard" }
             );
             let response = serde_json::json!({
                 "jsonrpc": "2.0",
@@ -1614,7 +1877,7 @@ async fn taskrabbit_and_typed_prompts_survive_semantic_launch_rejection() {
         if typed {
             prompt::open_typed_prompt(&mut app, rsi_common::types::SessionKind::Task, None);
         } else {
-            prompt::open_taskrabbit_popup(&mut app);
+            prompt::open_blank_popup(&mut app);
         }
         for c in "keep exact draft".chars() {
             handle_overlay_key(&mut app, key(KeyCode::Char(c))).await;

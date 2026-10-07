@@ -43,6 +43,9 @@ pub struct AgentReadSessionEventsRequestV1 {
     pub event_types: Option<Vec<EventType>>,
     #[serde(default)]
     pub max_bytes: Option<u32>,
+    /// Return the final assistant message up to the larger full-message cap.
+    #[serde(default)]
+    pub final_message_full: bool,
 }
 
 impl AgentReadSessionEventsRequestV1 {
@@ -91,6 +94,8 @@ impl AgentReadSessionEventsRequestV1 {
 /// Character cap on `final_message.content` (larger than the per-event cap,
 /// since the final message is the worker's result).
 pub const FINAL_MESSAGE_MAX_CHARS: usize = 8_000;
+/// Character cap for an explicitly requested full final message.
+pub const FINAL_MESSAGE_FULL_MAX_CHARS: usize = 32 * 1024;
 
 /// One bounded event projection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -197,6 +202,7 @@ mod tests {
         let ok: AgentReadSessionEventsRequestV1 =
             serde_json::from_value(serde_json::json!({"session_id": id})).unwrap();
         assert_eq!(ok.validate(), Ok(()));
+        assert!(!ok.final_message_full);
         assert_eq!(ok.effective_limit(), AGENT_READ_EVENTS_DEFAULT_LIMIT);
         let mut bad = ok.clone();
         bad.limit = Some(0);

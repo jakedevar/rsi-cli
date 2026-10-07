@@ -1,6 +1,7 @@
 use crate::overlay::manager_v2::{
     ManagerSection, ManagerSurface, board,
     catalog::{ManagerLaunchPickerState, PickerStage},
+    decisions::{self, Stage},
     policy,
 };
 use crate::ui::theme;
@@ -61,6 +62,7 @@ pub(super) fn render(frame: &mut Frame, area: Rect, view: &ManagerSurface) {
         ManagerSection::Board if view.ledger.composite.is_some() => {
             render_composite_board(frame, layout[1], view);
         }
+        ManagerSection::Decisions => render_decisions(frame, layout[1], &view.ledger),
         section => render_board(frame, layout[1], &view.ledger, section),
     }
 }
@@ -140,7 +142,7 @@ fn render_composite_board(frame: &mut Frame, area: Rect, view: &ManagerSurface) 
         Constraint::Length(u16::try_from(kpis.len().clamp(1, 3)).unwrap_or(3)),
         Constraint::Min(2),
         Constraint::Length(4),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .split(area);
     frame.render_widget(identity, parts[0]);
@@ -196,8 +198,16 @@ fn render_composite_board(frame: &mut Frame, area: Rect, view: &ManagerSurface) 
         &mut ListState::default().with_selected(selected_item),
     );
     if let Some(row) = state.selected_row() {
-        frame.render_widget(
+        let is_decision = state.selected_origin().is_some_and(|(section, _)| {
+            section == rsi_common::harness_manager_v2::ManagerInspectSectionV2::Decisions
+        }) && board::row_text(row, "type") == Some("decision");
+        let details = if is_decision {
+            Paragraph::new(decision_detail(state, row, state.inspection.observed_at))
+        } else {
             Paragraph::new(board::row_details(row).join("\n"))
+        };
+        frame.render_widget(
+            details
                 .scroll((state.detail_scroll, 0))
                 .wrap(Wrap { trim: false }),
             columns[1],
@@ -206,9 +216,394 @@ fn render_composite_board(frame: &mut Frame, area: Rect, view: &ManagerSurface) 
     render_answer_and_message(frame, parts[3], state);
     frame.render_widget(
         Paragraph::new("1-5/Tab section · j/k row · Enter full section · a answer · o session · r refresh · PgUp/PgDn detail · Esc close")
-            .style(hints()),
+            .style(hints())
+            .wrap(Wrap { trim: false }),
         parts[4],
     );
+}
+
+fn stage_color(stage: Stage) -> Color {
+    match stage {
+        Stage::NeedsYou => theme::status_waiting(),
+        Stage::InFlight => theme::status_running(),
+        Stage::Stale => theme::warning_status(),
+        Stage::Closed => theme::dim_metadata(),
+    }
+}
+
+fn stage_marker(stage: Stage, row: &serde_json::Value) -> &'static str {
+    match stage {
+        Stage::NeedsYou => "●",
+        Stage::InFlight => "◐",
+        Stage::Stale => "○",
+        Stage::Closed => match decisions::status(row) {
+            "answered" => "✓",
+            "withdrawn" => "⊘",
+            "archived" => "▣",
+            _ => "✗",
+        },
+    }
+}
+
+/// A settled record's own colour: a manager's ruling, the operator's answer
+/// and a withdrawal each read differently from the generic closed grey.
+fn row_color(stage: Stage, row: &serde_json::Value) -> Color {
+    if stage != Stage::Closed {
+        return stage_color(stage);
+    }
+    match decisions::status(row) {
+        "answered" if decisions::ruled_by(row).is_some() => theme::teal(),
+        "answered" => theme::status_completed(),
+        "withdrawn" => theme::status_stalled(),
+        _ => theme::dim_metadata(),
+    }
+}
+
+/// A short status tag at the end of a list line: how a settled record
+/// ended, or that a pending one belongs to a delegated manager.
+fn row_tag(stage: Stage, row: &serde_json::Value) -> Option<&'static str> {
+    match stage {
+        Stage::Closed => Some(match decisions::status(row) {
+            "answered" if decisions::ruled_by(row).is_some() => "ruled",
+            "answered" => "answered",
+            "withdrawn" => "withdrawn",
+            "archived" => "archived",
+            "declined" => "declined",
+            _ => return None,
+        }),
+        Stage::NeedsYou | Stage::Stale if decisions::answerable_by(row) == Some("manager") => {
+            Some("manager")
+        }
+        _ => None,
+    }
+}
+
+/// The Decisions section (#1428): live records first under stage headings,
+/// one line per record, and one readable view of the selected record.
+fn render_decisions(frame: &mut Frame, area: Rect, state: &board::BoardState) {
+    let parts = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(4),
+        Constraint::Length(4),
+        Constraint::Length(2),
+    ])
+    .split(area);
+    frame.render_widget(
+        Paragraph::new(state.identity.as_str()).style(Style::default().bold()),
+        parts[0],
+    );
+    let now = state.inspection.observed_at;
+    let rows = &state.inspection.rows;
+    let count = |stage| {
+        rows.iter()
+            .filter(|r| decisions::stage(r, now) == stage)
+            .count()
+    };
+    let mut summary = format!(
+        "{} need you · {} sending · {} stale · {} closed",
+        count(Stage::NeedsYou),
+        count(Stage::InFlight),
+        count(Stage::Stale),
+        count(Stage::Closed)
+    );
+    if state.inspection.next_cursor.is_some() {
+        summary.push_str(" · more records on the next page (n)");
+    }
+    summary.push_str(&format!(" · as of {}", now.format("%H:%M:%S UTC")));
+    frame.render_widget(Paragraph::new(summary).style(hints()), parts[1]);
+    let columns =
+        Layout::horizontal([Constraint::Percentage(40), Constraint::Min(20)]).split(parts[2]);
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No decisions recorded for this project.").style(hints()),
+            columns[0],
+        );
+    } else {
+        render_decision_list(frame, columns[0], state, now);
+    }
+    if let Some(row) = rows.get(state.selected) {
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::LEFT)
+            .border_style(hints())
+            .padding(Padding::left(1));
+        let inner = block.inner(columns[1]);
+        frame.render_widget(block, columns[1]);
+        frame.render_widget(
+            Paragraph::new(decision_detail(state, row, now))
+                .scroll((state.detail_scroll, 0))
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+    }
+    render_answer_and_message(frame, parts[3], state);
+    frame.render_widget(
+        Paragraph::new(decision_hints(state))
+            .style(hints())
+            .wrap(Wrap { trim: false }),
+        parts[4],
+    );
+    if let Some(prompt) = &state.archive {
+        render_archive_confirm(frame, area, prompt);
+    }
+}
+
+/// The bulk-archive confirmation: the count, a preview, and the keys.
+fn render_archive_confirm(frame: &mut Frame, area: Rect, prompt: &board::ArchivePrompt) {
+    let count = prompt.items.len();
+    let height = u16::try_from(count.min(5) + 7)
+        .unwrap_or(12)
+        .min(area.height);
+    let popup = super::fixed_centered_rect(area, 78.min(area.width), height);
+    frame.render_widget(Clear, popup);
+    let block = theme::overlay_block()
+        .title(" Archive stale decisions ")
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let noun = if count == 1 { "decision" } else { "decisions" };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "Archive {count}{} stale {noun}?",
+                if prompt.complete { "" } else { " (the first)" }
+            ),
+            Style::default().bold(),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "Pending over {} days, or owned by a manager that is gone. They are archived, never deleted.",
+                prompt.older_than_days
+            ),
+            hints(),
+        )),
+    ];
+    for headline in prompt.headlines.iter().take(5) {
+        let width = usize::from(inner.width).saturating_sub(4);
+        lines.push(Line::from(format!(
+            "  · {}",
+            crate::ui::navigator_layout::truncate_cells_with_ellipsis(headline, width)
+        )));
+    }
+    if count > 5 {
+        lines.push(Line::from(Span::styled(
+            format!("  … and {} more", count - 5),
+            hints(),
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Enter or y archive · Esc or n cancel",
+        Style::default().fg(theme::accent()).bold(),
+    )));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn render_decision_list(
+    frame: &mut Frame,
+    area: Rect,
+    state: &board::BoardState,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let width = usize::from(area.width).saturating_sub(2);
+    let mut items = Vec::new();
+    let mut selected_item = None;
+    let mut heading = None;
+    for (index, row) in state.inspection.rows.iter().enumerate() {
+        let stage = decisions::stage(row, now);
+        if heading != Some(stage) {
+            heading = Some(stage);
+            let total = state
+                .inspection
+                .rows
+                .iter()
+                .filter(|r| decisions::stage(r, now) == stage)
+                .count();
+            let note = if stage == Stage::Stale {
+                " · over 7d · X archives"
+            } else {
+                ""
+            };
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("{} {total}{note}", stage.heading()),
+                Style::default().fg(stage_color(stage)).bold(),
+            ))));
+        }
+        if index == state.selected {
+            selected_item = Some(items.len());
+        }
+        let age = decisions::compact_age(decisions::age_secs(row, now));
+        let tag = row_tag(stage, row);
+        let tag_width = tag.map_or(0, |t| t.chars().count() + 2);
+        let title_width = width.saturating_sub(age.chars().count() + tag_width + 3);
+        let title = crate::ui::navigator_layout::truncate_cells_with_ellipsis(
+            &decisions::headline(row),
+            title_width,
+        );
+        let pad = width.saturating_sub(
+            2 + crate::ui::navigator_layout::display_width(&title)
+                + tag_width
+                + age.chars().count(),
+        );
+        let dim = stage == Stage::Closed;
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(
+                format!("{} ", stage_marker(stage, row)),
+                Style::default().fg(row_color(stage, row)),
+            ),
+            Span::styled(
+                title,
+                if dim {
+                    Style::default().fg(theme::dim_metadata())
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(
+                tag.map_or_else(String::new, |t| format!("{t}  ")),
+                Style::default().fg(row_color(stage, row)),
+            ),
+            Span::styled(age, hints()),
+        ])));
+    }
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_style(selection())
+            .highlight_symbol("› "),
+        area,
+        &mut ListState::default().with_selected(selected_item),
+    );
+}
+
+/// One readable view of a record: question, status, what it blocks, options
+/// with the recommendation, the answer and a short history.
+fn decision_detail(
+    state: &board::BoardState,
+    row: &serde_json::Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<Line<'static>> {
+    let parsed = decisions::parse_row(row);
+    let stage = decisions::stage(row, now);
+    let heading = |label: &str| {
+        Line::from(Span::styled(
+            label.to_string(),
+            Style::default().fg(theme::accent()).bold(),
+        ))
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        decisions::headline(row),
+        Style::default().bold(),
+    ))];
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(
+                "{} {}",
+                stage_marker(stage, row),
+                decisions::status_text(row)
+            ),
+            Style::default().fg(row_color(stage, row)).bold(),
+        ),
+        Span::styled(
+            format!(
+                " · asked {} ago · {}",
+                decisions::compact_age(decisions::age_secs(row, now)),
+                board::row_text(row, "key").unwrap_or("unknown key")
+            ),
+            hints(),
+        ),
+    ]));
+    if let Some(who) = decisions::answerable_by_label(row) {
+        lines.push(Line::from(format!("Answerable by: {who}")));
+    }
+    if let Some(manager) = decisions::ruled_by(row) {
+        lines.push(Line::from(Span::styled(
+            format!("Ruled by: {manager} (a delegated manager settled this; no operator answer)"),
+            Style::default().fg(theme::teal()),
+        )));
+    }
+    if let Some(blocks) = decisions::blocks_label(row) {
+        lines.push(Line::from(Span::styled(
+            format!("Blocks: {blocks}"),
+            Style::default().fg(theme::warning_status()),
+        )));
+    }
+    if !parsed.context.is_empty() {
+        lines.push(Line::raw(""));
+        lines.extend(parsed.context.iter().map(|c| Line::raw(c.clone())));
+    }
+    if !parsed.options.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(heading("OPTIONS"));
+        let cursor = state
+            .effective_option()
+            .filter(|_| decisions::is_pending(row));
+        for (i, option) in parsed.options.iter().enumerate() {
+            let mut spans = vec![
+                Span::styled(
+                    if cursor == Some(i) { "› " } else { "  " },
+                    Style::default().fg(theme::accent()).bold(),
+                ),
+                Span::styled(
+                    format!("{}  ", option.label),
+                    Style::default().fg(theme::accent()).bold(),
+                ),
+                Span::styled(
+                    option.text.clone(),
+                    if cursor == Some(i) {
+                        Style::default().bold()
+                    } else {
+                        Style::default()
+                    },
+                ),
+            ];
+            if parsed.recommended == Some(i) {
+                spans.push(Span::styled(
+                    "  ★ recommended",
+                    Style::default().fg(theme::status_completed()),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+    if let Some(answer) = board::row_text(row, "answer").filter(|a| !a.is_empty()) {
+        lines.push(Line::raw(""));
+        lines.push(heading("ANSWER"));
+        lines.push(Line::raw(answer.to_string()));
+    }
+    lines.push(Line::raw(""));
+    lines.push(heading("HISTORY"));
+    for (age, what) in decisions::history(row, now) {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{age:>5} ago  "), hints()),
+            Span::raw(what),
+        ]));
+    }
+    lines
+}
+
+fn decision_hints(state: &board::BoardState) -> String {
+    if state.archive.is_some() {
+        return "Enter/y archive the listed stale decisions · Esc/n cancel".to_string();
+    }
+    let row = state.inspection.rows.get(state.selected);
+    let pending = row.is_some_and(decisions::is_pending);
+    let parsed = state.selected_question().unwrap_or_default();
+    let answer = if !pending {
+        String::new()
+    } else if parsed.options.is_empty() {
+        " · Enter/a write an answer".to_string()
+    } else {
+        let mut hint = " · h/l option · Enter answer the › option".to_string();
+        if parsed.recommended.is_some() {
+            hint.push_str(" · y accept ★ recommendation");
+        }
+        hint.push_str(" · a write your own");
+        hint
+    };
+    format!(
+        "j/k decision{answer} · X archive stale · o session · r reload · PgUp/PgDn scroll · 1-5 section · Esc close"
+    )
 }
 
 fn render_answer_and_message(frame: &mut Frame, area: Rect, state: &board::BoardState) {
@@ -218,10 +613,9 @@ fn render_answer_and_message(frame: &mut Frame, area: Rect, state: &board::Board
         // answer separate from errors even when the question is very long.
         frame.render_widget(
             Paragraph::new(format!(
-                "{} · version {} · {}\nAnswer: {}▏",
+                "Answering {} · {}\nAnswer: {}▏",
                 draft.target.decision_key,
-                draft.target.expected_row_version,
-                draft.question,
+                decisions::parse_question(&draft.question).headline,
                 draft.target.answer,
             )),
             bottom[0],
@@ -498,7 +892,7 @@ fn render_board(frame: &mut Frame, area: Rect, state: &board::BoardState, sectio
         Constraint::Length(2),
         Constraint::Min(2),
         Constraint::Length(4),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .split(area);
     frame.render_widget(
@@ -579,5 +973,5 @@ fn render_board(frame: &mut Frame, area: Rect, state: &board::BoardState, sectio
         );
     }
     render_answer_and_message(frame, parts[3], state);
-    frame.render_widget(Paragraph::new("1-5 section · Tab/Shift-Tab · [ ] inspect · j/k row · n/p page · PgUp/PgDn detail · r refresh · a answer · o session · Esc close").style(hints()),parts[4]);
+    frame.render_widget(Paragraph::new("1-5 section · Tab/Shift-Tab · [ ] inspect · j/k row · n/p page · PgUp/PgDn detail · r refresh · a answer · o session · Esc close").style(hints()).wrap(Wrap { trim: false }),parts[4]);
 }

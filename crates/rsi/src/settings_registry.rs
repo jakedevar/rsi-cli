@@ -212,7 +212,7 @@ impl SettingsSection {
     #[must_use]
     pub const fn summary(self) -> &'static str {
         match self {
-            Self::ThemeColors => "The built-in theme, per-role overrides and legacy colors.",
+            Self::ThemeColors => "The built-in theme and per-role overrides.",
             Self::Screen => "Text-area background, animation styles and detail column placement.",
             Self::SessionList => "What the session navigator and cards show.",
             Self::TranscriptDefaults => "What a newly opened transcript shows.",
@@ -265,7 +265,6 @@ macro_rules! setting_ids {
 setting_ids! {
     BuiltInTheme,
     ThemeRoles,
-    LegacyColors,
     ResetTheme,
     TextAreaBackground,
     BackgroundColor,
@@ -309,6 +308,7 @@ setting_ids! {
     ContextRotationClaudePct,
     ContextRotationCodexPct,
     CoordinatorContextCap,
+    WorkerContextCap,
     StallDetection,
     StallClassifier,
     ClassifierIdleClaude,
@@ -344,8 +344,14 @@ setting_ids! {
     WorkerScopeCpuWeight,
     RollingQueueEnabled,
     DeployDrainEnabled,
+    DeployDrainHold,
+    HostLoadAdmissionThreshold,
     RollingQueueBatchSize,
     RollingQueueSpeculationDepth,
+    RollingQueueGateTimeout,
+    JobTestTimeout,
+    CpuAndonCpuMinutes,
+    CpuAndonHostLoad,
     ProgramHoldWhileChildren,
     ChildKeepaliveEnabled,
     ChildKeepaliveWindow,
@@ -364,6 +370,7 @@ setting_ids! {
     VaultCheckTtl,
     OpenRouterRoute,
     BedrockRoute,
+    ProviderProfile,
     ApiRouteFallback,
     OpenRouterContextBudget,
     HarnessMaxIterations,
@@ -483,6 +490,8 @@ impl SettingOwner {
 pub enum SettingApply {
     /// TUI-owned rows apply immediately.
     Immediate,
+    /// An independently launched message bridge reads its file at startup.
+    BridgeRestart,
     /// Daemon-owned rows follow the daemon catalog's class.
     Daemon(ApplyClass),
 }
@@ -492,6 +501,7 @@ impl SettingApply {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Immediate => "immediately",
+            Self::BridgeRestart => "after bridge restart",
             Self::Daemon(class) => class.label(),
         }
     }
@@ -541,22 +551,10 @@ pub static SETTINGS: &[SettingSpec] = &[
         destructive: false,
     },
     SettingSpec {
-        id: SettingId::LegacyColors,
-        section: SettingsSection::ThemeColors,
-        label: "Legacy message/editor colors",
-        summary: "Edits the legacy message-border and editor-cursor color slots.",
-        detail: None,
-        keywords: &["legacy", "border", "cursor"],
-        kind: SettingKind::Action,
-        owner: SettingOwner::Tui,
-        apply: SettingApply::Immediate,
-        destructive: false,
-    },
-    SettingSpec {
         id: SettingId::ResetTheme,
         section: SettingsSection::ThemeColors,
         label: "Reset active theme",
-        summary: "Clears every semantic role override while keeping the selected theme and legacy colors.",
+        summary: "Clears every semantic role override while keeping the selected theme.",
         detail: None,
         keywords: &["reset", "overrides"],
         kind: SettingKind::Action,
@@ -658,7 +656,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         label: "Navigator optional columns",
         summary: "Turns optional navigator columns on or off; J/K move the selected column, saved per preset.",
         detail: Some(
-            "Optional columns: Navigator age, Navigator model / effort, Navigator retry, Navigator cost, Navigator work, Navigator rotation, Navigator project, Navigator created. J / K move the selected column later / earlier in the active preset's order, which is saved separately for each preset. Required columns cannot be hidden.",
+            "Optional columns: Navigator age, Navigator model, Navigator retry, Navigator cost, Navigator work, Navigator rotation, Navigator project, Navigator created. J / K move the selected column later / earlier in the active preset's order, which is saved separately for each preset. Required columns cannot be hidden.",
         ),
         keywords: &["navigator", "columns"],
         kind: SettingKind::DynamicList,
@@ -672,7 +670,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         label: "Card fields",
         summary: "Chooses which facts render on session-list cards.",
         detail: Some(
-            "Card fields: Context bar, Cost, Turn count, Retry info, Pin indicator, Rotation depth, Heat color, Description, Kind pill (TR/BUG), Docregblock pill, Accumulated work time, Created date.",
+            "Card fields: Cost, Turn count, Retry info, Pin indicator, Rotation depth, Heat color, Description, Kind pill (TR/BUG), Docregblock pill, Accumulated work time, Created date.",
         ),
         keywords: &["card", "fields"],
         kind: SettingKind::DynamicList,
@@ -860,12 +858,12 @@ pub static SETTINGS: &[SettingSpec] = &[
         label: "Stall classifier model",
         summary: "Model the stall classifier calls to judge a stalled session.",
         detail: Some(
-            "The classifier is built when the daemon starts, so a new model applies after a daemon restart. The classifier's thresholds live in AGENT AUTOMATION ▸ Stall Detection.",
+            "The next classification uses the saved model; an in-flight classification keeps its model. The classifier's thresholds live in AGENT AUTOMATION ▸ Stall Detection.",
         ),
         keywords: &["classifier", "stall", "model"],
         kind: SettingKind::Edit,
         owner: SettingOwner::Daemon("stall_classifier_model"),
-        apply: SettingApply::Daemon(ApplyClass::DaemonRestart),
+        apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },
     SettingSpec {
@@ -889,7 +887,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["system prompt", "preset"],
         kind: SettingKind::Cycle,
         owner: SettingOwner::Daemon("system_prompt_preset"),
-        apply: SettingApply::Daemon(ApplyClass::DaemonRestart),
+        apply: SettingApply::Daemon(ApplyClass::NextSpawn),
         destructive: false,
     },
     SettingSpec {
@@ -1023,7 +1021,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["retry", "stall"],
         kind: SettingKind::Bool,
         owner: SettingOwner::Daemon("retry_on_stall"),
-        apply: SettingApply::Daemon(ApplyClass::DaemonRestart),
+        apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },
     SettingSpec {
@@ -1035,7 +1033,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["reconciliation", "liveness"],
         kind: SettingKind::Bool,
         owner: SettingOwner::Daemon("reconciliation_enabled"),
-        apply: SettingApply::Daemon(ApplyClass::DaemonRestart),
+        apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },
     SettingSpec {
@@ -1110,6 +1108,22 @@ pub static SETTINGS: &[SettingSpec] = &[
         destructive: false,
     },
     SettingSpec {
+        id: SettingId::WorkerContextCap,
+        section: SettingsSection::RetriesRecovery,
+        label: "Worker context cap (0 off, 1-100 = % of window)",
+        summary: "Live context at which a worker with a launching manager or Epic lead is told to pass the baton (commit, append a handoff to its Issue, end its turn) and its launcher gets a worker_context_cap notice. Read or set a provider or model override with :worker-context-cap <Provider[/model]> [pct|tokens|default].",
+        detail: Some(
+            "Default 60 (60% of the session's known context window). Values 1-100 are a percentage of the window, 32000-2000000 are tokens, 0 turns it off. Managers may propose it within operator bounds.",
+        ),
+        keywords: &[
+            "context", "cap", "worker", "baton", "handoff", "tokens", "percent",
+        ],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("worker_context_cap_tokens"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
         id: SettingId::StallDetection,
         section: SettingsSection::StallDetection,
         label: "Stall detection",
@@ -1118,7 +1132,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["stall", "detector"],
         kind: SettingKind::Bool,
         owner: SettingOwner::Daemon("stall_detection_enabled"),
-        apply: SettingApply::Daemon(ApplyClass::DaemonRestart),
+        apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },
     SettingSpec {
@@ -1127,12 +1141,12 @@ pub static SETTINGS: &[SettingSpec] = &[
         label: "Stall classifier",
         summary: "Asks a model whether a flagged session is really stalled before nudging it.",
         detail: Some(
-            "Turning it off applies now; turning it on needs a daemon restart. The classifier model is edited in MODELS ▸ Model Roles.",
+            "Turning it on or off applies to the next detector tick and received signal. The classifier model is edited in MODELS ▸ Model Roles.",
         ),
         keywords: &["classifier", "stall", "nudge"],
         kind: SettingKind::Bool,
         owner: SettingOwner::Daemon("stall_classifier_enabled"),
-        apply: SettingApply::Daemon(ApplyClass::LiveOffRestartOn),
+        apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },
     SettingSpec {
@@ -1144,7 +1158,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["classifier", "idle", "claude"],
         kind: SettingKind::Edit,
         owner: SettingOwner::Daemon("stall_classifier_idle_secs"),
-        apply: SettingApply::Daemon(ApplyClass::DaemonRestart),
+        apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },
     SettingSpec {
@@ -1156,7 +1170,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["classifier", "idle", "codex"],
         kind: SettingKind::Edit,
         owner: SettingOwner::Daemon("stall_classifier_idle_secs_codex"),
-        apply: SettingApply::Daemon(ApplyClass::DaemonRestart),
+        apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },
     SettingSpec {
@@ -1168,7 +1182,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["classifier", "cooldown"],
         kind: SettingKind::Edit,
         owner: SettingOwner::Daemon("stall_classifier_cooldown_secs"),
-        apply: SettingApply::Daemon(ApplyClass::DaemonRestart),
+        apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },
     SettingSpec {
@@ -1180,7 +1194,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["classifier", "max"],
         kind: SettingKind::Edit,
         owner: SettingOwner::Daemon("stall_classifier_max_per_session"),
-        apply: SettingApply::Daemon(ApplyClass::DaemonRestart),
+        apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },
     SettingSpec {
@@ -1230,19 +1244,19 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["dream", "observations", "threshold"],
         kind: SettingKind::Edit,
         owner: SettingOwner::Daemon("dream_observation_threshold"),
-        apply: SettingApply::Daemon(ApplyClass::DaemonRestart),
+        apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },
     SettingSpec {
         id: SettingId::DreamCooldown,
         section: SettingsSection::MemoryDreaming,
         label: "Dream cooldown",
-        summary: "Minimum seconds between consolidation cycles.",
+        summary: "Cooldown used by the next consolidation cycle; an existing cooldown keeps its deadline.",
         detail: None,
         keywords: &["dream", "cooldown"],
         kind: SettingKind::Edit,
         owner: SettingOwner::Daemon("dream_cooldown_secs"),
-        apply: SettingApply::Daemon(ApplyClass::DaemonRestart),
+        apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },
     SettingSpec {
@@ -1550,6 +1564,45 @@ pub static SETTINGS: &[SettingSpec] = &[
         destructive: false,
     },
     SettingSpec {
+        id: SettingId::DeployDrainHold,
+        section: SettingsSection::Orchestration,
+        label: "Deploy hold limit (s)",
+        summary: "How long an agent-requested deploy may hold new launches while it waits for its quiet point (0-3600 seconds, default 600; 0 never holds).",
+        detail: Some(
+            "A worker turn can run for an hour, so a deploy that held new launches until its max wait starved the manager. Past this limit the deploy keeps waiting for a quiet point (no lander, job or scoped worker mid-turn) without holding anything, then holds again only from its first quiet poll until the restart. An operator restart is not limited. The manager can also cancel its own waiting deploy (AgentRequestDeploy cancel: true).",
+        ),
+        keywords: &[
+            "deploy", "drain", "hold", "limit", "quiet", "restart", "lull",
+        ],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("deploy_drain_hold_secs"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::HostLoadAdmissionThreshold,
+        section: SettingsSection::Orchestration,
+        label: "Host load limit for new launches",
+        summary: "Hold a manager's new worker launches while the host's 1-minute load average is above this (0-1024, default 40; 0 never holds).",
+        detail: Some(
+            "Several projects' managers share one host, and their workers build and test, so a dozen started together push the load far past the core count. While the 1-minute load plus the launches admitted in the last minute is above this limit, the daemon holds a manager's create_session (Issue workers and topology nodes included): it stays queued, never refused, shows as held: host_load in AgentManagerGetAction and AgentGetDaemonInfo, and starts on its own when the load drops, oldest first. Operator sessions, a worker's own spawns, retries and lead recovery are never held. Platforms without a load average admit everything.",
+        ),
+        keywords: &[
+            "host",
+            "load",
+            "admission",
+            "hold",
+            "launch",
+            "manager",
+            "uptime",
+            "busy",
+        ],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("host_load_admission_threshold"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
         id: SettingId::RollingQueueBatchSize,
         section: SettingsSection::Orchestration,
         label: "Merge queue batch size",
@@ -1570,6 +1623,62 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["merge", "queue", "speculation", "landing"],
         kind: SettingKind::Cycle,
         owner: SettingOwner::Daemon("rolling_queue_speculation_depth"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::RollingQueueGateTimeout,
+        section: SettingsSection::Orchestration,
+        label: "Merge queue gate timeout (min)",
+        summary: "Wall-time budget of one merge-queue batch's gating, bisect included (30-1440 minutes, default 360).",
+        detail: Some(
+            "When a batch runs past it, the running lander is stopped and every member not yet settled is refused with queue_gate_timeout, which wakes its owner; the queue then moves on to the next batch.",
+        ),
+        keywords: &["merge", "queue", "gate", "timeout", "landing"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("rolling_queue_gate_timeout_mins"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::JobTestTimeout,
+        section: SettingsSection::Orchestration,
+        label: "Agent test job timeout (min)",
+        summary: "Default wall-clock timeout of an agent's AgentSubmitJob test job (5-180 minutes, default 20); a manager may raise one job.",
+        detail: Some(
+            "Counted from unit launch, not submit. Past it the daemon stops the job's unit and settles it failed with job_timed_out, which wakes its owner. A job held before launch by a deploy drain is failed job_admission_timed_out after the drain hold cap plus 5 minutes. Candidate-receipt runs keep the unit's own cap unless they name a timeout.",
+        ),
+        keywords: &["job", "test", "timeout", "runaway", "andon"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("job_test_timeout_mins"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::CpuAndonCpuMinutes,
+        section: SettingsSection::Orchestration,
+        label: "CPU andon: CPU-minutes per tree",
+        summary: "One agent process tree (a session's provider scope or a job unit) past this many CPU-minutes is a runaway (0 off, default 240).",
+        detail: Some(
+            "The daemon samples cgroup CPU time once a minute (Linux; unsupported elsewhere), records a runaway_process friction event and tells the owning manager the session and a suggested halt. It never stops the tree itself.",
+        ),
+        keywords: &["cpu", "andon", "runaway", "test", "load"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("cpu_andon_cpu_minutes"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::CpuAndonHostLoad,
+        section: SettingsSection::Orchestration,
+        label: "CPU andon: host load",
+        summary: "At or above this 1-minute host load, one agent process tree using a dominant share of it is a runaway (0 off, default 40).",
+        detail: Some(
+            "Same andon as the CPU-minutes trigger: a runaway_process friction event and one manager notice per tree, never an automatic stop.",
+        ),
+        keywords: &["cpu", "andon", "runaway", "load", "uptime"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("cpu_andon_host_load"),
         apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },
@@ -1933,6 +2042,22 @@ pub static SETTINGS: &[SettingSpec] = &[
         destructive: false,
     },
     SettingSpec {
+        id: SettingId::ProviderProfile,
+        section: SettingsSection::ProviderIsolation,
+        label: "Provider profile",
+        summary: "all launches every provider as before; aws_only allows only Claude Code on Amazon Bedrock (a Bedrock Claude model id), refuses every other launch with provider_profile_refused, and filters the model pickers. Set the AWS region and Bedrock key with :aws-setup.",
+        detail: Some(
+            "Checked at every launch, continuation, rotation and spawn. Under aws_only a Claude launch that names no model runs us.anthropic.claude-sonnet-5-v1:0.",
+        ),
+        keywords: &[
+            "provider", "profile", "aws", "bedrock", "claude", "only", "restrict",
+        ],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("provider_profile"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
         id: SettingId::ApiRouteFallback,
         section: SettingsSection::ProviderIsolation,
         label: "API route fallback",
@@ -2245,7 +2370,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["signal", "bridge"],
         kind: SettingKind::Edit,
         owner: SettingOwner::File("signal.toml"),
-        apply: SettingApply::Immediate,
+        apply: SettingApply::BridgeRestart,
         destructive: false,
     },
     SettingSpec {
@@ -2257,7 +2382,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["imessage", "bridge"],
         kind: SettingKind::Edit,
         owner: SettingOwner::File("imessage.toml"),
-        apply: SettingApply::Immediate,
+        apply: SettingApply::BridgeRestart,
         destructive: false,
     },
     SettingSpec {
@@ -2332,6 +2457,10 @@ mod tests {
         (
             "action_handler/daemon_config.rs",
             include_str!("action_handler/daemon_config.rs"),
+        ),
+        (
+            "action_handler/aws_setup.rs",
+            include_str!("action_handler/aws_setup.rs"),
         ),
         ("overlay/graph.rs", include_str!("overlay/graph.rs")),
     ];
@@ -2467,6 +2596,34 @@ mod tests {
                 .is_some_and(|detail| detail.contains("zero automatic retries")
                     && detail.contains("retry_policy.rs:14-18"))
         );
+    }
+
+    #[test]
+    fn live_apply_audit_covers_every_setting_and_converted_control() {
+        let audit = include_str!("../../../docs/settings-live-apply-audit.md");
+        for spec in SETTINGS {
+            assert!(
+                audit.contains(&format!("(`{:?}`)", spec.id)),
+                "{:?} audit row",
+                spec.id
+            );
+        }
+        for id in [
+            SettingId::RetryOnStall,
+            SettingId::StallDetection,
+            SettingId::ReconciliationLoop,
+            SettingId::StallClassifier,
+            SettingId::ClassifierModel,
+            SettingId::ClassifierIdleClaude,
+            SettingId::ClassifierIdleCodex,
+            SettingId::ClassifierCooldown,
+            SettingId::ClassifierMaxPerSession,
+            SettingId::ObservationThreshold,
+            SettingId::DreamCooldown,
+        ] {
+            let spec = SETTINGS.iter().find(|spec| spec.id == id).unwrap();
+            assert_eq!(spec.apply, SettingApply::Daemon(ApplyClass::Live), "{id:?}");
+        }
     }
 
     #[test]

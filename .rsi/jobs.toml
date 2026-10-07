@@ -1,0 +1,35 @@
+# Project-declared durable verification recipes for AgentSubmitJob
+# {"kind":"test","params":{"recipe":"<name>"}} (#1558). The runner is make
+# (Makefile targets of the same name); the daemon wraps it in cargo-slot.
+version = 1
+
+[recipes.scoped-test]
+runner = "make"
+target = "scoped-test"
+timeout_minutes = 20
+cpu_quota_percent = 200
+
+# #1584: the scoped-test recipes also take the request's focused `filters`
+# (PACKAGE=FILTER, at most 16) as RSI_SCOPED_TEST_FILTERS; `make` passes them
+# `--total-max-sec` below this cap so sequential package budgets fit inside it.
+
+# Lander tmpfs parity (#1577): the same derived filters, with the test binaries
+# run under a private tmpfs TMPDIR. Reports `TMPFS_PARITY unavailable` and exits 0
+# where no tmpfs exists.
+[recipes.scoped-test-tmpfs]
+runner = "make"
+target = "scoped-test-tmpfs"
+timeout_minutes = 20
+cpu_quota_percent = 200
+
+[recipes.check-touched-shards]
+runner = "make"
+target = "check-touched-shards"
+timeout_minutes = 20
+cpu_quota_percent = 200
+
+[recipes.deploy-migration-backup]
+runner = "make"
+target = "test-deploy-migration-backup"
+timeout_minutes = 20
+cpu_quota_percent = 200

@@ -1004,6 +1004,7 @@ fn create_action(
             caller: config.manager_session_id,
         },
         AgentManagerControlRequestV2 {
+            project_id: None,
             fence: ManagerFenceV2 {
                 scope_version: config.row_version,
                 policy_version: policy.row_version,
@@ -1014,6 +1015,7 @@ fn create_action(
                 kind: SessionKind::Task,
                 query: "Scoped resource launch".into(),
                 launch,
+                sandbox_source: None,
             },
         },
     )
@@ -1967,6 +1969,7 @@ fn manager_v2_resources_preserves_large_retired_accounting_history_with_small_li
         .prepare_manager_action(
             config.manager_session_id,
             AgentManagerPrepareControlRequestV2 {
+                project_id: None,
                 operation: PreparedManagerActionV2::RetryLead {
                     epic_id: epic,
                     message: "retry after retired cohort".into(),
@@ -2074,6 +2077,7 @@ fn manager_v2_resources_reports_created_session_usage_against_the_quota() {
             model: "fixture-model".into(),
             effort: None,
         },
+        sandbox_source: None,
     };
     for query in ["first worker", "second worker"] {
         store

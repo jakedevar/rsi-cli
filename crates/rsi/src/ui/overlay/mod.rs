@@ -5,13 +5,14 @@ mod ai_command;
 mod budget_policy_form;
 mod card_editor;
 mod cohort_settlement;
-mod color_customizer;
 mod command_palette;
 mod create_entity_form;
 mod diagnostics;
 mod dialectic;
 mod esp_square;
 mod file_explorer;
+mod fleet;
+mod global_manager_workspace;
 pub(crate) mod graph;
 pub(crate) mod graph_layout;
 mod harness_manager;
@@ -26,6 +27,7 @@ mod manager_v2;
 mod mcp_server_form;
 mod memory_search;
 mod message_bridge_form;
+mod model_switch;
 mod notification_browser;
 mod parent_picker;
 mod project_form;
@@ -438,136 +440,10 @@ pub(crate) fn apply_geometry_deltas(base: Rect, geom: &ModalGeometry, viewport: 
     Rect::new(x as u16, y as u16, w as u16, h as u16)
 }
 
-/// Render the first (stacked) overlay when TaskRabbit is displayed simultaneously.
-/// Returns the `Rect` used, or `None` if the overlay type doesn't support stacked rendering.
-fn render_stacked_first_overlay(
-    frame: &mut Frame,
-    area: Rect,
-    stacked: &OverlayState,
-    app: &App,
-) -> Option<Rect> {
-    match stacked {
-        OverlayState::Prompt {
-            surface,
-            working_dir,
-            purpose,
-            available_commands,
-            model_override,
-            provider_override,
-            model_dropdown,
-            sandbox_enabled,
-            launch,
-            ..
-        } => {
-            let max_h = (area.height * 50 / 100).max(9); // 6 chrome + 3 min textarea
-            let min_rows = prompt::body_min_rows(purpose, launch);
-            let geom_key = crate::app::App::geometry_key_for_purpose(purpose);
-            let geom = app
-                .modal_geometries
-                .get(&geom_key)
-                .cloned()
-                .unwrap_or_default();
-            let rect = if let Some(ref preview) = surface.corrected_preview {
-                compute_dynamic_preview_rect(
-                    area,
-                    &surface.textarea,
-                    preview,
-                    6,
-                    min_rows,
-                    area.y + 1,
-                    max_h,
-                    Some(purpose),
-                    None,
-                )
-            } else {
-                compute_dynamic_popup_rect_with_manual_height(
-                    area,
-                    &surface.textarea,
-                    6,
-                    min_rows,
-                    area.y + 1,
-                    max_h,
-                    Some(purpose),
-                    None,
-                    &geom,
-                )
-            };
-            let effort_bar_counts = app.model_effort_bar_counts(
-                model_override.as_deref(),
-                provider_override.unwrap_or(app.selected_provider),
-            );
-            let view = prompt::launch_view(
-                app,
-                purpose,
-                launch,
-                working_dir,
-                model_override.as_deref(),
-                *provider_override,
-                *sandbox_enabled,
-                effort_bar_counts,
-            );
-            prompt::render_prompt_popup(
-                frame,
-                area,
-                surface,
-                working_dir,
-                purpose,
-                available_commands,
-                app.selected_model.as_deref(),
-                effort_bar_counts,
-                Some(rect),
-                false, // stacked = not focused
-                None,
-                &geom,
-                model_override.as_deref(),
-                Some(model_dropdown),
-                &view,
-            );
-            Some(rect)
-        }
-        OverlayState::InputModal { surface, .. } => {
-            let max_h = (area.height * 50 / 100).max(6); // 3 chrome + 3 min textarea
-            let rect = if let Some(ref preview) = surface.corrected_preview {
-                compute_dynamic_preview_rect(
-                    area,
-                    &surface.textarea,
-                    preview,
-                    3,
-                    3,
-                    area.y + 1,
-                    max_h,
-                    None,
-                    None,
-                )
-            } else {
-                compute_dynamic_popup_rect(
-                    area,
-                    &surface.textarea,
-                    3,
-                    3,
-                    area.y + 1,
-                    max_h,
-                    None,
-                    None,
-                )
-            };
-            input_modal::render_input_modal(
-                frame,
-                area,
-                surface,
-                Some(rect),
-                &ModalGeometry::default(),
-            );
-            Some(rect)
-        }
-        _ => None,
-    }
-}
-
 /// Render the active overlay on top of the main layout.
 /// Call this LAST in the render function (painter's algorithm).
 pub fn render_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
-    // --- Input overlay stack (multiple Blank/TaskRabbit prompts) ---
+    // --- Input overlay stack (multiple Blank prompts) ---
     if !app.input_overlays.is_empty()
         && !matches!(app.overlay, OverlayState::KeybindingsHelp { .. })
     {
@@ -577,116 +453,6 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         render_input_overlay_stack(frame, area, app);
         return;
-    }
-
-    // --- Legacy stacked rendering (InputModal + TaskRabbit via overlay_stack) ---
-    if let OverlayState::Prompt {
-        surface: tr_surface,
-        working_dir: tr_wd,
-        purpose: purpose @ PromptPurpose::TaskRabbit,
-        available_commands: tr_cmds,
-        model_override: tr_model_override,
-        provider_override: tr_provider_override,
-        model_dropdown: tr_model_dropdown,
-        sandbox_enabled: tr_sandbox_enabled,
-        launch: tr_launch,
-        ..
-    } = &app.overlay
-    {
-        let list_w = crate::ui::compute_session_list_width(app);
-        if let Some(stacked) = app.overlay_stack.last() {
-            let first_rect = render_stacked_first_overlay(frame, area, stacked, app);
-            if let Some(first_rect) = first_rect {
-                // Render TaskRabbit below with 1-row gap
-                let tr_y = first_rect.y + first_rect.height + 1;
-                if tr_y < area.y + area.height {
-                    let max_h = (area.y + area.height).saturating_sub(tr_y);
-                    let min_rows = prompt::body_min_rows(purpose, tr_launch);
-                    let geom_key = crate::app::App::geometry_key_for_purpose(purpose);
-                    let geometry_changed = if tr_surface.corrected_preview.is_none() {
-                        normalize_prompt_manual_height(
-                            &mut app.modal_geometries,
-                            &geom_key,
-                            area,
-                            &tr_surface.textarea,
-                            6,
-                            min_rows,
-                            tr_y,
-                            max_h,
-                            Some(purpose),
-                            None,
-                        )
-                    } else {
-                        false
-                    };
-                    if geometry_changed {
-                        crate::state::PersistedState::capture(app).save();
-                    }
-                    let geom = app
-                        .modal_geometries
-                        .get(&geom_key)
-                        .cloned()
-                        .unwrap_or_default();
-                    let tr_rect = if let Some(ref preview) = tr_surface.corrected_preview {
-                        compute_dynamic_preview_rect(
-                            area,
-                            &tr_surface.textarea,
-                            preview,
-                            6,
-                            min_rows,
-                            tr_y,
-                            max_h,
-                            Some(purpose),
-                            None,
-                        )
-                    } else {
-                        compute_dynamic_popup_rect_with_manual_height(
-                            area,
-                            &tr_surface.textarea,
-                            6,
-                            min_rows,
-                            tr_y,
-                            max_h,
-                            Some(purpose),
-                            None,
-                            &geom,
-                        )
-                    };
-                    let effort_bar_counts = app.model_effort_bar_counts(
-                        tr_model_override.as_deref(),
-                        tr_provider_override.unwrap_or(app.selected_provider),
-                    );
-                    let view = prompt::launch_view(
-                        app,
-                        purpose,
-                        tr_launch,
-                        tr_wd,
-                        tr_model_override.as_deref(),
-                        *tr_provider_override,
-                        *tr_sandbox_enabled,
-                        effort_bar_counts,
-                    );
-                    prompt::render_prompt_popup(
-                        frame,
-                        area,
-                        tr_surface,
-                        tr_wd,
-                        purpose,
-                        tr_cmds,
-                        app.selected_model.as_deref(),
-                        effort_bar_counts,
-                        Some(tr_rect),
-                        true, // focused
-                        Some(list_w),
-                        &geom,
-                        tr_model_override.as_deref(),
-                        Some(tr_model_dropdown),
-                        &view,
-                    );
-                }
-                return;
-            }
-        }
     }
 
     render_regular_overlay(frame, area, app);
@@ -859,6 +625,12 @@ fn render_regular_overlay_inner(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         return;
     }
+    // The global manager workspace's conversation pane updates the shown
+    // session's per-frame view state (heights, scroll), like a detail pane.
+    if matches!(app.overlay, OverlayState::GlobalManagerWorkspace(..)) {
+        global_manager_workspace::render(frame, area, app);
+        return;
+    }
     match &app.overlay {
         OverlayState::None => {}
         OverlayState::ThemePicker {
@@ -882,13 +654,6 @@ fn render_regular_overlay_inner(frame: &mut Frame, area: Rect, app: &mut App) {
                 *assessment,
                 *committed,
             );
-        }
-        OverlayState::ColorCustomizer {
-            focused_field,
-            inputs,
-            errors,
-        } => {
-            color_customizer::render_color_customizer(frame, area, *focused_field, inputs, errors);
         }
         OverlayState::TextAreaBgEditor { input, error } => {
             text_area_bg_editor::render_text_area_bg_editor(frame, area, input, *error);
@@ -1015,6 +780,9 @@ fn render_regular_overlay_inner(frame: &mut Frame, area: Rect, app: &mut App) {
         OverlayState::ManagerTree(state) => {
             manager_tree::render(frame, area, state);
         }
+        OverlayState::Fleet(state) => fleet::render(frame, area, state),
+        // Rendered from the mutable borrow above.
+        OverlayState::GlobalManagerWorkspace(..) => {}
         OverlayState::HarnessManagerV2(state) => {
             manager_v2::render(frame, area, state);
         }
@@ -1450,6 +1218,9 @@ fn render_regular_overlay_inner(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         OverlayState::SessionInfoPanel { session_id } => {
             session_info::render_session_info_panel(frame, area, *session_id, app);
+        }
+        OverlayState::ModelSwitch(state) => {
+            model_switch::render_model_switch(frame, area, state);
         }
         OverlayState::CreateEntityForm {
             kind,

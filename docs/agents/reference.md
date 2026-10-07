@@ -53,6 +53,16 @@ The allowlist lives in `tools/check_personal_paths.py` and is deliberately tiny
 (GitHub repo slugs, the public resolver `8.8.8.8`); private, loopback, CGNAT and
 documentation ranges pass without an entry.
 
+`check-operator-identifiers.sh` (Issue #1454) keeps the operator's personal data
+out of git. The operator lists identifiers (e-mail, phone, address; one per
+line, `#` comments) in `~/.rsi/operator-identifiers` (override with
+`$RSI_OPERATOR_IDENTIFIERS_FILE`; never commit it). The pre-commit hook
+(`--staged`) and the pre-push hook for `refs/heads/rolling` (`--range`, so the
+lander's push is covered) refuse added lines, `thoughts/` included, that contain
+one, and print the file, line and list entry number without echoing the value.
+With no list the guard is a no-op. Issue bodies are not scanned; the written
+rule in `AGENTS.md` covers them.
+
 Rust is pinned by `rust-toolchain.toml`. Use the pinned toolchain when building, testing, formatting, or linting.
 
 ## Critical Type Rules
@@ -476,3 +486,13 @@ the stored model and are preflighted the same way, before the continuation
 fence, the invocation admission and the successor custody bind, so a session
 whose resolved model is allowed keeps working and one whose model is not is
 refused with its predecessor left intact.
+
+## Landing granularity (#1245)
+
+The rule lives in `AGENTS.md` "Landing": land one accepted change per gate,
+filtered to what it touches; batch waits, never landings. Evidence, dated
+2026-10-05: a 10-change integration batch ran 46 shard gates for 2 h 47 min
+while #1197 alone took 3 min, because one combined gate carried the union of
+every source's filters. Gate speed work is #1244. The merged filters spanned
+most rsid shards and rsid-store modules, so the gate cost scaled with the batch
+instead of with any one change.

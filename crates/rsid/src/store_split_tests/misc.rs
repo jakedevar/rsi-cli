@@ -190,12 +190,15 @@ async fn d04_uuidv5_domains_and_display_numbers_are_unchanged() {
         })
         .unwrap();
     let params = rsi_common::rpc::AgentCreateIssueParams {
+        project_id: None,
         title: "attributed".into(),
         body: String::new(),
         priority: None,
         labels: vec![],
         assignee: None,
         idempotency_key: "d04-pinned-domain".into(),
+        harness: false,
+        source_issue: None,
     };
     let attributed = control
         .agent_create_issue(caller, params.clone())
@@ -232,8 +235,23 @@ fn d04_agent_and_native_schemas_reject_linkage_spoof_fields() {
     let schema = rsi_common::agent_control_schema::AgentControlVerbV1::CreateIssue
         .descriptor()
         .parameters();
+    // #1235: project_id is the global seat's optional target project, checked
+    // against the grant in the Store; it is never creator identity.
+    let mut targeted = serde_json::json!({"title":"x","idempotency_key":"k"});
+    targeted["project_id"] = serde_json::json!(Uuid::new_v4());
+    assert!(
+        serde_json::from_value::<rsi_common::rpc::AgentCreateIssueParams>(targeted.clone())
+            .is_ok_and(|params| params.project_id.is_some())
+    );
+    assert!(
+        crate::session::harness::tools::rsi_control::agent_create_issue_from_args(&targeted)
+            .is_ok()
+    );
+    assert_eq!(
+        schema["properties"]["project_id"]["default"],
+        serde_json::Value::Null
+    );
     for field in [
-        "project_id",
         "idea_id",
         "source_event_id",
         "source_finding_ref",

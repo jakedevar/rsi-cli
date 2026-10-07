@@ -44,9 +44,9 @@ Keys the event loop decodes itself, before or beside the Vim keymap. Each table 
 | `Ctrl-\` | any context | toggle the embedded terminal overlay (the shell keeps running) |
 | `Ctrl-O` | normal mode, no overlay, not inserting | jump back in the session jumplist |
 | `Ctrl-I` | normal mode, no overlay, not inserting | jump forward in the session jumplist |
-| `Ctrl-H` | session list focused (normal mode, no overlay) | previous session-list zone (Main ← TaskRabbit ← Jobs ← Archive, wrapping) |
+| `Ctrl-H` | session list focused (normal mode, no overlay) | previous session-list zone (Main ← Jobs ← Archive, wrapping) |
 | `Ctrl-H` | other pane focused (normal mode, no overlay) | focus the pane to the left |
-| `Ctrl-L` | session list focused (normal mode, no overlay) | next session-list zone (Main → TaskRabbit → Jobs → Archive, wrapping) |
+| `Ctrl-L` | session list focused (normal mode, no overlay) | next session-list zone (Main → Jobs → Archive, wrapping) |
 | `Ctrl-L` | other pane focused (normal mode, no overlay; not a stale Issues editor) | focus the pane to the right |
 | `Ctrl-Shift-Up` | movable overlay open | make the overlay shorter |
 | `Ctrl-Shift-Down` | movable overlay open | make the overlay taller |
@@ -61,8 +61,8 @@ Keys the event loop decodes itself, before or beside the Vim keymap. Each table 
 | `Ctrl-Shift-Left` | normal mode, no overlay | narrow the session-list sidebar |
 | `Ctrl-Left` | session detail focused (normal mode, no overlay, not inserting) | move the transcript column left (snaps to Left Aligned at the edge) |
 | `Ctrl-Right` | session detail focused (normal mode, no overlay, not inserting) | move the transcript column right (unsnaps Left Aligned) |
-| `Ctrl-Left` | normal mode, no overlay, not inserting | focus the pane to the left (zones: gs / gt / gj / ga) |
-| `Ctrl-Right` | normal mode, no overlay, not inserting | focus the pane to the right (zones: gs / gt / gj / ga) |
+| `Ctrl-Left` | normal mode, no overlay, not inserting | focus the pane to the left (zones: gs / gj / ga) |
+| `Ctrl-Right` | normal mode, no overlay, not inserting | focus the pane to the right (zones: gs / gj / ga) |
 | `Shift-Down` | normal mode, no overlay, not inserting | select the next transcript event |
 | `Shift-Up` | normal mode, no overlay, not inserting | select the previous transcript event |
 
@@ -132,7 +132,6 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `/` | Filter sessions | Starts an incremental `/` filter over the session list; Enter keeps the filter, Esc clears it. |
 | `r` | Refresh navigation | Re-fetches sessions, projects and labels from the daemon. |
 | `T` | Choose built-in theme | Opens the built-in theme picker; `:theme <name>` applies a theme directly. |
-| `<Space>b` | Edit legacy message/editor colors | Opens the legacy message and editor color customizer. |
 | `<Space>i` | Open or focus Issues workspace | Opens the Issues workspace pane for the current project, or focuses it if already open. |
 | `<Space>gp` | Edit manager policy | Opens the harness manager policy editor (operator-owned manager limits and choices). |
 | `<Space>gb` | Open manager board | Opens the harness manager work board. |
@@ -141,7 +140,7 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `x` | Soft interrupt running session | Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it. |
 | `X` | INTERRUPT NOW | Press twice within five seconds to cancel the active turn and mark it HARD. |
 | `<Space>hs` | Downgrade hard pause to soft | Changes the selected session's HARD marker to SOFT so a granted manager may restart it. |
-| `<Space>hc` | Clear operator pause | Clears the selected session's SOFT or HARD marker. |
+| `<Space>hc` | Clear operator pause | Clears the selected session's SOFT or HARD marker; a manager seat shows its age and any held succession, and the key must be pressed twice to confirm. |
 | `<Space>c` | Continue selected session | `<Space>c` sends literal `continue`; `:continue` opens a prompt, and `:continue <text>` sends text directly. |
 | `P` | Pin or unpin selected session | Pins or unpins the selected session at the top of the list. |
 | `<Space>a` | Archive selected session | Archives the selected session (reversible with U from the Archive zone). |
@@ -156,13 +155,13 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `ZQ` | Quit | Quits rsi (the daemon and its sessions keep running). |
 | `ZZ` | Quit | Quits rsi (the daemon and its sessions keep running). |
 | `<Space>p` | Choose project | Opens the project picker. |
-| `<Space>o` | Launch task session | Opens the TaskRabbit one-shot prompt; `:task <text>` launches it directly. |
 | `Ctrl-N` | Launch blank session | Opens the blank general-purpose session prompt; `:blank <text>` launches it directly. |
 | `<Space>N` | Launch blank session | Opens the blank general-purpose session prompt; `:blank <text>` launches it directly. |
 | `<Space>,` | Open settings | Opens the settings pane. |
 | `<Space>X` | Emergency stop all | Emergency HARD stop: denies new paid work, cancels active model invocations, and marks interrupted sessions HARD. |
 | `<Space>v` | Open graph review | Opens the visual workflow graph review editor. |
 | `gL` | Set Epic lead | Sets the focused leaf session as the lead of its parent Epic. |
+| `gm` | Open global manager workspace | Opens the global manager workspace above all projects: the grant, the global seat and each granted project's PM health; Enter opens the seat or a PM session. |
 | `<Space>q` | Close pane | Closes the focused pane. |
 | `>` | Next tab | Switches to the next tab. |
 | `<` | Previous tab | Switches to the previous tab. |
@@ -182,7 +181,6 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `]g` | Next label group | Moves the selection to the first session of the next label group. |
 | `[g` | Previous label group | Moves the selection to the first session of the previous label group. |
 | `gs` | Go to Main zone | Switches the session list to the Main zone. |
-| `gt` | Go to TaskRabbit zone | Switches the session list to the TaskRabbit zone of one-shot sessions. |
 | `gj` | Go to Jobs zone | Switches the session list to the Jobs zone of scheduled-job sessions. |
 | `gr` | Recent completions | Focuses the recent-completions list in the right sidebar. |
 | `l` | Enter from list | Enters the selected session from the list (moves focus right). |
@@ -207,12 +205,14 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `F3` | Session info | Opens the session info panel: id, provider and model, working directory, project, hierarchy, rating (1-10), label, tags and context usage. |
 | `F2` | Rename session | Renames the selected session inline. |
 | `Ctrl-M` | Model dropdown | Opens or closes the model dropdown for the next launch (plain `M` stays free for text surfaces). |
+| `<Space>mm` | Switch session model / effort | Opens a picker of the models and efforts this session's provider can switch to, within the operator launch-model allowlist. It shows the current and queued model and effort and whether the switch keeps the provider conversation; Enter queues it for the next turn, never interrupting a running turn. |
 | `<Space>C` | Change session project | Moves the selected session to another project. |
 | `<Space>r` | Toggle auto-rotation | Disables or re-enables automatic context rotation for the selected session. |
 | `<Space>k` | Cancel pending retry | Cancels the selected session's pending automatic retry. |
 | `<Space>x` | Commit and push | Continues the selected session with `/ci_commit` to commit and push its work. |
 | `<Space>T` | Open in new tab | Opens the selected session in a new tab. |
 | `<Space>gg` | Git panel (lazygit) | Suspends the TUI and runs lazygit in the session's working directory. |
+| `<Space>bb` | System monitor (btop) | Suspends the TUI and runs btop when it is installed. |
 | `<Space>e` | File explorer | Toggles the left-anchored file explorer drawer. |
 | `<Space><Space>` | Find file | Opens the fuzzy file finder. |
 | `gf1` | Open recent file N | Opens the Nth most recent file (`gf1` to `gf9`). |
@@ -250,7 +250,8 @@ Reserved sequences: prefixes wait for the next key; no-ops keep retired chords f
 | `<Space>gr` | no-op | retired; the label picker is `:group` |
 | `<Space>R` | no-op | retired; the rating overlay is `:rate` |
 | `<Space>S` | no-op | retired emergency-stop chord; use <Space>X |
-| `gm` | no-op | retired merge-queue chord |
+| `gt` | no-op | retired TaskRabbit zone chord; use gs / gj / ga |
+| `<Space>o` | no-op | retired TaskRabbit launcher; use <Space>N or :blank |
 | `g?` | no-op | retired; the dialectic overlay is `:ask` |
 | `gX` | no-op | retired modal launcher; the command moved under <Space>g |
 | `gq` | no-op | retired modal launcher; the command moved under <Space>g |
@@ -348,13 +349,12 @@ In session list, search filters sessions by query text (case-insensitive). In se
 | Key | Action | Description |
 |-----|--------|-------------|
 | `gs` | GoToSessionsZone | Switch to sessions (main) zone from anywhere |
-| `gt` | GoToTaskRabbitZone | Switch to TaskRabbit zone from anywhere |
 | `gj` | GoToJobsZone | Switch to Jobs zone (scheduled job sessions) |
 | `l` | NavigateRight | Enter session from list, OR next workspace from detail |
 | `Left` / `Ctrl+Tab` | NavListUp | Navigate session list up (previous) from list or detail view (normal mode only) |
 | `Right` / `Ctrl+Shift+Tab` | NavListDown | Navigate session list down (next) from list or detail view (normal mode only) |
-| `Shift+Left` | NavListUp + Enter | Navigate to previous item and open it in session detail (Archive/TaskRabbit/Jobs/Main zones) |
-| `Shift+Right` | NavListDown + Enter | Navigate to next item and open it in session detail (Archive/TaskRabbit/Jobs/Main zones) |
+| `Shift+Left` | NavListUp + Enter | Navigate to previous item and open it in session detail (Archive/Jobs/Main zones) |
+| `Shift+Right` | NavListDown + Enter | Navigate to next item and open it in session detail (Archive/Jobs/Main zones) |
 | `Enter` | EnterSession | Open selected session — works from both list and detail view |
 | `Backspace` | AscendOrBack | Ascend one hierarchy container, or return to the session list/detail as applicable |
 
@@ -371,16 +371,20 @@ Intentional pass-through exceptions:
 | Key | Behavior |
 |-----|----------|
 | `Up` / `Down` | Always scroll the session detail transcript, even while editing the input bar |
-| `Space` leader sequences | Pass through in input-bar normal mode so global leader chords still work |
+| `Space` / `g` leader sequences | Pass through in input-bar normal mode when no vim command is pending (`g` only on an empty draft; with a draft it is the `gg` prefix) |
 | Unhandled normal-mode keys | Pass through when the input bar does not handle them |
 
 Use `Esc` to leave input-bar insert mode; this does not blur the input bar if draft text remains. Submit with `Ctrl+Enter` or clear/send the draft to restore the fully transparent empty-input behavior.
+
+Pending vim commands keep their next key in the input bar and new-session prompt: `f<Space>` finds a space, `dt<Space>` deletes up to a space, `fg` finds `g`, `r<Space>` replaces a character with a space, and `dgg` deletes through the first line. Counts, operators, and text-object prefixes also retain their continuation keys.
+
+The focused input bar's border and mode label are green in insert mode, yellow while awaiting an `f`/`F`/`t`/`T` target, and red while awaiting a delete motion. Global leaders show `LEADER: G` in light blue or `LEADER: SPACE` in purple; nested Space chords retain the Space label. Normal mode keeps the theme's default colors.
 
 ### Model Selection
 
 | Key | Action | Description |
 |-----|--------|-------------|
-| `Ctrl+M` | ToggleModelDropdown | Toggle model dropdown, anchored to the header row -- sets the default model for new sessions. Also works in Blank/TaskRabbit prompts for per-session model override. |
+| `Ctrl+M` | ToggleModelDropdown | Toggle model dropdown, anchored to the header row -- sets the default model for new sessions. Also works in Blank prompts for per-session model override. |
 
 ### Theme Selection
 
@@ -627,12 +631,14 @@ detail view.
 | `yy` | CopySessionUuid | Session-list focus: copy the focused complete session UUID via OSC 52; toast: `session <uuid> copied` |
 | `yy` | YankEventContent | Transcript focus: copy the content of the event at cursor to system clipboard (OSC 52, excludes header) |
 
-Navigator symbols (one vocabulary shared by the list, inspector, and activity pane; the activity pane shows a dim key, defined in `crates/rsi/src/ui/glyphs.rs`):
+Navigator symbols (shared vocabulary in `crates/rsi/src/ui/glyphs.rs`; press `?`, then `s` for the searchable symbol legend with meanings, locations and examples. The navigator footer gives an abbreviated lifecycle, attention and role key):
 
 - Pin and lifecycle: `∞` is the pin-column header and `◆` a pinned row; lifecycle is `◐` starting, `●` running, `?` waiting, `✓` completed, `×` failed, `■` interrupted, or `·` archived.
 - Attention: `!` action required (waiting input/approval, failed), `↺` retry pending, `⧗` stalled, `•` unread output. `↻N` is rotation depth.
+- Containers: `▣` Group, `▲` Epic in the function/title cell; `◉` in the status column means running descendants. `⏸` is an operator soft pause on an interrupted session.
 - Columns: `◔` context fill (`◌` = unknown, never `0%`), `⇄` turns, `▮` effort as a one-cell gauge scaled to the model's effort ladder (`▁`…`█`).
-- Provider glyph before the model: `✻` Claude, `◎` Codex, `◉` Codex app-server, `⋈` OpenRouter, `⌂` Local, `△` Antigravity, `◇` Pioneer, `⌘` Harness. The list model is the canonical ID minus its vendor namespace (`claude-opus-5-5` → `opus-5-5`); the inspector shows the full ID.
+- Provider glyph before the model: `✻` Claude, `◎` Codex, `◉` Codex app-server, `⋈` OpenRouter, `☁` Bedrock, `⌂` Local, `△` Antigravity, `◇` Pioneer, `⌘` Harness. The list model is the canonical ID minus its vendor namespace (`claude-opus-5-5` → `opus-5-5`); the inspector shows the full ID.
+- Compact context: `≈` approximate usage, `!` stale usage, `?` missing usage; the following `·T/K/C/R/L/O` identifies budget evidence (runtime telemetry, configured, provider catalog, repository fallback, legacy unverified, official documentation). Example: `42%≈·R` means 42% used with approximate usage and a repository-fallback budget. Shape meanings depend on their column or pane.
 - Roles: a leaf titled `Role: subject` shows a colored two-letter role code (`Mg` Manager, `Pl` Planner, `Rs` Researcher, `Iv` Investigator, `Im` Implementer, `Rf` Refactorer, `Db` Debugger, `Rv` Reviewer, `Vf` Verifier, …; unknown roles use their first two letters). Color is the role family: lead, plan, build, debug, check. Containers always show their full name.
 - Inspector: `#` session ID, `⌂` working directory, `⊡` sandbox, `⎇` branch (`⊡ ⎇` when they share the session UUID), `+` created, `Δ` updated, `◷` work/run time, `→` current work or next action, `▎` quoted latest output.
 
@@ -668,7 +674,8 @@ unchanged.
 | `<Space>8` | `<Space>8` | JumpAttentionN(8) |
 | `<Space>9` | `<Space>9` | JumpAttentionN(9) |
 | `<Space>a` | `<Space>a` | ArchiveSession |
-| `<Space>b` | `<Space>b` | OpenColorCustomizer |
+| `<Space>b` | `<Space>b` | Prefix only; system tools subnamespace |
+| `<Space>bb` | `<Space>bb` | OpenBtop |
 | `<Space>c` | `<Space>c` | QuickContinue |
 | `<Space>C` | `<Space>C` | ReassignSessionProject |
 | `<Space>e` | `<Space>e` | ToggleFileExplorer |
@@ -683,7 +690,6 @@ unchanged.
 | `<Space>K` | `<Space>K` | OpenScheduleBrowser |
 | `<Space>m` | `<Space>n` | BlankPrompt |
 | `<Space>M` | `<Space>M` | OpenMemorySearch |
-| `<Space>o` | `<Space>o` | TaskRabbitPrompt |
 | `<Space>p` | `<Space>p` | OpenProjectPicker |
 | `<Space>q` | `<Space>q` | CloseFocusedPane |
 | `<Space>r` | `<Space>r` | ToggleRotationDisabled |
@@ -708,7 +714,6 @@ unchanged.
 | `gB` | `<Space>B` | CreateBug; old `gB` is an inert guard |
 | `gs` | `gs` | GoToSessionsZone — retained zone navigation |
 | `ga` | `ga` | GoToArchiveZone — retained zone navigation |
-| `gt` | `gt` | GoToTaskRabbitZone — retained zone navigation |
 | `gj` | `gj` | GoToJobsZone — retained zone navigation |
 | `gr` | `gr` | OpenRecentCompletions — retained navigation |
 | `gL` | `gL` | SetEpicLead — retained mutation |
@@ -723,7 +728,7 @@ unchanged.
 | `gf8` | `gf8` | OpenRecentFileN(8) — retained navigation |
 | `gf9` | `gf9` | OpenRecentFileN(9) — retained navigation |
 | `gg` | `gg` | Vim jump-top motion — retained |
-| `gm` | `gm` | Retired no-op — retained |
+| `gm` | `gm` | OpenGlobalManagerWorkspace — rebound from a retired no-op (#1213) |
 | `g?` | `g?` | Retired no-op — retained |
 
 The registered manager actions remain under `<Space>g` and contextual help (`?`)
@@ -919,11 +924,12 @@ arguments open that editor on Enter.
 | `:manager inspect` |  | Open manager inspect | Opens the harness manager inspect view (workers, work, requests, topology and events). |
 | `:kill` | `:ki` | Soft interrupt running session | Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it. |
 | `:pause soft` |  | Downgrade hard pause to soft | Changes the selected session's HARD marker to SOFT so a granted manager may restart it. |
-| `:pause clear` |  | Clear operator pause | Clears the selected session's SOFT or HARD marker. |
+| `:pause clear` |  | Clear operator pause | Clears the selected session's SOFT or HARD marker; a manager seat shows its age and any held succession, and the key must be pressed twice to confirm. |
 | `:continue [arg]` | `:cont [arg]` | Continue selected session | `<Space>c` sends literal `continue`; `:continue` opens a prompt, and `:continue <text>` sends text directly. |
 | `:archive` | `:arc` | Archive selected session | Archives the selected session (reversible with U from the Archive zone). |
 | `:delete` | `:del` | Delete selected session | Deletes the selected session after the double-tap `DD` (moves it to the trash). |
 | `:rotate` | `:rot` | Rotate session context | Rotates the selected session into a fresh context, carrying a handoff forward. |
+| `:rotation-abandon [arg]` |  | Abandon blocked rotation | Moves the selected session's blocked rotation to a fresh replacement session that takes the sandbox and the seat; `:rotation-abandon <provider>[/<model>]` picks its launch. Run twice to confirm. |
 | `:archives` |  | Open archives | Switches the session list to the Archive zone. |
 | `:model [arg]` | `:mod [arg]` | Choose model | Opens the model picker, or `:model <name>` selects a model for new launches. |
 | `:sessions` | `:ls` | List sessions | Lists sessions in the session list. |
@@ -931,7 +937,6 @@ arguments open that editor on Enter.
 | `:quit` | `:q` `:qall` `:qa` `:quit!` `:q!` | Quit | Quits rsi (the daemon and its sessions keep running). |
 | `:projects` |  | Choose project | Opens the project picker. |
 | `:project [arg]` |  | Switch project | Switches to the named project, or opens the picker without a name. |
-| `:task [arg]` | `:ta [arg]` | Launch task session | Opens the TaskRabbit one-shot prompt; `:task <text>` launches it directly. |
 | `:blank [arg]` | `:bl [arg]` | Launch blank session | Opens the blank general-purpose session prompt; `:blank <text>` launches it directly. |
 | `:project-new [arg]` |  | Create project | Creates a project: `:project-new <name> [path]`, or opens the form. |
 | `:project-edit [arg]` |  | Edit project | Edits the named or current project. |
@@ -954,6 +959,17 @@ arguments open that editor on Enter.
 | `:manager appoint` |  | Appoint harness manager | Appoints the selected session as the harness manager. |
 | `:manager scope` |  | Edit manager scope | Edits the harness manager's scope. |
 | `:manager clear` |  | Clear manager scope | Clears the harness manager's scope. |
+| `:fleet` |  | Open fleet workspace | Shows active agents and usage rates across all projects. |
+| `:global-manager` | `:gm` `:manager workspace` | Open global manager workspace | Opens the global manager workspace above all projects: the grant, the global seat and each granted project's PM health; Enter opens the seat or a PM session. |
+| `:manager global [arg]` |  | Show global manager grant | Shows the active global manager grant; `:manager global set <active\|sessions\|containers\|spend\|groups> <value>` changes one per-project cap; `:manager global configure <JSON>` sends a full typed grant request. |
+| `:manager global appoint [arg]` |  | Appoint global manager | Appoints the focused session as the global manager over the named projects (comma-separated; default: every project). |
+| `:manager global revoke` |  | Revoke global manager | Revokes the active global manager grant; the seat keeps its session but loses its authority. |
+| `:manager portfolio [arg]` |  | Manager portfolio nodes | Lists managers above project level (portfolio nodes of any tier); `:manager portfolio show <node>`, `appoint <label> [projects...]` (focused session as seat; `--adopt <node,...>` appoints it above existing nodes), `configure <JSON>` and `revoke <node>` inspect or change one. |
+| `:manager escalations [arg]` |  | Manager escalations | Lists escalations that reached the top of their manager chain and top-of-chain reports; `:manager escalations rule <hop> <text>` rules one (the ruling returns down the chain to the source seat and never answers a human approval), `ack <notice>` marks a report read, `all` includes closed rows, failed or uncertain tier mail is listed with its reason and `undelivered [<cursor>]` pages it. |
+| `:manager friction [arg]` |  | Manager friction | Shows the friction rollup (the andon): refusals, deploy timeouts, superseded handoffs and lander refusals the daemon recorded, by signature, with the kaizen Issue filed for each repeating one; `:manager friction <hours>` widens the window (default 24, at most 720). The board's Inspect · Friction section shows one project's rows. |
+| `:manager tree` |  | Open manager tree | Opens the manager hierarchy tree: the global grant, project seats, area nodes and led Epics. |
+| `:manager node [arg]` |  | Manager area nodes | Lists manager area nodes; `:manager node get <UUID>`, `configure <JSON>` and `revoke <UUID> <epoch>` inspect or change one. |
+| `:manager restart [arg]` |  | Operator quiet-point restart | Shows the pending quiet-point restart; `:manager restart now` forces it and `:manager restart cancel` cancels it. |
 | `:rate [arg]` | `:r [arg]` | Rate selected session | Rates the selected session 1-10: `:rate <n>`, or opens the rating overlay (digits 1-9, 0 = 10). |
 | `:split` | `:sp` | Split pane horizontally | Splits the focused pane horizontally (handled by the pane's window commands). |
 | `:vsplit` | `:vs` | Split pane vertically | Splits the focused pane vertically (handled by the pane's window commands). |
@@ -1131,7 +1147,7 @@ Clipboard paste works from either mode and switches to insert mode automatically
 
 #### Settings Side (`Ctrl+O`, or `Tab` in normal mode)
 
-New-session prompts (blank and TaskRabbit) flip to a settings side where the launch is adjusted before it is sent. Flipping keeps the prompt's text and editing mode, so `Ctrl+O` from insert mode, a change, and `Ctrl+O` again resumes typing. `Esc` or `Tab` also flips back. `Ctrl+Enter`, `Ctrl+T`, `Ctrl+S`, `Ctrl+Q`, `Ctrl+E`, `Ctrl+B` and `Ctrl+M` keep working on the settings side; other keys never edit the hidden text.
+New-session prompts (blank) flip to a settings side where the launch is adjusted before it is sent. Flipping keeps the prompt's text and editing mode, so `Ctrl+O` from insert mode, a change, and `Ctrl+O` again resumes typing. `Esc` or `Tab` also flips back. `Ctrl+Enter`, `Ctrl+T`, `Ctrl+S`, `Ctrl+Q`, `Ctrl+E`, `Ctrl+B` and `Ctrl+M` keep working on the settings side; other keys never edit the hidden text.
 
 | Row | Keys | Effect |
 |-----|------|--------|
@@ -1182,10 +1198,10 @@ Overlay normal mode supports the full vim text editing feature set documented in
 |-----|--------|-------------|
 | `Ctrl+Q` | Close | Close overlay without submitting (normal or insert mode) |
 | `?` | Help | Contextual help for the prompt (normal mode with no pending command) |
-| `Ctrl+O` | Settings Side | Flip to / from the launch settings side (Blank/TaskRabbit only); `Tab` does the same in normal mode |
-| `Ctrl+E` | Cycle Effort | Cycle effort level (Blank/TaskRabbit only; `None` starts at the selected model default, then follows the ordered ladder: Opus 5 / Opus 4.7+ / Sonnet 5 `low`→`medium`→`high`→`xhigh`→`max`; Opus/Sonnet 4.6 `low`→`medium`→`high`→`max`; Codex GPT-5.6 Sol/Terra `low`→`medium`→`high`→`xhigh`→`max`→`ultra`; GPT-5.6 Luna through `max`; GPT-5.5/5.2 through `xhigh`) |
-| `Ctrl+M` | Model Selector | Open model selector (Blank/TaskRabbit only) — selection sets per-modal override |
-| `Ctrl+B` | Toggle Sandbox | Toggle sandbox (git-worktree isolation) for this launch (Blank/TaskRabbit only; capability-gated — no-op against daemons without sandbox support) |
+| `Ctrl+O` | Settings Side | Flip to / from the launch settings side (Blank only); `Tab` does the same in normal mode |
+| `Ctrl+E` | Cycle Effort | Cycle effort level (Blank only; `None` starts at the selected model default, then follows the ordered ladder: Opus 5 / Opus 4.7+ / Sonnet 5 `low`→`medium`→`high`→`xhigh`→`max`; Opus/Sonnet 4.6 `low`→`medium`→`high`→`max`; Codex GPT-5.6 Sol/Terra `low`→`medium`→`high`→`xhigh`→`max`→`ultra`; GPT-5.6 Luna through `max`; GPT-5.5/5.2 through `xhigh`) |
+| `Ctrl+M` | Model Selector | Open model selector (Blank only) — selection sets per-modal override |
+| `Ctrl+B` | Toggle Sandbox | Toggle sandbox (git-worktree isolation) for this launch (Blank only; capability-gated — no-op against daemons without sandbox support) |
 
 #### Modal Geometry (Any Mode)
 
@@ -1203,7 +1219,7 @@ These keys work in centered modal windows, including prompts, pickers, forms, he
 | `Ctrl+Up` | Move Up | Move modal up |
 | `Ctrl+0` | Reset Geometry | Reset modal position/size to defaults |
 
-Geometry changes persist across sessions, keyed by modal purpose (for example Blank, TaskRabbit, ContinueSession, InputModal, NotificationBrowser, SortPicker). Terminal resize recomputes the base rect; deltas apply on top.
+Geometry changes persist across sessions, keyed by modal purpose (for example Blank, ContinueSession, InputModal, NotificationBrowser, SortPicker). Terminal resize recomputes the base rect; deltas apply on top.
 
 ### Question Panel
 
@@ -1226,13 +1242,12 @@ Claude sessions can raise structured questions through `AskUserQuestion`. The pa
 
 #### Input Overlay Stack Navigation
 
-When multiple Blank/TaskRabbit input overlays are open simultaneously, use these keys to navigate focus between them. The focused overlay receives all key input and has a bright border; unfocused overlays have a dimmed border.
+When multiple Blank input overlays are open simultaneously, use these keys to navigate focus between them. The focused overlay receives all key input and has a bright border; unfocused overlays have a dimmed border.
 
 | Key | Action | Description |
 |-----|--------|-------------|
 | `Ctrl+J` | Focus Down | Move focus to the next (newer) input overlay |
 | `Ctrl+K` | Focus Up | Move focus to the previous (older) input overlay |
-| `Space+o` | Open TaskRabbit | Open a new TaskRabbit overlay (always opens, stacks below existing) |
 | `Space+n` | Open Blank | Open a new Blank session overlay (always opens, stacks below existing) |
 
 These keys work in both insert and normal mode within any input overlay. `Space+o` and `Space+n` require normal mode. Overlays stack vertically with the oldest at the top and the newest at the bottom. When more overlays exist than fit on screen, the view scrolls to keep the focused overlay visible.
@@ -1241,19 +1256,39 @@ These keys work in both insert and normal mode within any input overlay. `Space+
 
 ### Model Dropdown (Widget)
 
-The model dropdown is a reusable inline widget anchored below the header row (or below the model badge in Blank/TaskRabbit prompts). It is NOT an overlay — it intercepts keys when open.
+The model dropdown is a reusable inline widget anchored below the header row (or below the model badge in Blank prompts). It is NOT an overlay — it intercepts keys when open. The same picker serves the global `Ctrl+M` picker, Settings model rows, the new-session modal, the create-entity form, the manager launch catalog and the Prompt Creator.
+
+Browsing is tentative: nothing changes until `Enter` (or `1`-`9`) picks a model. `Esc` / `q` close the picker and leave the launch default (provider, endpoint, model, effort) and any per-launch override exactly as before it opened, however many providers were browsed or filtered.
+
+Press `/` to filter the current provider's catalog. The top row shows the query and a `matches of total` count. Search ignores case, and every space-separated term must appear in the model name or ID; punctuation and spacing are ignored as a fallback, so `opus45` finds `claude-opus-4-5`. Matched text is highlighted, results keep catalog order, and each query edit highlights the first match, so typing a query and pressing `Enter` picks the best hit. While typing, every printable key (including `j`, `k`, `q`, `1`-`9` and Space) goes into the query, never to a shortcut or leader. The query is kept when cycling providers and when discovery refreshes the catalog, and is cleared when the picker closes.
 
 | Key | Action | Description |
 |-----|--------|-------------|
-| `j` / `Down` | Move Down | Navigate to next model |
-| `k` / `Up` | Move Up | Navigate to previous model |
-| `g` | Go to Top | Jump to first model |
-| `G` | Go to Bottom | Jump to last model |
-| `Tab` | Cycle Provider Forward | Cycle provider forward (Claude → Codex → Pioneer → Local → Gemini → Harness → custom providers) |
-| `Shift+Tab` / `BackTab` | Cycle Provider Backward | Cycle provider in reverse order |
-| `Enter` | Select | Select model and close dropdown |
-| `1`-`9` | Direct Select | Select model by number (1-indexed) |
-| `Esc` / `q` | Cancel | Close dropdown without changing model |
+| `j` / `Down` | Move Down | Navigate to the next (filtered) model |
+| `k` / `Up` | Move Up | Navigate to the previous (filtered) model |
+| `g` / `Home` | Go to Top | Jump to the first (filtered) model |
+| `G` / `End` | Go to Bottom | Jump to the last (filtered) model |
+| `Tab` | Cycle Provider Forward | Preview the next provider's models (Claude → Codex → Pioneer → OpenRouter → Bedrock → Local → Antigravity → CodexAppServer → Harness → custom providers), keeping any filter. Browsing is tentative: nothing changes until `Enter` |
+| `Shift+Tab` / `BackTab` | Cycle Provider Backward | Preview providers in reverse order (tentative, like `Tab`) |
+| `/` | Filter | Start filtering, or resume editing a kept filter |
+| `Enter` | Select | Commit the highlighted model together with the browsed provider (and, for the default model, its endpoint and catalog), then close. Works while typing a filter; does nothing when no model matches |
+| `1`-`9` | Direct Select | Select the Nth visible (filtered) model, outside filter typing |
+| `Esc` / `q` | Cancel | Close the dropdown without changing anything (see above) |
+
+While typing a filter:
+
+| Key | Action | Description |
+|-----|--------|-------------|
+| Printable keys | Type | Add to the query |
+| `Backspace` | Delete | Delete the last character; on an empty query, stop filtering |
+| `Ctrl-W` / `Ctrl-U` | Delete Word / Clear | Delete the last word / clear the whole query |
+| `Up` / `Down` / `Ctrl-P` / `Ctrl-N` | Move | Navigate the filtered models |
+| `Home` / `End` | First / Last | Jump to the first / last match |
+| `Tab` / `Shift+Tab` | Cycle Provider | Run the same query against the next / previous provider |
+| `Enter` | Select | Pick the highlighted match |
+| `Esc` | Stop Typing | Keep the filter and its results for `j`/`k`/`1`-`9`; a second `Esc` closes the picker |
+
+The Prompt Creator's picker has a fixed catalog (no `Tab`); there `m` also closes it outside filter typing.
 
 ### Theme Picker Overlay
 
@@ -1329,6 +1364,8 @@ Entity card fact editor for project or user cards. Facts are injected into sessi
 | `Enter` | Apply | Apply selected sort order |
 | `Esc` / `q` | Cancel | Close without changing sort |
 
+Orders: **Longest idle** (the default; idle the longest at the top), **Recently active**, **Oldest first** and **Newest first** (by creation), and **Grouped by label**. Except for label grouping and an active `/` filter, the Main zone keeps its sections (Managers, Needs you, In flight, Recent, Quiet) and the order applies inside each one. The scope header names the order in effect beside the count, for example `⇅ Longest idle · 20 sessions`.
+
 ### Prompt Preview Overlay
 
 | Key | Action | Description |
@@ -1351,7 +1388,7 @@ Activated with `ga`. Browse and restore archived sessions as a zone tab in the s
 | `gg` / `G` | Jump | Jump to first/last archived session |
 | `Enter` / `l` | Open | Open selected archived session in detail view |
 | `U` | Unarchive | Restore selected session (moves back to active list) |
-| `gs` / `gt` / `gj` / `ga` | Zone Jump | Switch directly to Sessions / TaskRabbit / Jobs / Archive |
+| `gs` / `gj` / `ga` | Zone Jump | Switch directly to Sessions / Jobs / Archive |
 
 ### File Explorer Overlay (`<Space>e`)
 
@@ -1725,12 +1762,16 @@ The secret is rendered FULLY masked (every character as `*`, never a partial rev
 
 Help is generated from the shared action registry and the captured focus, selection, mode, pending state, and daemon connection. It shows the bindings for that context and omits actions that cannot currently run. Search is case-insensitive, matches action names, descriptions, bindings, and aliases, and requires every space-separated term to match. Closing help restores the exact pane or suspended overlay, including its selection, scroll, editor draft, and transient state.
 
+Press `s` inside help to open **Symbols**. This grouped legend explains core session-browser, inspector, activity and transcript symbols, including providers, roles, context confidence and budget-source suffixes. Each entry names its location and gives a short explanation; `/` matches the glyph, name, location and explanation. Identical shapes can have different meanings: `◉` is running descendants in a container's status cell and Codex App Server in the provider column. Long explanations wrap, and scrolling follows the wrapped lines. `Tab` cycles **Contextual → All Commands → Symbols**; `Shift-Tab` reverses the cycle. Search text stays literal, so `s` typed while searching does not change views.
+
 Contextual help also covers every overlay that owns its own keys (forms such as Create Entity in normal or insert mode, pickers, the model dropdown, File Explorer and its finder, the file viewer, Telescope, the command palette, the manager surfaces, notifications, the question panel, archive/trash, graph review, the recursive DAG browser, and settings-style editors). Those rows come from one discovery catalog in `crates/rsi/src/action_registry.rs` (`OVERLAY_HELP_ROUTES`), appear under the overlay's name, and match help search; they describe the overlay's handler and are never dispatched through the action registry or the command palette. From these overlays, open help with `Ctrl+Alt+G`; `?` is left to the overlay's own handler (Scheduled Jobs and the Theme Role Editor also accept `?`).
 
 **Scroll Mode (default):**
 
 | Key | Action | Description |
 |-----|--------|-------------|
+| `s` | Symbols | Show symbol meanings, locations and examples |
+| `Tab` / `Shift-Tab` | Help View | Cycle contextual keys, all commands and symbols forward / backward |
 | `/` | Search | Enter descriptor search mode |
 | `j` / `Down` | Scroll Down | Scroll content down one line |
 | `k` / `Up` | Scroll Up | Scroll content up one line |
@@ -1747,7 +1788,7 @@ Contextual help also covers every overlay that owns its own keys (forms such as 
 
 | Key | Action | Description |
 |-----|--------|-------------|
-| *any char* | Filter | Search action names, descriptions, bindings, and aliases; all terms must match |
+| *any char* | Filter | Search current help view; symbol search includes shapes, names, locations and explanations; all terms must match |
 | `Backspace` | Delete | Remove last character from search |
 | `Enter` | Accept | Accept filter and return to scroll mode |
 | `Esc` | Clear | Clear filter and return to scroll mode |
@@ -1946,15 +1987,55 @@ Open **Settings → Integrations → Remote → Remote access**. The page edits 
 
 ### Manager Tree
 
-`:manager tree` opens a read-only tree of the manager hierarchy from one bounded operator snapshot (`GetManagerTree`): the active global grant, each project's manager seat, its area manager nodes, and Epics with leads. Each row shows seat health (status, model, context fill, last activity), the selected scope, live capabilities, the allowance and what it has reserved for reports, and load counts (running workers, direct reports, pending escalations, pending operator decisions). A count the daemon could not traverse completely shows `?`, and the header says the traversal is incomplete. Large trees page: the header shows `N of M nodes loaded` and `n` (or moving past the last row) loads the next page. Appointment, scope, grants and revocation stay on `:manager appoint`, `:manager global` and `:manager node`; human decisions stay in `:manager decisions`.
+`:manager tree` opens the manager hierarchy from one bounded operator snapshot (`GetManagerTree`): the active global grant, each project's manager seat, its area manager nodes, and Epics with leads. Rows are drawn as a guided tree (`├─`, `└─`, `│`) with a coloured kind badge and aligned columns: seat health (status, context fill, last activity, model when it fits), scope and grant (capabilities, allowance and what it reserves for reports), and load (running workers, direct reports, pending escalations, pending operator decisions; nonzero escalations and decisions are highlighted). A count the daemon could not traverse completely shows `?`; a row whose children could not all be listed is flagged `! partial`, and the header says the traversal is incomplete. Nothing is cut silently: the header shows `N of M nodes loaded`, the column header shows which rows are on screen, and a partial tree ends with `… K more node(s) not loaded`. `n` (or moving past the last row) loads the next page. The detail pane under the tree shows the selected node in full and which actions are available there, with the reason for each unavailable one.
+
+In-tree actions use the existing typed operator RPCs, carry the version the operator reviewed, and reload the tree after every outcome. Before a confirm opens the action reads the node's current version; if the tree was stale it reloads instead. Destructive actions (revoke, replace, narrowing) show the descendant impact and need `y`; `Enter` does not confirm them.
+
+| Row | `a` appoint / replace seat | `e` edit | `x` revoke |
+|-----|----------------------------|----------|------------|
+| Global | The focused session becomes the seat (`ConfigureGlobalManager`) | Toggle granted projects and edit the per-project caps: active, created sessions and containers, spend, groups (`ConfigureGlobalManager`) | `RevokeGlobalManager` |
+| Portfolio (any tier) | The focused session becomes the seat (`ConfigurePortfolioNode`) | Toggle granted projects and edit the per-project caps (`ConfigurePortfolioNode`) | `RevokePortfolioNode`: grantor-scoped, so operator-granted children move up a level and the node's own appointees are revoked with their subtree |
+| Project | The focused session becomes the seat, keeping the live scope (`ConfigureHarnessManager`) | Opens the `:manager scope` picker | Clear the scope, revoking supervision (`ConfigureHarnessManager`) |
+| Area node | Unavailable: no RPC moves an area seat (revoke, then delegate anew) | Carve the allowance of a node without reports (`ConfigureManagerNode`) | `RevokeManagerNode` |
+| Epic | Unavailable | Unavailable | Unavailable |
+
+On a portfolio row two more actions add or move levels (#1237). `A` appoints the focused session as a new manager directly above the node (`ConfigurePortfolioNode` with `adopt_node_ids`): the new node takes the node's place (a root, or under the same parent), covers its projects and is granted one unit more than it in every allowance. `m` marks the node; `m` on a sibling then moves the marked node under that sibling, which widens to cover the marked node's projects and adopts it (`Esc` cancels a pending move). Both show the moved subtree's impact and need `y`; the moved nodes keep their seats, epochs, ledgers and workers.
+
+The focused session is the one selected in the session list behind the tree; it must be an unarchived leaf (and in the project, for a project seat). Human decisions stay in `:manager decisions`.
 
 | Key | Action |
 |-----|--------|
 | `j` / `k` / `g` / `G` | Move the selection |
+| `PgDn` / `PgUp` (`Ctrl-d` / `Ctrl-u`) | Move a page |
 | `h` / `l` | Fold (or fold the parent) / unfold the selected node |
-| `Enter` | Open the selected node's session |
+| `Space` | Toggle the selected node's fold |
+| `H` / `L` | Fold every node / unfold every node |
+| `Enter` | Open the selected manager node's console (Portfolio, Project or Area row; a pre-#1236 global row opens `gm`); on an Epic row, open its lead's session |
+| `o` | Open the selected node's project workspace |
+| `p` | Preview descendant impact and action availability (sends nothing) |
+| `a` / `e` / `x` | Appoint or replace the seat / edit scope or grant / revoke (see above) |
+| `A` / `m` | Portfolio rows: appoint a manager above the node / move the node under a sibling (`m` here, then `m` on the sibling) |
+| `y` / `n` | In a confirm: send / cancel (`Esc` also cancels) |
 | `n` | Load the next page |
 | `r` | Refresh the snapshot, keeping the selected node |
+| `Esc` / `q` | Close; the selection and folds are restored when the tree reopens |
+
+### Global Manager Workspace (`gm`, `:global-manager`)
+
+`gm` (the `g` leader, then `m`) or `:global-manager` (also `:gm`, `:manager workspace`) opens the global manager workspace: one full-screen view above every project. It is not part of any project tab, so it shows the same content from every tab. It reads one bounded operator-only snapshot (`GetGlobalManagerWorkspace`): the active global grant (or the most recent revoked one), the global seat's session, and for each granted project its PM seat health plus portfolio signals (open / in-progress / operator-request Issues, running and waiting sessions, pending questions and approvals). Each seat shows `ACTIVE`, `IDLE`, `WAITING`, `PAUSED`, `STOPPED`, `MISSING` or `REVOKED`. The view is a console (#1231): the manager seats (the global seat, then each project's PM, indented by level) sit on the left, and the selected seat's live conversation sits on the right with its input bar. It uses the same renderer as the session detail pane and updates from the same event stream. `i` types to the selected seat in place (`t` selects the global seat first). Enter or Ctrl-Enter sends, and Esc leaves typing; drafts stay with each seat's session. `Tab` focuses the transcript for scrolling. Below 96 columns the list and the conversation take turns. `n` instantiates a manager in one flow. Pick the seat (global, or a project's PM), a provider/model/effort from the allowed launch catalog (the grant's launches plus the operator default) and, for the global seat, its projects. It then launches a fresh session and appoints it through `ConfigureGlobalManager` or `ConfigureHarnessManager` plus the Execute policy. Validation and refusals show inline. When the launch succeeded but the appointment was refused, Enter retries only the appointment. With no grant the view says how to launch one (or appoint an existing session with `:manager global appoint [project names...]`). Missing, stopped and revoked seats say what to do. The view reloads every 15 seconds while open, after any `:manager global`, `:manager node` or `:manager restart` command, and on `r`; a failed reload keeps the last snapshot and says so. Enter opens the selected seat's session in a tab showing its project (opening one when needed). `?` lists the keys.
+
+The same console renders any manager node (#1240). Enter on a Portfolio, Project or Area row of the manager tree opens that node's console from the operator-only `GetManagerNodeWorkspace` snapshot. The header names the node it reports to, its grant, a fleet rollup of its coverage (active agents and 5-minute and 1-hour token and cost rates, 24-hour invocations) and the escalations waiting on it. The seats are the node's own seat, each child portfolio node (as a digest with its summed counts) with the projects it covers beneath it, then the projects the node manages directly and its child areas. Enter on a child row opens that child's console, and Backspace opens the parent's. In a node console, `n` launches project managers only; appoint portfolio and area seats from the manager tree. `gm` still opens the global through `GetGlobalManagerWorkspace`.
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` / `g` / `G` | Move the selection |
+| `Enter` / `l` | Open the console's own seat (on the seat row) or the project's PM session; a project without a PM opens its session list; a child node row opens that node's console |
+| `Backspace` | Open the parent node's console |
+| `t` | Talk: select the console's own seat and type to it, from any row |
+| `p` | Open the selected project's tab |
+| `T` | Open the manager tree |
+| `:` | Open the command palette (`:manager global appoint ...`, `:manager global revoke`, ...) |
+| `r` | Refresh the snapshot |
 | `Esc` / `q` | Close |
 
 ## Overlay Key Reference (generated)
@@ -2068,10 +2149,15 @@ Keys of the theme role editor.
 | --- | --- |
 | `j / k, Down / Up` | Move selection |
 | `g / G` | Jump to first / last |
+| `/` | Filter models by name or ID |
+| `Up / Down / Ctrl-N / Ctrl-P` | Navigate filtered models while typing a filter |
+| `Home / End` | First / last filtered model |
+| `Backspace / Ctrl-W / Ctrl-U` | Delete filter character / word / whole query |
 | `Tab / Shift-Tab` | Next / previous provider |
-| `1-9` | Select numbered model |
+| `1-9` | Select numbered model (not while typing a filter) |
 | `Enter` | Select model |
-| `Esc / q` | Close model picker |
+| `Esc` | Stop typing a filter (keeps it); else close model picker |
+| `q` | Close model picker (not while typing a filter) |
 <!-- rsi:generated:end -->
 
 ### Sort Picker
@@ -2083,7 +2169,6 @@ Keys of the theme role editor.
 | `g / G` | Jump to first / last |
 | `Enter` | Apply sort order |
 | `Esc / q` | Close without changing |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2098,7 +2183,6 @@ Keys of the theme role editor.
 | `1-9` | Apply numbered theme |
 | `Enter` | Apply theme |
 | `Esc / q` | Revert preview and close |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2116,7 +2200,6 @@ Keys of the theme role editor.
 | `Ctrl-E` | Edit highlighted project |
 | `Ctrl-D` | Delete highlighted project |
 | `Esc` | Close picker |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2134,7 +2217,6 @@ Keys of the theme role editor.
 | `Ctrl-E` | Edit highlighted label |
 | `Ctrl-D` | Delete highlighted label |
 | `Esc` | Close picker |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2149,7 +2231,6 @@ Keys of the theme role editor.
 | `Type, Backspace` | Filter parents |
 | `Enter` | Set parent |
 | `Esc` | Close picker |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2243,7 +2324,6 @@ Keys of the theme role editor.
 | `Down / Up, Ctrl-J / Ctrl-K` | Move selection |
 | `Enter` | Open file in viewer |
 | `Esc` | Close telescope |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2302,7 +2382,11 @@ Keys of the theme role editor.
 | `[ / ]` | Previous / next Inspect subsection (Inspect) |
 | `j / k, Down / Up` | Move selection |
 | `g / G` | Jump to first / last |
-| `Enter / a` | Answer selected decision |
+| `h / l, Left / Right` | Highlight previous / next option |
+| `Enter` | Answer the highlighted option (or write an answer) |
+| `y` | Accept the asker's recommendation |
+| `a` | Write your own answer |
+| `X` | Archive stale decisions (asks to confirm the count; never deletes) |
 | `o` | Open the selected row's session |
 | `n / p` | Next / previous page |
 | `r` | Reload section |
@@ -2337,6 +2421,27 @@ Keys of the theme role editor.
 | `Esc` | Cancel entry |
 <!-- rsi:generated:end -->
 
+### Global Manager Workspace
+
+<!-- rsi:generated:begin overlay-global-manager-workspace -->
+| Keys | Action |
+| --- | --- |
+| `j / k, Down / Up` | Move selection |
+| `g / G` | Jump to first / last |
+| `i` | Type to the selected seat's manager here |
+| `t` | Select the console's own seat and type to it |
+| `n` | Launch and appoint a manager (seat, launch, scope) |
+| `Tab` | Focus the conversation: j/k, Ctrl-D/U scroll, g/G ends |
+| `Enter / l` | Open the seat's session in its project tab, or a child node's console |
+| `Backspace` | Open the parent node's console |
+| `p` | Open the selected project's tab |
+| `T` | Open the manager tree |
+| `F` | Open the fleet workspace |
+| `r` | Refresh the snapshot |
+| `:` | Open the command palette |
+| `Esc / q` | Close (Esc leaves typing or the conversation first) |
+<!-- rsi:generated:end -->
+
 ### Notifications
 
 <!-- rsi:generated:begin overlay-notifications -->
@@ -2351,7 +2456,6 @@ Keys of the theme role editor.
 | `Ctrl+Arrows` | Move modal |
 | `Ctrl+Shift+Arrows` | Resize modal |
 | `Ctrl+0` | Reset modal geometry |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2366,7 +2470,6 @@ Keys of the theme role editor.
 | `Enter` | Open selected session |
 | `i` | Return to input bar in insert mode |
 | `Esc / q` | Close |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2407,7 +2510,6 @@ Keys of the theme role editor.
 | `U` | Restore session |
 | `D` | Purge session permanently |
 | `Esc / q` | Close |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2423,7 +2525,6 @@ Keys of the theme role editor.
 | `A` | Begin authorization |
 | `r` | Refresh receipt |
 | `Esc / q` | Close |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2449,7 +2550,6 @@ Keys of the theme role editor.
 | `H / J / K / L` | Pan graph view |
 | `c` | Camera follows selection |
 | `q` | Close graph review |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2464,7 +2564,6 @@ Keys of the theme role editor.
 | `H / J / K / L` | Pan graph view |
 | `c` | Camera follows selection |
 | `q` | Close graph review |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2488,7 +2587,6 @@ Keys of the theme role editor.
 | `c` | Camera follows selection |
 | `Esc` | Back out of detail |
 | `q` | Close graph review |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2534,7 +2632,6 @@ Keys of the theme role editor.
 | `c` | Continue recovery |
 | `!` | Reveal control details |
 | `Esc / q` | Close inspector, then browser |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2618,7 +2715,6 @@ Keys of the theme role editor.
 | `o` | Overwrite settings on disk |
 | `r` | Reload settings from disk |
 | `c / Esc` | Cancel save |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2657,22 +2753,6 @@ Keys of the theme role editor.
 | `Esc` | Cancel |
 <!-- rsi:generated:end -->
 
-### Color Customizer
-
-<!-- rsi:generated:begin overlay-color-customizer -->
-| Keys | Action |
-| --- | --- |
-| `Tab / j / Down` | Next field |
-| `Shift-Tab / k / Up` | Previous field |
-| `Type, Backspace` | Edit hex color |
-| `Enter` | Apply color |
-| `Delete` | Reset field to default |
-| `Esc / q` | Close |
-| `Space o` | Close and open a TaskRabbit session prompt |
-| `Space N` | Close and open a blank session prompt |
-| `Space ;` | Open the command palette |
-<!-- rsi:generated:end -->
-
 ### Text Area Background
 
 <!-- rsi:generated:begin overlay-text-area-background -->
@@ -2682,7 +2762,6 @@ Keys of the theme role editor.
 | `Enter` | Apply color |
 | `Delete` | Clear override |
 | `Esc / q` | Close |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2697,7 +2776,6 @@ Keys of the theme role editor.
 | `Ctrl-D / Ctrl-U` | Scroll preview down / up |
 | `Enter` | Open selected session |
 | `p / Esc / q` | Close |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2711,7 +2789,6 @@ Keys of the theme role editor.
 | `Ctrl-D / Ctrl-U` | Half page down / up |
 | `g / Home, G / End` | Jump to top / bottom |
 | `Esc / q` | Close |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2722,7 +2799,6 @@ Keys of the theme role editor.
 | Keys | Action |
 | --- | --- |
 | `Esc / q` | Close |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2735,7 +2811,6 @@ Keys of the theme role editor.
 | `R` | Rate session |
 | `G` | Edit labels |
 | `Esc / q` | Close |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2749,7 +2824,29 @@ Keys of the theme role editor.
 | `h / l, Left / Right` | Lower / raise rating |
 | `Enter` | Save rating |
 | `Esc / q` | Close |
-| `Space o` | Close and open a TaskRabbit session prompt |
+| `Space N` | Close and open a blank session prompt |
+| `Space ;` | Open the command palette |
+<!-- rsi:generated:end -->
+
+### Switch Model / Effort
+
+Opened from a session with `<Space>mm`. The picker asks the daemon what the
+session may switch to: the provider's models (narrowed by the operator
+launch-model allowlist), the chosen model's effort levels, the current and
+queued model and effort, and whether the switch keeps the provider
+conversation. `Enter` queues the switch for the session's next turn; a running
+turn is never interrupted. The session status line shows the queued target
+(`→ model · effort`) until the session's effective model and effort match it.
+Sessions on providers that cannot switch in place get the reason as a toast.
+
+<!-- rsi:generated:begin overlay-switch-model-effort -->
+| Keys | Action |
+| --- | --- |
+| `j / k, Down / Up` | Pick model |
+| `g / G` | First / last model |
+| `h / l, Left / Right` | Lower / raise effort |
+| `Enter` | Queue switch for the next turn |
+| `Esc / q` | Close |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2811,7 +2908,6 @@ Keys of the theme role editor.
 | `Enter` | Commit fact (editing) |
 | `Esc` | Cancel fact edit (editing) |
 | `Esc / q` | Save and close |
-| `Space o` | Close and open a TaskRabbit session prompt |
 | `Space N` | Close and open a blank session prompt |
 | `Space ;` | Open the command palette |
 <!-- rsi:generated:end -->
@@ -2858,7 +2954,7 @@ Keys of the theme role editor.
 | `Ctrl-B` | Toggle sandbox (isolated git worktree) |
 | `? (normal)` | Show this help |
 | `Ctrl-J / Ctrl-K` | Focus next / previous stacked prompt |
-| `Space o / Space N (normal)` | Stack a TaskRabbit / blank prompt |
+| `Space N (normal)` | Stack a blank prompt |
 | `Ctrl-Q` | Close and keep the draft |
 | `Ctrl-Y` | Compile prompt |
 | `a / d` | Accept / discard the compiled preview |
@@ -2907,6 +3003,62 @@ Keys of the theme role editor.
 | `h j k l, w b` | Move cursor (normal mode) |
 <!-- rsi:generated:end -->
 
+### Fleet
+
+<!-- rsi:generated:begin overlay-fleet -->
+| Keys | Action |
+| --- | --- |
+| `j / k, Down / Up` | Move selection |
+| `g / G` | Jump to first / last |
+| `/` | Filter agents and usage groups |
+| `Tab` | Focus agents / usage groups |
+| `yy` | Copy selected session UUID |
+| `s` | Choose sort column |
+| `S` | Reverse sort |
+| `b` | Group usage by project / provider / model |
+| `w` | Rate window: 5 min / 1 h / 24 h |
+| `Enter` | Open selected session |
+| `r` | Refresh |
+| `:` | Commands |
+| `Esc / q` | Close fleet |
+<!-- rsi:generated:end -->
+
+### Fleet Filter
+
+<!-- rsi:generated:begin overlay-fleet-filter -->
+| Keys | Action |
+| --- | --- |
+| `Type / Backspace` | Edit filter |
+| `Enter / Esc` | Finish filter |
+<!-- rsi:generated:end -->
+
+### Fleet Sort
+
+<!-- rsi:generated:begin overlay-fleet-sort -->
+| Keys | Action |
+| --- | --- |
+| `1 / 2 / 3 / 4 / 5` | Choose one of the five displayed sort columns |
+| `Esc` | Cancel sort |
+<!-- rsi:generated:end -->
+
+### Fleet Usage
+
+<!-- rsi:generated:begin overlay-fleet-usage -->
+| Keys | Action |
+| --- | --- |
+| `j / k, Down / Up` | Move selection |
+| `g / G` | Jump to first / last |
+| `/` | Filter usage groups and agents |
+| `s` | Choose sort column |
+| `S` | Reverse sort |
+| `Tab / Enter` | Focus active agents |
+| `b` | Group by project / provider / model |
+| `w` | Rate window: 5 min / 1 h / 24 h |
+| `r` | Refresh |
+| `:` | Commands |
+| `Esc / q` | Close fleet |
+<!-- rsi:generated:end -->
+
 ### Screens Without an Overlay Catalog
 
 <!-- rsi:generated:begin overlay-exemptions -->
@@ -2924,7 +3076,7 @@ Screens without an overlay key catalog, and where their keys are documented.
 | Graph review: info dashboard focused | The dashboard panel owns keys while focused, separate from graph editing. | keybindings.md § Graph Review Overlay (`<Space>v` or `:graph`) |
 | Satellite registry browser | The browser owns its peer, link and cached session keys. | keybindings.md § Satellite Registry Browser |
 | Remote settings | The page owns its enable, device and project keys. | keybindings.md § Remote Settings |
-| Manager tree (:manager tree) | The read-only tree owns its fold, paging and jump keys. | keybindings.md § Manager Tree |
+| Manager tree (:manager tree) | The tree owns its fold, paging, jump and in-tree action keys. | keybindings.md § Manager Tree |
 | Legacy scratch adoption | The browser owns its select, adopt and refresh keys. | keybindings.md § Legacy Scratch Adoption |
 <!-- rsi:generated:end -->
 
@@ -3182,7 +3334,6 @@ The recent-files list is the top 9 distinct file paths from `Edit` / `MultiEdit`
 
 Most popup modals support **toggle** behavior: the same keybinding that opens a modal will close it when pressed again. This applies to all modals opened from normal mode:
 
-- **TaskRabbitPrompt** (`<Space>o`) — Opens a new TaskRabbit overlay (stacks with existing input overlays; close with `Ctrl+Q` or `Esc` from within)
 - **BlankPrompt** (`Ctrl-N`, `<Space>N`) — Opens a new Blank overlay (stacks with existing input overlays; close with `Ctrl+Q` or `Esc` from within)
 - **ModelDropdown** (`Ctrl+M`) — Press `Ctrl+M` to toggle model dropdown open/close (anchored below the header row or prompt model badge)
 - **ThemePicker** (`T`) — Press `T` to toggle open/close
@@ -3208,6 +3359,8 @@ Several keybindings change behavior based on context:
 - **Event cursor**: A `▎` marker in mauve shows which event is "at cursor" in the detail view. The cursor is derived from scroll position and updated by `Shift+Down`/`Shift+Up` navigation. Fold commands operate on the cursored event.
 
 Normal Session List and Settings views do not reserve a persistent command-hint row. The row appears transiently only for `:`, `/`, or inline input. Medium/high-priority TTL notifications render in the center of the top status bar instead. A confirmed Session List filter remains visible in the scope header without consuming a row. Descriptive Settings context/impact panel footers are unchanged.
+
+The top status bar shows the running-session count on the left and, on the right, the default launch model: `default ✻ sonnet-5 · xhigh` (provider glyph, model, and effort; a dim effort is the model's own default). `Ctrl-M`, `:model <name>` and Settings ▸ Model Roles ▸ Default model change it; the chip updates at once and a toast confirms the new default. In either picker, `Tab` only previews another provider's models: the default changes when a model is picked, and `Esc` leaves it as it was. On a bar too narrow to keep the centered notification lane readable, the chip is hidden.
 
 ### Input Bar vs Overlay
 

@@ -186,6 +186,7 @@ impl World {
         key: &str,
     ) -> Result<rsi_common::topology_agent::AgentTopologyExecuteResultV1> {
         let request = AgentTopologyExecuteRequestV1 {
+            project_id: None,
             topology_id: topology.topology_id.unwrap(),
             expected_digest: topology.definition_digest.clone(),
             epic_id: epic,
@@ -218,6 +219,7 @@ impl World {
             &store,
             caller,
             &AgentTopologyGetExecutionRequestV1 {
+                project_id: None,
                 execution_id,
                 after_sequence: None,
                 limit: None,
@@ -237,6 +239,7 @@ impl World {
             &store,
             caller,
             &AgentTopologyInterruptRequestV1 {
+                project_id: None,
                 execution_id,
                 expected_row_version,
                 idempotency_key: key.into(),
@@ -349,6 +352,7 @@ fn definition(
 
 fn upsert_request(name: &str, definition: TopologyDefinition) -> AgentTopologyUpsertRequestV1 {
     AgentTopologyUpsertRequestV1 {
+        project_id: None,
         name: name.into(),
         definition,
         scope: AgentTopologyScopeV1::Epic,
@@ -881,6 +885,7 @@ async fn t4_a6_idempotent_execute_is_deduplicated() {
     assert_eq!(executions, 1);
     // The same key with a different request conflicts.
     let changed = AgentTopologyExecuteRequestV1 {
+        project_id: None,
         topology_id: flow.topology_id.unwrap(),
         expected_digest: flow.definition_digest.clone(),
         epic_id: world.epic_a,
@@ -1622,6 +1627,7 @@ async fn t4_r1_upsert_key_replays_identical_and_conflicts_on_changed_content() {
 async fn t4_r1_execute_rechecks_topology_after_custody_resolution() {
     let world = World::new(automation()).await;
     let request = |topology: Uuid, digest: &str, key: &str| AgentTopologyExecuteRequestV1 {
+        project_id: None,
         topology_id: topology,
         expected_digest: digest.to_owned(),
         epic_id: world.epic_a,
@@ -2011,6 +2017,7 @@ async fn t4_r3_execute_rechecks_allowed_launches_after_custody_resolution() {
         .await
         .unwrap();
     let request = AgentTopologyExecuteRequestV1 {
+        project_id: None,
         topology_id: flow.topology_id.unwrap(),
         expected_digest: flow.definition_digest,
         epic_id: world.epic_a,
@@ -2061,6 +2068,7 @@ async fn t4_r3_execute_rechecks_fanout_knob_after_custody_resolution() {
         .await
         .unwrap();
     let request = |key: &str| AgentTopologyExecuteRequestV1 {
+        project_id: None,
         topology_id: flow.topology_id.unwrap(),
         expected_digest: flow.definition_digest.clone(),
         epic_id: world.epic_a,
@@ -2140,6 +2148,7 @@ async fn t4_r3_execute_policy_race_records_refused_request() {
         .await
         .unwrap();
     let request = AgentTopologyExecuteRequestV1 {
+        project_id: None,
         topology_id: flow.topology_id.unwrap(),
         expected_digest: flow.definition_digest,
         epic_id: world.epic_a,
@@ -2237,4 +2246,311 @@ async fn t4_r3_cross_scope_resolve_and_interrupt_only_append_request_ledger() {
         assert_eq!(rows[0].2, "refused");
         assert_eq!(rows[0].3.as_deref(), Some("not_found_in_scope"));
     }
+}
+
+// ─── #1235: the global seat holds the topology verbs in its grant ──────────
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn global_seat_runs_topology_in_a_granted_project_and_is_refused_outside_it() {
+    use rsi_common::global_manager::{
+        ConfigureGlobalManagerRequestV1, MANAGER_PROJECT_NOT_IN_SCOPE,
+    };
+    let world = World::new(automation()).await;
+    let (hub, seat, foreign, foreign_epic) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    {
+        let store = world.harness.executor.store.lock().await;
+        let now = chrono::Utc::now();
+        for (id, name) in [(hub, "Hub"), (foreign, "Foreign")] {
+            store
+                .insert_project(&Project {
+                    id,
+                    name: name.into(),
+                    path: Some(world.harness.repo.clone()),
+                    description: None,
+                    color: Project::DEFAULT_COLOR.into(),
+                    context_files: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .unwrap();
+        }
+        let foreign_group = Uuid::new_v4();
+        for (id, project, kind, parent) in [
+            (seat, hub, SessionKind::Standard, None),
+            (foreign_group, foreign, SessionKind::Group, None),
+            (
+                foreign_epic,
+                foreign,
+                SessionKind::Epic,
+                Some(foreign_group),
+            ),
+        ] {
+            let mut row =
+                crate::session::agent_verbs::tests::test_session(id, world.harness.repo.clone());
+            row.project_id = Some(project);
+            row.session_kind = kind;
+            row.parent_id = parent;
+            row.status = SessionStatus::Running;
+            store.insert_session(&row).unwrap();
+        }
+        store
+            .configure_global_manager(
+                &ConfigureGlobalManagerRequestV1 {
+                    session_id: seat,
+                    project_ids: vec![world.project],
+                    allowed_launches: vec![luna()],
+                    project_policy: automation(),
+                    expected_grant_version: 0,
+                    idempotency_key: "global-topology".into(),
+                },
+                "operator:test",
+            )
+            .unwrap();
+    }
+    // Upsert and execute on Epic C, which the PM's own scope does not hold:
+    // the global covers the whole granted project.
+    let mut on_c = upsert_request("global-flow", definition(&[("A", &luna())], &[]));
+    on_c.project_id = Some(world.project);
+    on_c.epic_id = Some(world.epic_c);
+    let flow = world.upsert(seat, &on_c).await.unwrap();
+    let request = AgentTopologyExecuteRequestV1 {
+        project_id: Some(world.project),
+        topology_id: flow.topology_id.unwrap(),
+        expected_digest: flow.definition_digest.clone(),
+        epic_id: world.epic_c,
+        inputs: serde_json::Value::Null,
+        base_commit: Some(world.harness.base.clone()),
+        idempotency_key: "global-run".into(),
+    };
+    let run = agent::execute(&world.harness.executor.store, || KNOBS, seat, &request)
+        .await
+        .unwrap()
+        .result;
+    let view = world.get(seat, run.execution_id).await.unwrap();
+    assert_eq!(view.execution.requested_by_kind, "manager");
+    // The launch gate admits the node under the global grant.
+    assert_eq!(
+        world
+            .harness
+            .executor
+            .advance(run.execution_id)
+            .await
+            .unwrap(),
+        Step::Wait
+    );
+    let attempt = world.harness.attempt(run.execution_id, "A", 0, 1).await;
+    assert_eq!(attempt.status, AttemptStatus::Running);
+
+    // A project outside the grant is refused on every topology verb.
+    let mut outside = upsert_request("foreign-flow", definition(&[("A", &luna())], &[]));
+    outside.project_id = Some(foreign);
+    outside.epic_id = Some(foreign_epic);
+    assert_eq!(
+        error_code(&world.upsert(seat, &outside).await.unwrap_err()),
+        MANAGER_PROJECT_NOT_IN_SCOPE
+    );
+    let mut list = AgentTopologyListRequestV1::default();
+    list.project_id = Some(foreign);
+    assert_eq!(
+        error_code(&world.list(seat, &list).await.unwrap_err()),
+        MANAGER_PROJECT_NOT_IN_SCOPE
+    );
+    let mut foreign_run = request.clone();
+    foreign_run.project_id = Some(foreign);
+    foreign_run.epic_id = foreign_epic;
+    foreign_run.idempotency_key = "foreign-run".into();
+    assert_eq!(
+        error_code(
+            &agent::execute(&world.harness.executor.store, || KNOBS, seat, &foreign_run)
+                .await
+                .unwrap_err()
+        ),
+        MANAGER_PROJECT_NOT_IN_SCOPE
+    );
+    // An Epic of another project under a granted project_id is not in scope.
+    let mut mixed = upsert_request("mixed-flow", definition(&[("A", &luna())], &[]));
+    mixed.project_id = Some(world.project);
+    mixed.epic_id = Some(foreign_epic);
+    assert_eq!(
+        error_code(&world.upsert(seat, &mixed).await.unwrap_err()),
+        "not_found_in_scope"
+    );
+    // The PM cannot name another project.
+    let mut pm_foreign = upsert_request("pm-foreign", definition(&[("A", &luna())], &[]));
+    pm_foreign.project_id = Some(foreign);
+    pm_foreign.epic_id = Some(foreign_epic);
+    assert_eq!(
+        error_code(&world.upsert(world.manager, &pm_foreign).await.unwrap_err()),
+        MANAGER_PROJECT_NOT_IN_SCOPE
+    );
+}
+
+// ─── #1275: topology launches are charged up the portfolio chain ───────────
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn topology_launches_inherit_and_recheck_live_ancestor_grants() {
+    use rsi_common::global_manager::ConfigureGlobalManagerRequestV1;
+    for copied in [false, true] {
+        let own = if copied { vec![luna(), glm()] } else { vec![] };
+        let world = World::new(policy(&[ManagerCapabilityV2::Automation], own, 64)).await;
+        let seat = Uuid::new_v4();
+        let grant = |allowed, version, key: &str| ConfigureGlobalManagerRequestV1 {
+            session_id: seat,
+            project_ids: vec![world.project],
+            allowed_launches: allowed,
+            project_policy: policy(&[ManagerCapabilityV2::Automation], vec![], 64),
+            expected_grant_version: version,
+            idempotency_key: key.into(),
+        };
+        {
+            let store = world.harness.executor.store.lock().await;
+            let mut row =
+                crate::session::agent_verbs::tests::test_session(seat, world.harness.repo.clone());
+            row.project_id = Some(world.project);
+            row.status = SessionStatus::Running;
+            store.insert_session(&row).unwrap();
+            store
+                .configure_global_manager(&grant(vec![luna(), glm()], 0, "wide"), "operator:test")
+                .unwrap();
+        }
+        // Both the PM and the Epic lead inherit the same live ceiling.
+        let mut request = upsert_request("live-launches", definition(&[("A", &luna())], &[]));
+        request.scope = AgentTopologyScopeV1::Manager;
+        let flow = world.upsert(world.manager, &request).await.unwrap();
+        let queued = world
+            .execute(world.manager, &flow, world.epic_a, "queued")
+            .await
+            .unwrap();
+        world
+            .upsert(
+                world.lead_a,
+                &upsert_request("lead-live-launches", definition(&[("A", &luna())], &[])),
+            )
+            .await
+            .unwrap();
+        {
+            let store = world.harness.executor.store.lock().await;
+            let version = store.active_global_grant().unwrap().unwrap().grant_version;
+            store
+                .configure_global_manager(&grant(vec![glm()], version, "narrow"), "operator:test")
+                .unwrap();
+        }
+        // No PM policy edit: the accepted execution must recheck the ancestor.
+        assert_eq!(
+            world
+                .harness
+                .executor
+                .advance(queued.execution_id)
+                .await
+                .unwrap(),
+            Step::Done
+        );
+        let attempt = world.harness.attempt(queued.execution_id, "A", 0, 1).await;
+        assert_eq!(attempt.status, AttemptStatus::Blocked);
+        assert_eq!(attempt.error.as_deref(), Some("launch_not_granted"));
+        assert_eq!(world.harness.launches().len(), 0);
+        assert_eq!(
+            error_code(
+                &world
+                    .execute(world.manager, &flow, world.epic_a, "after")
+                    .await
+                    .unwrap_err()
+            ),
+            "policy_refused"
+        );
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn topology_launches_are_charged_against_every_ancestor_allowance() {
+    use rsi_common::global_manager::{
+        ConfigureGlobalManagerRequestV1, MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED,
+    };
+    // The PM's own allowance is ample; a global above it allows two.
+    let world = World::new(policy(&[ManagerCapabilityV2::Automation], vec![luna()], 64)).await;
+    {
+        let store = world.harness.executor.store.lock().await;
+        let seat = Uuid::new_v4();
+        let mut row =
+            crate::session::agent_verbs::tests::test_session(seat, world.harness.repo.clone());
+        row.project_id = Some(world.project);
+        row.status = SessionStatus::Running;
+        store.insert_session(&row).unwrap();
+        store
+            .configure_global_manager_confirmed(
+                &ConfigureGlobalManagerRequestV1 {
+                    session_id: seat,
+                    project_ids: vec![world.project],
+                    allowed_launches: vec![luna()],
+                    project_policy: policy(&[ManagerCapabilityV2::Automation], vec![luna()], 2),
+                    expected_grant_version: 0,
+                    idempotency_key: "global-cap-2".into(),
+                },
+                "operator:test",
+                // The operator reviewed the cap preview (#1398, #1562).
+                true,
+            )
+            .unwrap();
+    }
+    let mut request = upsert_request("ancestor-charged", definition(&[("A", &luna())], &[]));
+    request.scope = AgentTopologyScopeV1::Manager;
+    let flow = world.upsert(world.manager, &request).await.unwrap();
+    let mut runs = Vec::new();
+    for key in ["one", "two", "three"] {
+        runs.push(
+            world
+                .execute(world.manager, &flow, world.epic_a, key)
+                .await
+                .unwrap()
+                .execution_id,
+        );
+    }
+    for run in &runs[..2] {
+        assert_eq!(
+            world.harness.executor.advance(*run).await.unwrap(),
+            Step::Wait
+        );
+    }
+    // The third launch finds the global's allowance spent by topology alone.
+    assert_eq!(
+        world.harness.executor.advance(runs[2]).await.unwrap(),
+        Step::Done
+    );
+    let third = world.harness.attempt(runs[2], "A", 0, 1).await;
+    assert_eq!(third.failure_class.as_deref(), Some("policy_refused"));
+    assert_eq!(
+        third.error.as_deref(),
+        Some(MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED)
+    );
+    assert_eq!(world.harness.launches().len(), 2);
+    // A new admission is refused up front by the ancestor's allowance.
+    assert_eq!(
+        error_code(
+            &world
+                .execute(world.manager, &flow, world.epic_a, "four")
+                .await
+                .unwrap_err()
+        ),
+        MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED
+    );
+    // A lifecycle creation counts the topology launches too.
+    let store = world.harness.executor.store.lock().await;
+    let config = store.get_harness_manager(world.project).unwrap().unwrap();
+    let error = store
+        .manager_ancestor_creation_allowance(&config, false, 1, 0)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains(MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED),
+        "{error}"
+    );
 }

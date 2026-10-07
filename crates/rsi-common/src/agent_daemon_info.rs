@@ -108,6 +108,54 @@ pub struct AgentGetDaemonInfoResultV1 {
     /// and what is held. Absent from older daemons.
     #[serde(default)]
     pub deploy_drain: DeployDrainV1,
+    /// Host-load admission (#1417): whether manager launches are held while
+    /// the host's 1-minute load is above the operator's threshold, and what
+    /// is held. Absent from older daemons.
+    #[serde(default)]
+    pub host_load: HostLoadAdmissionV1,
+}
+
+/// The typed reason a manager launch is held while the host's 1-minute load
+/// average is above the operator's `host_load_admission_threshold` (#1417).
+pub const HOST_LOAD: &str = "host_load";
+
+/// Default of the operator setting `host_load_admission_threshold`: the
+/// 1-minute load above which manager launches are held (0 disables).
+pub const HOST_LOAD_THRESHOLD_DEFAULT: u32 = 40;
+
+/// Upper bound of `host_load_admission_threshold`.
+pub const HOST_LOAD_THRESHOLD_MAX: u32 = 1024;
+
+/// Host-load admission status (#1417). The daemon holds a manager's
+/// `create_session` (queued, never refused; Issue-worker launches and
+/// topology node launches included) while `load + recent_admissions` is above
+/// `threshold`, and releases held launches oldest-first as the load drops.
+/// A worker's own spawns, retries, successors, lead recovery and operator
+/// sessions are never held.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HostLoadAdmissionV1 {
+    /// Operator setting `host_load_admission_threshold`; 0 disables the hold.
+    #[serde(default)]
+    pub threshold: u32,
+    /// False on a platform that reports no load average: everything is
+    /// admitted and `load` is absent.
+    #[serde(default)]
+    pub supported: bool,
+    /// The host's 1-minute load average when last read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load: Option<f64>,
+    /// Launches admitted in the last minute that `load` has not absorbed
+    /// yet; each counts one toward the comparison with `threshold`.
+    #[serde(default)]
+    pub recent_admissions: u32,
+    /// True while new manager launches are held.
+    #[serde(default)]
+    pub holding: bool,
+    /// Held launches, oldest first (bounded): queued manager `create_session`
+    /// actions (`manager_create_session`) and waiting topology nodes
+    /// (`topology_node`). Each carries `reason: host_load`.
+    #[serde(default)]
+    pub held: Vec<HeldWorkV1>,
 }
 
 /// The typed reason a launch, continuation, wake or job is held or refused
@@ -117,13 +165,15 @@ pub const DEPLOY_DRAINING: &str = "deploy_draining";
 /// One piece of work parked behind a draining deploy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeldWorkV1 {
-    /// `child_spawn`, `topology_node`, `queue_batch` (merge queue held, #1128).
+    /// `child_spawn`, `topology_node`, `queue_batch` (merge queue held, #1128);
+    /// under host-load admission (#1417) `manager_create_session` or
+    /// `topology_node`.
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<uuid::Uuid>,
     /// RFC3339 with nanoseconds.
     pub since: String,
-    /// Always [`DEPLOY_DRAINING`].
+    /// [`DEPLOY_DRAINING`], or [`HOST_LOAD`] under host-load admission.
     pub reason: String,
 }
 
@@ -133,17 +183,30 @@ pub struct HeldWorkV1 {
 /// as due rows and are counted in `wakes_held`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeployDrainV1 {
+    /// True while new work is held. An agent deploy holds for at most the
+    /// operator's `deploy_drain_hold_secs` (#1320/#1311); past it the deploy
+    /// keeps waiting for a quiet point (`waiting`) without holding anything.
     pub draining: bool,
+    /// The deploy waiting for its quiet point, held or not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deploy_id: Option<uuid::Uuid>,
     /// RFC3339 with nanoseconds: the hold is released no later than this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_by: Option<String>,
+    /// True while a deploy waits for its quiet point (held or not).
+    #[serde(default)]
+    pub waiting: bool,
+    /// RFC3339 with nanoseconds: the waiting deploy gives up (settles
+    /// `timed_out`) at this time if no quiet point came.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_deadline_at: Option<String>,
     #[serde(default)]
     pub held: Vec<HeldWorkV1>,
     /// Why the waiting deploy has not restarted yet (#1177): the latest
     /// quiet-point blockers (`landing_in_progress`, `job_running`,
     /// `worker_mid_turn`, ...). Empty when no deploy waits or none blocks.
+    /// A worker mid-turn blocks because a restart interrupts it: provider
+    /// processes are not re-adopted, the interrupted turn is resumed.
     #[serde(default)]
     pub blockers: Vec<String>,
     /// Launches, continuations and jobs refused with `deploy_draining` since

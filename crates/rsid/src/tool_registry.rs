@@ -306,7 +306,8 @@ fn register_rsi_control_tools(
             name: rsi_control::native_tool_name(AgentControlVerbV1::ReadSessionEvents).to_string(),
             description: "Read a bounded page of a session's conversation events (tail, or \
                  forward from after_sequence) plus its final assistant message and terminal \
-                 reason. Scope: your own child, a child of an Epic you lead, or a session in \
+                 reason. Set final_message_full to return up to 32768 characters of the final \
+                 message. Scope: your own child, a child of an Epic you lead, or a session in \
                  your manager scope."
                 .to_string(),
             parameters: AgentControlVerbV1::ReadSessionEvents
@@ -443,7 +444,7 @@ fn register_rsi_control_tools(
                 "Read one local Issue in the project owned by the Epic you currently lead."
             }
             rsi_control::IssueControlToolKind::Update => {
-                "CAS-update active Issue content as the current owning-Epic lead or manager with issue-coordinate authority."
+                "CAS-update active Issue content as the current owning-Epic lead or manager with issue-coordinate authority; a live Issue-bound worker may append to its own Issue's body only."
             }
             rsi_control::IssueControlToolKind::UpdateStatus => {
                 "CAS-update one Issue status as the current owning-Epic lead or manager with issue-coordinate authority."
@@ -809,6 +810,8 @@ mod tests {
                 "AgentGetDaemonInfo",
                 "AgentRequestDeploy",
                 "AgentGlobalAppointManager",
+                "AgentManagerAppointChild",
+                "AgentManagerRevokeChild",
             ]),
             "the native CodexAppServer RPC-only verb set changed without review"
         );
@@ -1119,8 +1122,12 @@ mod tests {
         let schema = rsi_common::agent_control_schema::AgentControlVerbV1::CreateIssue
             .descriptor()
             .parameters();
+        // #1235: project_id is only the global seat's optional target project.
+        assert_eq!(
+            schema["properties"]["project_id"]["default"],
+            serde_json::Value::Null
+        );
         for field in [
-            "project_id",
             "idea_id",
             "source_event_id",
             "source_finding_ref",

@@ -2,27 +2,39 @@
 //! messages and PM appointments.
 //!
 //! The grant is isolated from `manager_nodes`: a project-less node there would
-//! be seen by every node query and by the legacy-mail rule. At most one grant
-//! is active; rows are retained and only `state`/`updated_at` change.
+//! be seen by every node query and by the legacy-mail rule. Rows are retained
+//! and only `state`/`updated_at` change.
+//!
+//! Since #1236 (S2) every active grant belongs to a portfolio node
+//! (`portfolio_nodes.rs`), one active grant per node and per seat. The seat
+//! verbs resolve the caller's own node; the operator `*GlobalManager` calls
+//! are shims over the single active root labelled `global` and refuse
+//! `global_manager_ambiguous` when there are several.
 
 use chrono::{SecondsFormat, Utc};
 use rsi_common::global_manager::{
     ConfigureGlobalManagerRequestV1, GLOBAL_MANAGER_IDEMPOTENCY_CONFLICT,
-    GLOBAL_MANAGER_MAILBOX_FULL, GLOBAL_MANAGER_NOT_CONFIGURED, GLOBAL_MANAGER_NOT_SEAT,
-    GLOBAL_MANAGER_STALE, GLOBAL_PROJECT_HAS_NO_MANAGER, GLOBAL_PROJECT_NOT_IN_GRANT,
-    GLOBAL_REPORT_NOT_AUTHORIZED, GlobalIssueCountsV1, GlobalManagerGrantV1,
-    GlobalManagerMessageReceiptV1, GlobalPmPolicyV1, RevokeGlobalManagerRequestV1,
+    GLOBAL_MANAGER_INVALID_REQUEST, GLOBAL_MANAGER_MAILBOX_FULL, GLOBAL_MANAGER_NOT_CONFIGURED,
+    GLOBAL_MANAGER_NOT_SEAT, GLOBAL_MANAGER_STALE, GLOBAL_PROJECT_HAS_NO_MANAGER,
+    GLOBAL_PROJECT_NOT_IN_GRANT, GLOBAL_REPORT_NOT_AUTHORIZED, GlobalIssueCountsV1,
+    GlobalManagerGrantV1, GlobalManagerMessageReceiptV1, GlobalPmPolicyV1,
+    RevokeGlobalManagerRequestV1,
 };
 use rsi_common::harness_manager_v2::{
     ConfigureHarnessManagerPolicyRequestV2, ManagerLaunchChoiceV2,
 };
-use rsi_common::types::{Recurrence, ScheduleSpec, ScheduledJob, SessionStatus, WakeMode};
+use rsi_common::types::{Recurrence, ScheduleSpec, ScheduledJob, WakeMode};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::Store;
+use super::portfolio_nodes;
 use crate::error::{DaemonError, Result};
+use rsi_common::portfolio_nodes::{
+    ConfigurePortfolioNodeRequestV1, GLOBAL_TIER_LABEL, MANAGER_NODE_STALE,
+    PORTFOLIO_IDEMPOTENCY_CONFLICT, PORTFOLIO_INVALID_REQUEST, RevokePortfolioNodeRequestV1,
+};
 
 // The provisional number is assigned at landing.
 // RSI-RELEASED-MIGRATION-BEGIN: global-manager-migration
@@ -170,7 +182,7 @@ fn parse_uuid(text: &str) -> Result<Uuid> {
     Uuid::parse_str(text).map_err(|_| DaemonError::Store("invalid global manager identity".into()))
 }
 
-type GrantRow = (
+pub(super) type GrantRow = (
     String,
     i64,
     String,
@@ -183,11 +195,16 @@ type GrantRow = (
     String,
 );
 
-const GRANT_COLUMNS_ACTIVE: &str = "SELECT id,grant_version,seat_session_id,state,project_ids_json,allowed_launches_json,project_policy_json,operator_origin,created_at,updated_at FROM global_manager_grants WHERE state='active'";
-const GRANT_COLUMNS_BY_KEY: &str = "SELECT id,grant_version,seat_session_id,state,project_ids_json,allowed_launches_json,project_policy_json,operator_origin,created_at,updated_at FROM global_manager_grants WHERE idempotency_key=?1";
-const GRANT_COLUMNS_BY_VERSION: &str = "SELECT id,grant_version,seat_session_id,state,project_ids_json,allowed_launches_json,project_policy_json,operator_origin,created_at,updated_at FROM global_manager_grants WHERE grant_version=?1";
+const GRANT_COLUMNS_ACTIVE_BY_ID: &str = "SELECT id,grant_version,seat_session_id,state,project_ids_json,allowed_launches_json,project_policy_json,operator_origin,created_at,updated_at FROM global_manager_grants WHERE id=?1 AND state='active'";
 
-fn read_grant_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GrantRow> {
+/// The newest grant of a node labelled `global`, or a pre-#1236 grant (whose
+/// revoked rows carry no node): what the operator workspace shows when no
+/// `global` root is active.
+const GRANT_COLUMNS_LATEST_GLOBAL: &str = "SELECT id,grant_version,seat_session_id,state,project_ids_json,allowed_launches_json,project_policy_json,operator_origin,created_at,updated_at FROM global_manager_grants
+ WHERE node_id IS NULL OR node_id IN (SELECT id FROM manager_portfolio_nodes WHERE tier_label='global')
+ ORDER BY grant_version DESC LIMIT 1";
+
+pub(super) fn read_grant_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GrantRow> {
     Ok((
         row.get(0)?,
         row.get(1)?,
@@ -202,7 +219,7 @@ fn read_grant_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GrantRow> {
     ))
 }
 
-fn grant_from_row(row: GrantRow) -> Result<GlobalManagerGrantV1> {
+pub(super) fn grant_from_row(row: GrantRow) -> Result<GlobalManagerGrantV1> {
     let (id, version, seat, state, projects, launches, policy, origin, created, updated) = row;
     let timestamp = |text: &str| {
         super::parse_timestamp(text)
@@ -273,6 +290,8 @@ pub struct GlobalProjectRow {
     pub path: Option<String>,
     pub manager_session_id: Option<Uuid>,
     pub scope_version: Option<i64>,
+    /// The project's manager scope was revoked.
+    pub scope_revoked: bool,
     pub policy: Option<GlobalPmPolicyV1>,
     pub issues: GlobalIssueCountsV1,
     pub running_sessions: i64,
@@ -281,106 +300,155 @@ pub struct GlobalProjectRow {
     pub pending_approvals: i64,
 }
 
+/// The `global` shim's active grant read through `conn`: the active grant
+/// of the single active root labelled `global` (`global_manager_ambiguous`
+/// when several exist).
+pub(crate) fn active_global_grant_on(
+    conn: &rusqlite::Connection,
+) -> Result<Option<GlobalManagerGrantV1>> {
+    let Some(node) = portfolio_nodes::global_shim_node_on(conn)? else {
+        return Ok(None);
+    };
+    Ok(portfolio_nodes::node_grant_on(conn, node)?.map(|record| record.grant))
+}
+
+/// Map the portfolio refusals the v0 shim surfaces to its own codes.
+fn shim_code(error: DaemonError) -> DaemonError {
+    match error {
+        DaemonError::InvalidParam(code) if code == MANAGER_NODE_STALE => {
+            refused(GLOBAL_MANAGER_STALE)
+        }
+        DaemonError::InvalidParam(code) if code == PORTFOLIO_IDEMPOTENCY_CONFLICT => {
+            refused(GLOBAL_MANAGER_IDEMPOTENCY_CONFLICT)
+        }
+        other => other,
+    }
+}
+
 impl Store {
-    /// The active grant, if any.
+    /// Compatibility shim (#1236): the active grant of the single active root
+    /// labelled `global`, if any; `global_manager_ambiguous` when several.
     pub fn active_global_grant(&self) -> Result<Option<GlobalManagerGrantV1>> {
+        active_global_grant_on(&self.conn)
+    }
+
+    /// The shim's active grant, else the most recent (revoked) grant of a
+    /// `global` node or of the pre-#1236 history: the operator workspace shows
+    /// a revoked seat rather than an unappointed one.
+    pub fn latest_global_grant(&self) -> Result<Option<GlobalManagerGrantV1>> {
+        if let Some(grant) = self.active_global_grant()? {
+            return Ok(Some(grant));
+        }
         self.conn
-            .query_row(GRANT_COLUMNS_ACTIVE, [], read_grant_row)
+            .query_row(GRANT_COLUMNS_LATEST_GLOBAL, [], read_grant_row)
             .optional()?
             .map(grant_from_row)
             .transpose()
     }
 
-    fn global_grant_by_key(&self, key: &str) -> Result<Option<GlobalManagerGrantV1>> {
-        self.conn
-            .query_row(GRANT_COLUMNS_BY_KEY, [key], read_grant_row)
-            .optional()?
-            .map(grant_from_row)
-            .transpose()
-    }
-
-    fn global_grant_by_version(&self, version: i64) -> Result<Option<GlobalManagerGrantV1>> {
-        self.conn
-            .query_row(GRANT_COLUMNS_BY_VERSION, [version], read_grant_row)
-            .optional()?
-            .map(grant_from_row)
-            .transpose()
-    }
-
-    /// Operator-only: appoint or replace the global seat. The previous active
-    /// grant is revoked and the new one inserted in one transaction.
+    /// Operator-only shim: appoint or replace the seat of the single root
+    /// labelled `global` (created on first use). The previous active grant is
+    /// revoked and the new one inserted in one transaction; the node keeps its
+    /// id and the edit opens a new authority epoch.
     pub fn configure_global_manager(
         &self,
         request: &ConfigureGlobalManagerRequestV1,
         operator_origin: &str,
     ) -> Result<GlobalManagerGrantV1> {
+        self.configure_global_manager_confirmed(request, operator_origin, false)
+    }
+
+    /// The global shim carries the operator's explicit reduction acknowledgment.
+    pub fn configure_global_manager_confirmed(
+        &self,
+        request: &ConfigureGlobalManagerRequestV1,
+        operator_origin: &str,
+        confirm_cap_reductions: bool,
+    ) -> Result<GlobalManagerGrantV1> {
         request.validate().map_err(refused)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        if let Some(existing) = self.global_grant_by_key(&request.idempotency_key)? {
-            let same = existing.seat_session_id == request.session_id
-                && existing.project_ids == request.project_ids
-                && existing.allowed_launches == request.allowed_launches
-                && existing.project_policy == request.project_policy;
+        if let Some(existing) =
+            portfolio_nodes::grant_by_key_on(&self.conn, &request.idempotency_key)?
+        {
+            // #1236: a replay binds to the shim's semantics: a grant of a root
+            // labelled `global` (or pre-#1236 history), written by an operator
+            // configure, never a context-cap transfer or another tier's key.
+            let global_node = match existing.node_id {
+                None => true,
+                Some(node) => {
+                    existing.parent_node_id.is_none()
+                        && portfolio_nodes::node_row_on(&self.conn, node)?
+                            .is_some_and(|row| row.tier_label == GLOBAL_TIER_LABEL)
+                }
+            };
+            let same = global_node
+                && existing.grantor == "operator"
+                && !request.idempotency_key.starts_with("context-cap:")
+                && existing.grant.seat_session_id == request.session_id
+                && existing.grant.project_ids == request.project_ids
+                && existing.grant.allowed_launches == request.allowed_launches
+                && existing.grant.project_policy == request.project_policy;
             if !same {
                 return Err(refused(GLOBAL_MANAGER_IDEMPOTENCY_CONFLICT));
             }
             tx.commit()?;
-            return Ok(existing);
+            return Ok(existing.grant);
         }
-        let active = self.active_global_grant()?;
-        let actual = active.as_ref().map_or(0, |grant| grant.grant_version);
+        let node = portfolio_nodes::global_shim_node_on(&self.conn)?;
+        let active = match node {
+            Some(node) => portfolio_nodes::node_grant_on(&self.conn, node)?,
+            None => None,
+        };
+        let actual = active
+            .as_ref()
+            .map_or(0, |record| record.grant.grant_version);
         if actual != request.expected_grant_version {
             return Err(refused(GLOBAL_MANAGER_STALE));
         }
-        let seat = self
-            .get_session(request.session_id)?
-            .ok_or_else(|| refused("global_manager_seat_unavailable"))?;
-        if !rsi_common::is_leaf_kind(seat.session_kind)
-            || matches!(
-                seat.status,
-                SessionStatus::Archived | SessionStatus::Deleted
-            )
-        {
-            return Err(refused("global_manager_seat_unavailable"));
-        }
-        for project in &request.project_ids {
-            if self.get_project(*project)?.is_none() {
-                return Err(refused("global_manager_unknown_project"));
-            }
-        }
-        let now = stamp();
-        if let Some(active) = &active {
-            self.conn.execute(
-                "UPDATE global_manager_grants SET state='revoked',updated_at=?2 WHERE id=?1 AND state='active'",
-                params![active.grant_id.to_string(), now],
-            )?;
-            self.retire_global_grant_messages(active.grant_id, &now)?;
-        }
-        let next: i64 = self.conn.query_row(
-            "SELECT COALESCE(MAX(grant_version),0)+1 FROM global_manager_grants",
-            [],
-            |row| row.get(0),
-        )?;
-        self.conn.execute(
-            "INSERT INTO global_manager_grants(id,grant_version,seat_session_id,state,project_ids_json,allowed_launches_json,project_policy_json,operator_origin,idempotency_key,created_at,updated_at)
-             VALUES(?1,?2,?3,'active',?4,?5,?6,?7,?8,?9,?9)",
-            params![
-                Uuid::new_v4().to_string(),
-                next,
-                request.session_id.to_string(),
-                serde_json::to_string(&request.project_ids)?,
-                serde_json::to_string(&request.allowed_launches)?,
-                serde_json::to_string(&request.project_policy)?,
+        let (expected_authority_epoch, child_policy, max_direct_reports) = match (node, &active) {
+            (Some(node), Some(record)) => (
+                portfolio_nodes::node_row_on(&self.conn, node)?
+                    .map_or(0, |row| row.authority_epoch),
+                record.child_policy.clone(),
+                record.max_direct_reports,
+            ),
+            _ => (
+                0,
+                None,
+                rsi_common::portfolio_nodes::PORTFOLIO_DEFAULT_MAX_DIRECT_REPORTS,
+            ),
+        };
+        let saved = self
+            .configure_portfolio_node_as_in_tx_confirmed(
+                &ConfigurePortfolioNodeRequestV1 {
+                    node_id: node,
+                    parent_node_id: None,
+                    adopt_node_ids: Vec::new(),
+                    expected_parent_grant_version: None,
+                    tier_label: GLOBAL_TIER_LABEL.into(),
+                    seat_session_id: request.session_id,
+                    project_ids: request.project_ids.clone(),
+                    allowed_launches: request.allowed_launches.clone(),
+                    policy: request.project_policy.clone(),
+                    child_policy,
+                    max_direct_reports,
+                    expected_node_grant_version: actual,
+                    expected_authority_epoch,
+                    idempotency_key: request.idempotency_key.clone(),
+                },
+                portfolio_nodes::PortfolioGrantor::Operator,
                 operator_origin,
-                request.idempotency_key,
-                now,
-            ],
-        )?;
-        let grant = self
-            .active_global_grant()?
-            .ok_or_else(|| DaemonError::Store("global manager grant vanished".into()))?;
+                None,
+                confirm_cap_reductions,
+            )
+            .map_err(|error| match error {
+                DaemonError::InvalidParam(code) if code == PORTFOLIO_INVALID_REQUEST => {
+                    refused(GLOBAL_MANAGER_INVALID_REQUEST)
+                }
+                other => shim_code(other),
+            })?;
         tx.commit()?;
-        Ok(grant)
+        Ok(saved.grant)
     }
 
     /// #1005: the daemon rotated the global seat at its context cap; the
@@ -391,7 +459,7 @@ impl Store {
     /// seat (already moved, revoked or replaced).
     pub fn transfer_global_seat(&self, predecessor: Uuid, successor: Uuid) -> Result<bool> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let moved = self.transfer_global_seat_in_tx(predecessor, successor)?;
+        let moved = self.transfer_seat_node_in_tx(predecessor, successor)?;
         tx.commit()?;
         Ok(moved)
     }
@@ -414,109 +482,59 @@ impl Store {
         if self.published_rotation_successor_of(predecessor, rotation_id)? != Some(successor) {
             return Ok(false);
         }
-        let moved = self.transfer_global_seat_in_tx(predecessor, successor)?;
+        let moved = self.transfer_seat_node_in_tx(predecessor, successor)?;
         tx.commit()?;
         Ok(moved)
     }
 
-    /// The #1005 grant move inside the caller's transaction: the
-    /// rotation successor's publication commits the grant move with the
-    /// publication itself (#1142 F3), so no crash can leave the grant on the
-    /// archived predecessor of a published successor. The caller holds the
-    /// `IMMEDIATE` transaction and the spawn guards.
-    pub(crate) fn transfer_global_seat_in_tx(
-        &self,
-        predecessor: Uuid,
-        successor: Uuid,
-    ) -> Result<bool> {
-        let Some(active) = self.active_global_grant()? else {
-            return Ok(false);
-        };
-        if active.seat_session_id != predecessor {
-            return Ok(false);
-        }
-        let lineage: Option<Option<String>> = self
-            .conn
-            .query_row(
-                "SELECT continued_from FROM sessions WHERE id=?1 AND status NOT IN ('Archived','Deleted')",
-                [successor.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if lineage.flatten() != Some(predecessor.to_string()) {
-            return Err(refused("global_manager_successor_unrelated"));
-        }
-        let now = stamp();
-        self.conn.execute(
-            "UPDATE global_manager_grants SET state='revoked',updated_at=?2 WHERE id=?1 AND state='active'",
-            params![active.grant_id.to_string(), now],
-        )?;
-        self.retire_global_grant_messages(active.grant_id, &now)?;
-        let next: i64 = self.conn.query_row(
-            "SELECT COALESCE(MAX(grant_version),0)+1 FROM global_manager_grants",
-            [],
-            |row| row.get(0),
-        )?;
-        self.conn.execute(
-            "INSERT INTO global_manager_grants(id,grant_version,seat_session_id,state,project_ids_json,allowed_launches_json,project_policy_json,operator_origin,idempotency_key,created_at,updated_at)
-             SELECT ?1,?2,?3,'active',project_ids_json,allowed_launches_json,project_policy_json,operator_origin,?4,?5,?5
-             FROM global_manager_grants WHERE id=?6",
-            params![
-                Uuid::new_v4().to_string(),
-                next,
-                successor.to_string(),
-                format!("context-cap:{successor}"),
-                now,
-                active.grant_id.to_string(),
-            ],
-        )?;
-        Ok(true)
-    }
-
-    /// Operator-only: revoke the active grant. A replay after the revocation
-    /// returns the revoked grant.
+    /// Operator-only shim: revoke the single active root labelled `global`
+    /// (its node, grant and coverage). A replay after the revocation returns
+    /// the revoked grant.
     pub fn revoke_global_manager(
         &self,
         request: &RevokeGlobalManagerRequestV1,
     ) -> Result<GlobalManagerGrantV1> {
         request.validate().map_err(refused)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let Some(active) = self.active_global_grant()? else {
-            let revoked = self
-                .global_grant_by_version(request.expected_grant_version)?
-                .filter(|grant| grant.state == "revoked")
-                .ok_or_else(|| refused(GLOBAL_MANAGER_NOT_CONFIGURED))?;
+        let node = portfolio_nodes::global_shim_node_on(&self.conn)?;
+        let active = match node {
+            Some(node) => portfolio_nodes::node_grant_on(&self.conn, node)?,
+            None => None,
+        };
+        let (Some(node), Some(active)) = (node, active) else {
+            let revoked =
+                portfolio_nodes::grant_by_version_on(&self.conn, request.expected_grant_version)?
+                    .map(|record| record.grant)
+                    .filter(|grant| grant.state == "revoked")
+                    .ok_or_else(|| refused(GLOBAL_MANAGER_NOT_CONFIGURED))?;
             tx.commit()?;
             return Ok(revoked);
         };
-        if active.grant_version != request.expected_grant_version {
+        if active.grant.grant_version != request.expected_grant_version {
             return Err(refused(GLOBAL_MANAGER_STALE));
         }
-        let now = stamp();
-        self.conn.execute(
-            "UPDATE global_manager_grants SET state='revoked',updated_at=?2 WHERE id=?1 AND state='active'",
-            params![active.grant_id.to_string(), now],
-        )?;
-        self.retire_global_grant_messages(active.grant_id, &now)?;
-        let revoked = self
-            .global_grant_by_version(active.grant_version)?
-            .ok_or_else(|| DaemonError::Store("global manager grant vanished".into()))?;
+        let epoch =
+            portfolio_nodes::node_row_on(&self.conn, node)?.map_or(0, |row| row.authority_epoch);
+        let (revoked, _) = self
+            .revoke_portfolio_node_in_tx(&RevokePortfolioNodeRequestV1 {
+                node_id: node,
+                expected_grant_version: active.grant.grant_version,
+                expected_authority_epoch: epoch,
+                idempotency_key: request.idempotency_key.clone(),
+            })
+            .map_err(shim_code)?;
         tx.commit()?;
-        Ok(revoked)
+        Ok(revoked.grant)
     }
 
-    /// The active grant whose seat is exactly `caller`. v0 authority does not
-    /// follow rotation lineage (global succession is out of scope: the
-    /// operator re-appoints). Every other caller, a revoked grant and a
-    /// replaced seat are refused with `global_manager_not_seat`.
+    /// The active grant whose seat is exactly `caller`, on any portfolio
+    /// node. Authority does not follow rotation lineage by itself: a
+    /// context-cap transfer moves the grant to the successor. Every other
+    /// caller, a revoked grant and a replaced seat are refused with
+    /// `global_manager_not_seat`.
     pub fn global_seat_grant(&self, caller: Uuid) -> Result<GlobalManagerGrantV1> {
-        let grant = self
-            .active_global_grant()?
-            .ok_or_else(|| refused(GLOBAL_MANAGER_NOT_SEAT))?;
-        if grant.seat_session_id != caller {
-            return Err(refused(GLOBAL_MANAGER_NOT_SEAT));
-        }
-        Ok(grant)
+        self.portfolio_seat_grant(caller)?
+            .ok_or_else(|| refused(GLOBAL_MANAGER_NOT_SEAT))
     }
 
     /// The live PM seat of a project: a non-revoked appointment whose current
@@ -574,17 +592,29 @@ impl Store {
         if !grant.project_ids.contains(&project) {
             return Ok(false);
         }
+        // #1236: no sibling reach, even to a PM seat that also seats a node.
+        let own = portfolio_nodes::seat_grant_on(&self.conn, caller)?.and_then(|r| r.node_id);
+        if self
+            .portfolio_seat_node(target)?
+            .is_some_and(|node| Some(node) != own)
+        {
+            return Ok(false);
+        }
         Ok(self.global_live_manager(project)? == Some(target))
     }
 
     /// The grant and project of a PM reporting up: `caller` must be the
-    /// current PM seat of a project in the active grant.
+    /// current PM seat of a project, and the grant is the active grant of the
+    /// portfolio node covering that project.
     pub fn global_report_grant(&self, caller: Uuid) -> Result<(GlobalManagerGrantV1, Uuid)> {
         let denied = || refused(GLOBAL_REPORT_NOT_AUTHORIZED);
-        let grant = self.active_global_grant()?.ok_or_else(denied)?;
         let project = self
             .get_session(caller)?
             .and_then(|session| session.project_id)
+            .ok_or_else(denied)?;
+        let grant = self
+            .covering_portfolio_grant(project)?
+            .map(|record| record.grant)
             .ok_or_else(denied)?;
         if !grant.project_ids.contains(&project) {
             return Err(denied());
@@ -602,6 +632,17 @@ impl Store {
             Err(DaemonError::InvalidParam(_)) => Ok(false),
             Err(error) => Err(error),
         }
+    }
+
+    /// #1235: whether `session` was ever the seat of a global grant (active or
+    /// retired). Effect gates use it so a retired seat's request never falls
+    /// back to another principal's authority.
+    pub fn is_global_seat_ever(&self, session: Uuid) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM global_manager_grants WHERE seat_session_id=?1)",
+            [session.to_string()],
+            |row| row.get(0),
+        )?)
     }
 
     /// Whether `caller` is the active global seat (catalog advertisement only).
@@ -818,14 +859,16 @@ impl Store {
         Ok(())
     }
 
-    /// Disable every pending message of a replaced or revoked grant.
-    fn retire_global_grant_messages(&self, grant_id: Uuid, now: &str) -> Result<()> {
+    /// Disable every pending message of a replaced or revoked grant, and
+    /// (#1238) retire the queued tier mail and open escalation hops at either
+    /// end under it.
+    pub(super) fn retire_global_grant_messages(&self, grant_id: Uuid, now: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE scheduled_jobs SET enabled=0,updated_at=?2 WHERE enabled=1 AND id IN
              (SELECT id FROM global_manager_messages WHERE grant_id=?1)",
             params![grant_id.to_string(), now],
         )?;
-        Ok(())
+        self.retire_tier_grant(grant_id, now)
     }
 
     /// Disable every pending global-manager message to a project's PM seat
@@ -836,7 +879,8 @@ impl Store {
              (SELECT id FROM global_manager_messages WHERE project_id=?1 AND direction='to_manager')",
             params![project_id.to_string(), now],
         )?;
-        Ok(())
+        // #1238: queued tier mail to the seat and its own reports.
+        self.retire_tier_project_seat(project_id, now)
     }
 
     /// Delivery-time fence for a scheduled job. Non-global jobs pass. A global
@@ -849,12 +893,14 @@ impl Store {
 
     /// Whether `job_id` is a global-manager message (the scheduler binds its
     /// delivery to the exact job row even on a manual trigger).
+    /// #1238: tier messages (`manager_tier_messages`) ride the same path.
     pub fn is_global_message(&self, job_id: Uuid) -> Result<bool> {
-        Ok(self.conn.query_row(
+        let legacy: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM global_manager_messages WHERE id=?1)",
             [job_id.to_string()],
             |row| row.get(0),
-        )?)
+        )?;
+        Ok(legacy || self.is_tier_message(job_id)?)
     }
 
     /// Effect-claim half of the delivery fence. Runs inside the continuation
@@ -869,6 +915,7 @@ impl Store {
         tip: Uuid,
     ) -> Result<bool> {
         let mut deliverable = true;
+        let mut claimed = Vec::new();
         for &job_id in job_ids {
             if !self.is_global_message(job_id)? {
                 continue;
@@ -883,10 +930,21 @@ impl Store {
                 .optional()?
                 .unwrap_or(false);
             if enabled && self.global_message_deliverable_to(job_id, Some(tip))? {
+                claimed.push(job_id);
                 continue;
             }
             self.retire_global_message(job_id)?;
             deliverable = false;
+        }
+        // #1238/#1266: tier messages are claimed only with a claim that
+        // succeeds. A refused batch commits only its retirements (the caller
+        // commits them), so its current messages stay queued and deliverable.
+        // A successful claim leaves them `claimed`: the continuation settles
+        // them delivered, failed or uncertain (`settle_tier_messages`).
+        if deliverable {
+            for job_id in claimed {
+                self.claim_tier_message(job_id)?;
+            }
         }
         Ok(deliverable)
     }
@@ -898,6 +956,9 @@ impl Store {
         job_id: Uuid,
         delivery_tip: Option<Uuid>,
     ) -> Result<bool> {
+        if let Some(deliverable) = self.tier_message_deliverable(job_id, delivery_tip)? {
+            return Ok(deliverable);
+        }
         let row: Option<(String, String, String, String)> = self
             .conn
             .query_row(
@@ -909,12 +970,16 @@ impl Store {
         let Some((grant_id, direction, project, target)) = row else {
             return Ok(true);
         };
-        let Some(grant) = self.active_global_grant()? else {
+        // The message's own grant must still be its node's active grant.
+        let grant = self
+            .conn
+            .query_row(GRANT_COLUMNS_ACTIVE_BY_ID, [&grant_id], read_grant_row)
+            .optional()?
+            .map(grant_from_row)
+            .transpose()?;
+        let Some(grant) = grant else {
             return Ok(false);
         };
-        if grant.grant_id.to_string() != grant_id {
-            return Ok(false);
-        }
         let target = parse_uuid(&target)?;
         let tip = match delivery_tip {
             Some(tip) => tip,
@@ -927,14 +992,15 @@ impl Store {
         Ok(grant.project_ids.contains(&project) && self.global_live_manager(project)? == Some(tip))
     }
 
-    /// Retire one undeliverable global message without delivering it.
+    /// Retire one undeliverable global (or #1238 tier) message without
+    /// delivering it.
     pub fn retire_global_message(&self, job_id: Uuid) -> Result<()> {
         self.conn.execute(
             "UPDATE scheduled_jobs SET enabled=0,updated_at=?2 WHERE id=?1 AND enabled=1
              AND id IN (SELECT id FROM global_manager_messages)",
             params![job_id.to_string(), stamp()],
         )?;
-        Ok(())
+        self.retire_tier_message(job_id)
     }
 
     /// Mark an appointment complete with the scope and policy versions.
@@ -991,12 +1057,17 @@ impl Store {
         Ok(rows)
     }
 
-    fn global_project_row(&self, project: rsi_common::types::Project) -> Result<GlobalProjectRow> {
+    pub(crate) fn global_project_row(
+        &self,
+        project: rsi_common::types::Project,
+    ) -> Result<GlobalProjectRow> {
         let key = project.id.to_string();
         let config = self.get_harness_manager(project.id)?;
+        let effective_caps = self.project_effective_resource_caps(project.id)?;
         let policy = self
             .get_harness_manager_policy(project.id)?
             .map(|policy| GlobalPmPolicyV1 {
+                effective_caps,
                 policy_version: policy.row_version,
                 mode: policy.policy.mode,
                 revoked: policy.revoked,
@@ -1042,6 +1113,7 @@ impl Store {
                 .filter(|c| !c.is_revoked())
                 .and_then(|c| c.current_session_id),
             scope_version: config.as_ref().map(|c| c.row_version),
+            scope_revoked: config.as_ref().is_some_and(|c| c.is_revoked()),
             policy,
             issues,
             running_sessions: running,

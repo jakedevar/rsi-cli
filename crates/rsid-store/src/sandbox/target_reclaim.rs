@@ -12,6 +12,7 @@ use nix::fcntl::{AtFlags, OFlag, OpenHow, RenameFlags, ResolveFlag, open, openat
 use nix::sys::stat::{Mode, SFlag, fchmod, fstat, fstatat, mkdirat};
 use nix::unistd::{UnlinkatFlags, dup, fsync, unlinkat};
 use rsi_common::sandbox_storage::SandboxBuildCacheReclaimSkipReason as SkipReason;
+use rsi_common::sandbox_storage::SandboxReclaimCheck;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -557,36 +558,50 @@ impl PinnedSandboxRoot {
         sandbox_root: &Path,
         allocation_id: Uuid,
     ) -> Result<Self, SkipReason> {
+        Self::open_checked(sandbox_base, sandbox_root, allocation_id).map_err(|(reason, _)| reason)
+    }
+
+    /// [`Self::open`], naming the exact identity check that refused (#1575).
+    pub fn open_checked(
+        sandbox_base: &Path,
+        sandbox_root: &Path,
+        allocation_id: Uuid,
+    ) -> Result<Self, (SkipReason, SandboxReclaimCheck)> {
+        let identity = |name| (SkipReason::GitOrRootIdentityRefusal, check(name));
         let base_path = std::fs::canonicalize(sandbox_base)
-            .map_err(|_| SkipReason::GitOrRootIdentityRefusal)?;
+            .map_err(|_| identity("sandbox_base_unresolvable"))?;
         let base_raw = open(
             &base_path,
             OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
             Mode::empty(),
         )
-        .map_err(map_open_error)?;
+        .map_err(|error| (map_open_error(error), check("sandbox_base_open_failed")))?;
         // SAFETY: `open` returned a new owned descriptor.
         let base_fd = unsafe { OwnedFd::from_raw_fd(base_raw) };
         let base_stat =
-            fstat(base_fd.as_raw_fd()).map_err(|_| SkipReason::GitOrRootIdentityRefusal)?;
+            fstat(base_fd.as_raw_fd()).map_err(|_| identity("sandbox_base_stat_failed"))?;
         let component = allocation_id.to_string();
-        let root_fd = open_beneath_dir(base_fd.as_raw_fd(), OsStr::new(&component))?;
+        let root_fd = open_beneath_dir(base_fd.as_raw_fd(), OsStr::new(&component))
+            .map_err(|reason| (reason, check("sandbox_root_open_failed")))?;
         let root_stat =
-            fstat(root_fd.as_raw_fd()).map_err(|_| SkipReason::GitOrRootIdentityRefusal)?;
+            fstat(root_fd.as_raw_fd()).map_err(|_| identity("sandbox_root_stat_failed"))?;
         if root_stat.st_dev as u64 != base_stat.st_dev as u64 {
-            return Err(SkipReason::MountOrDeviceCrossing);
+            return Err((
+                SkipReason::MountOrDeviceCrossing,
+                check("sandbox_root_on_other_device"),
+            ));
         }
         let root_path = std::fs::canonicalize(sandbox_root)
-            .map_err(|_| SkipReason::GitOrRootIdentityRefusal)?;
+            .map_err(|_| identity("sandbox_root_unresolvable"))?;
         if root_path != base_path.join(&component) || root_path != sandbox_root {
-            return Err(SkipReason::GitOrRootIdentityRefusal);
+            return Err(identity("sandbox_root_path_mismatch"));
         }
         let path_stat =
-            std::fs::metadata(&root_path).map_err(|_| SkipReason::GitOrRootIdentityRefusal)?;
+            std::fs::metadata(&root_path).map_err(|_| identity("sandbox_root_stat_failed"))?;
         use std::os::unix::fs::MetadataExt;
         if path_stat.dev() != root_stat.st_dev as u64 || path_stat.ino() != root_stat.st_ino as u64
         {
-            return Err(SkipReason::GitOrRootIdentityRefusal);
+            return Err(identity("sandbox_root_identity_changed"));
         }
         Ok(Self {
             base_fd,
@@ -613,6 +628,53 @@ impl PinnedSandboxRoot {
             }
             Err(reason) => TargetReclaimOutcome::refused(reason),
         }
+    }
+
+    /// The whole-target staging protocol is safe only for a tree of Cargo
+    /// output and RSI scratch (see [`is_reclaimable_target_entry`]). Retain a
+    /// tree with any other top-level entry in its entirety: moving unknown
+    /// manager state even temporarily would break consumers of its original
+    /// pathname.
+    pub(crate) fn ensure_idle_cargo_target(&self) -> Result<(), SkipReason> {
+        self.ensure_idle_cargo_target_checked()
+            .map_err(|(reason, _)| reason)
+    }
+
+    /// [`Self::ensure_idle_cargo_target`], naming the exact check that refused
+    /// and, for an unrecognized tree, the offending entry (#1575).
+    pub(crate) fn ensure_idle_cargo_target_checked(
+        &self,
+    ) -> Result<(), (SkipReason, SandboxReclaimCheck)> {
+        let by_reason = |reason: SkipReason| (reason, check(reason.as_str()));
+        let unreadable = || {
+            (
+                SkipReason::UnreadableEntry,
+                check("target_entry_unreadable"),
+            )
+        };
+        let target = self.open_target_identity().map_err(by_reason)?;
+        let fd = target._fd.as_raw_fd();
+        let mut dir = Dir::from_fd(dup(fd).map_err(|_| unreadable())?).map_err(|_| unreadable())?;
+        for entry in dir.iter() {
+            current_pass_state()
+                .charge_filesystem_entry(0)
+                .map_err(by_reason)?;
+            let entry = entry.map_err(|_| unreadable())?;
+            let name = entry.file_name();
+            if matches!(name.to_bytes(), b"." | b"..") {
+                continue;
+            }
+            let stat =
+                fstatat(Some(fd), name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(|_| unreadable())?;
+            let kind = SFlag::from_bits_truncate(stat.st_mode);
+            if !is_reclaimable_target_entry(name.to_bytes(), kind) {
+                return Err((
+                    SkipReason::TargetUnrecognizedContent,
+                    SandboxReclaimCheck::with_subject("target_entry_unrecognized", name.to_bytes()),
+                ));
+            }
+        }
+        ensure_no_target_process(self.root_path(), &self.root_path().join("target"))
     }
 
     pub fn registered_target_identity(&self) -> Result<RegisteredTargetIdentity, SkipReason> {
@@ -977,6 +1039,185 @@ impl PinnedSandboxRoot {
         }
         Ok(fd)
     }
+}
+
+fn check(name: &'static str) -> SandboxReclaimCheck {
+    SandboxReclaimCheck::new(name)
+}
+
+/// Top-level `target/` entries that carry nobody's state: what Cargo writes
+/// there, the daemon's execution scratch (`.rsi-tmp`, the sandbox `TMPDIR`) and
+/// the repository's own test-runner fixtures and locks. Every sandbox target
+/// holds `.rsi-tmp`, so a stricter list would retain all of them (#1575).
+/// Anything else may be a manager's or an operator's state (#1429) and keeps
+/// the whole tree. Entry types are exact: a symlink or special file named like
+/// a Cargo entry is not one.
+fn is_reclaimable_target_entry(name: &[u8], kind: SFlag) -> bool {
+    const FIXTURE_SUFFIX: &[u8] = b"-fixtures";
+    if kind == SFlag::S_IFDIR {
+        matches!(
+            name,
+            b"debug"
+                | b"release"
+                | b"doc"
+                | b"package"
+                | b"tmp"
+                | b"cargo-timings"
+                | b"criterion"
+                | b"dhat"
+                | b".rsi-tmp"
+                | b"rsid-test-shards"
+        ) || (name.len() > FIXTURE_SUFFIX.len() && name.ends_with(FIXTURE_SUFFIX))
+    } else if kind == SFlag::S_IFREG {
+        matches!(
+            name,
+            b".rustc_info.json"
+                | b"CACHEDIR.TAG"
+                | b".cargo-lock"
+                | b".future-incompat-report.json"
+                | b".rsid-test-shards.lock"
+        )
+    } else {
+        false
+    }
+}
+
+/// Check processes as well as the provider active map. A foreground shell or
+/// detached systemd unit may use the sandbox between provider turns. Procfs
+/// observations are bounded by the reclaim pass budget and never logged.
+/// Nondumpable unrelated services (e.g. credential agents) are outside RSI's
+/// process tree. Unreadable RSI units fail closed instead of disabling all
+/// reclamation whenever such an unrelated service is running.
+fn ensure_no_target_process(
+    root: &Path,
+    target: &Path,
+) -> Result<(), (SkipReason, SandboxReclaimCheck)> {
+    use std::os::unix::fs::MetadataExt;
+    let by_reason = |reason: SkipReason| (reason, check(reason.as_str()));
+    let unreadable = |pid: u32| {
+        (
+            SkipReason::UnreadableEntry,
+            SandboxReclaimCheck::with_subject("process_scan_unreadable", pid.to_string()),
+        )
+    };
+    let in_use = |pid: u32| {
+        (
+            SkipReason::ActiveOwner,
+            SandboxReclaimCheck::with_subject("process_uses_sandbox", pid.to_string()),
+        )
+    };
+    let processes = std::fs::read_dir("/proc").map_err(|_| unreadable(0))?;
+    let uid = nix::unistd::getuid().as_raw();
+    for process in processes {
+        current_pass_state().checkpoint(0).map_err(by_reason)?;
+        let process = process.map_err(|_| unreadable(0))?;
+        let Ok(pid) = process.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        // The reclaimer itself owns pinned target descriptors.
+        if pid == std::process::id() {
+            continue;
+        }
+        let path = process.path();
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if process_has_exited(&error) => continue,
+            Err(_) => return Err(unreadable(pid)),
+        };
+        if metadata.uid() != uid {
+            continue;
+        }
+        let cgroup = match std::fs::read_to_string(path.join("cgroup")) {
+            Ok(cgroup) => cgroup,
+            Err(error) if process_has_exited(&error) => continue,
+            Err(_) => return Err(unreadable(pid)),
+        };
+        let owned_unit = cgroup
+            .split('/')
+            .any(|component| component.starts_with("rsi-"));
+        for link in ["cwd", "exe"] {
+            match std::fs::read_link(path.join(link)) {
+                Ok(value) if value.starts_with(root) => return Err(in_use(pid)),
+                Ok(_) => {}
+                // A zombie or a process exiting during the scan has no cwd.
+                Err(error) if process_has_exited(&error) => {}
+                Err(error)
+                    if !owned_unit && error.kind() == std::io::ErrorKind::PermissionDenied => {}
+                Err(_) => return Err(unreadable(pid)),
+            }
+        }
+        // A gate clone or a shell waiting between cargo commands may have no
+        // cwd/fd beneath the cache yet. Inspect only the Cargo target setting;
+        // environment values are never persisted or included in diagnostics.
+        match std::fs::read(path.join("environ")) {
+            Ok(environment) => {
+                for variable in environment.split(|byte| *byte == 0) {
+                    if let Some(value) = variable.strip_prefix(b"CARGO_TARGET_DIR=") {
+                        let configured = Path::new(OsStr::from_bytes(value));
+                        let configured = if configured.is_absolute() {
+                            configured.to_path_buf()
+                        } else {
+                            std::fs::read_link(path.join("cwd"))
+                                .map_err(|_| unreadable(pid))?
+                                .join(configured)
+                        };
+                        let configured = normalize_lexically(&configured);
+                        if configured.starts_with(target) {
+                            return Err(in_use(pid));
+                        }
+                    }
+                }
+            }
+            Err(error) if process_has_exited(&error) => continue,
+            Err(error) if !owned_unit && error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(_) => return Err(unreadable(pid)),
+        }
+        let descriptors = match std::fs::read_dir(path.join("fd")) {
+            Ok(descriptors) => descriptors,
+            Err(error) if process_has_exited(&error) => continue,
+            Err(error) if !owned_unit && error.kind() == std::io::ErrorKind::PermissionDenied => {
+                continue;
+            }
+            Err(_) => return Err(unreadable(pid)),
+        };
+        for descriptor in descriptors {
+            current_pass_state().checkpoint(0).map_err(by_reason)?;
+            let descriptor = descriptor.map_err(|_| unreadable(pid))?;
+            match std::fs::read_link(descriptor.path()) {
+                Ok(value) if value.starts_with(target) => return Err(in_use(pid)),
+                Ok(_) => {}
+                Err(error) if process_has_exited(&error) => {}
+                Err(error)
+                    if !owned_unit && error.kind() == std::io::ErrorKind::PermissionDenied => {}
+                Err(_) => return Err(unreadable(pid)),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Collapse `.` and `..` components without touching the filesystem so a
+/// relative `CARGO_TARGET_DIR` such as `../sandbox/target` is compared with the
+/// target by its real components. `..` never ascends above the root.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() && !normalized.has_root() {
+                    normalized.push("..");
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn process_has_exited(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(nix::libc::ESRCH)
 }
 
 fn stage_bucket_index(entry_name: &str) -> u8 {
@@ -4556,6 +4797,179 @@ mod tests {
         assert_eq!(meta.ino(), ino, "external link must keep the same inode");
         assert_eq!(meta.len(), len, "external link content must be intact");
         assert_eq!(meta.nlink(), 1, "only the external link may remain");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn cargo_target_guard_preserves_unknown_files_and_non_cargo_entry_types() {
+        use std::os::unix::fs::FileTypeExt;
+        let (temp, base, root, id) = fixture();
+        let pinned = PinnedSandboxRoot::open(&base, &root, id).unwrap();
+        std::fs::create_dir(root.join("target/debug")).unwrap();
+        std::fs::write(root.join("target/lander"), b"manager state").unwrap();
+        assert_eq!(
+            pinned.ensure_idle_cargo_target(),
+            Err(SkipReason::TargetUnrecognizedContent)
+        );
+        assert_eq!(
+            std::fs::read(root.join("target/lander")).unwrap(),
+            b"manager state"
+        );
+        std::fs::remove_file(root.join("target/lander")).unwrap();
+        let outside = temp.path().join("sentinel");
+        std::fs::write(&outside, b"preserved").unwrap();
+        symlink(&outside, root.join("target/.rustc_info.json")).unwrap();
+        assert_eq!(
+            pinned.ensure_idle_cargo_target(),
+            Err(SkipReason::TargetUnrecognizedContent)
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"preserved");
+        assert!(
+            std::fs::symlink_metadata(root.join("target/.rustc_info.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_file(root.join("target/.rustc_info.json")).unwrap();
+        std::fs::remove_dir(root.join("target/debug")).unwrap();
+        // A FIFO is a non-directory special file; unlike a Unix socket it has
+        // no SUN_LEN path limit under long temporary directories.
+        nix::unistd::mkfifo(&root.join("target/debug"), Mode::from_bits_truncate(0o600)).unwrap();
+        assert_eq!(
+            pinned.ensure_idle_cargo_target(),
+            Err(SkipReason::TargetUnrecognizedContent)
+        );
+        assert!(
+            std::fs::symlink_metadata(root.join("target/debug"))
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn reclaimable_target_entries_are_exact_about_names_and_types() {
+        let dir = SFlag::S_IFDIR;
+        let file = SFlag::S_IFREG;
+        // What a finished worker sandbox really holds (#1575): Cargo output,
+        // the daemon's `.rsi-tmp` scratch and the repository's test fixtures.
+        for name in [
+            &b"debug"[..],
+            b"release",
+            b"tmp",
+            b".rsi-tmp",
+            b"rsid-test-shards",
+            b"rsid-test-fixtures",
+            b"rsid-d00-fixtures",
+            b"slice8-harness-shell-fixtures",
+        ] {
+            assert!(is_reclaimable_target_entry(name, dir), "{name:?}");
+            assert!(!is_reclaimable_target_entry(name, file), "{name:?} as file");
+        }
+        for name in [
+            &b".rustc_info.json"[..],
+            b"CACHEDIR.TAG",
+            b".cargo-lock",
+            b".rsid-test-shards.lock",
+        ] {
+            assert!(is_reclaimable_target_entry(name, file), "{name:?}");
+            assert!(!is_reclaimable_target_entry(name, dir), "{name:?} as dir");
+        }
+        // Anything else may be someone's state: a manager's lander, a log, an
+        // artifact left beside the build output. Links and special files never
+        // count, whatever their name.
+        for name in [
+            &b"lander"[..],
+            b"artifact",
+            b"fixtures",
+            b"-fixtures",
+            b"x.bin",
+        ] {
+            assert!(!is_reclaimable_target_entry(name, dir), "{name:?}");
+            assert!(!is_reclaimable_target_entry(name, file), "{name:?}");
+        }
+        for kind in [SFlag::S_IFLNK, SFlag::S_IFIFO, SFlag::S_IFSOCK] {
+            assert!(!is_reclaimable_target_entry(b".rsi-tmp", kind));
+            assert!(!is_reclaimable_target_entry(b"debug", kind));
+            assert!(!is_reclaimable_target_entry(b".rustc_info.json", kind));
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn idle_cargo_target_accepts_a_real_worker_target_and_names_the_first_foreign_entry() {
+        let (_temp, base, root, id) = fixture();
+        let pinned = PinnedSandboxRoot::open(&base, &root, id).unwrap();
+        let target = root.join("target");
+        for dir in [
+            "debug",
+            "tmp",
+            ".rsi-tmp",
+            "rsid-test-fixtures",
+            "rsid-d00-fixtures",
+        ] {
+            std::fs::create_dir_all(target.join(dir).join("nested")).unwrap();
+            std::fs::write(target.join(dir).join("nested").join("blob"), b"scratch").unwrap();
+        }
+        for file in [".rustc_info.json", "CACHEDIR.TAG", ".rsid-test-shards.lock"] {
+            std::fs::write(target.join(file), b"{}").unwrap();
+        }
+        assert_eq!(pinned.ensure_idle_cargo_target(), Ok(()));
+        assert!(pinned.ensure_idle_cargo_target_checked().is_ok());
+
+        std::fs::write(target.join("lander"), b"manager state").unwrap();
+        let (reason, check) = pinned.ensure_idle_cargo_target_checked().unwrap_err();
+        assert_eq!(reason, SkipReason::TargetUnrecognizedContent);
+        assert_eq!(check.name(), "target_entry_unrecognized");
+        assert_eq!(check.token(), "target_entry_unrecognized:lander");
+        assert_eq!(
+            pinned.ensure_idle_cargo_target(),
+            Err(SkipReason::TargetUnrecognizedContent)
+        );
+        assert_eq!(
+            std::fs::read(target.join("lander")).unwrap(),
+            b"manager state"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn open_checked_names_the_identity_check_that_failed() {
+        let (temp, base, root, id) = fixture();
+        assert!(PinnedSandboxRoot::open_checked(&base, &root, id).is_ok());
+
+        let (reason, check) =
+            PinnedSandboxRoot::open_checked(&temp.path().join("absent"), &root, id).unwrap_err();
+        assert_eq!(reason, SkipReason::GitOrRootIdentityRefusal);
+        assert_eq!(check.name(), "sandbox_base_unresolvable");
+
+        let (reason, check) =
+            PinnedSandboxRoot::open_checked(&base, &root, Uuid::new_v4()).unwrap_err();
+        assert_eq!(reason, SkipReason::GitOrRootIdentityRefusal);
+        assert_eq!(check.name(), "sandbox_root_open_failed");
+
+        let alias = base.join("alias");
+        symlink(&root, &alias).unwrap();
+        let (reason, check) = PinnedSandboxRoot::open_checked(&base, &alias, id).unwrap_err();
+        assert_eq!(reason, SkipReason::GitOrRootIdentityRefusal);
+        assert_eq!(check.name(), "sandbox_root_path_mismatch");
+        assert_eq!(
+            PinnedSandboxRoot::open(&base, &alias, id).err(),
+            Some(SkipReason::GitOrRootIdentityRefusal)
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn configured_target_dir_is_compared_after_lexical_normalization() {
+        let target = Path::new("/sandboxes/a/target");
+        let alias =
+            normalize_lexically(&Path::new("/work/gate").join("../../sandboxes/a/./target/debug"));
+        assert!(alias.starts_with(target), "{alias:?}");
+        let sibling = normalize_lexically(Path::new("/sandboxes/a/target/../target2"));
+        assert!(!sibling.starts_with(target), "{sibling:?}");
+        assert_eq!(normalize_lexically(Path::new("/../x")), Path::new("/x"));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]

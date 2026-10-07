@@ -103,6 +103,45 @@ impl RootWorld {
                         }],
                         max_created_sessions: 4,
                         max_recovery_attempts: 0,
+                        allowed_launches: vec![
+                            ManagerLaunchChoiceV2 {
+                                provider: SessionProvider::Codex,
+                                model: "gpt-6-astra".into(),
+                                effort: None,
+                            },
+                            ManagerLaunchChoiceV2 {
+                                provider: SessionProvider::Codex,
+                                model: "gpt-6-astra".into(),
+                                effort: Some("high".into()),
+                            },
+                            ManagerLaunchChoiceV2 {
+                                provider: SessionProvider::Codex,
+                                model: "gpt-6-astra".into(),
+                                effort: Some("medium".into()),
+                            },
+                            ManagerLaunchChoiceV2 {
+                                provider: SessionProvider::Codex,
+                                model: "gpt-5.5".into(),
+                                effort: None,
+                            },
+                            ManagerLaunchChoiceV2 {
+                                provider: SessionProvider::CodexAppServer,
+                                model: "gpt-6-astra".into(),
+                                effort: None,
+                            },
+                            // These two cases isolate the provider backstop,
+                            // after launch-policy admission has succeeded.
+                            ManagerLaunchChoiceV2 {
+                                provider: SessionProvider::Local,
+                                model: "gpt-6-astra".into(),
+                                effort: Some("medium".into()),
+                            },
+                            ManagerLaunchChoiceV2 {
+                                provider: SessionProvider::Harness,
+                                model: "gpt-6-astra".into(),
+                                effort: Some("medium".into()),
+                            },
+                        ],
                         ..Default::default()
                     },
                 })
@@ -160,6 +199,7 @@ impl RootWorld {
             }
         };
         AgentManagerControlRequestV2 {
+            project_id: None,
             fence: ManagerFenceV2 {
                 scope_version: config.row_version,
                 policy_version: policy.row_version,
@@ -1224,7 +1264,7 @@ async fn manager_root_runtime_current_zero_caps_choice_global_disable_and_unknow
         } else {
             assert!(
                 case == 0 || case == 3 || case == 5,
-                "zero creation or restricted choice rejects before queue"
+                "zero creation or restricted choice rejects before queue (case {case})"
             );
         }
     }

@@ -505,6 +505,7 @@ mod tests {
                     fingerprint: crate::store::agent_deploys::deploy_fingerprint(SHA, "x", 60),
                     manifest: &manifest,
                     max_wait_secs: 60,
+                    interrupt_workers: false,
                 },
                 now,
             )

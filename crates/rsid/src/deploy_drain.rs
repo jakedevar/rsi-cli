@@ -12,6 +12,13 @@
 //! running jobs are never interrupted. A parentless operator session and the
 //! deploy's own caller are never held.
 //!
+//! The hold is also bounded by the operator's `deploy_drain_hold_secs`
+//! (#1320/#1311): an agent deploy holds new worker starts for at most that long
+//! after it was requested. Past it the deploy keeps waiting for a quiet point
+//! (`waiting`) without holding anything, and engages the hold again only from
+//! its first quiet poll through the restart. A worker turn can run for an
+//! hour, so an unbounded hold starved the manager without reaching quiet.
+//!
 //! The merge queue is held too (#1128): while a deploy drains, the queue loop
 //! admits no new batch (queued entries wait, the running batch finishes, so the
 //! `landing_in_progress` quiet-point blocker clears). The held queue shows in
@@ -20,8 +27,10 @@
 //! Held work is deferred, never dropped: durable work (spawn requests, topology
 //! nodes) waits in place and runs when the hold releases; scheduled wakes stay
 //! due and are re-evaluated next tick; work whose caller keeps the request
-//! (a manager create, a continuation, a job submit) is answered with the typed
-//! refusal [`DEPLOY_DRAINING`] and retried by that caller.
+//! (a manager create, a continuation, a landing or cloud-gate job submit) is
+//! answered with the typed refusal [`DEPLOY_DRAINING`] and retried by that
+//! caller. A `test` or `build` job submit is held instead (#1566): recorded
+//! `queued`, launched by the job loop once the hold ends.
 
 use crate::error::{DaemonError, Result};
 use crate::store::agent_deploys::DeployRow;
@@ -30,6 +39,9 @@ pub use rsi_common::agent_daemon_info::DEPLOY_DRAINING;
 use rsi_common::agent_daemon_info::{DeployDrainV1, HeldWorkV1};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// `hold_cap_secs` value meaning "no cap" (tests and constructors).
+const UNCAPPED: u64 = u64::MAX;
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -107,6 +119,11 @@ pub struct DeployDrain {
     queue_held: Mutex<Option<DateTime<Utc>>>,
     /// What the waiting deploy's last quiet-point poll found (#1177).
     blockers: Mutex<Vec<&'static str>>,
+    /// The deploy waiting for its quiet point and its own deadline, whether
+    /// or not it holds anything (#1320).
+    waiting_deploy: Mutex<Option<(Uuid, DateTime<Utc>)>>,
+    /// Operator `deploy_drain_hold_secs`, refreshed by the deploy runner.
+    hold_cap_secs: AtomicU64,
     next_ticket: AtomicU64,
     refused: AtomicU64,
     wakes_held: AtomicU64,
@@ -140,6 +157,8 @@ impl DeployDrain {
             waiting: Mutex::new(Vec::new()),
             queue_held: Mutex::new(None),
             blockers: Mutex::new(Vec::new()),
+            waiting_deploy: Mutex::new(None),
+            hold_cap_secs: AtomicU64::new(UNCAPPED),
             next_ticket: AtomicU64::new(0),
             refused: AtomicU64::new(0),
             wakes_held: AtomicU64::new(0),
@@ -151,13 +170,29 @@ impl DeployDrain {
     /// the operator setting is on and the deploy's deadline has not passed.
     /// Waiters are woken the moment the hold ends.
     pub(crate) fn sync(&self, live: Option<&DeployRow>, enabled: bool, now: DateTime<Utc>) {
+        self.sync_until(live, None, enabled, now);
+    }
+
+    /// [`Self::sync`] with the hold ending at `hold_end` when that comes
+    /// before the deploy's deadline (#1320). The deploy keeps `waiting` either
+    /// way.
+    pub(crate) fn sync_until(
+        &self,
+        live: Option<&DeployRow>,
+        hold_end: Option<DateTime<Utc>>,
+        enabled: bool,
+        now: DateTime<Utc>,
+    ) {
+        if let Ok(mut waiting) = self.waiting_deploy.lock() {
+            *waiting = live.map(|row| (row.id, row.deadline_at));
+        }
         let next = live
-            .filter(|row| enabled && now < row.deadline_at)
             .map(|row| Active {
                 deploy_id: row.id,
                 owner: row.owner_session_id,
-                deadline: row.deadline_at,
-            });
+                deadline: hold_end.map_or(row.deadline_at, |end| end.min(row.deadline_at)),
+            })
+            .filter(|active| enabled && now < active.deadline);
         self.state.send_if_modified(|current| {
             if *current == next {
                 false
@@ -166,6 +201,43 @@ impl DeployDrain {
                 true
             }
         });
+    }
+
+    /// Release the hold of deploy `deploy_id` at once (its owner cancelled
+    /// it, #1320). Another deploy's hold is left alone.
+    pub(crate) fn release(&self, deploy_id: Uuid) {
+        self.state.send_if_modified(|current| {
+            if current.is_some_and(|active| active.deploy_id == deploy_id) {
+                *current = None;
+                true
+            } else {
+                false
+            }
+        });
+        if let Ok(mut waiting) = self.waiting_deploy.lock()
+            && waiting.is_some_and(|(id, _)| id == deploy_id)
+        {
+            *waiting = None;
+        }
+    }
+
+    /// Set the operator's hold cap (`deploy_drain_hold_secs`).
+    pub(crate) fn set_hold_cap_secs(&self, secs: u64) {
+        self.hold_cap_secs.store(secs, Ordering::Relaxed);
+    }
+
+    /// The hold cap, `None` when uncapped.
+    pub(crate) fn hold_cap(&self) -> Option<chrono::Duration> {
+        let secs = self.hold_cap_secs.load(Ordering::Relaxed);
+        (secs != UNCAPPED)
+            .then(|| chrono::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX / 1000)))
+    }
+
+    /// The hold's release time for the deploy `id`, when it holds (#1311).
+    #[must_use]
+    pub fn release_by(&self) -> Option<(Uuid, DateTime<Utc>)> {
+        self.active_at(Utc::now())
+            .map(|active| (active.deploy_id, active.deadline))
     }
 
     /// Record the quiet-point blockers the latest poll found (empty clears).
@@ -310,13 +382,24 @@ impl DeployDrain {
                 reason: DEPLOY_DRAINING.to_string(),
             });
         }
+        let waiting = self
+            .waiting_deploy
+            .lock()
+            .ok()
+            .and_then(|waiting| *waiting)
+            .filter(|(_, deadline)| Utc::now() < *deadline);
         DeployDrainV1 {
             draining: active.is_some(),
-            deploy_id: active.map(|value| value.deploy_id),
+            deploy_id: active
+                .map(|value| value.deploy_id)
+                .or(waiting.map(|(id, _)| id)),
             release_by: active
                 .map(|value| value.deadline.to_rfc3339_opts(SecondsFormat::Nanos, true)),
+            waiting: waiting.is_some(),
+            deploy_deadline_at: waiting
+                .map(|(_, deadline)| deadline.to_rfc3339_opts(SecondsFormat::Nanos, true)),
             held,
-            blockers: if active.is_some() {
+            blockers: if active.is_some() || waiting.is_some() {
                 self.blockers.lock().map_or_else(
                     |_| Vec::new(),
                     |b| b.iter().map(|b| (*b).to_string()).collect(),

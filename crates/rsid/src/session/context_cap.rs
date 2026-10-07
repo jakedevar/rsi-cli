@@ -10,7 +10,14 @@
 //! ordinary one, so the manager seat, area node and lead custody move exactly
 //! as they do today; the global grant is re-issued to the successor when the
 //! rotation settles. Workers, reviewers, children and operator sessions hold
-//! no seat and are never capped.
+//! no seat and are never rotated.
+//!
+//! #1254: a session without a seat has its own cap, `worker_context_cap_tokens`
+//! (default 60% of its known context window). When it crosses it and has a
+//! launching manager or Epic lead, the daemon passes the baton once
+//! ([`crate::store::worker_baton`]): one durable mail tells the worker to
+//! commit, append a handoff and end its turn, and the launcher gets one
+//! `worker_context_cap` notice. Its turn is never interrupted.
 //!
 //! #1142 hardening. An automatic cap rotation (1) runs only at an idle boundary
 //! fenced by the exact idle incarnation ([`IdleFence`], checked under the
@@ -56,10 +63,8 @@ pub(super) fn capped_seat(store: &Store, session_id: Uuid) -> Result<Option<Coor
         Some(CoordinatorRole::Manager) => return Ok(Some(CoordinatorSeatV1::ProjectManager)),
         None => {}
     }
-    if store
-        .active_global_grant()?
-        .is_some_and(|grant| grant.seat_session_id == session_id)
-    {
+    // #1236: the seat of any portfolio node (one active grant per seat).
+    if store.portfolio_seat_grant(session_id)?.is_some() {
         return Ok(Some(CoordinatorSeatV1::GlobalManager));
     }
     let nodes: Vec<(String, String)> = {
@@ -299,6 +304,15 @@ fn latched(session_id: Uuid) -> bool {
         .contains(&session_id)
 }
 
+/// Forget the in-memory decision, as a daemon restart does.
+#[cfg(test)]
+pub(super) fn unlatch_for_test(session_id: Uuid) {
+    crossing_latch()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&session_id);
+}
+
 fn latch(session_id: Uuid) {
     crossing_latch()
         .lock()
@@ -311,31 +325,51 @@ fn latch(session_id: Uuid) {
 pub(super) enum CapCrossing {
     /// Below the cap, the cap is off, or already decided.
     None,
-    /// Not a coordinating seat: never capped.
+    /// Not a coordinating seat, and no worker cap applies: never capped.
     Worker,
+    /// #1254: a worker crossed its worker cap; `true` when this call passed
+    /// the baton (`false`: an earlier crossing already holds it, or the worker
+    /// has no launcher).
+    WorkerBaton(bool),
     /// Review or source ownership defers the rotation.
     Deferred(&'static str),
     /// A coordinating seat; `true` when this call recorded the rotation.
     Recorded(bool),
 }
 
-/// Decide one usage update of `session` at `measured_tokens` against `cap`.
+/// Decide one usage update of `session` at `measured_tokens` against the
+/// coordinator `cap` (seats) and the `worker_cap` (#1254, everyone else).
 pub(super) fn evaluate_cap_crossing(
     store: &Store,
     session: &Session,
     measured_tokens: u64,
     cap: Option<u64>,
+    worker_cap: Option<u64>,
     now: DateTime<Utc>,
 ) -> Result<CapCrossing> {
-    let Some(cap) = cap else {
-        return Ok(CapCrossing::None);
-    };
-    if measured_tokens < cap || latched(session.id) {
+    let crossed = |cap: Option<u64>| cap.filter(|&cap| measured_tokens >= cap);
+    if (crossed(cap).is_none() && crossed(worker_cap).is_none()) || latched(session.id) {
         return Ok(CapCrossing::None);
     }
     let Some(seat) = capped_seat(store, session.id)? else {
+        let Some(worker_cap) = crossed(worker_cap) else {
+            if worker_cap.is_some() {
+                // Above the coordinator cap but below its own: decided later.
+                return Ok(CapCrossing::None);
+            }
+            latch(session.id);
+            return Ok(CapCrossing::Worker);
+        };
+        let outcome =
+            store.record_worker_context_cap(session.id, measured_tokens, worker_cap, now)?;
         latch(session.id);
-        return Ok(CapCrossing::Worker);
+        return Ok(CapCrossing::WorkerBaton(
+            outcome == crate::store::worker_baton::WorkerBatonOutcome::Sent,
+        ));
+    };
+    let Some(cap) = crossed(cap) else {
+        // A seat below the coordinator cap (it crossed only the worker cap).
+        return Ok(CapCrossing::None);
     };
     if let Some(reason) = store.automatic_rotation_protection(session.id)? {
         return Ok(CapCrossing::Deferred(reason));
@@ -683,10 +717,7 @@ fn settle_global_grant(
     successor: Uuid,
     rotation_id: Option<&str>,
 ) -> Result<bool> {
-    if !store
-        .active_global_grant()?
-        .is_some_and(|grant| grant.seat_session_id == session_id)
-    {
+    if store.portfolio_seat_grant(session_id)?.is_none() {
         return Ok(false);
     }
     store.transfer_global_seat_if_published(session_id, successor, rotation_id)
@@ -1331,6 +1362,27 @@ impl super::SessionManager {
         Ok(rotated)
     }
 
+    /// #1254 restart backstop: finish every worker baton an earlier daemon
+    /// process recorded but did not fully send. Each effect is idempotent, so
+    /// a baton is never sent twice. Returns the number finished.
+    ///
+    /// # Errors
+    /// Store failures listing the records.
+    pub async fn deliver_pending_worker_batons(&self) -> Result<usize> {
+        let store = self.store.lock().await;
+        let mut finished = 0;
+        for worker in store.pending_worker_batons()? {
+            match store.deliver_worker_baton(worker) {
+                Ok(true) => finished += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%worker, %error, "Worker baton not finished; retried next pass");
+                }
+            }
+        }
+        Ok(finished)
+    }
+
     fn escalate_cap(&self, message: String) {
         tracing::warn!("{message}");
         self.event_bus
@@ -1452,28 +1504,28 @@ mod tests {
         let operator = session(&store, None, None);
         // Below the cap, or with the cap off, nothing happens.
         assert_eq!(
-            evaluate_cap_crossing(&store, &lead, 199_999, Some(200_000), at(0)).unwrap(),
+            evaluate_cap_crossing(&store, &lead, 199_999, Some(200_000), None, at(0)).unwrap(),
             CapCrossing::None
         );
         assert_eq!(
-            evaluate_cap_crossing(&store, &lead, 900_000, None, at(0)).unwrap(),
+            evaluate_cap_crossing(&store, &lead, 900_000, None, None, at(0)).unwrap(),
             CapCrossing::None
         );
         // A worker child and an operator session are never capped.
         for worker in [&child, &operator] {
             assert_eq!(
-                evaluate_cap_crossing(&store, worker, 900_000, Some(200_000), at(0)).unwrap(),
+                evaluate_cap_crossing(&store, worker, 900_000, Some(200_000), None, at(0)).unwrap(),
                 CapCrossing::Worker
             );
             assert!(cap_rotation(&store, worker.id).unwrap().is_none());
         }
         // The lead's crossing records exactly one rotation.
         assert_eq!(
-            evaluate_cap_crossing(&store, &lead, 210_000, Some(200_000), at(1)).unwrap(),
+            evaluate_cap_crossing(&store, &lead, 210_000, Some(200_000), None, at(1)).unwrap(),
             CapCrossing::Recorded(true)
         );
         assert_eq!(
-            evaluate_cap_crossing(&store, &lead, 250_000, Some(200_000), at(2)).unwrap(),
+            evaluate_cap_crossing(&store, &lead, 250_000, Some(200_000), None, at(2)).unwrap(),
             CapCrossing::None
         );
         let seat = CoordinatorSeatV1::EpicLead { epic_id: epic };
@@ -1655,6 +1707,217 @@ mod tests {
         );
         let record = cap_rotation(&store, lead.id).unwrap().unwrap();
         assert_eq!(record.reason.as_deref(), Some("seat_passed"));
+    }
+
+    /// Agent mail rows `(owner, target, payload)` addressed to `target`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    fn mail_to(store: &Store, target: Uuid) -> Vec<(String, String)> {
+        let mut statement = store
+            .conn
+            .prepare(
+                "SELECT owner_session_id, payload FROM agent_messages WHERE target_session_id=?1",
+            )
+            .unwrap();
+        statement
+            .query_map([target.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    /// #1254: a worker that crosses its cap gets exactly one baton mail and
+    /// its launcher exactly one typed `worker_context_cap` record, also after
+    /// a restart (latch cleared) and after a crash between the effects; a
+    /// seat still rotates as before and a session without a launcher gets
+    /// nothing.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn worker_crossing_passes_the_baton_once_even_across_a_restart() {
+        use crate::store::worker_baton::{WorkerBatonState, WorkerLauncherKind};
+        let store = Store::open_in_memory().unwrap();
+        let (lead, _epic, child) = lead_fixture(&store);
+        let child = store.get_session(child).unwrap().unwrap();
+        // Below the worker cap, or with only the coordinator cap crossed, the
+        // worker is not decided yet.
+        assert_eq!(
+            evaluate_cap_crossing(&store, &child, 599_999, None, Some(600_000), at(0)).unwrap(),
+            CapCrossing::None
+        );
+        assert_eq!(
+            evaluate_cap_crossing(&store, &child, 300_000, Some(200_000), Some(600_000), at(0))
+                .unwrap(),
+            CapCrossing::None
+        );
+        assert!(store.worker_baton(child.id).unwrap().is_none());
+        assert_eq!(
+            evaluate_cap_crossing(&store, &child, 650_000, Some(200_000), Some(600_000), at(1))
+                .unwrap(),
+            CapCrossing::WorkerBaton(true)
+        );
+        let record = store.worker_baton(child.id).unwrap().unwrap();
+        assert_eq!(record.state, WorkerBatonState::Sent);
+        assert_eq!(record.launcher.launcher, lead.id);
+        assert_eq!(record.launcher.kind, WorkerLauncherKind::EpicLead);
+        assert_eq!(
+            (record.measured_tokens, record.cap_tokens),
+            (650_000, 600_000)
+        );
+        let baton = mail_to(&store, child.id);
+        assert_eq!(baton.len(), 1);
+        assert_eq!(baton[0].0, lead.id.to_string());
+        assert!(
+            baton[0].1.contains("PIPELINE HANDOFF — BATON <sha>"),
+            "{}",
+            baton[0].1
+        );
+        assert!(baton[0].1.contains("Commit your work"), "{}", baton[0].1);
+        // #1332: the baton handoff closes with the Friction field.
+        assert!(
+            baton[0]
+                .1
+                .contains("whose last line is `Friction: none | #N[, #M] |"),
+            "{}",
+            baton[0].1
+        );
+        let notice = mail_to(&store, lead.id);
+        assert_eq!(notice.len(), 1);
+        assert_eq!(notice[0].0, child.id.to_string());
+        assert!(
+            notice[0]
+                .1
+                .contains("\"record_kind\":\"worker_context_cap\""),
+            "{}",
+            notice[0].1
+        );
+        assert!(
+            notice[0].1.contains("\"measured_tokens\":650000"),
+            "{}",
+            notice[0].1
+        );
+        assert!(
+            notice[0]
+                .1
+                .contains(&format!("continue_from: \"{}\"", child.id))
+        );
+        // The latch holds within this process.
+        assert_eq!(
+            evaluate_cap_crossing(&store, &child, 700_000, None, Some(600_000), at(2)).unwrap(),
+            CapCrossing::None
+        );
+        // A restart forgets the latch; the durable record keeps it one baton.
+        unlatch_for_test(child.id);
+        assert_eq!(
+            evaluate_cap_crossing(&store, &child, 700_000, None, Some(600_000), at(3)).unwrap(),
+            CapCrossing::WorkerBaton(false)
+        );
+        // A crash after the record but before it was marked sent: the restart
+        // pass finishes it with the same identities, so nothing is doubled.
+        let mut crashed = store.worker_baton(child.id).unwrap().unwrap();
+        crashed.state = WorkerBatonState::Due;
+        crashed.worker_mail_id = None;
+        crashed.launcher_notice = None;
+        store
+            .set_daemon_setting(
+                &format!("worker_baton:{}", child.id),
+                &serde_json::to_string(&crashed).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(store.pending_worker_batons().unwrap(), vec![child.id]);
+        assert!(store.deliver_worker_baton(child.id).unwrap());
+        assert!(!store.deliver_worker_baton(child.id).unwrap());
+        assert!(store.pending_worker_batons().unwrap().is_empty());
+        assert_eq!(mail_to(&store, child.id).len(), 1);
+        assert_eq!(mail_to(&store, lead.id).len(), 1);
+        // A session with no launcher is decided without a baton.
+        let operator = session(&store, None, None);
+        assert_eq!(
+            evaluate_cap_crossing(&store, &operator, 900_000, None, Some(600_000), at(4)).unwrap(),
+            CapCrossing::WorkerBaton(false)
+        );
+        assert!(store.worker_baton(operator.id).unwrap().is_none());
+        assert!(mail_to(&store, operator.id).is_empty());
+        // The lead holds a seat: it rotates as today and is never told to
+        // pass the baton, even past the worker cap.
+        assert_eq!(
+            evaluate_cap_crossing(&store, &lead, 900_000, Some(200_000), Some(600_000), at(5))
+                .unwrap(),
+            CapCrossing::Recorded(true)
+        );
+        assert!(store.worker_baton(lead.id).unwrap().is_none());
+        assert_eq!(mail_to(&store, lead.id).len(), 1);
+    }
+
+    /// #1254: the worker cap defaults to 60% of the known window; `1..=100`
+    /// is a percentage, larger values are tokens, `0` is off, and overrides
+    /// follow the coordinator cap's precedence.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn worker_cap_setting_defaults_to_sixty_percent_with_overrides() {
+        let config = crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
+        let opus = Some("claude-opus-5-5");
+        let claude = SessionProvider::Claude;
+        assert_eq!(config.to_json()["worker_context_cap_tokens"], 60);
+        assert_eq!(
+            config.worker_context_cap(claude, opus, 1_000_000),
+            Some(600_000)
+        );
+        assert_eq!(
+            config.worker_context_cap(claude, opus, 200_000),
+            Some(120_000)
+        );
+        // An unknown window has no percentage cap.
+        assert_eq!(config.worker_context_cap(claude, opus, 0), None);
+        for bad in [
+            serde_json::json!(101),
+            serde_json::json!(31_999),
+            serde_json::json!(2_000_001),
+            serde_json::json!("x"),
+        ] {
+            assert!(
+                config
+                    .update_field("worker_context_cap_tokens", &bad)
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            config.update_field("worker_context_cap_tokens", &serde_json::json!(300_000)),
+            Ok(true)
+        );
+        assert_eq!(config.worker_context_cap(claude, opus, 0), Some(300_000));
+        assert_eq!(
+            config.update_field("worker_context_cap.Claude", &serde_json::json!(50)),
+            Ok(true)
+        );
+        assert_eq!(
+            config.worker_context_cap(claude, opus, 1_000_000),
+            Some(500_000)
+        );
+        assert_eq!(
+            config.update_field(
+                "worker_context_cap.Claude/claude-opus-5-5",
+                &serde_json::json!(0)
+            ),
+            Ok(true)
+        );
+        assert_eq!(config.worker_context_cap(claude, opus, 1_000_000), None);
+        assert_eq!(
+            config.worker_context_cap(SessionProvider::Codex, Some("gpt-6-astra"), 0),
+            Some(300_000)
+        );
+        assert!(crate::config::is_persisted_runtime_config_field(
+            "worker_context_cap.Claude/claude-opus-5-5"
+        ));
+        assert!(!crate::config::is_persisted_runtime_config_field(
+            "worker_context_cap.Bogus"
+        ));
+        assert_eq!(
+            config.update_field("worker_context_cap.Claude", &serde_json::Value::Null),
+            Ok(true)
+        );
+        assert_eq!(
+            config.to_json()["worker_context_cap.Claude/claude-opus-5-5"],
+            0
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]

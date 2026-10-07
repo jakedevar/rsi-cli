@@ -120,6 +120,46 @@ pub async fn set_coordinator_context_cap(app: &mut App, args: &str) {
     }
 }
 
+/// #1254: read, set, or clear one provider or model override of the worker
+/// baton cap. The value is `0` (off), a percentage `1..=100` of the session's
+/// context window, or an absolute token count; the daemon validates it.
+#[allow(clippy::future_not_send)] // App belongs to the single-threaded event loop.
+pub async fn set_worker_context_cap(app: &mut App, args: &str) {
+    let mut parts = args.split_whitespace();
+    let (Some(key), value, None) = (parts.next(), parts.next(), parts.next()) else {
+        app.notify("Usage: :worker-context-cap <Provider[/model]> [pct|tokens|0|default]");
+        return;
+    };
+    if !require_authoritative_config(app) {
+        return;
+    }
+    let field = format!("worker_context_cap.{key}");
+    let Some(value) = value else {
+        match app.client.get_daemon_config().await {
+            Ok(config) => {
+                let current = config[field.as_str()]
+                    .as_u64()
+                    .map_or_else(|| "default".to_string(), |n| n.to_string());
+                app.notify(format!("Worker context cap for {key}: {current}"));
+            }
+            Err(error) => app.notify(format!("Failed to read worker context cap: {error}")),
+        }
+        return;
+    };
+    let json = if value == "default" {
+        serde_json::Value::Null
+    } else if let Ok(n) = value.parse::<u64>() {
+        serde_json::json!(n)
+    } else {
+        app.notify("Cap must be a percentage (1-100), a token count, 0 (off), or default");
+        return;
+    };
+    match app.client.update_daemon_config(&field, json).await {
+        Ok(()) => app.notify_success(format!("Worker context cap for {key}: {value}")),
+        Err(error) => app.notify(format!("Failed to update worker context cap: {error}")),
+    }
+}
+
 /// Read, set, or clear the operator launch-model allowlist from the TUI command
 /// line (Issue #692). The daemon validates and enforces it on every launch path;
 /// an empty list means unrestricted.
@@ -544,6 +584,9 @@ pub async fn toggle_daemon_feature(app: &mut App, idx: usize) {
             }
             if let Some(slug) = system_prompt_slug {
                 app.settings.system_prompt_preset = SystemPromptPreset::from_slug(&slug);
+            }
+            if field == rsi_common::provider_profile::PROVIDER_PROFILE_FIELD {
+                app.sync_provider_profile();
             }
             let label = app
                 .daemon_features
@@ -1186,9 +1229,9 @@ mod tests {
         let Some(index) = app
             .daemon_features
             .iter()
-            .position(|entry| entry.field == "stall_detection_enabled")
+            .position(|entry| entry.field == "queue_enabled")
         else {
-            panic!("stall_detection_enabled entry present");
+            panic!("queue_enabled entry present");
         };
 
         toggle_daemon_feature(&mut app, index).await;
@@ -1197,10 +1240,7 @@ mod tests {
         };
         assert_eq!(
             captured,
-            vec![(
-                "stall_detection_enabled".to_string(),
-                serde_json::json!(true)
-            )]
+            vec![("queue_enabled".to_string(), serde_json::json!(true))]
         );
 
         assert!(

@@ -19,6 +19,44 @@ pub enum CommandResult {
 ///
 /// Custom commands are checked first. If the command doesn't match any
 /// custom prefix, it returns `Unhandled` for modalkit to process.
+/// #1176: parse the `:rotation-abandon` target `provider[/model]`. No target
+/// keeps the blocked holder's provider and model. The provider name matches
+/// a `SessionProvider` case-insensitively.
+pub fn parse_abandon_target(
+    target: Option<&str>,
+) -> Result<(Option<rsi_common::types::SessionProvider>, Option<String>), String> {
+    let Some(target) = target.map(str::trim).filter(|target| !target.is_empty()) else {
+        return Ok((None, None));
+    };
+    let (name, model) = match target.split_once('/') {
+        Some((name, model)) => (name.trim(), Some(model.trim().to_string())),
+        None => (target, None),
+    };
+    const PROVIDERS: [&str; 9] = [
+        "Claude",
+        "Codex",
+        "Pioneer",
+        "OpenRouter",
+        "Bedrock",
+        "Local",
+        "Antigravity",
+        "CodexAppServer",
+        "Harness",
+    ];
+    let Some(canonical) = PROVIDERS
+        .iter()
+        .find(|provider| provider.eq_ignore_ascii_case(name))
+    else {
+        return Err(format!(
+            "Unknown provider `{name}`; use one of {}",
+            PROVIDERS.join(", ")
+        ));
+    };
+    let provider = serde_json::from_value(serde_json::Value::String((*canonical).to_string()))
+        .map_err(|error| format!("Unknown provider `{name}`: {error}"))?;
+    Ok((Some(provider), model.filter(|model| !model.is_empty())))
+}
+
 pub fn parse_command(input: &str) -> CommandResult {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -35,9 +73,12 @@ pub fn parse_command(input: &str) -> CommandResult {
     let Some((descriptor, args)) = resolve_command(trimmed) else {
         return CommandResult::Unhandled(trimmed.to_string());
     };
-    if !args.is_empty() && descriptor.command_aliases[0].starts_with("manager ") {
+    if !args.is_empty()
+        && descriptor.command_aliases[0].starts_with("manager ")
+        && descriptor.command_argument == crate::action_registry::CommandArgument::None
+    {
         return CommandResult::Unhandled(
-            "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node|tree|global|restart]"
+            "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node|tree|global|portfolio|escalations|friction|restart]"
                 .to_string(),
         );
     }
@@ -48,6 +89,8 @@ pub fn parse_command(input: &str) -> CommandResult {
                 | ActionId::AllCommands
                 | ActionId::Refresh
                 | ActionId::OpenIssuesWorkspace
+                | ActionId::Fleet
+                | ActionId::GlobalManagerWorkspace
         )
     {
         return CommandResult::Unhandled(trimmed.to_string());
@@ -78,6 +121,9 @@ pub fn parse_command(input: &str) -> CommandResult {
 
         // :rotate / :rot — manually trigger context rotation
         ActionId::RotateSession => CommandResult::LcAction(LcAction::RotateSession),
+        ActionId::AbandonRotation => {
+            CommandResult::LcAction(LcAction::AbandonRotation(args.map(str::to_string)))
+        }
 
         // :archives — switch to archive zone
         ActionId::Archives => CommandResult::LcAction(LcAction::GoToArchiveZone),
@@ -116,14 +162,6 @@ pub fn parse_command(input: &str) -> CommandResult {
                 CommandResult::LcAction(LcAction::SwitchProject(name.to_string()))
             }
             _ => CommandResult::LcAction(LcAction::OpenProjectPicker),
-        },
-
-        // :task [query] — launch TaskRabbit or open popup
-        ActionId::Task => match args {
-            Some(query) if !query.is_empty() => {
-                CommandResult::LcAction(LcAction::LaunchTaskRabbit(query.to_string()))
-            }
-            _ => CommandResult::LcAction(LcAction::TaskRabbitPrompt),
         },
 
         // :blank [query] — launch Blank general-purpose session or open popup
@@ -271,6 +309,26 @@ pub fn parse_command(input: &str) -> CommandResult {
             Some(command) if command.starts_with("global ") => CommandResult::LcAction(
                 LcAction::ManagerGlobalCommand(command[7..].trim().to_string()),
             ),
+            Some("portfolio") => {
+                CommandResult::LcAction(LcAction::ManagerPortfolioCommand("list".into()))
+            }
+            // #1238: the operator escalation queue.
+            Some("escalations") => {
+                CommandResult::LcAction(LcAction::ManagerEscalationsCommand("list".into()))
+            }
+            Some(command) if command.starts_with("escalations ") => CommandResult::LcAction(
+                LcAction::ManagerEscalationsCommand(command[12..].trim().to_string()),
+            ),
+            // #1333: the friction rollup (the andon).
+            Some("friction") => {
+                CommandResult::LcAction(LcAction::ManagerFrictionCommand(String::new()))
+            }
+            Some(command) if command.starts_with("friction ") => CommandResult::LcAction(
+                LcAction::ManagerFrictionCommand(command[9..].trim().to_string()),
+            ),
+            Some(command) if command.starts_with("portfolio ") => CommandResult::LcAction(
+                LcAction::ManagerPortfolioCommand(command[10..].trim().to_string()),
+            ),
             // #1122: the operator's pending quiet-point restart.
             Some("restart") => {
                 CommandResult::LcAction(LcAction::OperatorRestartCommand("status".into()))
@@ -279,10 +337,43 @@ pub fn parse_command(input: &str) -> CommandResult {
                 LcAction::OperatorRestartCommand(command[8..].trim().to_string()),
             ),
             Some(_) => CommandResult::Unhandled(
-                "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node|tree|global|restart]"
+                "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node|tree|global|portfolio|escalations|friction|restart]"
                     .to_string(),
             ),
         },
+        // #1213: registered spellings of the global manager, tree, node and
+        // restart commands (the `:manager <sub>` arms above stay as fallbacks).
+        ActionId::Fleet => CommandResult::LcAction(LcAction::OpenFleet),
+        ActionId::GlobalManagerWorkspace => {
+            CommandResult::LcAction(LcAction::OpenGlobalManagerWorkspace)
+        }
+        ActionId::ManagerGlobal => CommandResult::LcAction(LcAction::ManagerGlobalCommand(
+            args.unwrap_or("show").to_string(),
+        )),
+        ActionId::ManagerGlobalAppoint => CommandResult::LcAction(LcAction::ManagerGlobalCommand(
+            args.map_or_else(|| "appoint".to_string(), |names| format!("appoint {names}")),
+        )),
+        ActionId::ManagerGlobalRevoke => {
+            CommandResult::LcAction(LcAction::ManagerGlobalCommand("revoke".into()))
+        }
+        ActionId::ManagerPortfolio => CommandResult::LcAction(LcAction::ManagerPortfolioCommand(
+            args.unwrap_or("list").to_string(),
+        )),
+        ActionId::ManagerEscalations => CommandResult::LcAction(
+            LcAction::ManagerEscalationsCommand(args.unwrap_or("list").to_string()),
+        ),
+        ActionId::ManagerFriction => CommandResult::LcAction(LcAction::ManagerFrictionCommand(
+            args.unwrap_or_default().to_string(),
+        )),
+        ActionId::ManagerTree => {
+            CommandResult::LcAction(LcAction::ManagerNodeCommand("tree".into()))
+        }
+        ActionId::ManagerNode => CommandResult::LcAction(LcAction::ManagerNodeCommand(
+            args.unwrap_or("list").to_string(),
+        )),
+        ActionId::ManagerRestart => CommandResult::LcAction(LcAction::OperatorRestartCommand(
+            args.unwrap_or("status").to_string(),
+        )),
         ActionId::ManagerAppoint => CommandResult::LcAction(LcAction::AppointHarnessManager),
         ActionId::ManagerScope => CommandResult::LcAction(LcAction::EditHarnessManagerScope),
         ActionId::ManagerClear => CommandResult::LcAction(LcAction::ClearHarnessManagerScope),
@@ -436,6 +527,30 @@ mod tests {
                 LcAction::ManagerGlobalCommand("revoke".into()),
             ),
             (
+                "manager portfolio",
+                LcAction::ManagerPortfolioCommand("list".into()),
+            ),
+            (
+                "manager portfolio appoint pinnacle Rsi",
+                LcAction::ManagerPortfolioCommand("appoint pinnacle Rsi".into()),
+            ),
+            (
+                "manager escalations",
+                LcAction::ManagerEscalationsCommand("list".into()),
+            ),
+            (
+                "manager escalations rule 1a2b3c4d Ship it",
+                LcAction::ManagerEscalationsCommand("rule 1a2b3c4d Ship it".into()),
+            ),
+            (
+                "manager friction",
+                LcAction::ManagerFrictionCommand(String::new()),
+            ),
+            (
+                "manager friction 72",
+                LcAction::ManagerFrictionCommand("72".into()),
+            ),
+            (
                 "manager restart",
                 LcAction::OperatorRestartCommand("status".into()),
             ),
@@ -454,7 +569,7 @@ mod tests {
             assert_eq!(
                 parse_command(command),
                 CommandResult::Unhandled(
-                    "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node|tree|global|restart]"
+                    "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node|tree|global|portfolio|escalations|friction|restart]"
                         .to_string()
                 )
             );
@@ -463,6 +578,71 @@ mod tests {
             parse_command("manager node get 123"),
             CommandResult::LcAction(LcAction::ManagerNodeCommand("get 123".into()))
         );
+    }
+
+    /// #1213: the global manager, tree, node and restart commands resolve to
+    /// their own registered descriptors (so they reach the `:` dropdown) and
+    /// keep their arguments.
+    #[test]
+    fn global_manager_commands_resolve_to_registered_descriptors() {
+        use crate::action_registry::{ActionId, resolve_command};
+        for (command, id) in [
+            ("gm", ActionId::GlobalManagerWorkspace),
+            ("global-manager", ActionId::GlobalManagerWorkspace),
+            ("manager workspace", ActionId::GlobalManagerWorkspace),
+            ("manager global", ActionId::ManagerGlobal),
+            ("manager global configure {}", ActionId::ManagerGlobal),
+            ("manager global appoint Rsi", ActionId::ManagerGlobalAppoint),
+            ("manager global revoke", ActionId::ManagerGlobalRevoke),
+            ("manager global set active 12", ActionId::ManagerGlobal),
+            ("manager tree", ActionId::ManagerTree),
+            (
+                "manager portfolio revoke global",
+                ActionId::ManagerPortfolio,
+            ),
+            ("manager escalations ack 1a2b", ActionId::ManagerEscalations),
+            ("manager friction 48", ActionId::ManagerFriction),
+            ("manager node get 123", ActionId::ManagerNode),
+            ("manager restart now", ActionId::ManagerRestart),
+        ] {
+            assert_eq!(
+                resolve_command(command).map(|(descriptor, _)| descriptor.id),
+                Some(id),
+                "{command}"
+            );
+        }
+        for (command, action) in [
+            ("gm", LcAction::OpenGlobalManagerWorkspace),
+            ("global-manager", LcAction::OpenGlobalManagerWorkspace),
+            (
+                "manager global appoint",
+                LcAction::ManagerGlobalCommand("appoint".into()),
+            ),
+            (
+                "manager global set active 12",
+                LcAction::ManagerGlobalCommand("set active 12".into()),
+            ),
+            (
+                "manager global configure {\"a\":1}",
+                LcAction::ManagerGlobalCommand("configure {\"a\":1}".into()),
+            ),
+            (
+                "manager node revoke 123 4",
+                LcAction::ManagerNodeCommand("revoke 123 4".into()),
+            ),
+        ] {
+            assert_eq!(parse_command(command), CommandResult::LcAction(action));
+        }
+        for command in [
+            "manager global revoke now",
+            "manager tree extra",
+            "gm extra",
+        ] {
+            assert!(
+                matches!(parse_command(command), CommandResult::Unhandled(_)),
+                "{command}"
+            );
+        }
     }
 
     // --- :continue / :cont ---
@@ -731,6 +911,35 @@ mod tests {
         );
     }
 
+    // --- :rotation-abandon (#1176) ---
+
+    #[test]
+    fn rotation_abandon_parses_to_its_action_with_the_target() {
+        assert_eq!(
+            parse_command("rotation-abandon codex/gpt-5"),
+            CommandResult::LcAction(LcAction::AbandonRotation(Some("codex/gpt-5".to_string())))
+        );
+        assert_eq!(
+            parse_command("rotation-abandon"),
+            CommandResult::LcAction(LcAction::AbandonRotation(None))
+        );
+    }
+
+    #[test]
+    fn rotation_abandon_target_names_a_provider_and_optional_model() {
+        use rsi_common::types::SessionProvider;
+        assert_eq!(parse_abandon_target(None), Ok((None, None)));
+        assert_eq!(
+            parse_abandon_target(Some("codex/gpt-5")),
+            Ok((Some(SessionProvider::Codex), Some("gpt-5".to_string())))
+        );
+        assert_eq!(
+            parse_abandon_target(Some("CLAUDE")),
+            Ok((Some(SessionProvider::Claude), None))
+        );
+        assert!(parse_abandon_target(Some("nosuch/x")).is_err());
+    }
+
     // --- :group / :groups ---
 
     #[test]
@@ -759,8 +968,8 @@ mod tests {
     #[test]
     fn test_whitespace_trimming() {
         assert_eq!(
-            parse_command("  task  fix bug  "),
-            CommandResult::LcAction(LcAction::LaunchTaskRabbit("fix bug".to_string()))
+            parse_command("  blank  fix bug  "),
+            CommandResult::LcAction(LcAction::LaunchBlank("fix bug".to_string()))
         );
     }
 

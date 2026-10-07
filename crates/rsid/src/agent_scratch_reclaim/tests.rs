@@ -2199,68 +2199,135 @@ fn aside_name_replaced_before_the_final_rmdir_is_not_deleted() {
     assert!(fx.root().join(replacement).is_dir());
 }
 
-// Pruning only drops an allocation whose directory is provably gone.
+/// A registry entry with no directory behind it.
+fn bare_entry(ino: u64) -> Entry {
+    Entry {
+        nonce: registry::new_nonce(),
+        kind: RootKind::VarTmp.tag().to_string(),
+        uid: current_uid(),
+        ident: fsys::Ident { dev: 1, ino },
+        btime: 1,
+        parent: fsys::Ident { dev: 1, ino: 2 },
+        created_unix: 0,
+        path: "/nowhere".to_string(),
+        source: None,
+        clone: None,
+    }
+}
+
+fn tombstone_file(nonce: &str) -> String {
+    format!("{nonce}.reclaimed")
+}
+
+// #1171: pruning is decided by the registry's own durable record, never by what
+// the filesystem shows: only a tombstoned allocation loses its registry files.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[test]
-fn registry_prune_keeps_every_allocation_it_cannot_prove_gone() {
+fn registry_prune_drops_only_tombstoned_allocations() {
     let fx = Fx::new();
-    let present = fx.scratch("rsi-p-present", RootKind::VarTmp);
-    let aside_only = fx.scratch("rsi-p-aside", RootKind::VarTmp);
-    let gone = fx.scratch("rsi-p-gone", RootKind::VarTmp);
-    let in_progress = fx.scratch("rsi-p-progress", RootKind::VarTmp);
-    let unreadable_parent = fx.root().join("sub");
-    fs::create_dir(&unreadable_parent).unwrap();
-    let hidden = create_scratch_dir_in(
-        fx.registry(),
-        &unreadable_parent,
-        "rsi-p-hidden",
-        RootKind::VarTmp,
-    )
-    .unwrap();
-    let nonces: Vec<String> = [&present, &aside_only, &gone, &in_progress, &hidden]
+    let names = [
+        "rsi-p-live",
+        "rsi-p-hand",
+        "rsi-p-crash",
+        "rsi-p-done",
+        "rsi-p-mismatch",
+        "rsi-p-foreign",
+        "rsi-p-garbage",
+    ];
+    let dirs: Vec<PathBuf> = names
         .iter()
-        .map(|dir| nonce_of(dir))
+        .map(|name| fx.scratch(name, RootKind::VarTmp))
         .collect();
-    for dir in [&present, &aside_only, &gone, &in_progress, &hidden] {
+    let [live, by_hand, crashed, done, mismatched, foreign, _] = &dirs[..] else {
+        unreachable!()
+    };
+    let nonces: Vec<String> = dirs.iter().map(|dir| nonce_of(dir)).collect();
+    // Old, as the identity-proof prune demanded: age proves nothing here.
+    for dir in &dirs {
         fx.rewrite_entry(dir, |e| e.created_unix = 0);
     }
     let registry = Registry::open(fx.registry(), current_uid()).unwrap();
-    // A live allocation renamed aside with no manifest yet.
-    fs::rename(
-        &aside_only,
-        fx.root().join(format!("{ASIDE_PREFIX}rsi-p-aside-4242")),
+
+    // Removed behind the daemon's back: no tombstone, no prune.
+    fs::remove_dir_all(by_hand).unwrap();
+    // The crash window: a reclaim published its manifest and removed the tree
+    // but wrote no tombstone.
+    registry.manifest_put(&nonces[2], &[1, 2, 3]).unwrap();
+    fs::remove_dir_all(crashed).unwrap();
+    // Finished by a reclaim: entry, manifest and tombstone. The tree is still
+    // there with content, and prune must not touch it.
+    registry.manifest_put(&nonces[3], &[1]).unwrap();
+    registry.tombstone_put(&fx.entry_of(done)).unwrap();
+    // A tombstone for some other identity does not drop the entry it names.
+    let mut other = fx.entry_of(mismatched);
+    other.ident.ino ^= 1;
+    registry.tombstone_put(&other).unwrap();
+    // A tombstone others could write is not ours.
+    registry.tombstone_put(&fx.entry_of(foreign)).unwrap();
+    set_mode(&fx.registry().join(tombstone_file(&nonces[5])), 0o666);
+    // A tombstone that is not one.
+    fs::write(
+        fx.registry().join(tombstone_file(&nonces[6])),
+        b"not a tombstone",
     )
     .unwrap();
-    fs::remove_dir_all(&gone).unwrap();
-    // A reclaim in progress: manifest published, original name gone.
-    registry.manifest_put(&nonces[3], &[1, 2, 3]).unwrap();
-    fs::remove_dir_all(&in_progress).unwrap();
-    // The parent cannot be examined: gone cannot be proved.
-    fs::remove_dir_all(&hidden).unwrap();
-    set_mode(&unreadable_parent, 0);
-    // An orphan manifest whose entry is provably absent.
-    let orphan = registry::new_nonce();
-    registry.manifest_put(&orphan, &[1]).unwrap();
+    // A tombstone whose entry is already gone.
+    let orphan = bare_entry(9);
+    registry.tombstone_put(&orphan).unwrap();
+    let before = only_entries(done);
 
-    let mut budget = Budget::new(Instant::now() + Duration::from_secs(30), 100_000);
-    let pruned = unprivileged(|| registry.prune(u64::MAX / 2, 100, &mut budget, Some(&[])));
-    set_mode(&unreadable_parent, 0o700);
+    let pruned = prune_expecting(&registry, 2);
 
     let remaining = only_entries(fx.registry());
-    assert!(remaining.contains(&nonces[0]), "present: {remaining:?}");
-    assert!(remaining.contains(&nonces[1]), "aside: {remaining:?}");
-    assert!(!remaining.contains(&nonces[2]), "gone: {remaining:?}");
-    assert!(remaining.contains(&nonces[3]), "in progress: {remaining:?}");
-    assert!(
-        remaining.contains(&format!("{}.manifest", nonces[3])),
-        "manifest: {remaining:?}"
-    );
-    assert!(remaining.contains(&nonces[4]), "unreadable: {remaining:?}");
-    assert!(
-        !remaining.contains(&format!("{orphan}.manifest")),
-        "orphan: {remaining:?}"
-    );
     assert_eq!(pruned, 2, "{remaining:?}");
+    for kept in [0, 1, 2, 4, 5, 6] {
+        assert!(remaining.contains(&nonces[kept]), "{kept}: {remaining:?}");
+    }
+    assert!(remaining.contains(&format!("{}.manifest", nonces[2])));
+    for kept in [4, 5, 6] {
+        let name = tombstone_file(&nonces[kept]);
+        assert!(remaining.contains(&name), "{kept}: {remaining:?}");
+    }
+    for dropped in [
+        nonces[3].clone(),
+        format!("{}.manifest", nonces[3]),
+        tombstone_file(&nonces[3]),
+        tombstone_file(&orphan.nonce),
+    ] {
+        assert!(!remaining.contains(&dropped), "{dropped}: {remaining:?}");
+    }
+    // No tree was opened for writing: the tombstoned one is intact.
+    assert_eq!(only_entries(done), before);
+    assert_eq!(fs::read(done.join("data.bin")).unwrap(), vec![7u8; 8192]);
+    assert!(live.join("data.bin").is_file());
+    // A live allocation binds; a tombstoned one never does again.
+    assert!(registry.get(&nonces[0]).is_some());
+    assert!(registry.get(&nonces[4]).is_none());
+}
+
+// #1171: plain entries (which are never pruned) must not crowd tombstones out
+// of the per-call limit.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn registry_prune_reaches_a_tombstone_past_many_live_entries() {
+    let fx = Fx::new();
+    let registry = Registry::open_or_create(fx.registry(), current_uid()).unwrap();
+    for ino in 0..64 {
+        registry.put_new(&bare_entry(ino)).unwrap();
+    }
+    let done = bare_entry(1000);
+    registry.put_new(&done).unwrap();
+    registry.tombstone_put(&done).unwrap();
+
+    let pruned = eventually(|| {
+        let mut budget = Budget::new(Instant::now() + Duration::from_secs(30), 100_000);
+        let pruned = registry.prune(1, &mut budget);
+        (pruned == 1).then_some(pruned)
+    });
+
+    assert_eq!(pruned, Some(1));
+    assert!(!only_entries(fx.registry()).contains(&done.nonce));
+    assert_eq!(only_entries(fx.registry()).len(), 64);
 }
 
 /// Retry `attempt` for a few seconds: the custody lock is an `flock` on a
@@ -2310,101 +2377,30 @@ fn run_pass_until(cfg: &ScratchConfig, done: impl Fn(&ScratchReport) -> bool) ->
 
 fn prune_everything(registry: &Registry) -> usize {
     let mut budget = Budget::new(Instant::now() + Duration::from_secs(30), 100_000);
-    registry.prune(u64::MAX / 2, 100, &mut budget, Some(&[]))
+    registry.prune(100, &mut budget)
 }
 
-// #1152: an allocation renamed to any other name in its parent is still alive.
-#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
-#[test]
-fn registry_prune_keeps_an_allocation_renamed_within_its_parent() {
-    let fx = Fx::new();
-    let moved = fx.scratch("rsi-r-a", RootKind::VarTmp);
-    let nonce = nonce_of(&moved);
-    fx.rewrite_entry(&moved, |e| e.created_unix = 0);
-    let registry = Registry::open(fx.registry(), current_uid()).unwrap();
-    // Not an aside name of the recorded path: nothing at rsi-r-a, no
-    // `.rsi-reclaiming-rsi-r-a-*`, but the same directory lives at rsi-r-b.
-    fs::rename(&moved, fx.root().join("rsi-r-b")).unwrap();
-
-    let pruned = prune_everything(&registry);
-
-    assert_eq!(pruned, 0);
-    assert!(
-        registry.get(&nonce).is_some(),
-        "live allocation was dropped"
-    );
-    // The renamed tree is still reclaimable through its entry.
-    let report = run_pass_until(&fx.config(RootKind::VarTmp, OLD), |r| r.reclaimed == 1);
-    assert_eq!(report.reclaimed, 1, "{report:?}");
-}
-
-// #1152: absence is proved by identity, so a look-alike at the old path or a
-// parent that is not the registered one proves nothing either way, and a gone
-// allocation is dropped.
-#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
-#[test]
-fn registry_prune_drops_only_on_identity_proof_against_the_registered_parent() {
-    let fx = Fx::new();
-    let replaced = fx.scratch("rsi-i-replaced", RootKind::VarTmp);
-    let reparented = fx.scratch("rsi-i-reparented", RootKind::VarTmp);
-    let nonces: Vec<String> = [&replaced, &reparented]
-        .iter()
-        .map(|d| nonce_of(d))
-        .collect();
-    for dir in [&replaced, &reparented] {
-        fx.rewrite_entry(dir, |e| e.created_unix = 0);
-    }
-    // The allocation is gone; a different directory now holds its name.
-    // (Built before the removal so the replacement cannot reuse the inode.)
-    let stand_in = fx.root().join("rsi-i-stand-in");
-    fs::create_dir(&stand_in).unwrap();
-    fs::remove_dir_all(&replaced).unwrap();
-    fs::rename(&stand_in, &replaced).unwrap();
-    // The registered parent was replaced by a namesake (new inode): the entry
-    // can no longer bind, and absence in the namesake proves nothing about it.
-    fx.rewrite_entry(&reparented, |e| e.parent.ino ^= 1);
-    fs::remove_dir_all(&reparented).unwrap();
-    let registry = Registry::open(fx.registry(), current_uid()).unwrap();
-
-    let pruned = prune_expecting(&registry, 1);
-
-    assert_eq!(pruned, 1);
-    assert!(registry.get(&nonces[0]).is_none(), "gone allocation kept");
-    assert!(registry.get(&nonces[1]).is_some(), "unauthenticated parent");
-}
-
-// #1152: a prune never runs while a reclaim holds the custody lock, so a
-// manifest the reclaim publishes (and the entry it names) cannot be removed
-// from under it.
+// #1171: a prune never runs while a reclaim holds the custody lock, so the
+// registry files of a reclaim in flight cannot be removed from under it.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[test]
 fn registry_prune_is_serialized_with_a_reclaim_in_flight() {
     let fx = Fx::new();
     let dir = fx.scratch("rsi-f-flight", RootKind::VarTmp);
     let nonce = nonce_of(&dir);
-    fx.rewrite_entry(&dir, |e| e.created_unix = 0);
-    // Proof of absence would succeed: the directory is gone.
-    fs::remove_dir_all(&dir).unwrap();
     let registry = Registry::open(fx.registry(), current_uid()).unwrap();
+    registry.manifest_put(&nonce, &[1, 2, 3]).unwrap();
+    registry.tombstone_put(&fx.entry_of(&dir)).unwrap();
 
     let reclaim = registry.reclaim_guard().unwrap().unwrap();
     assert_eq!(prune_everything(&registry), 0, "prune ran under a reclaim");
-    assert!(registry.get(&nonce).is_some(), "entry dropped mid-reclaim");
-    // The reclaim publishes its proof afterwards and it survives.
-    registry.manifest_put(&nonce, &[1, 2, 3]).unwrap();
-    assert_eq!(prune_everything(&registry), 0);
+    let held = only_entries(fx.registry());
+    assert!(held.contains(&nonce), "{held:?}");
+    assert!(held.contains(&format!("{nonce}.manifest")), "{held:?}");
     drop(reclaim);
-    assert_eq!(prune_everything(&registry), 0, "manifest of a reclaim");
-    assert!(registry.get(&nonce).is_some());
-    assert_eq!(
-        registry.manifest_get(&nonce),
-        registry::ManifestState::Present(vec![1, 2, 3])
-    );
 
-    // Once the reclaim is finished the entry is prunable.
-    registry.manifest_remove(&nonce);
     assert_eq!(prune_expecting(&registry, 1), 1);
-    assert!(registry.get(&nonce).is_none());
+    assert_eq!(only_entries(fx.registry()), Vec::<String>::new());
 }
 
 // #1152: reclaims share the custody lock; a prune excludes them.
@@ -2466,146 +2462,116 @@ fn a_reclaim_holds_the_custody_lock_while_it_works() {
     assert!(eventually(|| registry.custody(true).unwrap()).is_some());
 }
 
-// #1152: registry pruning is off by default (a pass leaves every entry), and a
-// pass that opts in prunes what is proved gone and keeps a renamed live one.
+// #1171: a reclaim that completes leaves nothing behind in the registry, and
+// a pass prunes only what a reclaim of this daemon finished: an interrupted
+// finish (stopped right after the tombstone) is completed by the next pass, while an allocation removed behind the daemon's back and one
+// whose reclaim stopped before the tombstone keep their entries.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[test]
-fn a_pass_prunes_only_when_registry_pruning_is_enabled() {
+fn a_pass_prunes_only_what_a_reclaim_finished() {
     let fx = Fx::new();
-    let gone = fx.scratch("rsi-g-gone", RootKind::VarTmp);
-    let renamed = fx.scratch("rsi-g-renamed", RootKind::VarTmp);
-    let (gone_nonce, renamed_nonce) = (nonce_of(&gone), nonce_of(&renamed));
-    for dir in [&gone, &renamed] {
-        fx.rewrite_entry(dir, |e| e.created_unix = 0);
-    }
-    fs::remove_dir_all(&gone).unwrap();
-    fs::rename(&renamed, fx.root().join("rsi-g-elsewhere")).unwrap();
-    // Young enough that this pass reclaims nothing: only pruning acts.
-    let mut cfg = fx.config(RootKind::VarTmp, Duration::from_secs(365 * 24 * 3600));
+    let interrupted = fx.scratch("rsi-q-done", RootKind::VarTmp);
+    let by_hand = fx.scratch("rsi-q-hand", RootKind::VarTmp);
+    let crashed = fx.scratch("rsi-q-crash", RootKind::VarTmp);
+    let (done_nonce, hand_nonce, crash_nonce) = (
+        nonce_of(&interrupted),
+        nonce_of(&by_hand),
+        nonce_of(&crashed),
+    );
     let registry = Registry::open(fx.registry(), current_uid()).unwrap();
+    fs::remove_dir_all(&by_hand).unwrap();
+    registry.manifest_put(&crash_nonce, &[1, 2]).unwrap();
+    fs::remove_dir_all(&crashed).unwrap();
+    // The registry is on by default, in production and in the fixture.
+    let mut cfg = fx.config(RootKind::VarTmp, OLD);
+    assert!(cfg.registry_prune);
+    assert!(ScratchConfig::standard().registry_prune);
 
-    assert!(!cfg.registry_prune, "production default must be off");
+    // The reclaim got as far as the tombstone, then was interrupted.
+    cfg.registry_prune = false;
+    cfg.stop_after_tombstone = true;
     let report = run_pass(&cfg);
-    assert_eq!(report.reclaimed, 0, "{report:?}");
-    assert!(registry.get(&gone_nonce).is_some(), "pruned while disabled");
-    assert!(registry.get(&renamed_nonce).is_some());
+    assert_eq!(report.reclaimed, 1, "{report:?}");
+    assert!(!interrupted.exists());
+    let names = only_entries(fx.registry());
+    assert!(names.contains(&done_nonce), "{names:?}");
+    assert!(names.contains(&tombstone_file(&done_nonce)), "{names:?}");
 
+    // The next pass (pruning, as in production) finishes the removal.
     cfg.registry_prune = true;
-    let report = run_pass_until(&cfg, |_| registry.get(&gone_nonce).is_none());
+    cfg.stop_after_tombstone = false;
+    run_pass_until(&cfg, |_| {
+        !only_entries(fx.registry()).contains(&tombstone_file(&done_nonce))
+    });
+    let names = only_entries(fx.registry());
+    assert!(!names.contains(&done_nonce), "{names:?}");
+    assert!(!names.contains(&tombstone_file(&done_nonce)), "{names:?}");
+    // Nothing else was dropped.
+    assert!(names.contains(&hand_nonce), "{names:?}");
+    assert!(names.contains(&crash_nonce), "{names:?}");
+    assert!(
+        names.contains(&format!("{crash_nonce}.manifest")),
+        "{names:?}"
+    );
+}
+
+fn add_a_file_after_the_proof(aside: &Path) {
+    fs::write(aside.join("late.bin"), b"late").unwrap();
+}
+
+// #1171: a reclaim writes its tombstone only after the contents and provenance
+// are removed; one that stopped earlier leaves the entry (and no tombstone).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn a_reclaim_that_stops_before_the_removal_is_done_leaves_no_tombstone() {
+    let fx = Fx::new();
+    let dir = fx.scratch("rsi-t-late", RootKind::VarTmp);
+    let nonce = nonce_of(&dir);
+    let mut cfg = fx.config(RootKind::VarTmp, OLD);
+    cfg.after_proof = Some(add_a_file_after_the_proof);
+
+    let report = run_pass(&cfg);
+
+    assert_eq!(report.kept_changed, 1, "{report:?}");
+    let names = only_entries(fx.registry());
+    assert!(names.contains(&nonce), "{names:?}");
+    assert!(!names.contains(&tombstone_file(&nonce)), "{names:?}");
+}
+
+// #1171: a reclaim that completes removes every registry file of the
+// allocation (entry, manifest, tombstone).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn a_completed_reclaim_leaves_nothing_in_the_registry() {
+    let fx = Fx::new();
+    let dir = fx.scratch("rsi-t-clean", RootKind::VarTmp);
+    // The reclaim itself cleans up; a prune is not what removes these.
+    let mut cfg = fx.config(RootKind::VarTmp, OLD);
+    cfg.registry_prune = false;
+
+    let report = run_pass(&cfg);
+
+    assert_eq!(report.reclaimed, 1, "{report:?}");
+    assert!(!dir.exists());
+    assert_eq!(only_entries(fx.registry()), Vec::<String>::new());
+}
+
+// #1171: a tombstoned allocation never binds again, even if its directory and
+// record are still there.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn a_tombstoned_allocation_is_never_reclaimed_again() {
+    let fx = Fx::new();
+    let dir = fx.scratch("rsi-t-bound", RootKind::VarTmp);
+    let registry = Registry::open(fx.registry(), current_uid()).unwrap();
+    registry.tombstone_put(&fx.entry_of(&dir)).unwrap();
+    let mut cfg = fx.config(RootKind::VarTmp, OLD);
+    cfg.registry_prune = false;
+
+    let report = run_pass(&cfg);
+
     assert_eq!(report.reclaimed, 0, "{report:?}");
-    assert!(registry.get(&gone_nonce).is_none(), "gone entry kept");
-    assert!(registry.get(&renamed_nonce).is_some(), "live entry dropped");
-}
-
-thread_local! {
-    static RENAME_ROOT: std::cell::RefCell<PathBuf> = std::cell::RefCell::new(PathBuf::new());
-}
-
-fn rename_in_root(from: &str, to: &str) {
-    RENAME_ROOT.with(|root| {
-        let root = root.borrow();
-        fs::rename(root.join(from), root.join(to)).unwrap();
-    });
-}
-
-fn rename_after_both_inventories() {
-    // The view retries after a modified directory, so only the first time.
-    let moved = RENAME_ROOT.with(|root| root.borrow().join("rsi-v-b").exists());
-    if !moved {
-        rename_in_root("rsi-v-a", "rsi-v-b");
-    }
-}
-
-// #1152 review: a rename that lands after the inventories but before the view
-// is accepted changes the parent's stamps: the view is retaken, not trusted.
-#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
-#[test]
-fn registry_prune_retries_a_parent_modified_during_inventory() {
-    let fx = Fx::new();
-    let dir = fx.scratch("rsi-v-a", RootKind::VarTmp);
-    let nonce = nonce_of(&dir);
-    fx.rewrite_entry(&dir, |e| e.created_unix = 0);
-    let registry = Registry::open(fx.registry(), current_uid()).unwrap();
-    RENAME_ROOT.with(|root| *root.borrow_mut() = fx.root().to_path_buf());
-    registry::AFTER_INVENTORIES.with(|hook| hook.set(Some(rename_after_both_inventories)));
-
-    let pruned = prune_everything(&registry);
-    registry::AFTER_INVENTORIES.with(|hook| hook.set(None));
-
-    assert!(fx.root().join("rsi-v-b").is_dir());
-    assert_eq!(pruned, 0);
-    assert!(
-        registry.get(&nonce).is_some(),
-        "live allocation was dropped"
-    );
-}
-
-fn rename_during_listings(call: usize) {
-    match call {
-        // After the first listing, before its names are stat'ed.
-        1 => rename_in_root("rsi-w-a", "rsi-w-b"),
-        // After the second listing: it moves again.
-        2 => rename_in_root("rsi-w-b", "rsi-w-c"),
-        _ => {}
-    }
-}
-
-// #1152 review: a name that vanishes between the listing and its stat is an
-// ambiguity (retry, then retain), not a name to skip.
-#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
-#[test]
-fn registry_prune_keeps_an_allocation_renamed_between_listing_and_stat() {
-    let fx = Fx::new();
-    let dir = fx.scratch("rsi-w-a", RootKind::VarTmp);
-    let nonce = nonce_of(&dir);
-    fx.rewrite_entry(&dir, |e| e.created_unix = 0);
-    let registry = Registry::open(fx.registry(), current_uid()).unwrap();
-    RENAME_ROOT.with(|root| *root.borrow_mut() = fx.root().to_path_buf());
-    fsys::LISTINGS.with(|calls| calls.set(0));
-    fsys::AFTER_LISTING.with(|hook| hook.set(Some(rename_during_listings)));
-
-    let pruned = prune_everything(&registry);
-    fsys::AFTER_LISTING.with(|hook| hook.set(None));
-
-    assert!(fx.root().join("rsi-w-c").is_dir());
-    assert_eq!(pruned, 0);
-    assert!(
-        registry.get(&nonce).is_some(),
-        "live allocation was dropped"
-    );
-}
-
-// #1152 review: a mount below the parent could cover a name in it; an unreadable
-// mount table cannot exclude one. Either keeps every entry under that parent.
-#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
-#[test]
-fn registry_prune_retains_under_a_parent_a_mount_could_mask() {
-    let fx = Fx::new();
-    let dir = fx.scratch("rsi-m-a", RootKind::VarTmp);
-    let nonce = nonce_of(&dir);
-    fx.rewrite_entry(&dir, |e| e.created_unix = 0);
-    // The directory is not visible (as when something else is mounted on it).
-    fs::remove_dir_all(&dir).unwrap();
-    let registry = Registry::open(fx.registry(), current_uid()).unwrap();
-    let prune = |mounts: Option<&[PathBuf]>| {
-        let mut budget = Budget::new(Instant::now() + Duration::from_secs(30), 100_000);
-        registry.prune(u64::MAX / 2, 100, &mut budget, mounts)
-    };
-
-    assert_eq!(prune(None), 0, "unreadable mount table");
-    assert!(registry.get(&nonce).is_some());
-    let covering = [fx.root().join("rsi-m-a")];
-    assert_eq!(prune(Some(&covering)), 0, "mount point below the parent");
-    assert!(registry.get(&nonce).is_some());
-    // An unrelated mount (above, or elsewhere) does not hold it back.
-    let unrelated = [PathBuf::from("/proc"), fx.root().to_path_buf()];
-    let mut dropped = 0;
-    eventually(|| {
-        dropped = prune(Some(&unrelated));
-        (dropped == 1).then_some(())
-    });
-    assert_eq!(dropped, 1);
-    assert!(registry.get(&nonce).is_none());
+    assert!(dir.join("data.bin").is_file());
 }
 
 // #1152 review: a reclaim never waits for a prune; the candidate is deferred.
@@ -2640,76 +2606,234 @@ fn a_reclaim_defers_promptly_while_a_prune_holds_the_registry() {
     assert!(!dir.exists());
 }
 
-fn rename_when_accepted() {
-    let moved = RENAME_ROOT.with(|root| root.borrow().join("rsi-y-b").exists());
-    if !moved {
-        rename_in_root("rsi-y-a", "rsi-y-b");
+// #1171 review: a directory kept because late contents arrived before the
+// final rmdir is never tombstoned, so a prune cannot drop its custody entry.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn a_directory_kept_for_late_contents_is_never_tombstoned() {
+    let fx = Fx::new();
+    let dir = fx.scratch("rsi-t-rmdir", RootKind::VarTmp);
+    let nonce = nonce_of(&dir);
+    let mut cfg = fx.config(RootKind::VarTmp, OLD);
+    cfg.before_final_rmdir = Some(add_a_file_after_the_proof);
+
+    let report = run_pass(&cfg);
+    let again = run_pass(&cfg);
+
+    assert_eq!(report.kept_changed, 1, "{report:?}");
+    assert_eq!(again.reclaimed, 0, "{again:?}");
+    let names = only_entries(fx.registry());
+    assert!(names.contains(&nonce), "{names:?}");
+    assert!(!names.contains(&tombstone_file(&nonce)), "{names:?}");
+    let aside = only_entries(fx.root());
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert!(fx.root().join(&aside[0]).join("late.bin").is_file());
+}
+
+fn fail_sync_number(n: usize) {
+    fsys::SYNC_CALLS.with(|c| c.set(0));
+    fsys::FAIL_SYNC_AT.with(|c| c.set(n));
+}
+
+// #1171 review: the deletions are made durable (scratch directory, then its
+// parent) before a tombstone exists; a failed sync stops with no tombstone.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn a_failed_directory_sync_publishes_no_tombstone() {
+    for failing in [1, 2] {
+        let fx = Fx::new();
+        let dir = fx.scratch("rsi-t-sync", RootKind::VarTmp);
+        let nonce = nonce_of(&dir);
+        let cfg = fx.config(RootKind::VarTmp, OLD);
+
+        fail_sync_number(failing);
+        let report = run_pass(&cfg);
+        fail_sync_number(0);
+
+        assert_eq!(report.failed, 1, "sync {failing}: {report:?}");
+        let names = only_entries(fx.registry());
+        assert!(names.contains(&nonce), "sync {failing}: {names:?}");
+        assert!(
+            !names.contains(&tombstone_file(&nonce)),
+            "sync {failing}: {names:?}"
+        );
     }
 }
 
-// #1152 review: once a view is accepted and shows the allocation, a later
-// rename of its name must not read as absence (the view is never reopened by
-// name).
+// #1171 review: the tombstone outlives the entry and manifest removals until
+// those are durable; when the registry sync fails it is kept for a prune.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[test]
-fn registry_prune_keeps_an_allocation_renamed_after_the_view_is_accepted() {
+fn the_tombstone_is_kept_until_the_registry_removals_are_durable() {
     let fx = Fx::new();
-    let dir = fx.scratch("rsi-y-a", RootKind::VarTmp);
+    let dir = fx.scratch("rsi-t-regsync", RootKind::VarTmp);
     let nonce = nonce_of(&dir);
-    fx.rewrite_entry(&dir, |e| e.created_unix = 0);
+    let mut cfg = fx.config(RootKind::VarTmp, OLD);
+    cfg.registry_prune = false;
+
+    // Syncs: scratch dir (1), its parent (2), then the registry's.
+    fail_sync_number(3);
+    let report = run_pass(&cfg);
+    fail_sync_number(0);
+
+    assert_eq!(report.reclaimed, 1, "{report:?}");
+    assert_eq!(only_entries(fx.registry()), vec![tombstone_file(&nonce)]);
+    // A later prune completes it.
     let registry = Registry::open(fx.registry(), current_uid()).unwrap();
-    RENAME_ROOT.with(|root| *root.borrow_mut() = fx.root().to_path_buf());
-    registry::AFTER_VIEW.with(|hook| hook.set(Some(rename_when_accepted)));
+    assert_eq!(prune_expecting(&registry, 1), 1);
+    assert_eq!(only_entries(fx.registry()), Vec::<String>::new());
+}
 
-    let pruned = prune_everything(&registry);
-    registry::AFTER_VIEW.with(|hook| hook.set(None));
+// #1171 review: an entry whose identity cannot be checked against its tombstone
+// is kept with its manifest and tombstone; only agreement or proven absence
+// drops it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn registry_prune_keeps_an_entry_it_cannot_check_against_the_tombstone() {
+    let fx = Fx::new();
+    let registry = Registry::open_or_create(fx.registry(), current_uid()).unwrap();
+    // Entry-only birth-time mismatch (same device and inode).
+    let reborn = bare_entry(1);
+    registry.put_new(&reborn).unwrap();
+    let mut other = reborn.clone();
+    other.btime += 1;
+    registry.tombstone_put(&other).unwrap();
+    // An entry that cannot be read.
+    let unreadable = bare_entry(2);
+    registry.put_new(&unreadable).unwrap();
+    registry.manifest_put(&unreadable.nonce, &[1]).unwrap();
+    registry.tombstone_put(&unreadable).unwrap();
+    fs::write(
+        fx.registry().join(&unreadable.nonce),
+        b"\xff\xfe not an entry",
+    )
+    .unwrap();
 
-    assert!(fx.root().join("rsi-y-b").is_dir());
-    assert_eq!(pruned, 0);
-    assert!(
-        registry.get(&nonce).is_some(),
-        "live allocation was dropped"
+    assert_eq!(prune_everything(&registry), 0);
+    let kept = only_entries(fx.registry());
+    for nonce in [&reborn.nonce, &unreadable.nonce] {
+        assert!(kept.contains(nonce), "{kept:?}");
+        assert!(kept.contains(&tombstone_file(nonce)), "{kept:?}");
+    }
+    assert!(kept.contains(&format!("{}.manifest", unreadable.nonce)));
+
+    // Repaired to agree, the entry is dropped.
+    registry.replace(&other).unwrap();
+    assert_eq!(prune_expecting(&registry, 1), 1);
+    let kept = only_entries(fx.registry());
+    assert!(!kept.contains(&reborn.nonce), "{kept:?}");
+    assert!(kept.contains(&unreadable.nonce), "{kept:?}");
+}
+
+// #1171 review: a nonce a reclaim tombstoned is not reused by a new entry, so
+// a finish left half done cannot drop an entry created afterwards.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn a_tombstoned_nonce_is_never_registered_again() {
+    let fx = Fx::new();
+    let registry = Registry::open_or_create(fx.registry(), current_uid()).unwrap();
+    let done = bare_entry(5);
+    registry.put_new(&done).unwrap();
+    registry.tombstone_put(&done).unwrap();
+    // A partial finish: the entry is gone, the tombstone remains.
+    registry.remove_entry(&done.nonce);
+
+    let error = registry.put_new(&done).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        only_entries(fx.registry()),
+        vec![tombstone_file(&done.nonce)]
+    );
+    // Once the finish completes the nonce is free again.
+    assert_eq!(prune_expecting(&registry, 1), 1);
+    registry.put_new(&done).unwrap();
+}
+
+// #1171 review: the per-call limit applies to tombstones only, whatever order
+// the directory lists them in.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn tombstone_selection_is_not_crowded_out_by_live_entries() {
+    let mut names: Vec<String> = (0..64).map(|_| registry::new_nonce()).collect();
+    let done = registry::new_nonce();
+    names.push(format!("{done}.reclaimed"));
+    names.push(format!("{}.manifest", registry::new_nonce()));
+
+    assert_eq!(registry::tombstone_candidates(&names, 1), vec![done]);
+    assert!(registry::tombstone_candidates(&names, 0).is_empty());
+}
+
+fn move_the_allocation_and_install_an_empty_directory(parent: std::os::fd::RawFd, name: &str) {
+    if !name.starts_with(ASIDE_PREFIX) {
+        return;
+    }
+    let base = format!("/proc/self/fd/{parent}");
+    fs::rename(format!("{base}/{name}"), format!("{base}/moved-away")).unwrap();
+    fs::create_dir(format!("{base}/{name}")).unwrap();
+}
+
+// #1171 delta review: the final rmdir removes whatever directory has the name,
+// so a successful one proves the allocation gone only if its own inode has no
+// links left. Moved aside and replaced by an empty directory between the
+// identity stat and the rmdir, the allocation is retained with its entry.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn a_moved_allocation_whose_name_was_removed_is_not_tombstoned() {
+    let fx = Fx::new();
+    let dir = fx.scratch("rsi-t-moved", RootKind::VarTmp);
+    let nonce = nonce_of(&dir);
+    let cfg = fx.config(RootKind::VarTmp, OLD);
+    fsys::BEFORE_ROOT_RMDIR.with(|hook| {
+        hook.set(Some(move_the_allocation_and_install_an_empty_directory));
+    });
+
+    let report = run_pass(&cfg);
+    fsys::BEFORE_ROOT_RMDIR.with(|hook| hook.set(None));
+    let again = run_pass(&cfg);
+
+    assert_eq!(report.kept_changed, 1, "{report:?}");
+    assert_eq!(report.reclaimed, 0, "{report:?}");
+    assert_eq!(again.reclaimed, 0, "{again:?}");
+    let names = only_entries(fx.registry());
+    assert!(names.contains(&nonce), "{names:?}");
+    assert!(!names.contains(&tombstone_file(&nonce)), "{names:?}");
+    assert!(fx.root().join("moved-away").is_dir());
+}
+
+fn tombstone_after_the_create(registry: &Registry, entry: &Entry) {
+    registry.tombstone_put(entry).unwrap();
+}
+
+// #1171 delta review: a tombstone that appears between put_new's check and its
+// create leaves no entry behind.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn put_new_withdraws_an_entry_whose_nonce_was_tombstoned_meanwhile() {
+    let fx = Fx::new();
+    let registry = Registry::open_or_create(fx.registry(), current_uid()).unwrap();
+    let entry = bare_entry(3);
+    registry::AFTER_PUT_NEW.with(|hook| hook.set(Some(tombstone_after_the_create)));
+
+    let error = registry.put_new(&entry).unwrap_err();
+    registry::AFTER_PUT_NEW.with(|hook| hook.set(None));
+
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        only_entries(fx.registry()),
+        vec![tombstone_file(&entry.nonce)]
     );
 }
 
-fn move_back_when_accepted() {
+thread_local! {
+    static RENAME_ROOT: std::cell::RefCell<PathBuf> = std::cell::RefCell::new(PathBuf::new());
+}
+
+fn rename_in_root(from: &str, to: &str) {
     RENAME_ROOT.with(|root| {
         let root = root.borrow();
-        let away = root.join("sub").join("rsi-z-b");
-        if away.exists() {
-            fs::rename(away, root.join("rsi-z-b")).unwrap();
-        }
+        fs::rename(root.join(from), root.join(to)).unwrap();
     });
-}
-
-// #1152 review: an allocation moved to a sibling and back between the view that
-// lacked it and the drop of its entry is retained: absence is proved again from
-// a fresh view right before the drop.
-#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
-#[test]
-fn registry_prune_revalidates_before_dropping_an_entry() {
-    let fx = Fx::new();
-    let dir = fx.scratch("rsi-z-b", RootKind::VarTmp);
-    let nonce = nonce_of(&dir);
-    fx.rewrite_entry(&dir, |e| e.created_unix = 0);
-    let away = fx.root().join("sub");
-    fs::create_dir(&away).unwrap();
-    fs::rename(&dir, away.join("rsi-z-b")).unwrap();
-    let registry = Registry::open(fx.registry(), current_uid()).unwrap();
-    RENAME_ROOT.with(|root| *root.borrow_mut() = fx.root().to_path_buf());
-    // The first accepted view (of the registered parent) lacks the allocation;
-    // it comes home right after.
-    registry::AFTER_VIEW.with(|hook| hook.set(Some(move_back_when_accepted)));
-
-    let pruned = prune_everything(&registry);
-    registry::AFTER_VIEW.with(|hook| hook.set(None));
-
-    assert!(fx.root().join("rsi-z-b").is_dir(), "hook did not run");
-    assert_eq!(pruned, 0);
-    assert!(
-        registry.get(&nonce).is_some(),
-        "live allocation was dropped"
-    );
 }
 
 fn fx_inventory(

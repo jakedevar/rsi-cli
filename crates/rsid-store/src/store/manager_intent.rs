@@ -500,6 +500,21 @@ impl Store {
             } else if grant.policy.mode == ManagerOperatingModeV2::Monitor {
                 state["state"] = json!("monitoring");
                 state["reason"] = json!("ready_work_idle");
+            } else if let Some(lead) = lead
+                .as_ref()
+                .filter(|lead| self.manager_v2_lead_stale(&config, lead).unwrap_or(false))
+            {
+                // #1443: a seat change never wakes a lead that has been idle
+                // since before the appointment. Only the manager's explicit
+                // resume continues it; list it for the manager instead.
+                state["state"] = json!("stale_lead");
+                state["reason"] = json!("lead_idle_since_before_seat_appointment");
+                state["lead_last_activity_at"] =
+                    json!(self.manager_v2_lead_last_activity(lead)?.to_rfc3339());
+                state["seat_appointed_at"] = json!(config.updated_at.to_rfc3339());
+                state["next_action"] = json!(
+                    "Resume this stale lead explicitly with AgentManagerControl resume_lead if its work should continue; automatic Execute intent leaves it idle."
+                );
             } else if let Some(lead) = lead {
                 match self.manager_v2_intent_action(&config, &grant, epic, &lead, &ready) {
                     Ok(action) => {
@@ -603,6 +618,33 @@ impl Store {
         Ok(result)
     }
 
+    /// Newest of the lead row's own update stamp and its last conversation
+    /// event: the lead's last sign of life.
+    fn manager_v2_lead_last_activity(
+        &self,
+        lead: &rsi_common::types::Session,
+    ) -> Result<chrono::DateTime<chrono::Utc>> {
+        let last_event: Option<String> = self.conn.query_row(
+            "SELECT MAX(created_at) FROM conversation_events WHERE session_id=?1",
+            params![lead.id.to_string()],
+            |row| row.get(0),
+        )?;
+        let last_event = last_event
+            .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(&stamp).ok())
+            .map(|stamp| stamp.with_timezone(&chrono::Utc));
+        Ok(last_event.map_or(lead.updated_at, |event| event.max(lead.updated_at)))
+    }
+
+    /// #1443: a lead whose last activity predates the current seat
+    /// appointment is stale; the Execute intent must not wake it by itself.
+    fn manager_v2_lead_stale(
+        &self,
+        config: &HarnessManagerConfigV1,
+        lead: &rsi_common::types::Session,
+    ) -> Result<bool> {
+        Ok(self.manager_v2_lead_last_activity(lead)? < config.updated_at)
+    }
+
     fn manager_v2_pending_intent_actions(
         &self,
         config: &HarnessManagerConfigV1,
@@ -665,9 +707,11 @@ impl Store {
         {
             return Err(refused("manager_v2_lead_control_grant_required"));
         }
-        // Only the operator's explicit launch allowlist authorizes automatic
-        // recovery. Explicit manager actions have their own admission path.
-        if grant.policy.allowed_launches.is_empty() {
+        // An inherited ancestor allowlist also authorizes automatic recovery;
+        // an unbounded root policy still cannot select a launch automatically.
+        let mut choices =
+            self.manager_effective_launches(config, &grant.policy.allowed_launches)?;
+        if choices.is_empty() {
             return Err(refused("manager_v2_intent_launch_allowlist_required"));
         }
         let used:i64=self.conn.query_row("SELECT COUNT(*) FROM harness_manager_v2_operations WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3 AND kind='lifecycle_action' AND json_extract(payload_json,'$.origin.origin')='operating_intent' AND json_extract(payload_json,'$.request.operation.epic_id')=?4",params![config.project_id.to_string(),config.manager_session_id.to_string(),config.row_version,epic.to_string()],|r|r.get(0))?;
@@ -679,7 +723,6 @@ impl Store {
             model: model.clone(),
             effort: lead.effort.clone(),
         });
-        let mut choices = grant.policy.allowed_launches.clone();
         choices.sort_by_key(|choice| Some(choice) != current.as_ref());
         let choice = choices
             .into_iter()
@@ -762,6 +805,7 @@ impl Store {
         )?;
         let key = Uuid::new_v5(&Uuid::NAMESPACE_OID, fingerprint.as_bytes());
         Ok(AgentManagerControlRequestV2 {
+            project_id: None,
             fence: ManagerFenceV2 {
                 scope_version: config.row_version,
                 policy_version: grant.row_version,

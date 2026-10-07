@@ -366,6 +366,65 @@ mod tests {
         );
     }
 
+    /// #1213: the global manager commands appear in the `:` dropdown and
+    /// filter like every other command.
+    #[test]
+    fn command_palette_lists_and_filters_global_manager_commands() {
+        let app = crate::app::app_test_helpers::with_session_list(0);
+        let origin = ActionContext::from_app(&app);
+        let all = ranked(&origin, "");
+        for id in [
+            ActionId::GlobalManagerWorkspace,
+            ActionId::ManagerGlobal,
+            ActionId::ManagerGlobalAppoint,
+            ActionId::ManagerGlobalRevoke,
+            ActionId::ManagerTree,
+            ActionId::ManagerNode,
+            ActionId::ManagerRestart,
+        ] {
+            assert!(all.contains(&id), "{id:?} in the unfiltered dropdown");
+        }
+        let global = ranked(&origin, "manager global");
+        assert_eq!(global.first(), Some(&ActionId::ManagerGlobal));
+        for id in [
+            ActionId::ManagerGlobalAppoint,
+            ActionId::ManagerGlobalRevoke,
+        ] {
+            assert!(global.contains(&id), "{id:?} under `manager global`");
+        }
+        assert_eq!(
+            ranked(&origin, "manager global ap").first(),
+            Some(&ActionId::ManagerGlobalAppoint)
+        );
+        assert_eq!(
+            ranked(&origin, "manager tr").first(),
+            Some(&ActionId::ManagerTree)
+        );
+        assert_eq!(
+            ranked(&origin, "manager rest").first(),
+            Some(&ActionId::ManagerRestart)
+        );
+        assert_eq!(
+            ranked(&origin, "global-man").first(),
+            Some(&ActionId::GlobalManagerWorkspace)
+        );
+    }
+
+    #[tokio::test]
+    async fn command_palette_appoint_with_names_runs_as_typed() {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        open_command_palette(&mut app);
+        paste_text(&mut app, "manager global appoint Missing");
+        handle_key(&mut app, key(KeyCode::Enter)).await;
+        assert!(matches!(app.overlay, OverlayState::None));
+        // The command ran (and refused the unknown project) rather than
+        // opening the argument editor or the usage hint.
+        assert!(app.notifications.back().is_some_and(|notification| {
+            notification.message.contains("Focus the session")
+                || notification.message.contains("Unknown project")
+        }));
+    }
+
     #[tokio::test]
     async fn command_palette_enter_and_escape_transitions() {
         let mut app = crate::app::app_test_helpers::with_session_list(0);

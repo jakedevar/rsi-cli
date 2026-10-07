@@ -139,7 +139,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 frame.area(),
                 anchor,
                 &app.model_dropdown,
-                app.selected_model.as_deref(),
+                // Tab previews other providers; only the default's own
+                // catalog checks it.
+                app.default_model_in(&app.model_dropdown),
                 app.is_provider_available(app.model_dropdown.provider),
             );
         }
@@ -191,14 +193,43 @@ fn render_top_chrome(frame: &mut Frame, area: Rect, app: &App) -> Option<Rect> {
             )
         })
         .count();
-    let left_spans = vec![top_kv("\u{25CF}", &active.to_string(), theme::green(), bg)];
-    let right_spans = project_tab_spans(app, bg);
+    let left_spans = vec![
+        top_kv("\u{25CF}", &active.to_string(), theme::green(), bg),
+        Span::styled(
+            "running ",
+            Style::default().fg(theme::dim_metadata()).bg(bg),
+        ),
+    ];
     let left_width = spans_width(&left_spans).min(content_area.width);
-    let right_width = spans_width(&right_spans).min(
-        content_area
-            .width
-            .saturating_sub(left_width.saturating_add(1)),
-    );
+
+    // Right cluster: the default launch model, then the project tab dots.
+    // The chip yields when it would squeeze the centred toast lane.
+    let tab_spans = project_tab_spans(app, bg);
+    let tabs_width = spans_width(&tab_spans);
+    let chip_spans = default_model_chip_spans(app, bg);
+    let chip_width = spans_width(&chip_spans);
+    let fit_right = |width: u16| {
+        width.min(
+            content_area
+                .width
+                .saturating_sub(left_width.saturating_add(1)),
+        )
+    };
+    let chip_cluster_width = chip_width
+        .saturating_add(u16::from(tabs_width > 0))
+        .saturating_add(tabs_width);
+    let show_chip = chip_cluster_width <= fit_right(chip_cluster_width)
+        && centered_top_lane(content_area, left_width, chip_cluster_width)
+            .is_some_and(|lane| lane.width >= TOP_CHROME_MIN_TOAST_LANE);
+    let mut right_spans = Vec::new();
+    if show_chip {
+        right_spans.extend(chip_spans);
+        if tabs_width > 0 {
+            right_spans.push(Span::styled(" ", Style::default().bg(bg)));
+        }
+    }
+    right_spans.extend(tab_spans);
+    let right_width = fit_right(spans_width(&right_spans));
 
     frame.render_widget(
         Paragraph::new(Line::from(left_spans))
@@ -240,21 +271,64 @@ fn render_top_chrome(frame: &mut Frame, area: Rect, app: &App) -> Option<Rect> {
         }
     }
 
+    let right_x = content_area.x + content_area.width.saturating_sub(right_width);
     if right_width > 0 {
         frame.render_widget(
             Paragraph::new(Line::from(right_spans))
                 .style(Style::default().bg(bg))
                 .alignment(Alignment::Right),
-            Rect::new(
-                content_area.x + content_area.width.saturating_sub(right_width),
-                content_area.y,
-                right_width,
-                content_area.height,
-            ),
+            Rect::new(right_x, content_area.y, right_width, content_area.height),
         );
     }
 
+    // The `Ctrl-M` dropdown drops from the chip it changes; without the chip
+    // it keeps the fixed right-edge anchor.
+    if show_chip && right_width > 0 {
+        return Some(Rect::new(
+            right_x,
+            content_area.y,
+            chip_width.min(right_width),
+            1,
+        ));
+    }
     model_dropdown_anchor(content_area)
+}
+
+/// Narrowest centre lane the default-model chip may leave for toasts and the
+/// worker-pressure line; on a narrower bar the chip is not drawn.
+const TOP_CHROME_MIN_TOAST_LANE: u16 = 20;
+
+/// `default ✻ sonnet-5 · xhigh`: the model, provider and effort new sessions
+/// launch with. Read from the live selection every frame, so it changes the
+/// moment the `Ctrl-M` picker, `:model` or Settings ▸ Model Roles moves it.
+/// An effort the operator chose is bright; the model's own default is dim.
+fn default_model_chip_spans(app: &App, bg: Color) -> Vec<Span<'static>> {
+    use ratatui::style::Modifier;
+    let badge = app.default_model_badge();
+    let dim = Style::default().fg(theme::dim_metadata()).bg(bg);
+    let mut spans = vec![
+        Span::styled("default ", dim),
+        Span::styled(
+            format!("{} ", glyphs::provider_glyph(badge.provider)),
+            Style::default()
+                .fg(glyphs::provider_color(badge.provider))
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(badge.model, Style::default().fg(theme::model_text()).bg(bg)),
+    ];
+    if let Some((effort, chosen)) = badge.effort {
+        spans.push(Span::styled(" · ", dim));
+        spans.push(Span::styled(
+            effort,
+            if chosen {
+                Style::default().fg(theme::effort_text()).bg(bg)
+            } else {
+                dim
+            },
+        ));
+    }
+    spans
 }
 
 fn worker_pressure_status(pressure: &rsi_common::rpc::WorkerSliceMemoryPressure) -> String {
@@ -338,13 +412,13 @@ fn top_kv(label: &str, value: &str, value_color: Color, bg: Color) -> Span<'stat
     )
 }
 
-/// Fixed anchor for the global model dropdown (`M`). Post-header-cut there
-/// is no rendered chip left to measure — `render_model_dropdown`
-/// (`ui/widget/model_dropdown.rs`) only ever reads `anchor.x` / `anchor.y` /
-/// `anchor.height` (confirmed: `anchor.width` has zero reads in that file),
-/// so a stable 1-wide rect is sufficient. Anchored at the header's right
-/// edge. The anchor is geometry-only; the project dots may occupy the header
-/// cell while the dropdown itself opens below it.
+/// Fallback anchor for the global model dropdown (`Ctrl-M`) when the bar is
+/// too narrow for the default-model chip, which is the anchor otherwise —
+/// `render_model_dropdown` (`ui/widget/model_dropdown.rs`) only ever reads
+/// `anchor.x` / `anchor.y` / `anchor.height` (confirmed: `anchor.width` has
+/// zero reads in that file), so a stable 1-wide rect is sufficient. Anchored
+/// at the header's right edge. The anchor is geometry-only; the project dots
+/// may occupy the header cell while the dropdown itself opens below it.
 fn model_dropdown_anchor(area: Rect) -> Option<Rect> {
     if area.width == 0 || area.height == 0 {
         return None;
@@ -484,232 +558,13 @@ fn render_pane(
                 );
             }
             let session_area = full_area;
-            let mut clear_session_area = false;
+            let column = prepare_session_detail(app, *session_id, session_area);
 
-            // T5: cap the transcript/input-bar column on wide terminals. session_area
-            // itself is kept UNNARROWED — it is still used below for the full-width
-            // Clear on session switch, and gutter painting needs both Rects.
-            let requested_detail_width = app
-                .sessions
-                .get_mut(session_id)
-                .map(cached_table_requested_detail_width)
-                .unwrap_or(DETAIL_MAX_CONTENT_WIDTH);
-            let gutter_pct = app
-                .settings
-                .detail_column_alignment
-                .gutter_pct(app.settings.detail_column_position_pct);
-            let centered_area =
-                compute_aligned_detail_area(session_area, requested_detail_width, gutter_pct);
-
-            // Compute dynamic input bar height against the FINAL (centered) width, so
-            // the height pre-computation and the actual render agree exactly.
-            let input_bar_height = app
-                .sessions
-                .get(session_id)
-                .map(|state| {
-                    session::compute_input_bar_height(
-                        &state.input_bar.surface.textarea,
-                        centered_area.width,
-                    )
-                })
-                .unwrap_or(3);
-
-            let chunks = Layout::vertical([
-                Constraint::Fill(1),                  // Session content (scrollable)
-                Constraint::Length(input_bar_height), // Input bar (dynamic)
-            ])
-            .split(centered_area);
-
-            // Both areas are split from the SAME centered_area, so they are
-            // pixel-identical in x/width by construction — "input bar width == message
-            // width" holds without a separate equality check anywhere.
-            let content_area = chunks[0];
-            let input_bar_area = chunks[1];
-
-            // Determine if loading bar will be shown (needed for viewport calc)
-            let loading_container_height =
-                session::activity_indicator_height(app.settings.activity_indicator_style);
-            let is_active = app
-                .sessions
-                .get(session_id)
-                .map(|s| {
-                    matches!(
-                        s.session.status,
-                        rsi_common::types::SessionStatus::Running
-                            | rsi_common::types::SessionStatus::Starting
-                    )
-                })
-                .unwrap_or(false);
-            let show_loading_bar = is_active && content_area.height > 5;
-
-            // Pre-render: update height cache with the actual inner rendering width.
-            // Must account for the explicit transcript inset in render_session_detail.
-            // See theme::SESSION_DETAIL_HORIZ_INSET for the canonical value; heights
-            // are calculated against the same inner width used for rendering.
-            let content_width = content_area
-                .width
-                .saturating_sub(theme::SESSION_DETAIL_HORIZ_INSET);
-            let has_recursive_dag = app
-                .sessions
-                .get(session_id)
-                .map(|state| {
-                    crate::ui::session::recursive_dag_detail_line(
-                        &*app,
-                        &state.session,
-                        content_width,
-                    )
-                    .is_some()
-                })
-                .unwrap_or(false);
-            if let Some(state) = app.sessions.get_mut(session_id) {
-                if state.clear_next_render {
-                    clear_session_area = true;
-                    state.clear_next_render = false;
-                }
-                state.last_content_area = content_area;
-                height::update_event_heights(state, content_width);
-
-                // Drop the formulation reveal when disabled or expired; while
-                // it runs, keep the redraw heartbeat alive.
-                if let Some(form) = state.formulation {
-                    let now_ms = chrono::Utc::now().timestamp_millis();
-                    if session::formulation_progress(
-                        form,
-                        now_ms,
-                        app.settings.formulation_anim_enabled,
-                        app.settings.formulation_anim_ms,
-                    )
-                    .is_some()
-                    {
-                        app.has_formulation_animation = true;
-                    } else {
-                        state.formulation = None;
-                    }
-                }
-
-                // Compute vertical offset from content_area.y to first message line.
-                // Must mirror the header rows rendered in render_session_detail:
-                // title + metadata + divider (3) + active_task(0-1) + pending_archive(0-1)
-                // + issue_url(0-1) + sandbox(0-1) + recursive DAG(0-1).
-                let at_top = state.scroll_offset == 0;
-                let is_running = matches!(
-                    state.session.status,
-                    rsi_common::types::SessionStatus::Running
-                        | rsi_common::types::SessionStatus::Starting
-                );
-                let has_active_task = state.session.active_task.is_some();
-                let has_pending_archive = state.session.pending_archive && is_running;
-                let has_issue_url = state.session.issue_url.is_some();
-                let has_sandbox_info = state.session.sandbox_root.is_some();
-                let terminal_reason_visible = matches!(
-                    state.session.status,
-                    rsi_common::types::SessionStatus::Failed
-                        | rsi_common::types::SessionStatus::Interrupted
-                ) || (state.session.status
-                    == rsi_common::types::SessionStatus::Completed
-                    && state.session.terminal_reason.is_some());
-                let has_terminal_info = at_top
-                    && (terminal_reason_visible || crate::ui::session::has_terminal_error(state));
-                state.last_content_y_offset = crate::ui::session::session_detail_content_y_offset(
-                    at_top,
-                    has_active_task,
-                    has_pending_archive,
-                    has_issue_url,
-                    has_sandbox_info,
-                    has_terminal_info,
-                    has_recursive_dag,
-                );
-
-                let total_height = state.total_content_height;
-                // viewport = content_area height minus the fixed detail header rows.
-                // Shrink effective viewport when loading bar is active so text stays above it.
-                let viewport = content_area
-                    .height
-                    .saturating_sub(session::SESSION_DETAIL_HEADER_HEIGHT)
-                    as usize;
-                let viewport = if show_loading_bar {
-                    viewport.saturating_sub(loading_container_height as usize)
-                } else {
-                    viewport
-                };
-                state.last_viewport_height = viewport;
-                let max_scroll = total_height.saturating_sub(viewport);
-
-                if state.follow_tail {
-                    state.scroll_offset = max_scroll;
-                } else {
-                    // Clamp: never scroll past the last line of content
-                    state.scroll_offset = state.scroll_offset.min(max_scroll);
-
-                    // Re-enable follow_tail when user scrolls back to the
-                    // bottom (scroll-lock re-engage). This lets the view
-                    // auto-follow new content again once the user reaches
-                    // the end of the conversation.
-                    //
-                    // The hold-off flag prevents re-engage after explicit jumps
-                    // (Shift+Up/Down) whose target scroll offset may land near
-                    // max_scroll. The hold persists while scroll_offset stays
-                    // at/near max_scroll (height recalculations can shift
-                    // max_scroll between frames at ~120fps, so a single-frame
-                    // hold is insufficient). Clears naturally once the user
-                    // scrolls away from the bottom.
-                    if state.follow_tail_hold {
-                        // Only clear hold once scroll_offset drops below max_scroll
-                        if state.scroll_offset < max_scroll {
-                            state.follow_tail_hold = false;
-                        }
-                    } else if state.scroll_offset >= max_scroll && max_scroll > 0 {
-                        state.follow_tail = true;
-                    }
-                }
-
-                // When follow_tail is active, always select the newest event
-                // so the selection tracks new messages as they arrive.
-                // When NOT following tail (free-scroll), preserve the
-                // user's current selection and don't reassign it.
-                let prev_cursor = state.current_event_index;
-                if state.follow_tail && !state.events.is_empty() {
-                    state.current_event_index = Some(state.events.len() - 1);
-                } else if state.current_event_index.is_none() && !state.event_offsets.is_empty() {
-                    // Derive current_event_index from scroll_offset only as
-                    // a fallback when no cursor is set yet.
-                    state.current_event_index = state
-                        .event_offsets
-                        .iter()
-                        .rposition(|&off| off <= state.scroll_offset)
-                        .filter(|&idx| idx < state.events.len());
-                }
-
-                // Clamp cursor if events were removed (e.g., session cleared)
-                if let Some(idx) = state.current_event_index {
-                    if idx >= state.events.len() {
-                        state.current_event_index = if state.events.is_empty() {
-                            None
-                        } else {
-                            Some(state.events.len() - 1)
-                        };
-                    }
-                }
-
-                // If cursor changed, re-run height computation so the marker's width
-                // is accounted for on the correct event, then re-clamp scroll.
-                if state.current_event_index != prev_cursor {
-                    height::invalidate_heights(state);
-                    height::update_event_heights(state, content_width);
-                    let max_scroll = state.total_content_height.saturating_sub(viewport);
-                    if state.follow_tail {
-                        state.scroll_offset = max_scroll;
-                    } else {
-                        state.scroll_offset = state.scroll_offset.min(max_scroll);
-                    }
-                }
-            }
-
-            if clear_session_area {
+            if column.clear_session_area {
                 frame.render_widget(Clear, session_area);
             }
 
-            paint_detail_gutters(frame, session_area, centered_area, &app.settings);
+            paint_detail_gutters(frame, session_area, column.centered_area, &app.settings);
 
             // Check if file viewer is active for this session
             let file_viewer_active = app
@@ -725,35 +580,7 @@ fn render_pane(
                 let viewer_area = file_viewer_area_with_explorer_drawer(area, frame.area(), app);
                 session::render_file_viewer(frame, viewer_area, *session_id, focused, app);
             } else {
-                // Render session content
-                session::render_session_detail(frame, content_area, *session_id, focused, app);
-
-                // Render loading bar overlay on bottom row of content area (inside borders)
-                // when session is active. Painted last so it sits on top of content.
-                if show_loading_bar {
-                    // Inset to align with tool-call group geometry:
-                    // SESSION_DETAIL_HORIZ_INSET = 4 (1 border + 1 padding per side)
-                    let container_area = Rect::new(
-                        content_area.x + theme::SESSION_DETAIL_HORIZ_INSET / 2,
-                        content_area.y + content_area.height - 1 - loading_container_height,
-                        content_area
-                            .width
-                            .saturating_sub(theme::SESSION_DETAIL_HORIZ_INSET),
-                        loading_container_height,
-                    );
-                    if let Some(state) = app.sessions.get(session_id) {
-                        session::render_activity_indicator(
-                            frame,
-                            container_area,
-                            state,
-                            app.settings.activity_indicator_style,
-                        );
-                    }
-                    app.has_loading_bar = true;
-                }
-
-                // Render input bar (hidden when InputModal is active)
-                session::render_input_bar(frame, input_bar_area, *session_id, focused, app);
+                render_session_conversation(frame, &column, *session_id, focused, app);
 
                 // Resolve the current tab's SessionList pane. Check the layout tree
                 // first (split layouts), then fall back to the tab-stored session
@@ -777,6 +604,309 @@ fn render_pane(
             }
         }
     }
+}
+
+/// Geometry of one session-detail column (transcript plus input bar), computed
+/// by [`prepare_session_detail`] and drawn by [`render_session_conversation`].
+/// The detail pane and the global manager workspace's conversation pane
+/// (#1231) share both, so there is one conversation renderer.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DetailColumn {
+    /// The capped, aligned column inside the requested area.
+    pub centered_area: Rect,
+    /// Width of the three-row title header from `content_area.x`. Wider than
+    /// the column only while it is pinned to the pane's left edge.
+    pub header_width: u16,
+    pub content_area: Rect,
+    pub input_bar_area: Rect,
+    pub show_loading_bar: bool,
+    pub loading_container_height: u16,
+    /// The session asked for a full clear of its area before this frame.
+    pub clear_session_area: bool,
+}
+
+/// Lay out `session_id`'s detail column inside `session_area` and update its
+/// per-frame view state: event heights, header offset, viewport height,
+/// follow-tail scrolling and the event cursor.
+pub(crate) fn prepare_session_detail(
+    app: &mut App,
+    session_id: uuid::Uuid,
+    session_area: Rect,
+) -> DetailColumn {
+    let mut clear_session_area = false;
+    // T5: cap the transcript/input-bar column on wide terminals. session_area
+    // itself is kept UNNARROWED — it is still used below for the full-width
+    // Clear on session switch, and gutter painting needs both Rects.
+    let requested_detail_width = app
+        .sessions
+        .get_mut(&session_id)
+        .map(cached_table_requested_detail_width)
+        .unwrap_or(DETAIL_MAX_CONTENT_WIDTH);
+    let gutter_pct = app
+        .settings
+        .detail_column_alignment
+        .gutter_pct(app.settings.detail_column_position_pct);
+    let centered_area =
+        compute_aligned_detail_area(session_area, requested_detail_width, gutter_pct);
+    let header_width = detail_header_width(session_area, centered_area, gutter_pct);
+
+    // Compute dynamic input bar height against the FINAL (centered) width, so
+    // the height pre-computation and the actual render agree exactly.
+    let input_bar_height = app
+        .sessions
+        .get(&session_id)
+        .map(|state| {
+            session::compute_input_bar_height(
+                &state.input_bar.surface.textarea,
+                centered_area.width,
+            )
+        })
+        .unwrap_or(3);
+
+    let chunks = Layout::vertical([
+        Constraint::Fill(1),                  // Session content (scrollable)
+        Constraint::Length(input_bar_height), // Input bar (dynamic)
+    ])
+    .split(centered_area);
+
+    // Both areas are split from the SAME centered_area, so they are
+    // pixel-identical in x/width by construction — "input bar width == message
+    // width" holds without a separate equality check anywhere.
+    let content_area = chunks[0];
+    let input_bar_area = chunks[1];
+
+    // Determine if loading bar will be shown (needed for viewport calc)
+    let loading_container_height =
+        session::activity_indicator_height(app.settings.activity_indicator_style);
+    let is_active = app
+        .sessions
+        .get(&session_id)
+        .map(|s| {
+            matches!(
+                s.session.status,
+                rsi_common::types::SessionStatus::Running
+                    | rsi_common::types::SessionStatus::Starting
+            )
+        })
+        .unwrap_or(false);
+    let show_loading_bar = is_active && content_area.height > 5;
+
+    // Pre-render: update height cache with the actual inner rendering width.
+    // Must account for the explicit transcript inset in render_session_detail.
+    // See theme::SESSION_DETAIL_HORIZ_INSET for the canonical value; heights
+    // are calculated against the same inner width used for rendering.
+    let content_width = content_area
+        .width
+        .saturating_sub(theme::SESSION_DETAIL_HORIZ_INSET);
+    let has_recursive_dag = app
+        .sessions
+        .get(&session_id)
+        .map(|state| {
+            crate::ui::session::recursive_dag_detail_line(&*app, &state.session, content_width)
+                .is_some()
+        })
+        .unwrap_or(false);
+    if let Some(state) = app.sessions.get_mut(&session_id) {
+        if state.clear_next_render {
+            clear_session_area = true;
+            state.clear_next_render = false;
+        }
+        state.last_content_area = content_area;
+        height::update_event_heights(state, content_width);
+
+        // Drop the formulation reveal when disabled or expired; while
+        // it runs, keep the redraw heartbeat alive.
+        if let Some(form) = state.formulation {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            if session::formulation_progress(
+                form,
+                now_ms,
+                app.settings.formulation_anim_enabled,
+                app.settings.formulation_anim_ms,
+            )
+            .is_some()
+            {
+                app.has_formulation_animation = true;
+            } else {
+                state.formulation = None;
+            }
+        }
+
+        // Compute vertical offset from content_area.y to first message line.
+        // Must mirror the header rows rendered in render_session_detail:
+        // title + metadata + divider (3) + active_task(0-1) + pending_archive(0-1)
+        // + issue_url(0-1) + sandbox(0-1) + recursive DAG(0-1).
+        let at_top = state.scroll_offset == 0;
+        let is_running = matches!(
+            state.session.status,
+            rsi_common::types::SessionStatus::Running | rsi_common::types::SessionStatus::Starting
+        );
+        let has_active_task = state.session.active_task.is_some();
+        let has_pending_archive = state.session.pending_archive && is_running;
+        let has_issue_url = state.session.issue_url.is_some();
+        let has_sandbox_info = state.session.sandbox_root.is_some();
+        let terminal_reason_visible = matches!(
+            state.session.status,
+            rsi_common::types::SessionStatus::Failed
+                | rsi_common::types::SessionStatus::Interrupted
+        ) || (state.session.status
+            == rsi_common::types::SessionStatus::Completed
+            && state.session.terminal_reason.is_some());
+        let has_terminal_info =
+            at_top && (terminal_reason_visible || crate::ui::session::has_terminal_error(state));
+        state.last_content_y_offset = crate::ui::session::session_detail_content_y_offset(
+            at_top,
+            has_active_task,
+            has_pending_archive,
+            has_issue_url,
+            has_sandbox_info,
+            has_terminal_info,
+            has_recursive_dag,
+        );
+
+        let total_height = state.total_content_height;
+        // viewport = content_area height minus the fixed detail header rows.
+        // Shrink effective viewport when loading bar is active so text stays above it.
+        let viewport = content_area
+            .height
+            .saturating_sub(session::SESSION_DETAIL_HEADER_HEIGHT) as usize;
+        let viewport = if show_loading_bar {
+            viewport.saturating_sub(loading_container_height as usize)
+        } else {
+            viewport
+        };
+        state.last_viewport_height = viewport;
+        let max_scroll = total_height.saturating_sub(viewport);
+
+        if state.follow_tail {
+            state.scroll_offset = max_scroll;
+        } else {
+            // Clamp: never scroll past the last line of content
+            state.scroll_offset = state.scroll_offset.min(max_scroll);
+
+            // Re-enable follow_tail when user scrolls back to the
+            // bottom (scroll-lock re-engage). This lets the view
+            // auto-follow new content again once the user reaches
+            // the end of the conversation.
+            //
+            // The hold-off flag prevents re-engage after explicit jumps
+            // (Shift+Up/Down) whose target scroll offset may land near
+            // max_scroll. The hold persists while scroll_offset stays
+            // at/near max_scroll (height recalculations can shift
+            // max_scroll between frames at ~120fps, so a single-frame
+            // hold is insufficient). Clears naturally once the user
+            // scrolls away from the bottom.
+            if state.follow_tail_hold {
+                // Only clear hold once scroll_offset drops below max_scroll
+                if state.scroll_offset < max_scroll {
+                    state.follow_tail_hold = false;
+                }
+            } else if state.scroll_offset >= max_scroll && max_scroll > 0 {
+                state.follow_tail = true;
+            }
+        }
+
+        // When follow_tail is active, always select the newest event
+        // so the selection tracks new messages as they arrive.
+        // When NOT following tail (free-scroll), preserve the
+        // user's current selection and don't reassign it.
+        let prev_cursor = state.current_event_index;
+        if state.follow_tail && !state.events.is_empty() {
+            state.current_event_index = Some(state.events.len() - 1);
+        } else if state.current_event_index.is_none() && !state.event_offsets.is_empty() {
+            // Derive current_event_index from scroll_offset only as
+            // a fallback when no cursor is set yet.
+            state.current_event_index = state
+                .event_offsets
+                .iter()
+                .rposition(|&off| off <= state.scroll_offset)
+                .filter(|&idx| idx < state.events.len());
+        }
+
+        // Clamp cursor if events were removed (e.g., session cleared)
+        if let Some(idx) = state.current_event_index {
+            if idx >= state.events.len() {
+                state.current_event_index = if state.events.is_empty() {
+                    None
+                } else {
+                    Some(state.events.len() - 1)
+                };
+            }
+        }
+
+        // If cursor changed, re-run height computation so the marker's width
+        // is accounted for on the correct event, then re-clamp scroll.
+        if state.current_event_index != prev_cursor {
+            height::invalidate_heights(state);
+            height::update_event_heights(state, content_width);
+            let max_scroll = state.total_content_height.saturating_sub(viewport);
+            if state.follow_tail {
+                state.scroll_offset = max_scroll;
+            } else {
+                state.scroll_offset = state.scroll_offset.min(max_scroll);
+            }
+        }
+    }
+
+    DetailColumn {
+        centered_area,
+        header_width,
+        content_area,
+        input_bar_area,
+        show_loading_bar,
+        loading_container_height,
+        clear_session_area,
+    }
+}
+
+/// Draw a prepared detail column: the transcript, the activity indicator
+/// while the session runs, and the input bar.
+pub(crate) fn render_session_conversation(
+    frame: &mut Frame,
+    column: &DetailColumn,
+    session_id: uuid::Uuid,
+    focused: bool,
+    app: &mut App,
+) {
+    // Render session content
+    session::render_session_detail_with_header(
+        frame,
+        column.content_area,
+        column.header_width,
+        session_id,
+        focused,
+        app,
+    );
+
+    // Render loading bar overlay on bottom row of content area (inside borders)
+    // when session is active. Painted last so it sits on top of content.
+    if column.show_loading_bar {
+        // Inset to align with tool-call group geometry:
+        // SESSION_DETAIL_HORIZ_INSET = 4 (1 border + 1 padding per side)
+        let container_area = Rect::new(
+            column.content_area.x + theme::SESSION_DETAIL_HORIZ_INSET / 2,
+            column.content_area.y + column.content_area.height
+                - 1
+                - column.loading_container_height,
+            column
+                .content_area
+                .width
+                .saturating_sub(theme::SESSION_DETAIL_HORIZ_INSET),
+            column.loading_container_height,
+        );
+        if let Some(state) = app.sessions.get(&session_id) {
+            session::render_activity_indicator(
+                frame,
+                container_area,
+                state,
+                app.settings.activity_indicator_style,
+            );
+        }
+        app.has_loading_bar = true;
+    }
+
+    // Render input bar (hidden when InputModal is active)
+    session::render_input_bar(frame, column.input_bar_area, session_id, focused, app);
 }
 
 /// Paint the side gutters left over when `inner` (the centered content/input-bar
@@ -959,6 +1089,23 @@ fn compute_aligned_detail_area(area: Rect, requested_width: u16, gutter_pct: u8)
     Rect::new(area.x + gutter, area.y, target_width, area.height)
 }
 
+/// Title-header width for a detail column. A column attached to the left edge
+/// (`gutter_pct == 0`: Left Aligned, or Dynamic nudged all the way left)
+/// stretches its title bar to the pane's right edge; a column with a left
+/// gutter (centered, or Dynamic floating free of the sides) keeps the header
+/// at the column width.
+fn detail_header_width(session_area: Rect, column: Rect, gutter_pct: u8) -> u16 {
+    if gutter_pct == 0 {
+        session_area
+            .x
+            .saturating_add(session_area.width)
+            .saturating_sub(column.x)
+            .max(column.width)
+    } else {
+        column.width
+    }
+}
+
 /// Calculate the current width of the session list in the left gutter.
 pub(crate) fn compute_session_list_width(app: &App) -> u16 {
     let term_width = terminal_width_for_layout(app);
@@ -1098,8 +1245,8 @@ mod tests {
 
     #[test]
     fn top_chrome_header_content_is_width_invariant() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
         let app = fixture_app();
-        let _theme_render_guard = theme::test_render_guard();
         let mut contents = Vec::new();
         for width in [80u16, 111, 112, 160] {
             let backend = TestBackend::new(width, 1);
@@ -1114,7 +1261,12 @@ mod tests {
                 assert_eq!(terminal.backend().buffer()[(1, 0)].symbol(), "●");
                 assert_eq!(terminal.backend().buffer()[(1, 0)].fg, theme::green());
             }
-            let text = buffer_text(terminal.backend().buffer()).trim().to_string();
+            // The gap between the left count and the right-hand chip grows
+            // with the bar; the content itself must not change.
+            let text = buffer_text(terminal.backend().buffer())
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             assert!(
                 !text.contains('$'),
                 "budget chip must be gone at width {width}: {text:?}"
@@ -1133,13 +1285,104 @@ mod tests {
             contents.windows(2).all(|w| w[0] == w[1]),
             "header content must be identical across widths: {contents:?}"
         );
-        assert_eq!(contents[0], "● 1");
+        assert_eq!(contents[0], "● 1 running default ✻ Claude");
+    }
+
+    /// The default launch model sits at the right of the top bar with its
+    /// provider glyph, compact model label and effort, and it repaints the
+    /// frame after the default changes.
+    #[test]
+    fn top_chrome_shows_the_default_model_and_follows_a_change() {
+        let mut app = fixture_app();
+        // The rendered and expected glyph colours both read the global theme.
+        let _theme = theme::pin_theme_state();
+        app.selected_provider = rsi_common::types::SessionProvider::Claude;
+        app.selected_model = Some("claude-opus-5-5".to_string());
+        app.selected_effort = Some("max".to_string());
+
+        let draw = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 1)).expect("terminal");
+            let mut anchor = None;
+            terminal
+                .draw(|frame| {
+                    anchor = render_top_chrome(frame, Rect::new(0, 0, 100, 1), app);
+                })
+                .expect("draw");
+            let buffer = terminal.backend().buffer().clone();
+            (buffer_text(&buffer), buffer, anchor)
+        };
+
+        let (text, buffer, anchor) = draw(&app);
+        assert!(
+            text.trim_end().ends_with("default ✻ opus-5-5 · max"),
+            "{text:?}"
+        );
+        let glyph_x = text.chars().position(|ch| ch == '✻').expect("glyph") as u16;
+        assert_eq!(
+            buffer[(glyph_x, 0)].fg,
+            glyphs::provider_color(rsi_common::types::SessionProvider::Claude)
+        );
+        let chip_x = text
+            .find("default")
+            .map(|byte| text[..byte].chars().count() as u16);
+        assert_eq!(
+            anchor.map(|anchor| anchor.x),
+            chip_x,
+            "Ctrl-M drops its picker from the chip"
+        );
+
+        app.selected_provider = rsi_common::types::SessionProvider::Codex;
+        app.selected_model = Some("gpt-6-astra".to_string());
+        app.selected_effort = None;
+        let (text, ..) = draw(&app);
+        assert!(
+            text.trim_end().ends_with("default ◎ 6-astra · low"),
+            "the chip follows the new default, with the model's own effort: {text:?}"
+        );
+    }
+
+    #[test]
+    fn top_chrome_drops_the_model_chip_before_the_toast_lane_gets_too_narrow() {
+        let app = fixture_app();
+        let backend = TestBackend::new(44, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut anchor = None;
+        terminal
+            .draw(|frame| {
+                anchor = render_top_chrome(frame, Rect::new(0, 0, 44, 1), &app);
+            })
+            .expect("draw");
+        let text = buffer_text(terminal.backend().buffer());
+        assert_eq!(text.trim(), "● 1 running");
+        assert_eq!(anchor, model_dropdown_anchor(Rect::new(1, 0, 42, 1)));
+    }
+
+    #[test]
+    fn global_model_dropdown_checks_the_default_only_on_its_own_provider() {
+        use rsi_common::types::SessionProvider;
+        let mut app = fixture_app();
+        app.selected_provider = SessionProvider::Claude;
+        app.custom_provider_index = None;
+        app.selected_model = Some("claude-sonnet-5".to_string());
+        app.model_dropdown = crate::types::ModelDropdownState::new(
+            SessionProvider::Claude,
+            crate::app::models_for_provider(SessionProvider::Claude),
+            app.selected_model.as_deref(),
+        );
+        assert_eq!(
+            app.default_model_in(&app.model_dropdown),
+            Some("claude-sonnet-5")
+        );
+
+        // Pioneer also serves `claude-*` IDs; browsing it is only a preview.
+        app.model_dropdown.provider = SessionProvider::Pioneer;
+        assert_eq!(app.default_model_in(&app.model_dropdown), None);
     }
 
     #[test]
     fn top_chrome_places_color_coded_project_tabs_on_right() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
         let mut app = fixture_app();
-        let _theme_render_guard = theme::test_render_guard();
         let project_id = uuid::Uuid::new_v4();
         let mut project_tab = app.tabs[0].clone();
         project_tab.project_id = Some(project_id);
@@ -1310,6 +1553,28 @@ mod tests {
             assert_eq!(result.y, area.y);
             assert_eq!(result.height, area.height);
         }
+    }
+
+    #[test]
+    fn detail_header_stretches_only_when_column_is_attached_left() {
+        let area = Rect::new(5, 0, 200, 40);
+        let left = compute_aligned_detail_area(area, DETAIL_MAX_CONTENT_WIDTH, 0);
+        assert_eq!(detail_header_width(area, left, 0), area.width);
+
+        let floating = compute_aligned_detail_area(area, DETAIL_MAX_CONTENT_WIDTH, 30);
+        assert_eq!(
+            detail_header_width(area, floating, 30),
+            DETAIL_MAX_CONTENT_WIDTH
+        );
+
+        let centered = compute_aligned_detail_area(area, DETAIL_MAX_CONTENT_WIDTH, 50);
+        assert_eq!(
+            detail_header_width(area, centered, 50),
+            DETAIL_MAX_CONTENT_WIDTH
+        );
+
+        let narrow = Rect::new(0, 0, 80, 40);
+        assert_eq!(detail_header_width(narrow, narrow, 0), narrow.width);
     }
 
     #[test]

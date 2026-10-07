@@ -16,6 +16,7 @@
 mod agent_jobs_verb;
 pub(crate) mod agent_message_arbiter;
 pub(crate) mod agent_message_delivery;
+mod effect_fence;
 pub(crate) mod tree_admission;
 pub(crate) use rsid_store::store::{agent_message_dispatcher, agent_message_reconciler};
 mod agent_read_events;
@@ -51,14 +52,17 @@ pub(crate) mod manager_actions;
 mod manager_coordinator;
 mod manager_issue_worker; // #1100
 pub(crate) mod manager_ledger;
+mod manager_node_overview; // #1240
 pub(crate) mod manager_reviews;
 mod manager_succession;
 mod monitor;
 mod outcome;
 mod pending_approvals;
 mod persistence;
+pub(crate) mod post_handoff;
 pub mod preamble;
 mod projects;
+mod provider_model_validation;
 mod provider_spawn;
 mod provider_status_verb;
 mod queries;
@@ -84,6 +88,7 @@ mod spawn_single_flight;
 pub(crate) use crate::store_support::spawn_single_flight::RotationPublicationGuards;
 mod summarizer;
 pub(crate) mod tag_ops;
+pub(crate) mod tier_settlement;
 pub(crate) mod title;
 pub(crate) mod topology_agent_verbs;
 pub(crate) mod topology_bridge;
@@ -277,6 +282,9 @@ pub(crate) type TopologyAgentSelf = Arc<std::sync::OnceLock<std::sync::Weak<Sess
 pub struct SessionManager {
     /// Deploy drain (#1073): holds new child work while a deploy waits.
     pub(crate) deploy_drain: Arc<crate::deploy_drain::DeployDrain>,
+    /// Host-load admission (#1417): holds manager launches while the host's
+    /// 1-minute load is above the operator's threshold.
+    pub(crate) host_load: Arc<crate::host_load::HostLoadAdmission>,
     /// Set before the graceful restart drain; no new provider turn may start.
     pub(super) restart_draining: std::sync::atomic::AtomicBool,
     /// Operator-requested DRAIN restart, distinct from the hard signal path.
@@ -303,6 +311,8 @@ pub struct SessionManager {
     pub(super) persistence: PersistenceHandle,
     pub(super) model_call_settlements:
         crate::model_control::call_control::ModelCallSettlementWorker,
+    /// #1294: in-flight tier-mail claims and outcomes awaiting a write.
+    pub(super) tier_settlements: std::sync::Mutex<tier_settlement::TierSettlementLedger>,
     pub(super) project_index: Arc<RwLock<ProjectIndex>>,
     pub(super) context_rotation_enabled: bool,
     pub(super) socket_path: std::path::PathBuf,
@@ -437,6 +447,9 @@ pub struct SessionManager {
     /// parameter has no correct argument unless this set is visible outside the
     /// monitor that holds the grant.
     pub(crate) agent_message_arbiter: Arc<agent_message_arbiter::AgentMessageArbiter>,
+    /// #1183: agent mail handed to a tool-boundary hook and awaiting the
+    /// hook's `ConfirmBoundaryMail`.
+    pub(crate) boundary_deliveries: Arc<boundary_mail::PendingBoundaryDeliveries>,
 }
 
 /// Schedule a best-effort memory sync after project metadata changes.
@@ -662,6 +675,9 @@ impl SessionManager {
 
         Ok(Self {
             deploy_drain: Arc::new(crate::deploy_drain::DeployDrain::new()),
+            host_load: Arc::new(crate::host_load::HostLoadAdmission::new(Arc::clone(
+                &runtime_config,
+            ))),
             restart_draining: std::sync::atomic::AtomicBool::new(false),
             drain_restart_requested: std::sync::atomic::AtomicBool::new(false),
             active: Arc::new(RwLock::new(HashMap::new())),
@@ -680,6 +696,7 @@ impl SessionManager {
             custody_settlement_worker,
             persistence,
             model_call_settlements,
+            tier_settlements: std::sync::Mutex::default(),
             project_index,
             context_rotation_enabled,
             socket_path,
@@ -725,6 +742,7 @@ impl SessionManager {
             latest_daemon_restart,
             spawn_epoch: Arc::new(AtomicU64::new(1)),
             agent_message_arbiter,
+            boundary_deliveries: Arc::default(),
         })
     }
 
@@ -942,6 +960,12 @@ impl SessionManager {
     #[must_use]
     pub fn deploy_drain(&self) -> Arc<crate::deploy_drain::DeployDrain> {
         Arc::clone(&self.deploy_drain)
+    }
+
+    /// The host-load admission gate (#1417).
+    #[must_use]
+    pub fn host_load(&self) -> Arc<crate::host_load::HostLoadAdmission> {
+        Arc::clone(&self.host_load)
     }
 
     pub fn spawn_coordinator(&self) -> Arc<spawn_coordinator::SpawnCoordinator> {
@@ -1493,12 +1517,24 @@ fn compose_watch_line(
     retry_eligible: Option<bool>,
     question_pending: bool,
     sandbox_worktree_dirty: Option<bool>,
+    stranded_note: Option<&str>,
     arm_message: &str,
 ) -> String {
     let id_str = session.id.to_string();
     let uuid8 = &id_str[..8];
     let title = session.title.as_deref().unwrap_or("");
     let mut annotations: Vec<String> = Vec::new();
+    if session.stop_reason.as_deref() == Some(worker_result_guard::result_sha::RESULT_SHA_UNKNOWN) {
+        annotations.push("result-sha: result_sha_unknown".into());
+    }
+    if let Some(reason) = session
+        .stop_reason
+        .as_deref()
+        .and_then(|reason| reason.strip_prefix("daemon_restart_resume:"))
+        .filter(|reason| rsi_common::friction::is_friction_code(reason))
+    {
+        annotations.push(format!("restart-resume: {reason}"));
+    }
     if let Some(eligible) = retry_eligible {
         annotations.push(format!("retry-eligible: {eligible}"));
     }
@@ -1507,6 +1543,11 @@ fn compose_watch_line(
     }
     if sandbox_worktree_dirty == Some(true) {
         annotations.push("sandbox-worktree-dirty: true".to_string());
+    }
+    // #1555: a bound worker that ended without a report and has nothing of
+    // its own left to resume it.
+    if let Some(note) = stranded_note {
+        annotations.push(note.to_string());
     }
     let ann = if annotations.is_empty() {
         String::new()
@@ -1532,6 +1573,7 @@ impl SessionManager {
     async fn watch_decision_for(
         &self,
         watched: Uuid,
+        ordinary_child_watch: bool,
     ) -> Result<(WatchDecision, Option<rsi_common::types::Session>)> {
         let row = {
             let store = self.store.lock().await;
@@ -1565,6 +1607,20 @@ impl SessionManager {
                 .await
                 .no_result_wake_pending(watched)
                 .unwrap_or(false)
+        {
+            decision = WatchDecision::NotReady;
+        }
+        // #1588: an interim turn waiting on its own continuation or job does
+        // not complete an ordinary child watch. Durable manager notices keep
+        // their independent inbox/acknowledgement policy.
+        if ordinary_child_watch
+            && matches!(decision, WatchDecision::Fire { .. })
+            && let Some(session) = row.as_ref()
+            && self
+                .store
+                .lock()
+                .await
+                .worker_terminal_watch_pending(session)?
         {
             decision = WatchDecision::NotReady;
         }
@@ -1704,7 +1760,7 @@ impl SessionManager {
                 "watched session {watched} no longer exists"
             )));
         };
-        let (decision, row) = self.watch_decision_for(subject).await?;
+        let (decision, row) = self.watch_decision_for(subject, !manager_notice).await?;
         let mut recipient_idle_wake = false;
         let (retry_eligible, question_pending) = match decision {
             WatchDecision::NotReady => {
@@ -1815,16 +1871,19 @@ impl SessionManager {
         let mut lines = if durable_manager_notice {
             vec![job.message.clone()]
         } else {
-            let dirty = self
-                .store
-                .lock()
-                .await
-                .terminal_sandbox_worktree_dirty(primary_row.id)?;
+            let (dirty, stranded) = {
+                let store = self.store.lock().await;
+                (
+                    store.terminal_sandbox_worktree_dirty(primary_row.id)?,
+                    store.worker_watch_note(&primary_row)?,
+                )
+            };
             let mut line = compose_watch_line(
                 &primary_row,
                 retry_eligible,
                 question_pending,
                 dirty,
+                stranded.as_deref(),
                 &job.message,
             );
             if watched != subject {
@@ -1919,7 +1978,9 @@ impl SessionManager {
             let Some(sib_subject) = sib_subject else {
                 continue;
             };
-            let (mut sib_decision, sib_row) = self.watch_decision_for(sib_subject).await?;
+            let (mut sib_decision, sib_row) = self
+                .watch_decision_for(sib_subject, !sibling_managed)
+                .await?;
             if sib_decision == WatchDecision::NotReady
                 && sibling_durable_manager_notice
                 && self
@@ -1944,16 +2005,19 @@ impl SessionManager {
                 if durable_manager_notice {
                     lines.push(sibling.message.clone());
                 } else {
-                    let dirty = self
-                        .store
-                        .lock()
-                        .await
-                        .terminal_sandbox_worktree_dirty(sib_row.id)?;
+                    let (dirty, stranded) = {
+                        let store = self.store.lock().await;
+                        (
+                            store.terminal_sandbox_worktree_dirty(sib_row.id)?,
+                            store.worker_watch_note(&sib_row)?,
+                        )
+                    };
                     let mut line = compose_watch_line(
                         &sib_row,
                         sib_retry,
                         sib_question,
                         dirty,
+                        stranded.as_deref(),
                         &sibling.message,
                     );
                     if sib_watched != sib_subject {

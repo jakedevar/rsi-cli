@@ -549,3 +549,65 @@ async fn sha_on_rolling_fires_when_the_commit_reaches_origin_rolling() {
     world.pass().await;
     assert_eq!(world.launcher.deliveries().len(), 1, "fires at most once");
 }
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn sha_on_rolling_fires_when_rolling_advances_on_the_remote_without_a_local_fetch() {
+    let remote = tempfile::tempdir().expect("remote");
+    git(remote.path(), &["init", "-q", "--bare", "-b", "rolling"]);
+    let repo = tempfile::tempdir().expect("repo");
+    git(repo.path(), &["init", "-q", "-b", "rolling"]);
+    git(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "base"],
+    );
+    git(
+        repo.path(),
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    git(repo.path(), &["push", "-q", "origin", "rolling"]);
+    git(repo.path(), &["fetch", "-q", "origin"]);
+    git(repo.path(), &["commit", "-q", "--allow-empty", "-m", "fix"]);
+    let fix = git(repo.path(), &["rev-parse", "HEAD"]);
+
+    let world = World::new();
+    let (job, state) = build_wake_when_job(WakeWhenRequest {
+        message: "landed?".into(),
+        name: None,
+        predicate: WakePredicate {
+            jobs_terminal: None,
+            sha_on_rolling: Some(fix.clone()),
+        },
+        timeout_seconds: None,
+        working_dir: repo.path().to_path_buf(),
+        provider: None,
+        model: None,
+        project_id: None,
+        origin_session_id: world.owner,
+    })
+    .unwrap();
+    world
+        .store
+        .lock()
+        .await
+        .insert_wake_when(&job, &state, false)
+        .unwrap();
+    world.pass().await;
+    assert!(world.launcher.deliveries().is_empty(), "not on rolling yet");
+
+    // The lander publishes to the remote; nothing fetches into `repo`.
+    git(repo.path(), &["push", "-q", "origin", "rolling"]);
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/rolling", "HEAD~1"],
+    );
+    make_due(&world, job.id).await;
+    world.pass().await;
+    let deliveries = world.launcher.deliveries();
+    assert_eq!(deliveries.len(), 1, "the probe refreshed origin/rolling");
+    assert!(
+        deliveries[0]
+            .1
+            .contains(&format!("sha_on_rolling {fix}: satisfied"))
+    );
+}

@@ -22,6 +22,8 @@
 # CARGO_INCREMENTAL=0 and a tmpfs TMPDIR, other runs cap test threads at 4.
 # Shard, sweep and gate runs (see below) also get CARGO_INCREMENTAL=0.
 # Set RSI_CARGO_SLOT_LOCAL=1 to skip the daemon and use the local gates.
+# The child runs with RSI_CARGO_SLOT_HELD=1 so scripts/check-touched-shards and
+# scripts/scoped-test do not take a second slot inside a held one (#1560).
 is_lander=0
 # An argument right after --bin/-p/--package/--example names a build target, not
 # the lander executable (`cargo build --bin rsi-rolling-land` is a build).
@@ -59,11 +61,25 @@ class=build; [ $is_lander -eq 1 ] && class=lander
 lease=""
 child=""
 
+# Phase lines (#1591): a job log shows where a run is and how long it waited.
+# Format `rsi-phase <epoch> <name>[: detail]`, one line, flushed at once; the
+# daemon reads the last one into a job_timed_out result.
+phase() { printf 'rsi-phase %s %s\n' "$(date +%s)" "$*" >&2; }
+wait_t0=$SECONDS
+wait_beat=$SECONDS
+# beat: a still-waiting heartbeat at most every 60 s.
+beat() { if [ $((SECONDS - wait_beat)) -ge 60 ]; then wait_beat=$SECONDS; phase "slot-wait: still waiting $((SECONDS - wait_t0))s: $*"; fi; }
+# note_holder: record who holds a local slot lock (best effort, read by waiters).
+holder_file=""
+note_holder() { holder_file="$1.holder"; printf 'pid %s: %s\n' "$$" "$(printf '%s' "$label_text" | cut -c1-80)" >"$1.holder" 2>/dev/null; }
+label_text="$*"
+
 # run_child: start the command as a child (lock fds closed), forward signals,
 # release the daemon lease, clean up, and exit with the command's status.
 run_child() {
+  phase "slot-granted: waited $((SECONDS - wait_t0))s ($class); running"
   exec 3<&0
-  nice -n 19 ionice -c3 env CARGO_BUILD_JOBS=4 CARGO_PROFILE_DEV_DEBUG=line-tables-only "$@" <&3 3<&- 9>&- &
+  nice -n 19 ionice -c3 env RSI_CARGO_SLOT_HELD=1 CARGO_BUILD_JOBS=4 CARGO_PROFILE_DEV_DEBUG=line-tables-only "$@" <&3 3<&- 9>&- &
   child=$!
   exec 3<&-
   trap 'kill -TERM "$child" 2>/dev/null' TERM HUP
@@ -74,6 +90,7 @@ run_child() {
     kill -0 "$child" 2>/dev/null || break
   done
   release_lease
+  [ -n "$holder_file" ] && rm -f -- "$holder_file"
   [ -n "$LTMP" ] && rm -rf -- "$LTMP"
   exit "$rc"
 }
@@ -136,6 +153,7 @@ governed_wait() {
   [ -n "$PYTHON" ] || return 1
   local label out status id pos msg ticket="" lastmsg=""
   label="$*"
+  phase "slot-wait: asking the governor for a $class slot"
   while :; do
     out=$(rpc acquire "$class" "$$" "$label" "$ticket") || return 1
     read -r status id pos msg <<<"$out"
@@ -145,8 +163,10 @@ governed_wait() {
         ticket="$id"; lease="$id"  # release_lease also cancels a queued ticket
         if [ "$msg" != "$lastmsg" ]; then
           echo "cargo-slot: queued ($class position $pos): $msg" >&2
+          phase "slot-wait: queued ($class position $pos): $msg"
           lastmsg="$msg"
         fi
+        beat "$msg"
         sleep 2 ;;
       badticket) ticket=""; lease="" ;;
       *) return 1 ;;
@@ -161,6 +181,8 @@ trap 'release_lease; [ -n "$LTMP" ] && rm -rf -- "$LTMP"; exit 143' TERM HUP
 if governed_wait "$@"; then
   run_child "$@"
 fi
+phase "slot-wait: governor unreachable; using the local slot gates"
+wait_t0=$SECONDS
 
 # --- local fallback (rsid unreachable): the previous flock/gate behaviour ---
 MIN_FREE_GB=${RSI_CARGO_MIN_FREE_GB:-30}
@@ -177,11 +199,13 @@ while :; do
   free_gb=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
   if [ "${free_gb:-0}" -lt "$MIN_FREE_GB" ]; then
     [ $warned -eq 0 ] && echo "cargo-slot: only ${free_gb} GB free on / (< ${MIN_FREE_GB}); waiting for space" >&2 && warned=1
+    beat "disk free ${free_gb} GB < ${MIN_FREE_GB}"
     sleep 30; continue
   fi
   load1=$(cut -d' ' -f1 /proc/loadavg); maxload=${RSI_CARGO_MAX_LOAD:-$(( $(nproc) * 5 / 4 ))}
   if [ "${load1%%.*}" -ge "$maxload" ]; then
     [ $warned -eq 0 ] && echo "cargo-slot: load ${load1} >= ${maxload}; waiting" >&2 && warned=1
+    beat "load ${load1} >= ${maxload}"
     sleep 15; continue
   fi
   # Memory gate: MemAvailable, and anonymous + shmem memory of the workers slice
@@ -191,14 +215,18 @@ while :; do
   slice_gb=0; [ -r "$slice_stat" ] && slice_gb=$(awk '$1=="anon"||$1=="shmem"{s+=$2} END{printf "%d", s/1073741824}' "$slice_stat")
   if [ "$avail_gb" -lt "${RSI_CARGO_MIN_AVAIL_GB:-16}" ] || [ "$slice_gb" -ge "${RSI_CARGO_MAX_SLICE_GB:-30}" ]; then
     [ $warned -eq 0 ] && echo "cargo-slot: memory low (available ${avail_gb} GB, workers slice ${slice_gb} GB); waiting" >&2 && warned=1
+    beat "memory low (available ${avail_gb} GB, workers slice ${slice_gb} GB)"
     sleep 15; continue
   fi
   for i in $(seq 0 $((N-1))); do
     exec 9>>"$(lock_for $i)"
     if flock -n 9; then
+      note_holder "$(lock_for $i)"
       run_child "$@"
     fi
     exec 9>&-
   done
+  holders=$(for i in $(seq 0 $((N-1))); do cat "$(lock_for $i).holder" 2>/dev/null; done | tr '\n' ';')
+  beat "all $N $class slots busy; holders: ${holders:-unknown}"
   sleep 5
 done

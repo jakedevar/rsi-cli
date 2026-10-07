@@ -44,6 +44,18 @@ pub const GLOBAL_MANAGER_IDEMPOTENCY_CONFLICT: &str = "global_manager_idempotenc
 pub const GLOBAL_MANAGER_INVALID_REQUEST: &str = "global_manager_invalid_request";
 /// Too many undelivered messages wait for one recipient.
 pub const GLOBAL_MANAGER_MAILBOX_FULL: &str = "global_manager_mailbox_full";
+/// #1235: a project-bound verb named a `project_id` that no manager arm of the
+/// caller covers (not its own project's manager, not an area node there, and
+/// not inside the active global grant).
+pub const MANAGER_PROJECT_NOT_IN_SCOPE: &str = "manager_project_not_in_scope";
+/// #1235 rule (c): mutations flow down. A project manager or area node may not
+/// mutate the global seat or a session the global principal launched.
+pub const MANAGER_TARGET_OWNED_BY_ANCESTOR: &str = "manager_target_owned_by_ancestor";
+/// #1235 rule (b): one live Issue-bound worker per Issue across the chain.
+pub const MANAGER_ISSUE_WORKER_ALREADY_LIVE: &str = "manager_issue_worker_already_live";
+/// #1235 rule (d): the covering global grant's creation budget for the
+/// project, counted over every manager principal there, is spent.
+pub const MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED: &str = "manager_ancestor_allowance_exceeded";
 
 fn valid_key(key: &str) -> bool {
     !key.trim().is_empty() && key.len() <= 128
@@ -171,6 +183,9 @@ pub struct GlobalPmSeatV1 {
 /// The PM's saved V2 policy.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GlobalPmPolicyV1 {
+    /// Live project and ancestor ceilings; absent on revoked policies or older daemons.
+    #[serde(default)]
+    pub effective_caps: Option<crate::portfolio_nodes::ManagerResourceCapsV1>,
     pub policy_version: i64,
     pub mode: ManagerOperatingModeV2,
     pub revoked: bool,
@@ -209,6 +224,48 @@ pub struct GlobalProjectOverviewV1 {
 pub struct AgentGlobalOverviewResultV1 {
     pub grant_version: i64,
     pub projects: Vec<GlobalProjectOverviewV1>,
+}
+
+/// Operator-only (#1213): one bounded snapshot for the TUI global manager
+/// workspace. Not an agent verb: the seat reads `AgentGlobalOverview`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GetGlobalManagerWorkspaceRequestV1 {}
+
+/// The global seat's session as the operator sees it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GlobalSeatSessionV1 {
+    pub session_id: Uuid,
+    /// The project that owns the seat session (the jump target's tab).
+    pub project_id: Option<Uuid>,
+    pub status: SessionStatus,
+    pub provider: SessionProvider,
+    pub model: Option<String>,
+    pub context_fill_pct: Option<f64>,
+    pub cost_usd: Option<f64>,
+    pub updated_at: DateTime<Utc>,
+    pub pending_question: bool,
+}
+
+/// One project of the workspace grant.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GlobalWorkspaceProjectV1 {
+    pub overview: GlobalProjectOverviewV1,
+    /// The project's manager scope (PM seat) was revoked.
+    pub scope_revoked: bool,
+}
+
+/// `GetGlobalManagerWorkspace` result.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GlobalManagerWorkspaceV1 {
+    /// The active grant, else the most recent (revoked) grant, else `None`
+    /// when no global manager was ever appointed.
+    pub grant: Option<GlobalManagerGrantV1>,
+    /// The grant's seat session; `None` when the session no longer exists.
+    pub seat: Option<GlobalSeatSessionV1>,
+    pub projects: Vec<GlobalWorkspaceProjectV1>,
+    /// Granted project ids whose project no longer exists.
+    pub missing_project_ids: Vec<Uuid>,
 }
 
 /// `AgentGlobalSend {project_id, message, idempotency_key}`.

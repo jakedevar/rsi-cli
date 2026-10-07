@@ -18,6 +18,14 @@
 //! already an ancestor of `origin/rolling` settles as published; any other is
 //! returned to `queued` and re-driven. The lander is idempotent (an integrated
 //! source is refused), so re-driving cannot publish twice.
+//!
+//! A source that reached `origin/rolling` outside the queue (an operator merge
+//! or a direct landing) is never gated: each member's ancestry is re-checked
+//! right before its batch is gated, before every bisect step and after a
+//! lander run that reports a source "already integrated", and a landed member
+//! settles `published` with the tip that contains it (#1208). One batch's
+//! gating is bounded by the operator's `rolling_queue_gate_timeout_mins`; past
+//! it the unsettled members are refused with `queue_gate_timeout`.
 
 use crate::config::RuntimeConfig;
 use crate::error::{DaemonError, Result};
@@ -25,8 +33,9 @@ use crate::store::Store;
 use chrono::Utc;
 use rsi_common::rolling_queue::{
     QUEUE_BATCH_ANCESTRY_UNVERIFIED, QUEUE_BATCH_MERGE_CONFLICT, QUEUE_BATCH_POLICY_REFUSED,
-    QUEUE_BISECT_NO_PROGRESS, QUEUE_FILTER_MATCHES_NO_TESTS, QUEUE_MIGRATION_OUT_OF_ORDER,
-    QUEUE_REGATE_EXHAUSTED, ROLLING_QUEUE_MAX_BATCH_SIZE, RollingQueueEntryState,
+    QUEUE_BISECT_NO_PROGRESS, QUEUE_FILTER_MATCHES_NO_TESTS, QUEUE_GATE_TIMEOUT,
+    QUEUE_MIGRATION_OUT_OF_ORDER, QUEUE_REGATE_EXHAUSTED, QUEUE_SOURCE_ALREADY_INTEGRATED,
+    ROLLING_QUEUE_DEFAULT_GATE_TIMEOUT_MINS, ROLLING_QUEUE_MAX_BATCH_SIZE, RollingQueueEntryState,
     RollingQueueEntryV1, RollingQueueOutcome,
 };
 use std::path::{Path, PathBuf};
@@ -39,8 +48,9 @@ use uuid::Uuid;
 
 /// Poll interval of the runner loop.
 const TICK: Duration = Duration::from_secs(5);
-/// Hard ceiling on one lander run (the gate has its own per-command guards).
-const RUN_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+/// The lander's refusal of an `--accepted` source `origin/rolling` already
+/// contains ("accepted source <sha> is already integrated; ...").
+const ALREADY_INTEGRATED_MARKER: &str = "is already integrated";
 /// The out-of-band budget: a moved tip costs at most one regate of the head.
 const MAX_REGATES_ENV: &str = "RSI_LANDER_MAX_REGATED_STALE_RETRIES";
 const MAX_REGATES: usize = 1;
@@ -185,11 +195,8 @@ fn git_grep_hits(repo: &Path, args: &[&str]) -> Option<(bool, String)> {
 /// occur in the source of the package (for `rsid=shard:S:test(N)`, of the
 /// files carrying shard S's gate). Forms the check cannot reason about
 /// (`bin:`/`test:` targets, filtersets other than `test(...)`) are accepted.
-pub(crate) fn filter_selecting_no_tests(
-    repo: &Path,
-    commit: &str,
-    filters: &[String],
-) -> Option<String> {
+#[must_use]
+pub fn filter_selecting_no_tests(repo: &Path, commit: &str, filters: &[String]) -> Option<String> {
     filters
         .iter()
         .find(|filter| filter_provably_empty(repo, commit, filter))
@@ -231,6 +238,10 @@ fn filter_provably_empty(repo: &Path, commit: &str, filter: &str) -> bool {
     }
     let mut scope: Vec<String> = vec![dir.clone()];
     let mut package_dirs: Vec<String> = vec![dir];
+    // #1244: the lander runs a focused `rsid`/`rsid-store` filter (shard form
+    // or plain name) on one lib build of both packages, so the name may live
+    // in either package and in any shard; only an unknown shard still refuses.
+    let lib_family = rsid_lib_family_dirs(repo, commit, package);
     if let Some(shard) = shard {
         // A shard spans every package that declares its feature (rsid and
         // rsid-store since the #1021 S4 crate split), so the gate lookup covers
@@ -256,6 +267,10 @@ fn filter_provably_empty(repo: &Path, commit: &str, filter: &str) -> bool {
             .filter_map(|line| line.split_once(':').map(|(_, path)| path.to_string()))
             .collect();
         package_dirs = search_dirs;
+    }
+    if !lib_family.is_empty() {
+        scope.clone_from(&lib_family);
+        package_dirs = lib_family;
     }
     pattern
         .split("::")
@@ -293,6 +308,23 @@ fn segment_provably_absent(
     let mut args = vec!["-q", "-E", "-e", declaration.as_str(), commit, "--"];
     args.extend(package_dirs.iter().map(String::as_str));
     matches!(git_grep_hits(repo, &args), Some((false, _)))
+}
+
+/// `crates/rsid` and `crates/rsid-store` as present at `commit` when
+/// `package` is one of them (empty otherwise): the packages whose library
+/// tests one focused lander run selects from (#1244).
+fn rsid_lib_family_dirs(repo: &Path, commit: &str, package: &str) -> Vec<String> {
+    if package != "rsid" && package != "rsid-store" {
+        return Vec::new();
+    }
+    ["crates/rsid", "crates/rsid-store"]
+        .into_iter()
+        .filter(|dir| {
+            git(repo, &["ls-tree", "--name-only", commit, dir])
+                .is_some_and(|out| !out.trim().is_empty())
+        })
+        .map(str::to_owned)
+        .collect()
 }
 
 /// `crates/<package>` for every workspace package whose manifest at `commit`
@@ -397,11 +429,21 @@ pub(crate) fn derive_source_facts(repo: &Path, source: &str) -> SourceFacts {
 /// After a fetch, the published tip when `source` is an ancestor of
 /// `origin/rolling`. `None` when it is not (or git cannot say).
 pub(crate) fn landed_tip(repo: &Path, source: &str) -> Option<String> {
-    let _ = fetch_rolling(repo);
-    let tip = git(repo, &["rev-parse", "--verify", "origin/rolling^{commit}"])?
-        .trim()
-        .to_string();
-    git(repo, &["merge-base", "--is-ancestor", source, &tip]).map(|_| tip)
+    landed_tips(repo, &[source.to_string()]).pop().flatten()
+}
+
+/// After ONE fetch, the published tip for each source that is an ancestor of
+/// `origin/rolling`, in input order (`None`: not landed, or git cannot say).
+pub(crate) fn landed_tips(repo: &Path, sources: &[String]) -> Vec<Option<String>> {
+    let Some(tip) = fetch_tip(repo) else {
+        return vec![None; sources.len()];
+    };
+    sources
+        .iter()
+        .map(|source| {
+            git(repo, &["merge-base", "--is-ancestor", source, &tip]).map(|_| tip.clone())
+        })
+        .collect()
 }
 
 /// The migration number the lander actually gave `source`, read from the
@@ -525,6 +567,10 @@ pub struct LanderLauncher {
     /// How the host's Landlock ABI is read before the queue worktree is reset;
     /// replaced only by tests.
     fence_abi: write_fence::AbiProbe,
+    /// Wall-time budget of one batch's gating, every lander run included
+    /// (#1208). The runner loop refreshes it from the operator setting
+    /// `rolling_queue_gate_timeout_mins` before each batch.
+    gate_timeout: Duration,
 }
 
 impl LanderLauncher {
@@ -534,7 +580,23 @@ impl LanderLauncher {
             binary,
             workspace: None,
             fence_abi: WriteFence::kernel_abi,
+            gate_timeout: Duration::from_secs(
+                u64::from(ROLLING_QUEUE_DEFAULT_GATE_TIMEOUT_MINS) * 60,
+            ),
         }
+    }
+
+    /// Bound each batch's gating to `timeout` of wall time (#1208).
+    #[must_use]
+    pub fn with_gate_timeout(mut self, timeout: Duration) -> Self {
+        self.gate_timeout = timeout;
+        self
+    }
+
+    /// The wall-time budget one batch's gating is given.
+    #[must_use]
+    pub fn gate_timeout(&self) -> Duration {
+        self.gate_timeout
     }
 
     /// Run landings in daemon-owned worktrees and a dedicated cargo target
@@ -1410,6 +1472,24 @@ pub(crate) fn classify_run(
     if stderr.contains("stale retries exhausted") {
         return refuse(QUEUE_REGATE_EXHAUSTED, RollingQueueEntryState::Refused);
     }
+    if stderr.contains(ALREADY_INTEGRATED_MARKER) {
+        // Already on rolling: the landing happened, just not through this run
+        // (#1208). Never a red gate.
+        return match landed() {
+            Some(tip) => RunResult {
+                state: RollingQueueEntryState::Published,
+                outcome: RollingQueueOutcome {
+                    landed_sha: Some(tip),
+                    detail: Some("already on origin/rolling: landed outside the queue".into()),
+                    ..RollingQueueOutcome::default()
+                },
+            },
+            None => refuse(
+                QUEUE_SOURCE_ALREADY_INTEGRATED,
+                RollingQueueEntryState::Refused,
+            ),
+        };
+    }
     if stderr.contains("Conflict {") {
         return refuse(QUEUE_BATCH_MERGE_CONFLICT, RollingQueueEntryState::Refused);
     }
@@ -1429,10 +1509,49 @@ pub(crate) fn classify_run(
     refuse("gate_failed", RollingQueueEntryState::Refused)
 }
 
-/// Union of the members' filters; one member with none makes the batch run
-/// the lander's full affected gate.
-pub(crate) fn union_filters(entries: &[RollingQueueEntryV1]) -> Vec<String> {
-    if entries.iter().any(|entry| entry.test_filters.is_empty()) {
+/// Whether a changed path can alter what the Rust gate builds or tests: any
+/// Rust source (migrations and `build.rs` included), a Cargo manifest or lock,
+/// the toolchain pin, or cargo configuration.
+fn path_affects_rust_gate(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    path.ends_with(".rs")
+        || name == "Cargo.toml"
+        || name == "Cargo.lock"
+        || name == "rust-toolchain.toml"
+        || name == "rust-toolchain"
+        || path.starts_with(".cargo/")
+}
+
+/// Whether `source` is provably free of Rust, Cargo and migration changes
+/// relative to rolling. Any git failure answers `false`: the member is then
+/// treated as code, so an unknown diff never narrows the gate.
+pub(crate) fn source_is_rust_free(repo: &Path, source: &str) -> bool {
+    let base = ["origin/rolling", "rolling"].iter().find_map(|reference| {
+        git(repo, &["merge-base", source, reference]).map(|out| out.trim().to_string())
+    });
+    let Some(base) = base.filter(|base| !base.is_empty()) else {
+        return false;
+    };
+    git(
+        repo,
+        &["diff", "--name-only", "--no-renames", &base, source],
+    )
+    .is_some_and(|changed| !changed.lines().any(path_affects_rust_gate))
+}
+
+/// Union of the members' filters. A member with Rust changes and no filters
+/// makes the batch run the lander's full affected gate; a member whose diff
+/// touches no Rust, Cargo or migration file (`rust_free`) cannot change what
+/// the gate tests, so it contributes only the filters it carries and never
+/// widens the batch (#1527).
+pub(crate) fn union_filters(
+    entries: &[RollingQueueEntryV1],
+    rust_free: impl Fn(&RollingQueueEntryV1) -> bool,
+) -> Vec<String> {
+    if entries
+        .iter()
+        .any(|entry| entry.test_filters.is_empty() && !rust_free(entry))
+    {
         return Vec::new();
     }
     let mut union: Vec<String> = Vec::new();
@@ -1542,13 +1661,28 @@ fn run_cause(result: &RunResult, stderr: &str) -> Option<String> {
     Some(cause)
 }
 
+/// Why a lander run produced no report.
+#[derive(Debug)]
+enum LanderError {
+    /// The lander could not be started or waited for.
+    Unavailable(String),
+    /// The batch's gate wall-time budget ran out (#1208); the run (if any) was
+    /// stopped.
+    TimedOut,
+}
+
 async fn run_lander(
     launcher: &LanderLauncher,
     repo: &Path,
     entries: &[RollingQueueEntryV1],
     regates_left: usize,
     expected_tip: Option<&str>,
-) -> std::result::Result<std::process::Output, String> {
+    deadline: tokio::time::Instant,
+) -> std::result::Result<std::process::Output, LanderError> {
+    let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if budget.is_zero() {
+        return Err(LanderError::TimedOut);
+    }
     let mut command = Command::new(&launcher.binary);
     command
         .current_dir(repo)
@@ -1558,7 +1692,9 @@ async fn run_lander(
     for entry in entries {
         command.args(["--accepted", &entry.source_commit]);
     }
-    for filter in union_filters(entries) {
+    for filter in union_filters(entries, |entry| {
+        source_is_rust_free(repo, &entry.source_commit)
+    }) {
         command.args(["--test-filter", &filter]);
     }
     if let Some(tip) = expected_tip {
@@ -1576,19 +1712,41 @@ async fn run_lander(
         .kill_on_drop(true);
     if let Some(target) = launcher.target_dir() {
         // The queue owns its build directory: no per-session environment.
-        std::fs::create_dir_all(&target)
-            .map_err(|error| format!("cannot create the queue target: {error}"))?;
+        std::fs::create_dir_all(&target).map_err(|error| {
+            LanderError::Unavailable(format!("cannot create the queue target: {error}"))
+        })?;
         command.env("CARGO_TARGET_DIR", target);
     }
+    // Its own process group, so a timed-out run is stopped with everything it
+    // started that stayed in the group. The group is signalled only while the
+    // lander is unreaped, so a saved id can never hit a reused group (#1251).
+    command.process_group(0);
     let child = command
         .spawn()
-        .map_err(|error| format!("cannot start the lander: {error}"))?;
-    match tokio::time::timeout(RUN_TIMEOUT, child.wait_with_output()).await {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(error)) => Err(format!("lander wait failed: {error}")),
-        Err(_) => Err("lander run timed out".to_string()),
-    }
+        .map_err(|error| LanderError::Unavailable(format!("cannot start the lander: {error}")))?;
+    crate::process_control::capture_owned_group(
+        child,
+        deadline,
+        LANDER_SETTLE_LIMITS,
+        "rolling queue gate wall-time budget ran out; stopping the lander group",
+    )
+    .await
+    .map_err(|error| match error {
+        crate::process_control::OwnedGroupError::TimedOut => LanderError::TimedOut,
+        crate::process_control::OwnedGroupError::Io(error) => {
+            LanderError::Unavailable(format!("lander wait failed: {error}"))
+        }
+    })
 }
+
+/// How long a finished lander's output may stay open (a descendant that left
+/// its group still holding the pipes), and how long a stopped lander gets to
+/// exit, before the queue moves on (#1251).
+const LANDER_SETTLE_LIMITS: crate::process_control::OwnedGroupLimits =
+    crate::process_control::OwnedGroupLimits {
+        post_exit_drain: Duration::from_secs(10),
+        cleanup: Duration::from_secs(5),
+    };
 
 async fn with_store<T: Send + 'static>(
     store: &Arc<tokio::sync::Mutex<Store>>,
@@ -1621,6 +1779,8 @@ struct GroupRun {
     /// Short cause of a non-green run: refusal code, conflict paths or the
     /// first failing tests.
     cause: Option<String>,
+    /// The lander refused a source as already integrated into the tip (#1208).
+    already_integrated: bool,
 }
 
 impl GroupRun {
@@ -1656,17 +1816,30 @@ async fn run_group(
     entries: &[RollingQueueEntryV1],
     regates_left: usize,
     expected_tip: Option<&str>,
+    deadline: tokio::time::Instant,
 ) -> GroupRun {
-    match run_lander(launcher, repo, entries, regates_left, expected_tip).await {
+    match run_lander(
+        launcher,
+        repo,
+        entries,
+        regates_left,
+        expected_tip,
+        deadline,
+    )
+    .await
+    {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            // Only an uncertain publication needs the ancestry probe.
+            let already_integrated =
+                output.status.code() != Some(0) && stderr.contains(ALREADY_INTEGRATED_MARKER);
+            // Only an uncertain publication, or a lone source the lander calls
+            // already integrated, needs the ancestry probe.
             let uncertain = output.status.code() != Some(0)
-                && matches!(
+                && (matches!(
                     line_value(&stdout, "publication_status"),
                     Some("published" | "unknown")
-                );
+                ) || (already_integrated && entries.len() == 1));
             let landed = if uncertain {
                 let source = entries[0].source_commit.clone();
                 let probe_repo = repo.to_path_buf();
@@ -1712,9 +1885,20 @@ async fn run_group(
                 conflict_source,
                 log_path,
                 cause,
+                already_integrated,
             }
         }
-        Err(message) => GroupRun {
+        Err(LanderError::TimedOut) => GroupRun {
+            result: gate_timeout_result(launcher),
+            stdout: String::new(),
+            regates_used: 0,
+            own_tip: None,
+            conflict_source: None,
+            log_path: None,
+            cause: Some(QUEUE_GATE_TIMEOUT.into()),
+            already_integrated: false,
+        },
+        Err(LanderError::Unavailable(message)) => GroupRun {
             result: RunResult {
                 state: RollingQueueEntryState::Failed,
                 outcome: RollingQueueOutcome {
@@ -1729,8 +1913,136 @@ async fn run_group(
             conflict_source: None,
             log_path: None,
             cause: Some("lander_unavailable".into()),
+            already_integrated: false,
         },
     }
+}
+
+/// The typed refusal of a batch that ran past its gate wall-time budget.
+fn gate_timeout_result(launcher: &LanderLauncher) -> RunResult {
+    RunResult {
+        state: RollingQueueEntryState::Refused,
+        outcome: RollingQueueOutcome {
+            refusal: Some(QUEUE_GATE_TIMEOUT.to_string()),
+            detail: Some(format!(
+                "the batch gate ran past its {}-minute wall-time budget \
+                 (operator setting rolling_queue_gate_timeout_mins); the lander was \
+                 stopped and nothing was published for this source: re-enqueue it",
+                launcher.gate_timeout.as_secs() / 60
+            )),
+            ..RollingQueueOutcome::default()
+        },
+    }
+}
+
+fn is_gate_timeout(result: &RunResult) -> bool {
+    result.outcome.refusal.as_deref() == Some(QUEUE_GATE_TIMEOUT)
+}
+
+/// Settle every member that already reached `origin/rolling` outside the
+/// queue as `published` with the tip that contains it, so a landed commit is
+/// never gated, re-gated or refused (#1208). Returns the members still to
+/// gate, in queue order, and the tip they were checked against when any member
+/// had landed.
+async fn settle_already_landed(
+    store: &Arc<tokio::sync::Mutex<Store>>,
+    repo: &Path,
+    batch_id: Uuid,
+    members: Vec<RollingQueueEntryV1>,
+    settled: &mut Vec<(Uuid, RunResult)>,
+) -> Result<(Vec<RollingQueueEntryV1>, Option<String>)> {
+    if members.is_empty() {
+        return Ok((members, None));
+    }
+    let probe_repo = repo.to_path_buf();
+    let sources: Vec<String> = members.iter().map(|m| m.source_commit.clone()).collect();
+    let tips = tokio::task::spawn_blocking(move || landed_tips(&probe_repo, &sources))
+        .await
+        .map_err(|error| DaemonError::Process(format!("landed probe: {error}")))?;
+    let mut kept = Vec::new();
+    let mut landed = Vec::new();
+    for (entry, tip) in members.into_iter().zip(tips) {
+        match tip {
+            Some(tip) => landed.push((entry, tip)),
+            None => kept.push(entry),
+        }
+    }
+    let observed = landed.first().map(|(_, tip)| tip.clone());
+    let mut group = Vec::with_capacity(landed.len());
+    for (entry, tip) in landed {
+        let id = entry.id;
+        bisect_event(
+            store,
+            batch_id,
+            "already_landed",
+            Some(id),
+            serde_json::json!({ "source": entry.source_commit, "tip": tip }),
+        )
+        .await?;
+        if entry.migration_version.is_some() {
+            // The number it actually landed with, when a provisional commit
+            // renumbered it; otherwise it kept its own.
+            let (probe_repo, source) = (repo.to_path_buf(), entry.source_commit.clone());
+            let published = tokio::task::spawn_blocking(move || {
+                published_migration_number(&probe_repo, &source)
+            })
+            .await
+            .map_err(|error| DaemonError::Process(format!("landed migration probe: {error}")))?;
+            if let Some(version) = published {
+                with_store(store, move |s| {
+                    s.record_rolling_queue_assigned_migration(id, version)
+                })
+                .await?;
+            }
+        }
+        group.push((
+            id,
+            RunResult {
+                state: RollingQueueEntryState::Published,
+                outcome: RollingQueueOutcome {
+                    landed_sha: Some(tip),
+                    detail: Some(format!(
+                        "{} was already on origin/rolling (landed outside the queue); \
+                         settled without a gate",
+                        entry.source_commit
+                    )),
+                    ..RollingQueueOutcome::default()
+                },
+            },
+        ));
+    }
+    settle_group(store, &group).await?;
+    settled.extend(group);
+    Ok((kept, observed))
+}
+
+/// Settle `members` after the batch's gate wall-time budget ran out: a member
+/// that landed meanwhile is published, every other one is refused with
+/// `queue_gate_timeout` (#1208).
+async fn settle_timed_out(
+    store: &Arc<tokio::sync::Mutex<Store>>,
+    repo: &Path,
+    batch_id: Uuid,
+    members: Vec<RollingQueueEntryV1>,
+    result: &RunResult,
+    settled: &mut Vec<(Uuid, RunResult)>,
+) -> Result<()> {
+    let (rest, _) = settle_already_landed(store, repo, batch_id, members, settled).await?;
+    bisect_event(
+        store,
+        batch_id,
+        "gate_timeout",
+        None,
+        serde_json::json!({ "refused": rest.len(), "detail": result.outcome.detail }),
+    )
+    .await?;
+    let group: Vec<(Uuid, RunResult)> = rest
+        .iter()
+        .map(|entry| (entry.id, result.clone()))
+        .collect();
+    settle_group(store, &group).await?;
+    settled.extend(group);
+    Ok(())
 }
 
 /// Remove and return the member a conflicting multi-member run names, so only
@@ -1942,6 +2254,7 @@ pub(crate) async fn run_next_batch(
         return Ok(Vec::new());
     };
     let batch_id = claimed.batch_id;
+    let deadline = tokio::time::Instant::now() + launcher.gate_timeout;
     let mut settled = Vec::new();
     let mut members = claimed.entries;
     let repo = match queue_repo(launcher, &claimed.repo_path).await {
@@ -1964,27 +2277,69 @@ pub(crate) async fn run_next_batch(
             return Ok(settled);
         }
     };
+    // A member already on rolling (landed outside the queue) is published
+    // as is, never gated (#1208).
+    (members, _) = settle_already_landed(store, &repo, batch_id, members, &mut settled).await?;
     if members.len() > 1 {
         members = order_migrations(store, &repo, members, &mut settled).await?;
     }
     if members.is_empty() {
         return Ok(settled);
     }
-    let mut run = run_group(launcher, batch_id, &repo, &members, MAX_REGATES, None).await;
-    // An integration conflict belongs to one member: refuse that entry with its
-    // conflict path and gate the rest as if it had never been in the batch.
-    while let Some(culprit) = take_conflict_culprit(&mut members, &run) {
-        bisect_event(
-            store,
+    let mut run = run_group(
+        launcher,
+        batch_id,
+        &repo,
+        &members,
+        MAX_REGATES,
+        None,
+        deadline,
+    )
+    .await;
+    loop {
+        if let Some(culprit) = take_conflict_culprit(&mut members, &run) {
+            // An integration conflict belongs to one member: refuse that entry
+            // with its conflict path and gate the rest as if it had never been
+            // in the batch.
+            bisect_event(
+                store,
+                batch_id,
+                "conflict_isolated",
+                Some(culprit.id),
+                run.evidence(),
+            )
+            .await?;
+            settle(store, culprit.id, &run.result).await?;
+            settled.push((culprit.id, run.result.clone()));
+        } else if run.already_integrated {
+            // The lander found a member already on rolling: publish every
+            // landed member and gate only the rest.
+            let before = members.len();
+            (members, _) =
+                settle_already_landed(store, &repo, batch_id, members, &mut settled).await?;
+            if members.is_empty() {
+                return Ok(settled);
+            }
+            if members.len() == before {
+                break;
+            }
+        } else {
+            break;
+        }
+        run = run_group(
+            launcher,
             batch_id,
-            "conflict_isolated",
-            Some(culprit.id),
-            run.evidence(),
+            &repo,
+            &members,
+            MAX_REGATES,
+            None,
+            deadline,
         )
-        .await?;
-        settle(store, culprit.id, &run.result).await?;
-        settled.push((culprit.id, run.result.clone()));
-        run = run_group(launcher, batch_id, &repo, &members, MAX_REGATES, None).await;
+        .await;
+    }
+    if is_gate_timeout(&run.result) {
+        settle_timed_out(store, &repo, batch_id, members, &run.result, &mut settled).await?;
+        return Ok(settled);
     }
     let in_batch = members.len() > 1;
     let regates_left = MAX_REGATES.saturating_sub(run.regates_used);
@@ -2027,6 +2382,7 @@ pub(crate) async fn run_next_batch(
             result,
             first_base,
             regates_left,
+            deadline,
             &mut settled,
         )
         .await?;
@@ -2261,6 +2617,7 @@ async fn bisect_batch(
     first_red: RunResult,
     first_base: Option<String>,
     mut regates_left: usize,
+    deadline: tokio::time::Instant,
     settled: &mut Vec<(Uuid, RunResult)>,
 ) -> Result<()> {
     let mut pending = members;
@@ -2300,6 +2657,24 @@ async fn bisect_batch(
             break;
         }
         budget -= 1;
+        // A member that reached rolling outside the queue since the last step
+        // is published as is (#1208). The advance that landed it is accounted
+        // for, not charged as an out-of-band re-gate, and any red evidence that
+        // was observed with it in the window is dropped.
+        let before = pending.len();
+        let observed;
+        (pending, observed) =
+            settle_already_landed(store, repo, batch_id, pending, settled).await?;
+        if pending.len() != before {
+            window = None;
+            red_base = None;
+            if observed.is_some() {
+                expected_tip = observed;
+            }
+            if pending.is_empty() {
+                break;
+            }
+        }
         let current = probe_tip(repo).await;
         if let Some(current) = current.as_ref() {
             if expected_tip.as_ref().is_some_and(|tip| tip != current) {
@@ -2385,8 +2760,27 @@ async fn bisect_batch(
             &group,
             regates_left,
             expected_tip.as_deref(),
+            deadline,
         )
         .await;
+        if is_gate_timeout(&run.result) {
+            settle_timed_out(store, repo, batch_id, pending, &run.result, settled).await?;
+            break;
+        }
+        if run.already_integrated {
+            // Publish the landed member(s) and gate the rest again: this run's
+            // outcome says nothing about them.
+            let before = pending.len();
+            let observed;
+            (pending, observed) =
+                settle_already_landed(store, repo, batch_id, pending, settled).await?;
+            if pending.len() != before {
+                window = None;
+                red_base = None;
+                expected_tip = observed.or(expected_tip);
+                continue;
+            }
+        }
         regates_left = regates_left.saturating_sub(run.regates_used);
         let result = as_batch_result(run.result.clone());
         let base = run_base(&run.stdout, expected_tip.as_ref());
@@ -2610,6 +3004,7 @@ pub async fn run_rolling_queue_loop(
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "rolling queue restart reconcile deferred"),
     }
+    let mut launcher = launcher;
     let mut interval = tokio::time::interval(TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -2619,6 +3014,10 @@ pub async fn run_rolling_queue_loop(
         }
         let size = (config.rolling_queue_batch_size.load(Ordering::Relaxed) as usize)
             .clamp(1, ROLLING_QUEUE_MAX_BATCH_SIZE as usize);
+        let minutes = config
+            .rolling_queue_gate_timeout_mins
+            .load(Ordering::Relaxed);
+        launcher.gate_timeout = Duration::from_secs(u64::from(minutes.max(1)) * 60);
         match run_drain_aware_batch(&store, &launcher, size, &drain).await {
             Ok(results) => {
                 for (id, result) in results {
@@ -2731,11 +3130,10 @@ mod tests {
             let filters: Vec<String> = filters.iter().map(|f| (*f).to_string()).collect();
             filter_selecting_no_tests(&work, &commit, &filters)
         };
-        // The #1129 shape: the name exists in the repo but not in that shard.
-        assert_eq!(
-            find(&["rsid=shard:session-05:test(queue_lands)"]).as_deref(),
-            Some("rsid=shard:session-05:test(queue_lands)")
-        );
+        // The #1129 shape (the name exists, but in another shard) is
+        // accepted since #1244: the lander's focused run selects from every
+        // rsid library test, not from the named shard.
+        assert_eq!(find(&["rsid=shard:session-05:test(queue_lands)"]), None);
         assert_eq!(find(&["rsid=shard:other-01:test(queue_lands)"]), None);
         assert_eq!(find(&["rsid=shard:other-01"]), None);
         assert_eq!(
@@ -2839,11 +3237,14 @@ mod tests {
         // A shard shared by both packages finds a test in either of them.
         assert_eq!(find(&["rsid=shard:store-04:test(remote_read_page)"]), None);
         assert_eq!(find(&["rsid=shard:store-04:test(store_page_cursor)"]), None);
-        // The #1129 shape still refuses: the name exists, but not in that shard.
+        // #1244: a name in another shard or the sibling package is accepted,
+        // the plain spelling too; the lander's run selects from both packages.
         assert_eq!(
-            find(&["rsid=shard:session-01:test(h1_store_only_keysets)"]).as_deref(),
-            Some("rsid=shard:session-01:test(h1_store_only_keysets)")
+            find(&["rsid=shard:session-01:test(h1_store_only_keysets)"]),
+            None
         );
+        assert_eq!(find(&["rsid=h1_store_only_keysets"]), None);
+        assert_eq!(find(&["rsid-store=session_only"]), None);
         assert_eq!(
             find(&["rsid=shard:store-01:test(no_such_store_test)"]).as_deref(),
             Some("rsid=shard:store-01:test(no_such_store_test)")
@@ -4515,15 +4916,124 @@ exit 1
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
-    fn a_batch_gates_the_union_of_filters_and_any_unfiltered_member_widens_it() {
+    fn a_batch_gates_the_union_of_filters_and_a_rust_member_without_filters_widens_it() {
         let mut a = queued_entry_view("a", &["rsid=x", "rsi=y"]);
         let b = queued_entry_view("b", &["rsid=x", "rsi-common=z"]);
         assert_eq!(
-            union_filters(&[a.clone(), b.clone()]),
+            union_filters(&[a.clone(), b.clone()], |_| false),
             vec!["rsid=x", "rsi=y", "rsi-common=z"]
         );
         a.test_filters.clear();
-        assert!(union_filters(&[a, b]).is_empty());
+        assert!(union_filters(&[a, b], |_| false).is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_rust_free_member_without_filters_does_not_widen_the_batch() {
+        let a = queued_entry_view("a", &["rsid=x", "rsi=y"]);
+        let script = queued_entry_view("b", &[]);
+        let rust = queued_entry_view("c", &[]);
+        let script_commit = script.source_commit.clone();
+        let rust_free = |entry: &RollingQueueEntryV1| entry.source_commit == script_commit;
+        assert_eq!(
+            union_filters(&[a.clone(), script.clone()], rust_free),
+            vec!["rsid=x", "rsi=y"]
+        );
+        // A member with Rust changes and no filters still widens the batch.
+        assert!(union_filters(&[a, script, rust], rust_free).is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn only_rust_cargo_and_migration_paths_affect_the_gate() {
+        for path in [
+            "crates/rsid/src/lib.rs",
+            "crates/rsid-store/src/store/migrations/v090.rs",
+            "crates/rsid/build.rs",
+            "Cargo.toml",
+            "crates/rsid/Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            ".cargo/config.toml",
+        ] {
+            assert!(path_affects_rust_gate(path), "{path}");
+        }
+        for path in [
+            "scripts/check-touched-shards",
+            "docs/agents/routing.md",
+            "thoughts/shared/notes/x.md",
+            "tools/provisional-migrations/v091.json",
+            ".claude/commands/foo.md",
+        ] {
+            assert!(!path_affects_rust_gate(path), "{path}");
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn source_rust_freedom_reads_the_diff_against_rolling() {
+        let (_dir, repo) = rust_free_repo();
+        let git_in = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{args:?}");
+        };
+        let head = |branch: &str| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", branch])
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git_in(&["checkout", "-q", "-b", "docs", "rolling"]);
+        std::fs::create_dir_all(repo.join("scripts")).unwrap();
+        std::fs::write(repo.join("scripts/tool.sh"), "echo hi\n").unwrap();
+        git_in(&["add", "scripts/tool.sh"]);
+        git_in(&["commit", "-q", "-m", "script"]);
+        git_in(&["checkout", "-q", "-b", "code", "rolling"]);
+        std::fs::write(repo.join("lib.rs"), "fn a() {}\n").unwrap();
+        git_in(&["add", "lib.rs"]);
+        git_in(&["commit", "-q", "-m", "code"]);
+        assert!(source_is_rust_free(&repo, &head("docs")));
+        assert!(!source_is_rust_free(&repo, &head("code")));
+        // An unknown revision never narrows the gate.
+        assert!(!source_is_rust_free(&repo, &"0".repeat(40)));
+    }
+
+    fn rust_free_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        for args in [
+            vec!["init", "-q", "-b", "rolling"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(&args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        std::fs::write(repo.join("README"), "x\n").unwrap();
+        for args in [vec!["add", "README"], vec!["commit", "-q", "-m", "base"]] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(&args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        (dir, repo)
     }
 
     fn queued_entry_view(commit: &str, filters: &[&str]) -> RollingQueueEntryV1 {
@@ -5963,5 +6473,274 @@ exit 0
             .await
             .planned_rolling_queue_migration(id)
             .unwrap()
+    }
+
+    // #1208: a source already on rolling is published, never gated.
+
+    async fn assert_published_out_of_band(
+        store: &Arc<tokio::sync::Mutex<Store>>,
+        work: &Path,
+        id: Uuid,
+        sha: &str,
+    ) {
+        let entry = entry_of(store, id).await;
+        assert_eq!(entry.state, RollingQueueEntryState::Published, "{entry:?}");
+        let outcome = entry.outcome.unwrap();
+        assert_eq!(outcome.refusal, None);
+        let tip = outcome.landed_sha.unwrap();
+        assert!(
+            git(work, &["merge-base", "--is-ancestor", sha, &tip]).is_some(),
+            "the landed tip {tip} contains {sha}"
+        );
+        assert!(
+            outcome
+                .detail
+                .unwrap_or_default()
+                .contains("landed outside the queue")
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_member_already_on_rolling_is_published_without_a_gate() {
+        let (dir, _origin, work) = repos();
+        let shas: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|name| commit_file(&work, name, name, name))
+            .collect();
+        // The operator lands b directly, after it was enqueued.
+        let log = dir.path().join("lander.log");
+        let launcher = merging_lander(dir.path(), &work, &log, "");
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let ids = queue_all(&store, &work, &shas, None).await;
+        sh(
+            &work,
+            &format!("git push -q origin {}:refs/heads/rolling", shas[1]),
+        );
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        assert_eq!(results.len(), 3, "every member settles exactly once");
+        assert_published_out_of_band(&store, &work, ids[1], &shas[1]).await;
+        let runs = lander_runs(&log);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert!(
+            !runs[0].contains(&format!("--accepted {}", shas[1])),
+            "the landed source is not gated: {runs:?}"
+        );
+        for (id, sha) in [(ids[0], &shas[0]), (ids[2], &shas[2])] {
+            assert_landed(&store, &work, id, sha).await;
+        }
+        let guard = store.lock().await;
+        assert_eq!(events_of(&guard, "already_landed").len(), 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_batch_whose_sources_all_landed_runs_no_lander_and_settles_published() {
+        let (dir, _origin, work) = repos();
+        let shas: Vec<String> = ["a", "b"]
+            .iter()
+            .map(|name| commit_file(&work, name, name, name))
+            .collect();
+        let log = dir.path().join("lander.log");
+        let launcher = merging_lander(dir.path(), &work, &log, "");
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let ids = queue_all(&store, &work, &shas, None).await;
+        sh(
+            &work,
+            &format!(
+                "git checkout -q -B landed origin/rolling && git merge -q --no-edit {} {} \
+                 && git push -q origin HEAD:rolling",
+                shas[0], shas[1]
+            ),
+        );
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(lander_runs(&log).is_empty(), "nothing is gated");
+        for (id, sha) in ids.iter().zip(&shas) {
+            assert_published_out_of_band(&store, &work, *id, sha).await;
+        }
+        let state: String = store
+            .lock()
+            .await
+            .conn
+            .query_row("SELECT state FROM rolling_queue_batches", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "published");
+        assert_eq!(wake_count(&store).await, 2);
+    }
+
+    /// Guard for the merging lander: the first run that carries `sha` lands it
+    /// on rolling first (as an operator would) and then refuses it like the
+    /// real lander does an integrated source.
+    fn lands_then_refuses(work: &Path, marker: &Path, sha: &str) -> String {
+        format!(
+            "case \" $* \" in *\" {sha} \"*) if [ ! -f {marker} ]; then touch {marker}; \
+             git -C {work} push -q origin {sha}:refs/heads/rolling; \
+             echo 'rsi-rolling-land: accepted source {sha} is already integrated; supply \
+             --accepted BASE:{sha} with its historical accepted base' >&2; \
+             echo publication_status=not_published; exit 1; fi;; esac",
+            marker = marker.display(),
+            work = work.display(),
+        )
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_source_the_lander_calls_already_integrated_settles_published_not_gate_failed() {
+        let (dir, _origin, work) = repos();
+        let shas: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|name| commit_file(&work, name, name, name))
+            .collect();
+        let log = dir.path().join("lander.log");
+        let guard = lands_then_refuses(&work, &dir.path().join("landed"), &shas[1]);
+        let launcher = merging_lander(dir.path(), &work, &log, &guard);
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let ids = queue_all(&store, &work, &shas, None).await;
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert_published_out_of_band(&store, &work, ids[1], &shas[1]).await;
+        let runs = lander_runs(&log);
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert!(
+            !runs[1].contains(&format!("--accepted {}", shas[1])),
+            "the retry drops the landed source"
+        );
+        for (id, sha) in [(ids[0], &shas[0]), (ids[2], &shas[2])] {
+            assert_landed(&store, &work, id, sha).await;
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_lone_source_the_lander_calls_already_integrated_settles_published() {
+        let (dir, _origin, work) = repos();
+        let sha = commit_file(&work, "a", "a", "a");
+        let log = dir.path().join("lander.log");
+        let guard = lands_then_refuses(&work, &dir.path().join("landed"), &sha);
+        let launcher = merging_lander(dir.path(), &work, &log, &guard);
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let id = queued(&store, &work, &sha, "k").await;
+        let (settled, result) = run_next(&store, &launcher).await.unwrap().unwrap();
+        assert_eq!(settled, id);
+        assert_eq!(result.state, RollingQueueEntryState::Published);
+        assert_published_out_of_band(&store, &work, id, &sha).await;
+        assert_eq!(lander_runs(&log).len(), 1);
+        assert_eq!(wake_count(&store).await, 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn an_already_integrated_report_is_published_from_ancestry_or_typed_never_a_red_gate() {
+        let stderr = "rsi-rolling-land: accepted source abc is already integrated; supply --accepted BASE:abc";
+        let landed = classify_run(
+            Some(1),
+            "publication_status=not_published\n",
+            stderr,
+            || Some("f".repeat(40)),
+        );
+        assert_eq!(landed.state, RollingQueueEntryState::Published);
+        assert_eq!(landed.outcome.landed_sha, Some("f".repeat(40)));
+        let unconfirmed = classify_run(Some(1), "", stderr, || None);
+        assert_eq!(unconfirmed.state, RollingQueueEntryState::Refused);
+        assert_eq!(
+            unconfirmed.outcome.refusal.as_deref(),
+            Some(QUEUE_SOURCE_ALREADY_INTEGRATED)
+        );
+        assert!(!is_bisectable(&unconfirmed));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_member_landed_out_of_band_during_a_bisect_is_published_and_never_regated() {
+        let (dir, _origin, work) = repos();
+        let shas: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|name| commit_file(&work, name, name, name))
+            .collect();
+        let log = dir.path().join("lander.log");
+        // The first (whole-batch) run lands c out of band, then goes red on b.
+        let marker = dir.path().join("landed");
+        let guard = format!(
+            "if [ ! -f {marker} ]; then touch {marker}; git -C {work} push -q origin {c}:refs/heads/rolling; fi\n{red}",
+            marker = marker.display(),
+            work = work.display(),
+            c = shas[2],
+            red = red_when_any(&[(shas[1].as_str(), "q::b_breaks")]),
+        );
+        let launcher = merging_lander(dir.path(), &work, &log, &guard);
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let ids = queue_all(&store, &work, &shas, None).await;
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        assert_eq!(results.len(), 3, "every member settles exactly once");
+        assert_published_out_of_band(&store, &work, ids[2], &shas[2]).await;
+        assert_landed(&store, &work, ids[0], &shas[0]).await;
+        assert_isolated_red(&store, ids[1], "q::b_breaks").await;
+        let runs = lander_runs(&log);
+        assert!(
+            runs[1..]
+                .iter()
+                .all(|run| !run.contains(&format!("--accepted {}", shas[2]))),
+            "the landed member is never gated again: {runs:?}"
+        );
+        let guard = store.lock().await;
+        assert!(events_of(&guard, "regate_spent").is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_batch_past_its_gate_wall_time_is_refused_typed_and_the_lander_stopped() {
+        let (dir, _origin, work) = repos();
+        let shas: Vec<String> = ["a", "b"]
+            .iter()
+            .map(|name| commit_file(&work, name, name, name))
+            .collect();
+        let log = dir.path().join("lander.log");
+        let pid_file = dir.path().join("sleeper.pid");
+        let guard = format!("sleep 60 & echo $! > {pid}; wait", pid = pid_file.display());
+        let launcher = merging_lander(dir.path(), &work, &log, &guard)
+            .with_gate_timeout(Duration::from_secs(2));
+        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let ids = queue_all(&store, &work, &shas, None).await;
+        let started = std::time::Instant::now();
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "bounded by the budget"
+        );
+        assert_eq!(results.len(), 2);
+        for id in &ids {
+            let entry = entry_of(&store, *id).await;
+            assert_eq!(entry.state, RollingQueueEntryState::Refused);
+            let outcome = entry.outcome.unwrap();
+            assert_eq!(outcome.refusal.as_deref(), Some(QUEUE_GATE_TIMEOUT));
+            assert!(
+                outcome
+                    .detail
+                    .unwrap()
+                    .contains("rolling_queue_gate_timeout_mins")
+            );
+        }
+        for sha in &shas {
+            assert!(!is_ancestor_of_origin(&work, sha));
+        }
+        // The lander's process group, its children included, was stopped.
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let pid = nix::unistd::Pid::from_raw(pid.trim().parse().unwrap());
+        let mut alive = true;
+        for _ in 0..50 {
+            alive = nix::sys::signal::kill(pid, None).is_ok();
+            if !alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!alive, "the lander's child outlived the timeout");
+        let guard = store.lock().await;
+        assert_eq!(events_of(&guard, "gate_timeout").len(), 1);
+        drop(guard);
+        assert_eq!(wake_count(&store).await, 2);
     }
 }

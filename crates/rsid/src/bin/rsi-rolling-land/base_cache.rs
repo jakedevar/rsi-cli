@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const SCHEMA_VERSION: u8 = 1;
-/// Longest a lander waits on another lander's base-shard lock when the caller
-/// gives no tighter bound.
+/// Longest a test waits on a base-shard lock when it gives no tighter bound;
+/// the lander always passes its own bound (`acquire_within`).
+#[cfg(test)]
 const DEFAULT_LOCK_WAIT: Duration = Duration::from_secs(2 * 60 * 60);
 const LOCK_NOTICE_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -73,6 +74,7 @@ pub(super) struct BaseShardSlot {
 
 impl BaseShardSlot {
     /// Acquire with the default bounded wait (`DEFAULT_LOCK_WAIT`).
+    #[cfg(test)]
     pub(super) async fn acquire(
         root: &Path,
         rolling_sha: &str,
@@ -159,23 +161,6 @@ impl BaseShardSlot {
             fingerprint: fingerprint.into(),
             _lock: lock,
         })
-    }
-
-    /// Whether a valid entry for this key already exists, without taking the
-    /// slot lock or creating directories. A lock-free peek can race a writer;
-    /// it only decides whether a base compile is worth starting early.
-    pub(super) fn peek(root: &Path, rolling_sha: &str, shard: &str, fingerprint: &str) -> bool {
-        let Some(digest) = fingerprint.strip_prefix("sha256:") else {
-            return false;
-        };
-        let path = root
-            .join(rolling_sha)
-            .join(digest)
-            .join(format!("{shard}.json"));
-        fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<BaseShardEntry>(&bytes).ok())
-            .is_some_and(|entry| entry.matches(rolling_sha, shard, fingerprint))
     }
 
     pub(super) fn read(&self) -> Result<Option<BaseShardEntry>, String> {

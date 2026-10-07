@@ -34,11 +34,11 @@ use rsi_common::recursive_dag::RecursiveRecoveryBudget;
 use rsi_common::sandbox_storage::{
     SANDBOX_BUILD_CACHE_REPORT_VERSION, SANDBOX_BUILD_CACHE_REPORT_VERSION_V2,
     SandboxBuildCacheReclaimPassContentionV2 as ReclaimPassContention,
-    SandboxBuildCacheReclaimReportV2, SandboxBuildCacheReclaimReportWire,
-    SandboxBuildCacheReclaimSkipReason as ReclaimSkipReason,
-    SandboxBuildCacheReclaimStopReason as ReclaimStopReason, SandboxTargetReclaimIntentCountsV2,
-    SandboxTargetReclaimIntentSweepV2, SandboxTargetReclaimKeyV2, SandboxTargetReclaimSweepV2,
-    SandboxTargetRecoverySweepV2,
+    SandboxBuildCacheReclaimRefusalV2, SandboxBuildCacheReclaimReportV2,
+    SandboxBuildCacheReclaimReportWire, SandboxBuildCacheReclaimSkipReason as ReclaimSkipReason,
+    SandboxBuildCacheReclaimStopReason as ReclaimStopReason, SandboxReclaimCheck,
+    SandboxTargetReclaimIntentCountsV2, SandboxTargetReclaimIntentSweepV2,
+    SandboxTargetReclaimKeyV2, SandboxTargetReclaimSweepV2, SandboxTargetRecoverySweepV2,
 };
 pub use rsi_common::sandbox_storage::{SandboxBuildCacheReclaimReport, SandboxFilesystemStats};
 use rsi_common::types::{
@@ -165,6 +165,24 @@ impl Drop for SandboxFilesystemStatsOverrideGuard {
     }
 }
 
+/// Pins a roomy filesystem so a fixture that is not about pressure does not
+/// inherit the host disk's real usage (a full CI or hub disk would otherwise
+/// flip the pass into pressure mode and reorder its candidates).
+#[cfg(test)]
+fn install_no_pressure_stats_override_for_test(
+    path: &std::path::Path,
+) -> SandboxFilesystemStatsOverrideGuard {
+    install_sandbox_filesystem_stats_override_for_test(
+        path,
+        SandboxFilesystemStats {
+            total_bytes: 100,
+            available_bytes: 90,
+            used_bytes: 10,
+            used_percent: 10,
+        },
+    )
+}
+
 #[cfg(test)]
 fn install_sandbox_filesystem_stats_override_for_test(
     path: &std::path::Path,
@@ -187,6 +205,34 @@ fn install_sandbox_filesystem_stats_override_for_test(
 
 fn increment_reclaim_skip(report: &mut SandboxBuildCacheReclaimReport, reason: ReclaimSkipReason) {
     *report.skip_counts.entry(reason).or_insert(0) += 1;
+}
+
+/// Count a refused candidate and keep a bounded, named sample of it: no
+/// refusal in a report is anonymous (#1575). `check` is the exact check that
+/// failed; the reason's own name stands in when no finer check applies.
+fn refuse_candidate(
+    report: &mut SandboxBuildCacheReclaimReport,
+    refusals: &mut Vec<SandboxBuildCacheReclaimRefusalV2>,
+    candidate: &crate::store::sandbox_custody::TerminalCustodyReclaimCandidate,
+    reason: ReclaimSkipReason,
+    check: Option<rsi_common::sandbox_storage::SandboxReclaimCheck>,
+) {
+    increment_reclaim_skip(report, reason);
+    let for_reason = refusals
+        .iter()
+        .filter(|sample| sample.reason == reason)
+        .count();
+    if refusals.len() >= rsi_common::sandbox_storage::SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_MAX
+        || for_reason >= rsi_common::sandbox_storage::SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_PER_REASON
+    {
+        return;
+    }
+    refusals.push(SandboxBuildCacheReclaimRefusalV2 {
+        session_id: candidate.session_id,
+        custody_id: candidate.custody_id,
+        reason,
+        check: check.map_or_else(|| reason.as_str().to_string(), |check| check.token()),
+    });
 }
 
 fn reclaim_budget_stop_reason(reason: ReclaimSkipReason) -> Option<ReclaimStopReason> {
@@ -464,6 +510,10 @@ struct SandboxReclaimEvidence {
     inspected_terminal_rows: u32,
     custody_lookups: u32,
     pass_contention: Option<ReclaimPassContention>,
+    /// Bounded sample of refused candidates and the check each failed (#1575).
+    refusals: Vec<SandboxBuildCacheReclaimRefusalV2>,
+    /// The shared cargo `debug/` cache, which no sandbox owns (#1607).
+    shared_target: Option<rsi_common::sandbox_storage::SandboxSharedTargetReclaimV1>,
 }
 
 #[derive(Debug)]
@@ -490,6 +540,8 @@ impl SandboxReclaimRun {
                 .unwrap_or_else(empty_candidate_sweep),
             recovery_sweep: self.evidence.recovery_sweep,
             pass_contention: self.evidence.pass_contention,
+            refusals: self.evidence.refusals,
+            shared_target: self.evidence.shared_target,
         })
     }
 }
@@ -699,7 +751,7 @@ fn run_sandbox_reclaim_job(
     let immediate_recovery_context = (!dry_run && !prepared_only).then(|| context.clone());
     let run_started_at = Instant::now();
     let queue_wait_ms = bounded_elapsed_ms(enqueued_at);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         tracing::dispatcher::with_default(&dispatch, || {
             log_sandbox_build_cache_reclaim_started(trigger, dry_run, queue_wait_ms);
             runtime.block_on(SessionManager::run_sandbox_build_cache_reclaim_owned(
@@ -717,6 +769,32 @@ fn run_sandbox_reclaim_job(
             "sandbox reclaim coordinator job panicked".to_string(),
         ))
     });
+    // #1607: the shared cargo `debug/` cache has no owning sandbox row, so the
+    // candidate sweep never sees it. Inspect it on every pass that reports and
+    // reclaim it only when disk pressure is active (never `release/`).
+    if !prepared_only {
+        if let Ok(run) = result.as_mut() {
+            let min_idle = Duration::from_secs(run.report.config.ttl_secs);
+            run.evidence.shared_target = tracing::dispatcher::with_default(&dispatch, || {
+                if dry_run {
+                    let pressure = run.report.enabled && run.report.pressure_active_after;
+                    crate::shared_target_reclaim::preview(min_idle, pressure)
+                } else if run.report.enabled {
+                    let pressure =
+                        run.report.pressure_active_before || run.report.pressure_active_after;
+                    crate::shared_target_reclaim::run_and_log(trigger, min_idle, pressure)
+                } else {
+                    None
+                }
+            });
+            if let Some(shared) = &run.evidence.shared_target {
+                run.report.reclaimed_bytes = run
+                    .report
+                    .reclaimed_bytes
+                    .saturating_add(shared.reclaimed_bytes);
+            }
+        }
+    }
     let request_cancelled = result_tx.is_closed();
     let run_duration_ms = bounded_elapsed_ms(run_started_at);
     let total_elapsed_ms = bounded_elapsed_ms(enqueued_at);
@@ -1406,6 +1484,20 @@ fn log_sandbox_build_cache_reclaim_terminal(
         considered = report.candidates_considered,
         eligible = report.eligible_candidates,
         skip_counts = ?report.skip_counts,
+        refusal_samples = %run
+            .evidence
+            .refusals
+            .iter()
+            .map(|refusal| {
+                format!(
+                    "{}:{}:{}",
+                    refusal.session_id.simple().to_string().get(..8).unwrap_or_default(),
+                    refusal.reason.as_str(),
+                    refusal.check
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
         would_reclaim_count = report.would_reclaim_count,
         would_reclaim_bytes = report.would_reclaim_bytes,
         staged_count = report.staged_count,
@@ -1484,6 +1576,47 @@ fn log_sandbox_build_cache_reclaim_preaccept_error(
         // acceptance have no worker lifecycle to emit the typed error.  Once
         // accepted, the worker remains the sole terminal/error logger.
         log_sandbox_build_cache_reclaim_error(trigger, dry_run, error, false, None, None);
+    }
+}
+
+/// Pressure passes inspect this many times the configured candidate page.
+const PRESSURE_PAGE_MULTIPLIER: u32 = 4;
+
+#[cfg(test)]
+static PRESSURE_PAGE_MULTIPLIER_FOR_TEST: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(PRESSURE_PAGE_MULTIPLIER);
+
+/// Resets the test multiplier on drop so a failing test cannot leak it.
+#[cfg(test)]
+struct PressureMultiplierReset;
+
+#[cfg(test)]
+impl Drop for PressureMultiplierReset {
+    fn drop(&mut self) {
+        PRESSURE_PAGE_MULTIPLIER_FOR_TEST.store(PRESSURE_PAGE_MULTIPLIER, Ordering::SeqCst);
+    }
+}
+
+fn pressure_page_multiplier() -> u32 {
+    #[cfg(test)]
+    {
+        PRESSURE_PAGE_MULTIPLIER_FOR_TEST.load(Ordering::SeqCst)
+    }
+    #[cfg(not(test))]
+    {
+        PRESSURE_PAGE_MULTIPLIER
+    }
+}
+
+/// Per-pass candidate budget: a multiple of the configured page under
+/// pressure, never above the wire maximum.
+fn pressure_page_limit(max_candidates: u32, pressure_active: bool) -> u32 {
+    if pressure_active {
+        max_candidates
+            .saturating_mul(pressure_page_multiplier())
+            .min(rsi_common::sandbox_storage::SANDBOX_BUILD_CACHE_RECLAIM_MAX_CANDIDATES_MAX)
+    } else {
+        max_candidates
     }
 }
 
@@ -2772,6 +2905,7 @@ fn build_starting_session(
 /// (`CustodyCause::FreshLaunch`) and the agent-child fork admission
 /// (`CustodyCause::AgentSpawnChild`, H1-04 / F-011).
 pub(super) fn new_root_binding_from_allocation(
+    session_id: Uuid,
     allocation: &SandboxAllocation,
     working_dir: &std::path::Path,
     allocation_source_commit: Option<&str>,
@@ -2811,6 +2945,11 @@ pub(super) fn new_root_binding_from_allocation(
             })?
             .to_string_lossy()
             .to_string();
+    #[cfg(test)]
+    let reserved_custody_id = reserved_custody_id
+        .or_else(|| crate::store::stripe_liveness_support::take_fresh_root(session_id));
+    #[cfg(not(test))]
+    let _ = session_id;
     Ok(SessionCustodyBinding::New(NewCustodyRoot {
         custody_id: reserved_custody_id.unwrap_or_else(Uuid::new_v4),
         canonical_repo_dir: working_dir.to_string_lossy().to_string(),
@@ -5497,6 +5636,16 @@ impl SessionManager {
         }
         let provider = provider.unwrap_or(SessionProvider::Claude);
         apply_provider_model_default(provider, &mut model);
+        // #1407: under `aws_only` a Claude launch that names no model runs
+        // the Bedrock Claude default (Claude Code's own default is the
+        // Anthropic API, which the profile refuses).
+        if provider == SessionProvider::Claude
+            && model.is_none()
+            && self.runtime_config.provider_profile()
+                == rsi_common::provider_profile::ProviderProfile::AwsOnly
+        {
+            model = Some(rsi_common::provider_profile::AWS_ONLY_DEFAULT_MODEL.to_string());
+        }
         LaunchIdentitySnapshot {
             project_id,
             provider,
@@ -5559,7 +5708,8 @@ impl SessionManager {
         };
         tracing::warn!(
             model = model.unwrap_or("-"),
-            "launch refused: model is not on the operator launch-model allowlist"
+            code = rsi_common::provider_profile::launch_refusal_code(&reason),
+            "launch refused by the operator provider profile or launch-model allowlist"
         );
         Err(DaemonError::PolicyDenied(reason))
     }
@@ -5596,8 +5746,15 @@ impl SessionManager {
         }
         // Spawn gate: container kinds (Group, Epic) are organizational nodes
         // only — the daemon does not spawn a provider subprocess for them.
-        // Leaf kinds (Standard, TaskRabbit, Bug, Story, Task) proceed.
+        // Leaf kinds (Standard, Bug, Story, Task) proceed.
         let kind = config.session_kind.unwrap_or_default();
+        // New launches of the retired TaskRabbit kind are refused before any
+        // side effect. Retries and rotation successors of an existing row keep
+        // their kind and still pass.
+        if retry_admission.is_none() && config.continued_from.is_none() {
+            super::hierarchy::refuse_removed_session_kind(config.session_kind)
+                .map_err(|message| DaemonError::InvalidParam(message.to_string()))?;
+        }
         if !rsi_common::is_leaf_kind(kind) {
             return Err(DaemonError::InvalidParam(
                 "Cannot spawn a container-kind session".into(),
@@ -5839,12 +5996,42 @@ impl SessionManager {
                         // #1144: a manager-action child is allocated from the
                         // EXACT commit pinned at prepare time (the source gates
                         // already accepted the source as that commit or a
-                        // verified published fast-forward of it). Never from a
-                        // newer fetched `rolling` tip.
-                        (
-                            context.fork.fork_origin().to_path_buf(),
-                            context.fork.fork_commit().to_owned(),
-                        )
+                        // verified published fast-forward of it).
+                        // #1195: a `create_session` with the default `rolling`
+                        // source instead branches from the freshly fetched
+                        // published `rolling` tip, even when the shared
+                        // checkout is ahead of it with unpublished commits.
+                        let origin = context.fork.fork_origin().to_path_buf();
+                        let pinned = context.fork.fork_commit().to_owned();
+                        let rolling = context
+                            .claim
+                            .operation
+                            .context
+                            .source
+                            .as_ref()
+                            .is_some_and(|source| source.resolves_rolling_at_launch());
+                        if rolling {
+                            let fetch_origin = origin.clone();
+                            let selection = tokio::task::spawn_blocking(move || {
+                                crate::sandbox::git_worktree::fresh_rolling_base(
+                                    &fetch_origin,
+                                    session_id,
+                                    pinned,
+                                    crate::sandbox::git_worktree::RollingBasePolicy::PublishedTip,
+                                )
+                            })
+                            .await
+                            .map_err(|error| {
+                                DaemonError::Process(format!(
+                                    "manager rolling base observation join failed: {error}"
+                                ))
+                            })??;
+                            let commit = selection.commit.clone();
+                            rolling_selection = Some(selection);
+                            (origin, commit)
+                        } else {
+                            (origin, pinned)
+                        }
                     } else if let Some(context) = launch_purpose.topology_node() {
                         (
                             context.fork.origin().to_path_buf(),
@@ -6257,6 +6444,15 @@ impl SessionManager {
                 }
                 _ => origin,
             })
+        } else if let LaunchPurpose::GlobalAppointment(reserved) = &launch_purpose {
+            // #1314: a delegated appointment's root seat is its grantor's
+            // creation; admission gates and reserves it in that ledger.
+            Some(
+                self.store
+                    .lock()
+                    .await
+                    .manager_v2_appointment_origin(*reserved, resolved_project_id)?,
+            )
         } else {
             if matches!(
                 launch_purpose,
@@ -6567,6 +6763,7 @@ impl SessionManager {
         let direct_binding = if direct_interactive {
             Some(if let Some(allocation) = allocation.as_ref() {
                 new_root_binding_from_allocation(
+                    session_id,
                     allocation,
                     &working_dir,
                     allocation_source_commit.as_deref(),
@@ -7172,7 +7369,7 @@ impl SessionManager {
         };
 
         // Compose system prompt from multiple sources via context pipeline.
-        // Caller-provided prompt (e.g., TaskRabbit instructions) is preserved, not overwritten.
+        // Caller-provided prompt (e.g., a Blank session's preset) is preserved, not overwritten.
         //
         // RSI-006: hermetic eval mode bypasses ContextPipeline entirely. When
         // `config.skip_context_pipeline` is true, `system_prompt` is left untouched;
@@ -7183,7 +7380,7 @@ impl SessionManager {
         // with frozen corpus inputs, so they must be skipped.
         if !config.skip_context_pipeline && provider_uses_launch_system_prompt(provider) {
             tracing::info!(session_id = %session_id, "Launch: assembling context pipeline");
-            // Skip heavy context injection for TaskRabbit/Bug sessions (only active_task if present)
+            // Skip heavy context injection for Bug sessions (only active_task if present)
             let root_active_task = if let Some(context) = launch_purpose.manager_successor() {
                 context
                     .claim()
@@ -7196,14 +7393,12 @@ impl SessionManager {
                 None
             };
             let active_task = root_active_task.as_deref();
-            let (pipeline_project, pipeline_active_task) = if matches!(
-                config.session_kind,
-                Some(SessionKind::TaskRabbit) | Some(SessionKind::Bug)
-            ) {
-                (None, active_task)
-            } else {
-                (resolved_project.as_ref(), active_task)
-            };
+            let (pipeline_project, pipeline_active_task) =
+                if matches!(config.session_kind, Some(SessionKind::Bug)) {
+                    (None, active_task)
+                } else {
+                    (resolved_project.as_ref(), active_task)
+                };
 
             let pipeline = super::context_pipeline::ContextPipeline::new(
                 Arc::clone(&self.token_counter),
@@ -7219,7 +7414,7 @@ impl SessionManager {
                 &custody_context_cwd,
             );
             // Orchestration router — "the very mouth of the pipeline" for every
-            // leaf-kind session (Standard / TaskRabbit / Bug / Story / Task /
+            // leaf-kind session (Standard / Bug / Story / Task /
             // Feature / Refactor / Research). Frames the worker BEFORE the
             // per-kind preamble so the worker classifies its task as Singular vs
             // Team Implement before doing the kind-specific work. Container kinds
@@ -7833,6 +8028,7 @@ impl SessionManager {
                     // request stays an ordinary binding.
                     let binding = match allocation.as_ref() {
                         Some(allocation) => new_root_binding_from_allocation(
+                            session_id,
                             allocation,
                             &working_dir,
                             allocation_source_commit.as_deref(),
@@ -8748,6 +8944,12 @@ impl SessionManager {
                         }
                     }
                     let manager_gate_context = manager_successor_context.clone();
+                    // #1407: deferred App Server launches bypass the synchronous
+                    // spawn backstop. Re-read the live launch policy at every
+                    // process/productive-request boundary, including after the
+                    // initialize handshake or an authority fence awaited above.
+                    let app_server_launch_policy = Arc::clone(&runtime_config);
+                    let app_server_launch_model = config.model.clone();
                     #[cfg(test)]
                     let manager_action_gate = manager_action_context.is_some();
                     #[cfg(test)]
@@ -8761,6 +8963,8 @@ impl SessionManager {
                             app_server_control,
                             move |_checkpoint| {
                                 let context = manager_gate_context.clone();
+                                let runtime_config = Arc::clone(&app_server_launch_policy);
+                                let model = app_server_launch_model.clone();
                                 async move {
                                     #[cfg(test)]
                                     if manager_action_gate
@@ -8774,6 +8978,12 @@ impl SessionManager {
                                     }
                                     if let Some(context) = context {
                                         context.source_gate().await?;
+                                    }
+                                    if let Some(reason) = runtime_config.launch_model_refusal(
+                                        SessionProvider::CodexAppServer,
+                                        provider_effective_model(SessionProvider::CodexAppServer, model.as_deref()).as_deref(),
+                                    ) {
+                                        return Err(DaemonError::PolicyDenied(reason));
                                     }
                                     Ok(())
                                 }
@@ -9096,11 +9306,9 @@ impl SessionManager {
                     manager_successor_guards.take();
                 }
                 // Phase 7: Build TurnController based on SessionKind.
-                // TaskRabbit and Bug sessions may run multiple turns; Standard runs one.
+                // Bug sessions may run multiple turns; Standard runs one.
                 let turn_policy = match config.session_kind.unwrap_or_default() {
-                    SessionKind::TaskRabbit | SessionKind::Bug => {
-                        crate::turn_controller::ContinuationPolicy::MaxTurns(5)
-                    }
+                    SessionKind::Bug => crate::turn_controller::ContinuationPolicy::MaxTurns(5),
                     _ => crate::turn_controller::ContinuationPolicy::Single,
                 };
                 let turn_controller = crate::turn_controller::TurnController::new(turn_policy);
@@ -10560,14 +10768,24 @@ impl SessionManager {
             .map_or_else(
                 |_| Err(reclaim_store_busy_error()),
                 |store| {
+                    // Under pressure the page grows so one pass reaches the
+                    // recent large worker sandboxes, not only the walk's next
+                    // few old rows.
+                    let page_limit =
+                        pressure_page_limit(config.max_candidates, pressure_active_after);
+                    // #1607: under pressure a finished sandbox whose `target/` is
+                    // already gone has nothing to free and must not spend the
+                    // page budget that real targets need.
                     if dry_run {
-                        store.preview_terminal_reclaim_page_with(
-                            config.max_candidates,
+                        store.preview_terminal_reclaim_page_filtered(
+                            page_limit,
+                            pressure_active_after,
                             pressure_active_after,
                         )
                     } else {
-                        store.reserve_terminal_reclaim_page_with(
-                            config.max_candidates,
+                        store.reserve_terminal_reclaim_page_filtered(
+                            page_limit,
+                            pressure_active_after,
                             pressure_active_after,
                         )
                     }
@@ -10609,6 +10827,28 @@ impl SessionManager {
         reclaim_evidence.candidate_sweep = Some(wire_candidate_sweep(&page.evidence));
         reclaim_evidence.inspected_terminal_rows = page.evidence.inspected_terminal_rows;
         reclaim_evidence.custody_lookups = page.evidence.custody_lookups;
+        // Rows whose target was already gone were passed over for free (#1607).
+        if page.absent_skipped > 0 {
+            *report
+                .skip_counts
+                .entry(ReclaimSkipReason::TargetAbsent)
+                .or_insert(0) += page.absent_skipped;
+        }
+        // Rows the page withheld for a live consumer spent budget too: count
+        // and name them rather than dropping them silently (#1575).
+        for fenced in &page.fenced {
+            report.candidates_considered += 1;
+            refuse_candidate(
+                &mut report,
+                &mut reclaim_evidence.refusals,
+                &fenced.candidate,
+                ReclaimSkipReason::LiveConsumer,
+                Some(SandboxReclaimCheck::with_subject(
+                    "live_consumer",
+                    fenced.consumer,
+                )),
+            );
+        }
 
         if checkpoint_reclaim_report(&mut report, &pass_state) {
             report.filesystem_after = if dry_run {
@@ -10643,6 +10883,8 @@ impl SessionManager {
                     ReclaimStopReason::CandidateBudget
                 } else if recovered_any {
                     ReclaimStopReason::RecoveryOnly
+                } else if !page.fenced.is_empty() {
+                    ReclaimStopReason::AllRefused
                 } else {
                     ReclaimStopReason::NoCandidates
                 };
@@ -10680,7 +10922,13 @@ impl SessionManager {
             // prior pass is counted without touching the filesystem or logging
             // again. The cache only skips; custody fences still gate any effect.
             if worker_state.absent_target_cached(candidate.custody_id, candidate.generation) {
-                increment_reclaim_skip(&mut report, ReclaimSkipReason::TargetAbsent);
+                refuse_candidate(
+                    &mut report,
+                    &mut reclaim_evidence.refusals,
+                    &candidate,
+                    ReclaimSkipReason::TargetAbsent,
+                    Some(SandboxReclaimCheck::new("target_absent_remembered")),
+                );
                 continue;
             }
             // Age gate: only reclaim after the owning row has been idle past
@@ -10696,11 +10944,23 @@ impl SessionManager {
                             .ok()
                     });
             let Some(idle_secs) = idle_secs else {
-                increment_reclaim_skip(&mut report, ReclaimSkipReason::FreshOrInvalidTimestamp);
+                refuse_candidate(
+                    &mut report,
+                    &mut reclaim_evidence.refusals,
+                    &candidate,
+                    ReclaimSkipReason::FreshOrInvalidTimestamp,
+                    Some(SandboxReclaimCheck::new("updated_at_unparseable")),
+                );
                 continue;
             };
             if !pressure_active_after && idle_secs < config.ttl_secs {
-                increment_reclaim_skip(&mut report, ReclaimSkipReason::FreshOrInvalidTimestamp);
+                refuse_candidate(
+                    &mut report,
+                    &mut reclaim_evidence.refusals,
+                    &candidate,
+                    ReclaimSkipReason::FreshOrInvalidTimestamp,
+                    Some(SandboxReclaimCheck::new("idle_below_ttl")),
+                );
                 continue;
             }
 
@@ -10726,7 +10986,7 @@ impl SessionManager {
                 crate::sandbox::target_reclaim::with_reclaim_pass_state(
                     &candidate_pass_state,
                     || {
-                        crate::sandbox::custody::CustodyService::reclaim_terminal_target_outcome_phased(
+                        crate::sandbox::custody::CustodyService::reclaim_terminal_target_attempt_phased(
                             store_handle,
                             Arc::clone(&candidate_pass_state),
                             &active_owner,
@@ -10740,6 +11000,30 @@ impl SessionManager {
             })
             .await
             .map_err(|error| DaemonError::Process(error.to_string()))?;
+            let (reclaimed, refusal_check) = match reclaimed {
+                Ok(attempt) => (Ok(attempt.outcome), attempt.check),
+                Err(error) => (Err(error), None),
+            };
+            if let Ok(outcome) = &reclaimed
+                && matches!(
+                    outcome.kind,
+                    TargetReclaimKind::StagedRemoved | TargetReclaimKind::StagedPending
+                )
+            {
+                if let Ok(store) =
+                    tokio::time::timeout(RECLAIM_STORE_WAIT, context.store.lock()).await
+                    && let Err(error) = store.record_target_reclaim_notice(
+                        candidate.session_id,
+                        candidate.custody_id,
+                        candidate.generation,
+                        outcome.bytes,
+                        outcome.kind == TargetReclaimKind::StagedPending,
+                    )
+                {
+                    tracing::warn!(%error, session_id = %candidate.session_id,
+                        "Failed to record sandbox target reclaim notice");
+                }
+            }
             pause_reclaim_after_attempt_for_test(&base);
             match reclaimed {
                 Ok(outcome) if outcome.kind == TargetReclaimKind::Inspected => {
@@ -10785,7 +11069,13 @@ impl SessionManager {
                     let reason = outcome
                         .reason
                         .unwrap_or(ReclaimSkipReason::GitOrRootIdentityRefusal);
-                    increment_reclaim_skip(&mut report, reason);
+                    refuse_candidate(
+                        &mut report,
+                        &mut reclaim_evidence.refusals,
+                        &candidate,
+                        reason,
+                        refusal_check,
+                    );
                     if outcome.terminal_rejection {
                         report.eligible_candidates += 1;
                         report.staged_count += 1;
@@ -10810,9 +11100,12 @@ impl SessionManager {
                 }
                 Ok(_) => unreachable!("candidate path cannot return a recovery outcome"),
                 Err(error) => {
-                    increment_reclaim_skip(
+                    refuse_candidate(
                         &mut report,
+                        &mut reclaim_evidence.refusals,
+                        &candidate,
                         ReclaimSkipReason::CustodyOrGenerationDrift,
+                        Some(SandboxReclaimCheck::new("candidate_inspection_failed")),
                     );
                     tracing::warn!(
                         session_id = %candidate.session_id,
@@ -11107,7 +11400,7 @@ mod tests {
         }
         // A sandbox-requesting launch (named or unnamed model) is refused before
         // any sandbox is allocated.
-        let source = tempfile::tempdir().expect("source repository");
+        let source = disk_backed_tempdir("provider-model-unknown-source-");
         init_d00_git_repo(source.path());
         for model in [None, Some("claude-sonnet-5".to_string())] {
             let mut config = direct_interactive_test_config(source.path().to_path_buf());
@@ -11141,6 +11434,134 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 0, "a refused launch must leave {table} unchanged");
         }
+    }
+
+    /// Issue #1407: under `provider_profile = aws_only` the launch chokepoint
+    /// (every interactive, manager, Issue-worker, topology and appointment
+    /// launch passes it) refuses anything but Claude Code on a Bedrock Claude
+    /// model with `provider_profile_refused`, before any durable effect; a
+    /// Bedrock Claude launch passes, an unnamed Claude model takes the Bedrock
+    /// default, and `all` keeps today's behaviour.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn aws_only_profile_admits_only_claude_on_bedrock_at_the_launch_chokepoint() {
+        use rsi_common::provider_profile::AWS_ONLY_DEFAULT_MODEL;
+        let (manager, _db_dir, sandbox_base) = manager();
+        let work = tempfile::tempdir().expect("work dir");
+        let config_for = |provider: SessionProvider, model: Option<&str>| {
+            let mut config = direct_interactive_test_config(work.path().to_path_buf());
+            config.provider = Some(provider);
+            config.model = model.map(str::to_string);
+            config
+        };
+
+        // `all` (the default): every identity passes, and an unnamed Claude
+        // model stays Claude Code's own default.
+        for (provider, model) in [
+            (SessionProvider::Codex, Some("gpt-6-sol")),
+            (SessionProvider::Claude, Some("claude-opus-5-5")),
+            (SessionProvider::Claude, None),
+        ] {
+            assert!(
+                manager
+                    .enforce_launch_model_allowlist(provider, model)
+                    .is_ok(),
+                "{provider:?} {model:?}"
+            );
+        }
+        let (_, unnamed) = manager
+            .effective_launch_identity(&config_for(SessionProvider::Claude, None), false)
+            .await;
+        assert_eq!(unnamed, None);
+
+        manager
+            .runtime_config
+            .update_field("provider_profile", &serde_json::json!("aws_only"))
+            .unwrap();
+        for (provider, model) in [
+            (SessionProvider::Codex, Some("gpt-6-sol")),
+            (SessionProvider::Claude, Some("claude-opus-5-5")),
+            (SessionProvider::OpenRouter, None),
+            (SessionProvider::Harness, Some(AWS_ONLY_DEFAULT_MODEL)),
+            (SessionProvider::Bedrock, Some("global.openai.gpt-5.6-sol")),
+            (SessionProvider::Local, None),
+        ] {
+            let error = manager
+                .launch_session(config_for(provider, model))
+                .await
+                .expect_err("a non-Bedrock launch is refused under aws_only");
+            assert!(
+                matches!(error, crate::error::DaemonError::PolicyDenied(_)),
+                "{provider:?}: {error:?}"
+            );
+            assert!(
+                error.to_string().contains("provider_profile_refused:"),
+                "{provider:?}: {error}"
+            );
+        }
+
+        // Claude Code on a Bedrock Claude model passes the chokepoint.
+        let mut bedrock_claude = config_for(
+            SessionProvider::Claude,
+            Some("us.anthropic.claude-opus-5-5-v1:0"),
+        );
+        manager
+            .freeze_launch_identity(&mut bedrock_claude, false)
+            .await
+            .expect("Claude on Bedrock is admitted");
+        // An unnamed Claude model takes the Bedrock Claude default.
+        let mut unnamed = config_for(SessionProvider::Claude, None);
+        manager
+            .freeze_launch_identity(&mut unnamed, false)
+            .await
+            .expect("the aws_only default is admitted");
+        assert_eq!(unnamed.model.as_deref(), Some(AWS_ONLY_DEFAULT_MODEL));
+        // The Bedrock provider with a Claude model runs Claude Code under the
+        // default route and passes; routed to the Harness it is refused.
+        let mut via_bedrock = config_for(SessionProvider::Bedrock, Some(AWS_ONLY_DEFAULT_MODEL));
+        manager
+            .freeze_launch_identity(&mut via_bedrock, false)
+            .await
+            .expect("Bedrock Claude on Claude Code is admitted");
+        manager
+            .runtime_config
+            .update_field("api_route.bedrock", &serde_json::json!("harness"))
+            .unwrap();
+        let error = manager
+            .enforce_launch_model_allowlist(SessionProvider::Bedrock, Some(AWS_ONLY_DEFAULT_MODEL))
+            .expect_err("Bedrock Claude on the Harness is not Claude Code");
+        assert!(
+            error.to_string().contains("provider_profile_refused:"),
+            "{error}"
+        );
+
+        // Back to `all`: the refused launches pass the check again.
+        manager
+            .runtime_config
+            .update_field("provider_profile", &serde_json::json!("all"))
+            .unwrap();
+        assert!(
+            manager
+                .enforce_launch_model_allowlist(SessionProvider::Codex, Some("gpt-6-sol"))
+                .is_ok()
+        );
+        assert_eq!(
+            std::fs::read_dir(sandbox_base.path()).unwrap().count(),
+            0,
+            "a refused launch must not allocate a sandbox root"
+        );
+        assert!(manager.active.read().await.is_empty());
+        let sessions: i64 = manager
+            .store
+            .lock()
+            .await
+            .conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            sessions, 0,
+            "a refused launch must leave sessions unchanged"
+        );
     }
 
     /// Issue #692: the allowlist is checked on the EFFECTIVE model. A launch
@@ -13327,6 +13748,117 @@ done
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn build_cache_reclaim_preserves_manager_state_and_detached_consumers() {
+        let _isolation = reclaim_test_isolation();
+        let (manager, _db, sandbox_base) = manager();
+        let repo = disk_backed_tempdir("reclaim-live-consumers");
+        init_d00_git_repo(repo.path());
+        let stale = chrono::Utc::now() - chrono::Duration::days(30);
+        let (mixed, mixed_cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            SessionStatus::Completed,
+            stale,
+        )
+        .await;
+        for name in ["lander", "gate-filters", "chain.sh"] {
+            std::fs::write(mixed_cache.join(name), name).unwrap();
+        }
+        let (unit_owner, unit_cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            SessionStatus::Completed,
+            stale,
+        )
+        .await;
+        // A detached shell can run while its provider row is Completed. Pin a
+        // real subprocess cwd until reclaim finishes, then reap exactly it.
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .current_dir(unit_owner.sandbox_root.as_ref().unwrap())
+            .spawn()
+            .unwrap();
+        let (_gate_owner, gate_cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            SessionStatus::Completed,
+            stale,
+        )
+        .await;
+        let mut gate = Command::new("sleep")
+            .arg("60")
+            .current_dir(repo.path())
+            .env("CARGO_TARGET_DIR", &gate_cache)
+            .spawn()
+            .unwrap();
+        // Keep an exited child unreaped while the scanner runs. Linux reports
+        // ESRCH when reading a zombie's environ; that is absence, not refusal.
+        let mut zombie = Command::new("true")
+            .current_dir(repo.path())
+            .spawn()
+            .unwrap();
+        let (_running, running_cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            SessionStatus::Running,
+            stale,
+        )
+        .await;
+        let (_control, control_cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            SessionStatus::Completed,
+            stale,
+        )
+        .await;
+        assert!(
+            std::fs::read_to_string(format!("/proc/{}/status", zombie.id()))
+                .unwrap()
+                .lines()
+                .any(|line| line.starts_with("State:") && line.contains('Z'))
+        );
+        let report = run_build_cache_reclaim_fixture(&manager, false).await;
+        child.kill().unwrap();
+        child.wait().unwrap();
+        gate.kill().unwrap();
+        gate.wait().unwrap();
+        zombie.wait().unwrap();
+        assert_eq!(report.fully_removed_count, 1, "{report:?}");
+        assert!(!control_cache.exists());
+        for name in ["lander", "gate-filters", "chain.sh"] {
+            assert_eq!(
+                std::fs::read_to_string(mixed_cache.join(name)).unwrap(),
+                name
+            );
+        }
+        for cache in [&mixed_cache, &unit_cache, &gate_cache, &running_cache] {
+            assert_eq!(
+                std::fs::read(cache.join("debug/artifact.bin")).unwrap(),
+                vec![0u8; 4096]
+            );
+        }
+        let store = manager.store.lock().await;
+        assert!(
+            store
+                .target_reclaim_intent(
+                    store.live_custody_for_session(mixed.id).unwrap().custody_id,
+                    1
+                )
+                .unwrap()
+                .is_none()
+        );
+        let friction: u32 = store.conn.query_row("SELECT count(*) FROM friction_events WHERE signature='sandbox_target_reclaim:removed'", [], |row| row.get(0)).unwrap();
+        assert_eq!(friction, 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
     async fn build_cache_reclaim_sweeps_only_eligible_terminal_caches() {
         let _isolation = reclaim_test_isolation();
         let db_dir = disk_backed_tempdir("reclaim-eligible-db");
@@ -13477,7 +14009,7 @@ done
     async fn build_cache_reclaim_skips_in_memory_active_owner() {
         let _isolation = reclaim_test_isolation();
         let (manager, _db, sandbox_base) = manager();
-        let repo = TempDir::new().expect("repo dir");
+        let repo = disk_backed_tempdir("reclaim-active-owner");
         init_d00_git_repo(repo.path());
         let stale = chrono::Utc::now() - chrono::Duration::hours(7);
         let (session, cache) = build_cache_row(
@@ -13495,12 +14027,46 @@ done
             .await
             .insert(session.id, TrackedSession::new_for_test(session));
 
+        let preview = run_build_cache_reclaim_with_evidence_fixture(&manager, true).await;
+        assert_eq!(preview.report.eligible_candidates, 0, "{preview:?}");
+        assert_eq!(
+            preview
+                .report
+                .skip_counts
+                .get(&ReclaimSkipReason::ActiveOwner),
+            Some(&1),
+            "the preview must apply the in-memory consumer fence"
+        );
+        assert_eq!(preview.evidence.refusals.len(), 1);
+        assert_eq!(preview.evidence.refusals[0].check, "in_memory_active_owner");
+        assert!(cache.exists(), "preview retains the active owner's cache");
+        let pass = run_build_cache_reclaim_with_evidence_fixture(&manager, false).await;
+        assert_eq!(
+            pass.report.eligible_candidates,
+            preview.report.eligible_candidates
+        );
+        assert_eq!(pass.report.skip_counts, preview.report.skip_counts);
+        assert_eq!(pass.evidence.refusals, preview.evidence.refusals);
+        assert!(
+            cache.exists(),
+            "the real pass retains the active owner's cache"
+        );
+
         assert_eq!(
             manager.reclaim_terminal_build_caches().await.unwrap(),
             0,
             "an in-memory active owner must fence reclaim"
         );
         assert!(cache.exists(), "active owner cache must remain intact");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn build_cache_pressure_page_limit_grows_and_stays_within_the_wire_maximum() {
+        let _isolation = reclaim_test_isolation();
+        assert_eq!(pressure_page_limit(64, false), 64);
+        assert_eq!(pressure_page_limit(64, true), 256);
+        assert_eq!(pressure_page_limit(1000, true), 1024);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -13581,7 +14147,8 @@ done
         )
         .await;
         std::fs::remove_dir_all(cache.join("debug")).unwrap();
-        let file = cache.join("externally-retained");
+        std::fs::create_dir_all(cache.join("debug")).unwrap();
+        let file = cache.join("debug/externally-retained");
         std::fs::write(&file, vec![5_u8; 8 * 1024 * 1024]).unwrap();
         std::fs::File::open(&file).unwrap().sync_all().unwrap();
         let external = sandbox_base.path().join("external-hard-link");
@@ -13640,7 +14207,8 @@ done
         )
         .await;
         std::fs::remove_dir_all(cache.join("debug")).unwrap();
-        let file = cache.join("post-sizing-race");
+        std::fs::create_dir_all(cache.join("debug")).unwrap();
+        let file = cache.join("debug/post-sizing-race");
         std::fs::write(&file, vec![7_u8; 8 * 1024 * 1024]).unwrap();
         std::fs::File::open(&file).unwrap().sync_all().unwrap();
         let (file_ino, file_len) = {
@@ -13729,8 +14297,10 @@ done
         .await;
         std::fs::remove_dir_all(first_cache.join("debug")).unwrap();
         std::fs::remove_dir_all(second_cache.join("debug")).unwrap();
-        let first_file = first_cache.join("shared");
-        let second_file = second_cache.join("shared");
+        std::fs::create_dir_all(first_cache.join("debug")).unwrap();
+        std::fs::create_dir_all(second_cache.join("debug")).unwrap();
+        let first_file = first_cache.join("debug/shared");
+        let second_file = second_cache.join("debug/shared");
         std::fs::write(&first_file, vec![6_u8; 8 * 1024 * 1024]).unwrap();
         std::fs::File::open(&first_file)
             .unwrap()
@@ -14280,6 +14850,7 @@ done
         let _isolation = reclaim_test_isolation();
         let db_dir = disk_backed_tempdir("reclaim-oldest-db");
         let sandbox_base = disk_backed_tempdir("reclaim-oldest-sandbox");
+        let _stats = install_no_pressure_stats_override_for_test(sandbox_base.path());
         let manager = manager_for_disk_fixture(db_dir.path(), sandbox_base.path());
         let repo = TempDir::new().expect("repo dir");
         init_d00_git_repo(repo.path());
@@ -14333,6 +14904,7 @@ done
         let _isolation = reclaim_test_isolation();
         let db_dir = disk_backed_tempdir("reclaim-paging-db");
         let sandbox_base = disk_backed_tempdir("reclaim-paging-sandbox");
+        let _stats = install_no_pressure_stats_override_for_test(sandbox_base.path());
         let manager = manager_for_disk_fixture(db_dir.path(), sandbox_base.path());
         let repo = TempDir::new().expect("repo dir");
         init_d00_git_repo(repo.path());
@@ -14437,6 +15009,7 @@ done
         let _isolation = reclaim_test_isolation();
         let db_dir = disk_backed_tempdir("durable-reclaim-db-");
         let sandbox_base = disk_backed_tempdir("durable-reclaim-sandboxes-");
+        let _stats = install_no_pressure_stats_override_for_test(sandbox_base.path());
         let repo = disk_backed_tempdir("durable-reclaim-repo-");
         init_d00_git_repo(repo.path());
         let stale = chrono::Utc::now() - chrono::Duration::hours(9);
@@ -14531,6 +15104,7 @@ done
         let _isolation = reclaim_test_isolation();
         let db_dir = disk_backed_tempdir("crash-reclaim-db-");
         let sandbox_base = disk_backed_tempdir("crash-reclaim-sandboxes-");
+        let _stats = install_no_pressure_stats_override_for_test(sandbox_base.path());
         let repo = disk_backed_tempdir("crash-reclaim-repo-");
         init_d00_git_repo(repo.path());
         let stale = chrono::Utc::now() - chrono::Duration::hours(9);
@@ -15490,6 +16064,10 @@ done
     #[tokio::test]
     async fn pressure_reclaim_maintenance_crosses_mixed_refused_page() {
         let _isolation = reclaim_test_isolation();
+        // This test traverses a refused page by page; keep the page at the
+        // configured size instead of the widened pressure page.
+        PRESSURE_PAGE_MULTIPLIER_FOR_TEST.store(1, Ordering::SeqCst);
+        let _multiplier_reset = PressureMultiplierReset;
         let db = disk_backed_tempdir("pressure-refused-db-");
         let base = disk_backed_tempdir("pressure-refused-base-");
         let repo = disk_backed_tempdir("pressure-refused-repo-");
@@ -15543,7 +16121,11 @@ done
         std::fs::write(refused_target, b"retain refused target").unwrap();
         manager.persistence.barrier().await.unwrap();
         let preview = run_build_cache_reclaim_fixture(&manager, true).await;
-        assert_eq!(preview.candidates_considered, 3, "{preview:?}");
+        // Under pressure (#1607) the two oldest rows, whose targets are absent,
+        // are walked past without spending budget; the newest row (a real
+        // target) leads and the refused non-directory target follows.
+        assert_eq!(preview.candidates_considered, 2, "{preview:?}");
+        assert_eq!(preview.eligible_candidates, 1, "{preview:?}");
         assert_eq!(
             preview.skip_counts.get(&ReclaimSkipReason::TargetAbsent),
             Some(&2)
@@ -15552,10 +16134,11 @@ done
             preview
                 .skip_counts
                 .get(&ReclaimSkipReason::TargetNotDirectory),
-            Some(&1)
+            Some(&1),
+            "{preview:?}"
         );
         assert_eq!(preview.skip_counts.len(), 2, "{preview:?}");
-        assert_eq!(preview.stop_reason, ReclaimStopReason::CandidateBudget);
+        assert_eq!(preview.stop_reason, ReclaimStopReason::Completed);
         assert_eq!(
             manager
                 .store
@@ -15624,8 +16207,8 @@ done
             "mixed refusals must admit the next bounded pass"
         );
         let cursor = cursor.expect("actual refused page advances durable cursor");
-        assert_eq!(cursor.session_id, rows[2].0.id);
-        assert_eq!(cursor.updated_at, rows[2].0.updated_at.to_rfc3339());
+        assert_eq!(cursor.session_id, rows[3].0.id);
+        assert_eq!(cursor.updated_at, rows[3].0.updated_at.to_rfc3339());
         assert!(
             converged,
             "later authenticated target is reclaimed before the normal interval"
@@ -17746,6 +18329,502 @@ done
         );
     }
 
+    /// #1607: the hub's shared cargo `debug/` cache has no sandbox row. A
+    /// pressure pass removes it once idle (never `release/`) and the status
+    /// preview reports it without touching it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn pressure_pass_reclaims_idle_shared_debug_and_status_reports_it() {
+        use rsi_common::sandbox_storage::SandboxSharedTargetReclaimOutcome as Shared;
+        let _isolation = reclaim_test_isolation();
+        let db_dir = disk_backed_tempdir("reclaim-shared-db");
+        let sandbox_base = disk_backed_tempdir("reclaim-shared-sandbox");
+        let manager = manager_for_disk_fixture(db_dir.path(), sandbox_base.path());
+        let _filesystem_stats_override = install_sandbox_filesystem_stats_override_for_test(
+            sandbox_base.path(),
+            SandboxFilesystemStats {
+                total_bytes: 100,
+                available_bytes: 98,
+                used_bytes: 2,
+                used_percent: 2,
+            },
+        );
+        let shared = TempDir::new().expect("shared target");
+        let debug = shared.path().join("debug");
+        std::fs::create_dir_all(debug.join("deps")).unwrap();
+        std::fs::create_dir_all(shared.path().join("release/deps")).unwrap();
+        std::fs::write(debug.join("deps/libx.rlib"), vec![3u8; 32768]).unwrap();
+        std::fs::write(shared.path().join("release/deps/rsi"), vec![4u8; 4096]).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(8 * 3600);
+        for dir in [debug.join("deps"), debug.clone()] {
+            std::fs::File::open(dir).unwrap().set_modified(old).unwrap();
+        }
+        crate::shared_target_prune::set_shared_target_dir_for_test(Some(shared.path().into()));
+        let restore = scopeguard_restore_shared_target();
+
+        let preview = manager
+            .run_sandbox_build_cache_reclaim_wire_for_trigger(true, "preview")
+            .await
+            .unwrap();
+        let status = preview.v2().unwrap().shared_target.clone().unwrap();
+        assert_eq!(status.outcome, Shared::PressureInactive, "{status:?}");
+        assert!(status.measured_bytes >= 32768, "{status:?}");
+        assert!(
+            debug.join("deps/libx.rlib").is_file(),
+            "preview is read-only"
+        );
+
+        for (field, value) in [
+            ("sandbox_build_cache_reclaim_low_watermark_pct", 1),
+            ("sandbox_build_cache_reclaim_high_watermark_pct", 2),
+        ] {
+            manager
+                .runtime_config
+                .update_field(field, &serde_json::json!(value))
+                .unwrap();
+        }
+        let report = manager
+            .run_sandbox_build_cache_reclaim_wire_for_trigger(false, "operator_actual")
+            .await
+            .unwrap();
+        let shared_report = report.v2().unwrap().shared_target.clone().unwrap();
+        assert_eq!(
+            shared_report.outcome,
+            Shared::Reclaimed,
+            "{shared_report:?}"
+        );
+        assert!(shared_report.reclaimed_bytes >= 32768, "{shared_report:?}");
+        assert!(report.report().reclaimed_bytes >= shared_report.reclaimed_bytes);
+        assert!(!debug.exists());
+        assert!(shared.path().join("release/deps/rsi").is_file());
+        drop(restore);
+    }
+
+    struct SharedTargetRestore;
+    impl Drop for SharedTargetRestore {
+        fn drop(&mut self) {
+            crate::shared_target_prune::set_shared_target_dir_for_test(None);
+        }
+    }
+    fn scopeguard_restore_shared_target() -> SharedTargetRestore {
+        SharedTargetRestore
+    }
+
+    /// Lay out the top level of a finished worker's `target/` as the 2026-10-07
+    /// hub sandboxes had it (#1575): Cargo's `debug`, `tmp` and
+    /// `.rustc_info.json`, the daemon's `.rsi-tmp` execution scratch (TMPDIR),
+    /// and the test runner's fixture and lock entries.
+    fn populate_worker_target_scratch(cache: &std::path::Path) {
+        for dir in [".rsi-tmp", "tmp", "rsid-test-fixtures", "rsid-d00-fixtures"] {
+            std::fs::create_dir_all(cache.join(dir).join("nested")).expect("scratch dir");
+            std::fs::write(cache.join(dir).join("nested").join("blob"), vec![1u8; 2048])
+                .expect("scratch file");
+        }
+        for file in [".rustc_info.json", "CACHEDIR.TAG", ".rsid-test-shards.lock"] {
+            std::fs::write(cache.join(file), b"{}").expect("top-level file");
+        }
+    }
+
+    /// A fired continuation: the owner's wake was delivered, so the row is
+    /// disabled with `last_fired_at` set, as in the hub's `scheduled_jobs`.
+    async fn insert_fired_wakes(manager: &SessionManager, owner: Uuid) {
+        use rsi_common::types::{Recurrence, ScheduleSpec, ScheduledJob, WakeMode};
+        let now = chrono::Utc::now();
+        for mode in [WakeMode::Resume, WakeMode::OnTerminal(Uuid::new_v4())] {
+            let job = ScheduledJob {
+                id: Uuid::new_v4(),
+                name: "fired-verification".into(),
+                message: "verification finished".into(),
+                schedule: ScheduleSpec {
+                    recurrence: Recurrence::Once,
+                    anchor: now,
+                },
+                last_fired_at: Some(now),
+                next_fire_at: now,
+                enabled: false,
+                working_dir: None,
+                provider: None,
+                model: None,
+                project_id: None,
+                created_at: now,
+                updated_at: now,
+                wake_mode: mode,
+                wake_session_id: Some(owner),
+            };
+            manager
+                .store
+                .lock()
+                .await
+                .insert_scheduled_job(&job)
+                .expect("insert fired wake");
+        }
+    }
+
+    /// #1575: with #1552 deployed, pressure reclaim still freed nothing while
+    /// finished workers' `target/` held tens of GB. Mirror the real case: a
+    /// Completed worker sandbox cut from a real repository, recent `updated_at`,
+    /// fired (disabled) wakes, and the scratch entries every sandbox target
+    /// accumulates beside Cargo's own outputs.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn pressure_reclaims_finished_worker_target_with_scratch_entries_and_fired_wakes() {
+        let _isolation = reclaim_test_isolation();
+        let db_dir = disk_backed_tempdir("reclaim-1575-db");
+        let sandbox_base = disk_backed_tempdir("reclaim-1575-sandbox");
+        let manager = manager_for_disk_fixture(db_dir.path(), sandbox_base.path());
+        let _filesystem_stats_override = install_sandbox_filesystem_stats_override_for_test(
+            sandbox_base.path(),
+            SandboxFilesystemStats {
+                total_bytes: 100,
+                available_bytes: 98,
+                used_bytes: 2,
+                used_percent: 2,
+            },
+        );
+        let repo = disk_backed_tempdir("reclaim-1575-repo");
+        init_d00_git_repo(repo.path());
+        let (worker, cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            SessionStatus::Completed,
+            chrono::Utc::now() - chrono::Duration::minutes(2),
+        )
+        .await;
+        populate_worker_target_scratch(&cache);
+        insert_fired_wakes(&manager, worker.id).await;
+        manager.persistence.barrier().await.unwrap();
+        for (field, pct) in [
+            ("sandbox_build_cache_reclaim_low_watermark_pct", 1),
+            ("sandbox_build_cache_reclaim_high_watermark_pct", 2),
+        ] {
+            manager
+                .runtime_config
+                .update_field(field, &serde_json::json!(pct))
+                .unwrap();
+        }
+
+        let preview = run_build_cache_reclaim_fixture(&manager, true).await;
+        assert!(preview.pressure_active_after, "{preview:?}");
+        assert_eq!(
+            preview.eligible_candidates, 1,
+            "the dry-run preview must offer the finished worker: {preview:?}"
+        );
+        assert!(cache.exists(), "a dry run never deletes");
+
+        let report = run_build_cache_reclaim_fixture(&manager, false).await;
+        assert!(
+            !cache.exists(),
+            "the finished worker's whole target must be reclaimed under pressure: {report:?}"
+        );
+        assert_eq!(
+            report.eligible_candidates, preview.eligible_candidates,
+            "the preview's eligibility must agree with the real pass"
+        );
+        assert!(
+            repo.path().join(".git").exists()
+                && worker
+                    .sandbox_root
+                    .as_ref()
+                    .is_some_and(|root| root.exists()),
+            "only target/ may go; the worktree stays"
+        );
+    }
+
+    /// #1607: under pressure the candidate budget went to finished sandboxes
+    /// whose `target/` was already reclaimed (~1,500 of them on the hub), so
+    /// real targets were never reached and nothing was freed. One present
+    /// target sits between older and newer absent ones, beyond what either
+    /// lane's budget of 4 reaches; the first pass must still free it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn pressure_pass_frees_a_present_target_buried_among_absent_ones_in_one_pass() {
+        let _isolation = reclaim_test_isolation();
+        let db_dir = disk_backed_tempdir("reclaim-1607-db");
+        let sandbox_base = disk_backed_tempdir("reclaim-1607-sandbox");
+        let manager = manager_for_disk_fixture(db_dir.path(), sandbox_base.path());
+        let _filesystem_stats_override = install_sandbox_filesystem_stats_override_for_test(
+            sandbox_base.path(),
+            SandboxFilesystemStats {
+                total_bytes: 100,
+                available_bytes: 98,
+                used_bytes: 2,
+                used_percent: 2,
+            },
+        );
+        let repo = disk_backed_tempdir("reclaim-1607-repo");
+        init_d00_git_repo(repo.path());
+        let now = chrono::Utc::now();
+        let mut present_cache = None;
+        for ordinal in 0..13i64 {
+            // Rows 0..6 are the oldest, row 6 sits in the middle, rows 7..13
+            // are the newest; only row 6 keeps its target.
+            let minutes_ago = if ordinal < 6 {
+                400 - ordinal * 10
+            } else if ordinal == 6 {
+                200
+            } else {
+                60 - ordinal * 4
+            };
+            let (_row, cache) = build_cache_row(
+                &manager,
+                repo.path(),
+                sandbox_base.path(),
+                SessionStatus::Completed,
+                now - chrono::Duration::minutes(minutes_ago),
+            )
+            .await;
+            if ordinal == 6 {
+                present_cache = Some(cache);
+            } else {
+                std::fs::remove_dir_all(&cache).expect("simulate an already-reclaimed target");
+            }
+        }
+        let present_cache = present_cache.expect("one present target");
+        manager.persistence.barrier().await.unwrap();
+        for (field, value) in [
+            ("sandbox_build_cache_reclaim_max_candidates", 1),
+            ("sandbox_build_cache_reclaim_low_watermark_pct", 1),
+            ("sandbox_build_cache_reclaim_high_watermark_pct", 2),
+        ] {
+            manager
+                .runtime_config
+                .update_field(field, &serde_json::json!(value))
+                .unwrap();
+        }
+
+        let report = manager
+            .run_sandbox_build_cache_reclaim(false)
+            .await
+            .unwrap();
+        assert!(
+            !present_cache.exists(),
+            "the first pressure pass must free the present target: {report:?}"
+        );
+        assert!(report.reclaimed_bytes > 0, "{report:?}");
+        assert!(
+            report
+                .skip_counts
+                .get(&ReclaimSkipReason::TargetAbsent)
+                .copied()
+                .unwrap_or(0)
+                >= 6,
+            "absent rows are counted, not spent: {report:?}"
+        );
+        assert!(
+            report.candidates_considered <= 4,
+            "absent rows spent no candidate budget: {report:?}"
+        );
+    }
+
+    /// #1575: no refusal in a report is anonymous. Five finished workers, one
+    /// per outcome: reclaimable, unknown top-level content, a detached branch,
+    /// a live wake, an absent target. The report names each refused session and
+    /// the exact check, and the dry-run preview agrees with the real pass.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn reclaim_report_names_every_refusal_and_preview_agrees_with_the_pass() {
+        use rsi_common::types::{Recurrence, ScheduleSpec, ScheduledJob, WakeMode};
+        let _isolation = reclaim_test_isolation();
+        let db_dir = disk_backed_tempdir("reclaim-1575-named-db");
+        let sandbox_base = disk_backed_tempdir("reclaim-1575-named-sandbox");
+        let manager = manager_for_disk_fixture(db_dir.path(), sandbox_base.path());
+        let _filesystem_stats_override = install_sandbox_filesystem_stats_override_for_test(
+            sandbox_base.path(),
+            SandboxFilesystemStats {
+                total_bytes: 100,
+                available_bytes: 98,
+                used_bytes: 2,
+                used_percent: 2,
+            },
+        );
+        let repo = disk_backed_tempdir("reclaim-1575-named-repo");
+        init_d00_git_repo(repo.path());
+        let recent = || chrono::Utc::now() - chrono::Duration::minutes(2);
+        let completed = SessionStatus::Completed;
+
+        let (clean, clean_cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            completed,
+            recent(),
+        )
+        .await;
+        populate_worker_target_scratch(&clean_cache);
+
+        let (foreign, foreign_cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            completed,
+            recent(),
+        )
+        .await;
+        std::fs::write(foreign_cache.join("lander"), b"manager state").expect("foreign entry");
+
+        let (detached, detached_cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            completed,
+            recent(),
+        )
+        .await;
+        let detach = Command::new("git")
+            .current_dir(detached.sandbox_root.as_ref().expect("sandbox root"))
+            .args(["checkout", "--detach"])
+            .output()
+            .expect("detach worktree");
+        assert!(detach.status.success(), "{detach:?}");
+
+        let (fenced, fenced_cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            completed,
+            recent(),
+        )
+        .await;
+        let now = chrono::Utc::now();
+        manager
+            .store
+            .lock()
+            .await
+            .insert_scheduled_job(&ScheduledJob {
+                id: Uuid::new_v4(),
+                name: "pending-continuation".into(),
+                message: "continue".into(),
+                schedule: ScheduleSpec {
+                    recurrence: Recurrence::Once,
+                    anchor: now,
+                },
+                last_fired_at: None,
+                next_fire_at: now,
+                enabled: true,
+                working_dir: None,
+                provider: None,
+                model: None,
+                project_id: None,
+                created_at: now,
+                updated_at: now,
+                wake_mode: WakeMode::Resume,
+                wake_session_id: Some(fenced.id),
+            })
+            .expect("insert live wake");
+
+        let (absent, absent_cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            completed,
+            recent(),
+        )
+        .await;
+        std::fs::remove_dir_all(&absent_cache).expect("remove target");
+
+        manager.persistence.barrier().await.unwrap();
+        for (field, pct) in [
+            ("sandbox_build_cache_reclaim_low_watermark_pct", 1),
+            ("sandbox_build_cache_reclaim_high_watermark_pct", 2),
+        ] {
+            manager
+                .runtime_config
+                .update_field(field, &serde_json::json!(pct))
+                .unwrap();
+        }
+
+        let preview = run_build_cache_reclaim_with_evidence_fixture(&manager, true).await;
+        let pass = run_build_cache_reclaim_with_evidence_fixture(&manager, false).await;
+        for (label, run) in [("preview", &preview), ("pass", &pass)] {
+            // The absent target is walked past under pressure (#1607): counted
+            // as TargetAbsent, but neither considered nor named.
+            assert_eq!(
+                run.report.candidates_considered, 4,
+                "{label}: {:?}",
+                run.report
+            );
+            assert_eq!(
+                run.report.eligible_candidates, 1,
+                "{label}: {:?}",
+                run.report
+            );
+            assert_eq!(
+                run.evidence.refusals.len(),
+                3,
+                "{label}: every refused candidate is named: {:?}",
+                run.evidence.refusals
+            );
+            let check = |session: &Session| {
+                run.evidence
+                    .refusals
+                    .iter()
+                    .find(|refusal| refusal.session_id == session.id)
+                    .map(|refusal| (refusal.reason, refusal.check.as_str()))
+            };
+            assert_eq!(
+                check(&foreign),
+                Some((
+                    ReclaimSkipReason::TargetUnrecognizedContent,
+                    "target_entry_unrecognized:lander"
+                )),
+                "{label}"
+            );
+            assert_eq!(
+                check(&detached),
+                Some((
+                    ReclaimSkipReason::GitOrRootIdentityRefusal,
+                    "git_branch_mismatch"
+                )),
+                "{label}"
+            );
+            assert_eq!(
+                check(&fenced),
+                Some((
+                    ReclaimSkipReason::LiveConsumer,
+                    "live_consumer:enabled_wake"
+                )),
+                "{label}"
+            );
+            assert_eq!(check(&absent), None, "{label}");
+            assert_eq!(
+                run.report.skip_counts.get(&ReclaimSkipReason::TargetAbsent),
+                Some(&1),
+                "{label}: {:?}",
+                run.report
+            );
+            assert_eq!(
+                check(&clean),
+                None,
+                "{label}: the reclaimable worker is not refused"
+            );
+        }
+        assert_eq!(
+            preview.report.skip_counts, pass.report.skip_counts,
+            "the preview's refusals must match the pass"
+        );
+
+        assert!(!clean_cache.exists(), "the reclaimable target is gone");
+        assert!(
+            clean
+                .sandbox_root
+                .as_ref()
+                .is_some_and(|root| root.exists())
+        );
+        for retained in [&foreign_cache, &detached_cache, &fenced_cache] {
+            assert!(retained.exists(), "refused targets stay: {retained:?}");
+        }
+        let wire = pass
+            .into_wire()
+            .validate_wire()
+            .expect("the named refusals form a valid wire report");
+        assert_eq!(wire.v2().expect("V2 envelope").refusals.len(), 3);
+    }
+
     async fn admitted_session_launch_permit(
         manager: &SessionManager,
         session_id: Uuid,
@@ -18215,6 +19294,39 @@ done
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
+    async fn launch_refuses_the_removed_taskrabbit_kind_before_any_side_effect() {
+        let (manager, dir, _sandbox) = manager();
+        let mut config = scheduled_fresh_test_config(
+            ModelInvocationPurpose::AgentScheduleWakeFresh,
+            SessionProvider::Local,
+            dir.path().to_path_buf(),
+            None,
+            Uuid::new_v4(),
+        );
+        config.session_kind = Some(SessionKind::TaskRabbit);
+        let error = manager
+            .launch_session(config)
+            .await
+            .expect_err("TaskRabbit launches are refused");
+        assert!(
+            matches!(&error, DaemonError::InvalidParam(message)
+                if message == "TaskRabbit sessions were removed; launch a Standard session"),
+            "{error}"
+        );
+        assert!(
+            manager
+                .store
+                .lock()
+                .await
+                .load_sessions()
+                .expect("load sessions")
+                .is_empty(),
+            "refusal persists no session row"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
     async fn scheduled_fresh_pins_effective_standard_kind_against_project_worker_default() {
         let (manager, _dir, _sandbox) = manager();
         let project_id = Uuid::new_v4();
@@ -18324,7 +19436,11 @@ done
                         session_id: seat,
                         project_ids: vec![project_id],
                         allowed_launches: vec![launch.clone()],
-                        project_policy: ManagerPolicyV2::default(),
+                        // #1314: the appointed PM is charged to the grantor.
+                        project_policy: ManagerPolicyV2 {
+                            max_created_sessions: 1,
+                            ..ManagerPolicyV2::default()
+                        },
                         expected_grant_version: 0,
                         idempotency_key: "global-grant".into(),
                     },
@@ -18380,12 +19496,149 @@ done
                 .unwrap()
                 .unwrap();
             assert!(!policy.revoked);
+            // #1314: the launch reserved its slot in the grantor's ledger.
+            let reserved: i64 = store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM harness_manager_v2_records
+                     WHERE kind='resource_launch_origin' AND record_key=?1 AND manager_session_id=?2",
+                    [result.session_id.to_string(), seat.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(reserved, 1, "the seat launch is reserved by its grantor");
             store
                 .session_model_invocation_id(result.session_id)
                 .unwrap()
                 .expect("the PM launch has an admission binding")
         };
         cleanup_active_test_session(&manager, result.session_id, invocation_id).await;
+        server.abort();
+    }
+
+    /// #1314: the grantor's cohort fills after the appointment's admission
+    /// and before the provider runs. The launch funnel's Model Control
+    /// admission (the effect) rechecks the grantor's caps and refuses: no
+    /// session, no dispatch, no appointment.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn global_appointment_launch_rechecks_the_grantors_caps_at_the_effect() {
+        use rsi_common::global_manager::{
+            AgentGlobalAppointManagerRequestV1, ConfigureGlobalManagerRequestV1,
+        };
+        use rsi_common::harness_manager_v2::{ManagerLaunchChoiceV2, ManagerPolicyV2};
+        let (manager, _dir, _sandbox) = manager();
+        let (server, base_url, dispatches) = spawn_blocking_local_test_provider().await;
+        let cwd = std::env::current_dir().expect("current working directory");
+        let project_id = Uuid::new_v4();
+        let seat = Uuid::new_v4();
+        let launch = ManagerLaunchChoiceV2 {
+            provider: SessionProvider::Local,
+            model: "scheduled-fresh-test-model".into(),
+            effort: None,
+        };
+        {
+            let store = manager.store.lock().await;
+            let now = chrono::Utc::now();
+            store
+                .insert_project(&rsi_common::types::Project {
+                    id: project_id,
+                    name: format!("global appointment drift {project_id}"),
+                    path: Some(cwd.clone()),
+                    description: None,
+                    color: rsi_common::types::Project::DEFAULT_COLOR.into(),
+                    context_files: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .unwrap();
+            let mut seat_row = test_session(seat);
+            seat_row.working_dir = cwd.clone();
+            store.insert_session(&seat_row).unwrap();
+            store
+                .configure_global_manager(
+                    &ConfigureGlobalManagerRequestV1 {
+                        session_id: seat,
+                        project_ids: vec![project_id],
+                        allowed_launches: vec![launch.clone()],
+                        project_policy: ManagerPolicyV2 {
+                            max_created_sessions: 1,
+                            max_active_sessions: 1,
+                            ..ManagerPolicyV2::default()
+                        },
+                        expected_grant_version: 0,
+                        idempotency_key: "global-grant-drift".into(),
+                    },
+                    "operator:test",
+                )
+                .unwrap();
+        }
+        let request = AgentGlobalAppointManagerRequestV1 {
+            project_id,
+            launch,
+            query: "You are the project manager.".into(),
+            idempotency_key: "gm-launch-drift".into(),
+            sandbox: Some(false),
+        };
+        let reserved = std::sync::Mutex::new(None);
+        let error = super::super::global_manager_verbs::global_appoint_manager_with(
+            &manager.store,
+            seat,
+            &request,
+            |session_id| {
+                *reserved.lock().unwrap() = Some(session_id);
+                let mut config = super::super::global_manager_verbs::global_manager_launch_config(
+                    &request,
+                    cwd.clone(),
+                    session_id,
+                );
+                config.openai_base_url = Some(base_url.clone());
+                let manager = &manager;
+                async move {
+                    {
+                        // A worker starts in a live Epic of the project: the
+                        // grantor's one active slot is taken mid-launch.
+                        let store = manager.store.lock().await;
+                        let mut parent = None;
+                        for (kind, status) in [
+                            (SessionKind::Group, SessionStatus::Completed),
+                            (SessionKind::Epic, SessionStatus::Completed),
+                            (SessionKind::Task, SessionStatus::Running),
+                        ] {
+                            let mut row = test_session(Uuid::new_v4());
+                            row.project_id = Some(project_id);
+                            row.parent_id = parent;
+                            row.session_kind = kind;
+                            row.status = status;
+                            store.insert_session(&row).unwrap();
+                            parent = Some(row.id);
+                        }
+                    }
+                    manager.launch_global_appointment(config, session_id).await
+                }
+            },
+        )
+        .await
+        .expect_err("the effect-time gate refuses the launch");
+        assert!(
+            error
+                .to_string()
+                .contains("manager_v2_concurrency_capacity"),
+            "{error}"
+        );
+        let session_id = reserved.lock().unwrap().expect("the launcher ran");
+        let store = manager.store.lock().await;
+        assert!(store.get_session(session_id).unwrap().is_none());
+        assert_eq!(
+            store
+                .get_harness_manager(project_id)
+                .unwrap()
+                .map(|config| config.current_session_id),
+            None,
+            "no PM was appointed"
+        );
+        assert_eq!(dispatches.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(store);
         server.abort();
     }
 
@@ -25113,6 +26366,57 @@ done
         child_server.abort();
     }
 
+    /// #1417: host-load admission holds a manager's new workers only. A
+    /// worker's own `AgentSpawnChild` launch continues work that was already
+    /// admitted, so a host over the threshold never holds it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn a_loaded_host_does_not_hold_a_workers_own_agent_child_launch() {
+        let (manager, _dir, _sandbox) = manager();
+        let manager = Arc::new(manager);
+        manager
+            .host_load()
+            .set_source(Arc::new(|| crate::host_load::LoadReading::Load1(95.0)));
+        assert!(
+            manager.host_load().hold_now().is_some(),
+            "the host is over the threshold"
+        );
+        let repo = tempfile::tempdir().expect("canonical repo");
+        init_d00_git_repo(repo.path());
+        let canonical = std::fs::canonicalize(repo.path()).expect("canonical path");
+        let emitter = h1_7g_ordinary_emitter(&canonical);
+        manager
+            .store
+            .lock()
+            .await
+            .insert_session(&emitter)
+            .expect("insert ordinary emitter");
+        let (child_server, child_base_url, child_dispatches) =
+            spawn_blocking_local_test_provider().await;
+        let request =
+            h1_7g_reserve_spawn_request(&manager, emitter.id, canonical.clone(), child_base_url)
+                .await;
+        let reserved_child_id = request.child_session_id;
+
+        let child_id = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            manager.launch_agent_child(request),
+        )
+        .await
+        .expect("a worker's own spawn is not parked behind the host load")
+        .expect("the spawn launches");
+        assert_eq!(child_id, reserved_child_id);
+        wait_for_backend_dispatch(&child_dispatches).await;
+        let status = manager.host_load().status(&[]);
+        assert!(status.holding, "the hold itself is still in force");
+        assert!(
+            status.held.is_empty(),
+            "and the spawn never queued behind it"
+        );
+        h1_7g_cleanup_child(&manager, child_id).await;
+        child_server.abort();
+    }
+
     /// #1073: the launch gate's scope: a parentless launch (interactive or a
     /// parentless workflow node) is never held; a parented topology node waits
     /// in place and runs when the hold releases; a parented ordinary launch is
@@ -27928,6 +29232,68 @@ done
                 .is_none()
         );
         assert_eq!(tokens.get(&predecessor_token), Some(&predecessor_id));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aws_only_refuses_deferred_app_server_after_profile_changes() {
+        for (profile, may_spawn) in [("all", true), ("aws_only", false)] {
+            let (manager, dir, _sandbox) = manager();
+            init_d00_git_repo(dir.path());
+            let (epic_id, predecessor_id, receipt) = successor_launch_fixture(
+                &manager,
+                dir.path(),
+                "app-server-profile-change",
+                SessionProvider::CodexAppServer,
+            )
+            .await;
+            let marker = dir.path().join("off-profile-provider-started");
+            install_controller_candidate_test_app_server_binary(
+                receipt.candidate_session_id,
+                write_codex_app_server_start_marker(dir.path(), &marker),
+            );
+            let (reached, resume) = install_controller_candidate_test_pause(
+                receipt.candidate_session_id,
+                ControllerCandidateTestPhase::SuccessorBeforeDeferredProviderStart,
+            );
+            manager
+                .store
+                .lock()
+                .await
+                .update_session_status(predecessor_id, SessionStatus::Completed)
+                .expect("settle app-server predecessor");
+            let mut reconcile = Box::pin(manager.reconcile_agent_successor(receipt.reservation_id));
+            tokio::select! {
+                result = &mut reconcile => panic!("deferred successor crossed pre-start pause: {result:?}"),
+                reached = reached => reached.expect("deferred successor reached pre-start pause"),
+            }
+            manager
+                .runtime_config
+                .update_field("provider_profile", &serde_json::json!(profile))
+                .expect("change the live operator profile");
+            resume.send(()).expect("resume deferred provider start");
+            reconcile
+                .await
+                .expect_err("the changed profile refuses the deferred launch");
+            assert_eq!(
+                marker.exists(),
+                may_spawn,
+                "deferred process under {profile}"
+            );
+            let store = manager.store.lock().await;
+            let failed = store
+                .get_agent_successor(receipt.reservation_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                failed.state,
+                rsi_common::agent_coordination::AgentSuccessorStateV1::Failed
+            );
+            assert_eq!(
+                store.get_session(epic_id).unwrap().unwrap().lead_session_id,
+                Some(predecessor_id)
+            );
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]

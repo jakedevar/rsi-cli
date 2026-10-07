@@ -23,13 +23,10 @@ fn popup_rect(area: Rect, count: usize, geom: &ModalGeometry) -> Rect {
 
 fn icon(kind: NotificationKind) -> &'static str {
     match kind {
-        NotificationKind::TaskRabbitComplete
-        | NotificationKind::BugComplete
+        NotificationKind::BugComplete
         | NotificationKind::OperationSuccess
         | NotificationKind::Connected => "✓",
-        NotificationKind::TaskRabbitFailed
-        | NotificationKind::BugFailed
-        | NotificationKind::OperationFailed => "✗",
+        NotificationKind::BugFailed | NotificationKind::OperationFailed => "✗",
         NotificationKind::ConnectionFailed | NotificationKind::ConnectionLost => "⚡",
         NotificationKind::SessionLaunching | NotificationKind::SessionResuming => "…",
         NotificationKind::Info => "ℹ",

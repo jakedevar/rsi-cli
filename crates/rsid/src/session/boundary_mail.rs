@@ -17,12 +17,30 @@
 //! Each message goes through the same durable sequence the idle-boundary and
 //! Harness deliveries use: arbiter grant -> `claim_agent_message_exact`
 //! (`queued -> claimed`, one attempt row) -> `dispatching` marker -> the text is
-//! handed to the caller -> `AdmittedEffectPossible` is recorded. A message is
-//! therefore returned at most once: after the claim it is no longer `queued`,
-//! so the next hook (or the turn-end dispatcher) cannot pick it up again. If
-//! the daemon dies, or the hook dies before it prints, between the claim and
-//! the record, the attempt stays `dispatching` and reconciliation classifies
-//! it `uncertain` (#945): visible, never silently redelivered.
+//! handed to the hook. A message is therefore returned at most once: after the
+//! claim it is no longer `queued`, so the next hook (or the turn-end
+//! dispatcher) cannot pick it up again.
+//!
+//! # Delivery-correlated acknowledgement (#1183)
+//!
+//! Handing the text to the hook is not delivery, and neither is the hook
+//! printing it: the hook can die first, and the provider can time the hook out
+//! and discard its output. The attempt therefore stays `dispatching` (the
+//! message `claimed`) through three steps: the hook writes and flushes its
+//! output, then calls `ConfirmBoundaryMail` ([`confirm_boundary_mail`]) with
+//! the provider's own transcript locator from its hook input; the daemon then
+//! watches that transcript ([`await_boundary_mail_evidence`]) for the
+//! provider's record that it ACCEPTED the hook context (Codex: a developer
+//! `hooks.additional_context` item; Claude: a `hook_additional_context`
+//! attachment) containing the message's exact block. Only then is
+//! `AdmittedEffectPossible` recorded (`injected`), so only mail the model was
+//! actually given can be acknowledged by a later assistant event. Anything
+//! else (reply not written, hook died, provider discarded the output, an
+//! unverifiable locator, or a record that could not be persisted) stays
+//! pending until [`BOUNDARY_MAIL_CONFIRM_DEADLINE`] and settles `uncertain`
+//! ([`settle_unconfirmed_boundary_mail`]): visible, never re-sent, never
+//! acknowledged. A daemon death in between leaves it `dispatching`, which
+//! startup reconciliation classifies `uncertain` (#945).
 //!
 //! The delivery invocation is the session's CURRENT model invocation (the
 //! running turn's own): a boundary hook is not a new model call, so nothing new
@@ -46,7 +64,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rsi_common::agent_coordination::{
-    BoundaryAdmissionV1, BoundaryCapabilityKindV1, BoundaryClassificationV1, MessageAttemptFenceV1,
+    BoundaryAdmissionV1, BoundaryCapabilityKindV1, BoundaryClassificationV1,
+    BoundaryProviderKindV1, MessageAttemptFenceV1,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
@@ -64,6 +83,132 @@ use crate::store::agent_coordination::{ClaimAgentMessageOutcome, NoEffectDisposi
 /// At most this many messages are handed over per tool boundary; the rest wait
 /// for the next boundary (a hook must stay small and fast).
 pub(crate) const BOUNDARY_MAIL_MAX_PER_CLAIM: usize = 4;
+
+/// How long a hook has to confirm it printed the mail it claimed (#1183). The
+/// hook itself is killed by its provider after a few seconds, so a delivery
+/// still unconfirmed after this is settled `uncertain`.
+pub(crate) const BOUNDARY_MAIL_CONFIRM_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+/// Where a hook said the provider records what it accepted (#1183).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TranscriptEvidence {
+    path: std::path::PathBuf,
+    /// Bytes already scanned. Starts at the file length when the hook
+    /// confirmed: the provider records accepted context only after the hook
+    /// exits, so nothing earlier can be the evidence.
+    cursor: u64,
+}
+
+/// One agent message handed to a hook and not yet delivered.
+#[derive(Debug, Clone)]
+struct PendingBoundaryDelivery {
+    session_id: Uuid,
+    fence: MessageAttemptFenceV1,
+    authority_id: Uuid,
+    provider_kind: BoundaryProviderKindV1,
+    /// The exact block the hook prints, looked for in the provider transcript.
+    block: String,
+    /// Set once the hook confirmed it printed the block.
+    evidence: Option<TranscriptEvidence>,
+}
+
+/// Daemon-wide ledger of hook deliveries awaiting proof of delivery (#1183).
+/// Each entry is taken exactly once: by the evidence watcher once the
+/// provider transcript shows the hook context was accepted (and the delivery
+/// is persisted), or by the settlement that marks it `uncertain`.
+#[derive(Debug, Default)]
+pub(crate) struct PendingBoundaryDeliveries {
+    entries: std::sync::Mutex<HashMap<Uuid, PendingBoundaryDelivery>>,
+    #[cfg(test)]
+    fail_next_record: std::sync::atomic::AtomicBool,
+}
+
+impl PendingBoundaryDeliveries {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, PendingBoundaryDelivery>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn insert(&self, delivery: PendingBoundaryDelivery) {
+        self.lock().insert(delivery.fence.message_id, delivery);
+    }
+
+    /// Record that `session_id`'s hook printed `message_id`. Only the claiming
+    /// session's own, not-yet-printed delivery qualifies.
+    fn mark_printed(
+        &self,
+        session_id: Uuid,
+        message_id: Uuid,
+        evidence: TranscriptEvidence,
+    ) -> bool {
+        let mut entries = self.lock();
+        match entries.get_mut(&message_id) {
+            Some(delivery) if delivery.session_id == session_id && delivery.evidence.is_none() => {
+                delivery.evidence = Some(evidence);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn get(&self, message_id: Uuid) -> Option<PendingBoundaryDelivery> {
+        self.lock().get(&message_id).cloned()
+    }
+
+    fn advance_cursor(&self, message_id: Uuid, cursor: u64) {
+        if let Some(evidence) = self
+            .lock()
+            .get_mut(&message_id)
+            .and_then(|delivery| delivery.evidence.as_mut())
+        {
+            evidence.cursor = cursor;
+        }
+    }
+
+    fn take(&self, message_id: Uuid) -> Option<PendingBoundaryDelivery> {
+        self.lock().remove(&message_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    #[cfg(test)]
+    fn fail_next_record(&self) {
+        self.fail_next_record
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test seam: make the next delivery record fail like a store error.
+    fn take_injected_record_failure(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.fail_next_record
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+}
+
+/// How often the evidence watcher re-reads the provider transcript.
+pub(crate) const BOUNDARY_MAIL_EVIDENCE_POLL: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
+/// Largest transcript tail one poll reads.
+const TRANSCRIPT_SCAN_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The reply to `ConfirmBoundaryMail`: the ids now awaiting transcript
+/// evidence. Printing is not delivery; nothing is `injected` yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmBoundaryMailResponse {
+    pub confirmed: Vec<Uuid>,
+}
 
 /// One claimed message, ready to show the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +247,7 @@ pub(crate) async fn claim_boundary_mail(
     store: &Arc<Mutex<Store>>,
     arbiter: &Arc<AgentMessageArbiter>,
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
+    pending: &PendingBoundaryDeliveries,
     session_id: Uuid,
 ) -> Result<ClaimBoundaryMailResponse> {
     let mut response = ClaimBoundaryMailResponse::default();
@@ -125,7 +271,7 @@ pub(crate) async fn claim_boundary_mail(
                 BoundaryDecision::SyntheticContinuation(_) => break,
             }
         };
-        match claim_one(store, grant).await? {
+        match claim_one(store, pending, session_id, grant).await? {
             Some(mail) => response.messages.push(mail),
             None => break,
         }
@@ -329,8 +475,229 @@ pub(crate) async fn drain_operator_transcript_inbox(
     }
 }
 
+/// The agent-mail (non-operator) delivery ids in a rendered
+/// `ClaimBoundaryMail` reply.
+#[must_use]
+pub(crate) fn agent_message_ids(result: &serde_json::Value) -> Vec<Uuid> {
+    result
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|message| {
+            message
+                .get("sender_role")
+                .and_then(serde_json::Value::as_str)
+                != Some(OPERATOR_SENDER_ROLE)
+        })
+        .filter_map(|message| message.get("message_id")?.as_str()?.parse().ok())
+        .collect()
+}
+
+/// `ConfirmBoundaryMail` (#1183): `session_id`'s hook wrote and flushed its
+/// output for `params.message_ids`. That only proves the hook printed: the
+/// provider may still time the hook out and discard it. So nothing is
+/// recorded here; each still-pending delivery of this session's hook is
+/// marked printed with the provider transcript to watch, and
+/// [`await_boundary_mail_evidence`] records it `injected` only once that
+/// transcript shows the provider accepted the hook context.
+///
+/// # Errors
+///
+/// `confirm_boundary_mail_unverifiable_transcript` when the hook's transcript
+/// locator is missing or does not belong to this session's provider
+/// conversation. The deliveries stay pending, so the deadline settles them
+/// `uncertain`.
+pub(crate) async fn confirm_boundary_mail(
+    active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
+    pending: &PendingBoundaryDeliveries,
+    session_id: Uuid,
+    params: &rsi_common::boundary_mail_hook::ConfirmBoundaryMailParams,
+) -> Result<ConfirmBoundaryMailResponse> {
+    let provider_session_id = active
+        .read()
+        .await
+        .get(&session_id)
+        .and_then(|tracked| tracked.session.claude_session_id.clone());
+    let path = verified_transcript_path(
+        provider_session_id.as_deref(),
+        params.provider_session_id.as_deref(),
+        params.transcript_path.as_deref(),
+    )
+    .ok_or_else(|| {
+        crate::error::DaemonError::InvalidParam(
+            "confirm_boundary_mail_unverifiable_transcript".into(),
+        )
+    })?;
+    let cursor = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    let mut response = ConfirmBoundaryMailResponse::default();
+    for &message_id in &params.message_ids {
+        let evidence = TranscriptEvidence {
+            path: path.clone(),
+            cursor,
+        };
+        if pending.mark_printed(session_id, message_id, evidence) {
+            response.confirmed.push(message_id);
+        }
+    }
+    Ok(response)
+}
+
+/// The hook's transcript path, accepted only when it is this session's own
+/// provider conversation: the hook's provider session id equals the one rsid
+/// recorded for the session, and the path is an absolute `.jsonl` file named
+/// for it (`<id>.jsonl` for Claude, `rollout-...-<id>.jsonl` for Codex).
+fn verified_transcript_path(
+    recorded: Option<&str>,
+    claimed: Option<&str>,
+    path: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    let recorded = recorded.filter(|id| !id.trim().is_empty())?;
+    if claimed? != recorded {
+        return None;
+    }
+    let path = std::path::PathBuf::from(path?);
+    let name = path.file_name()?.to_str()?;
+    let named_for_session =
+        name == format!("{recorded}.jsonl") || name.ends_with(&format!("-{recorded}.jsonl"));
+    (path.is_absolute() && named_for_session && path.is_file()).then_some(path)
+}
+
+/// Read the complete transcript lines after `cursor`; returns the lines and
+/// the cursor past the last complete one.
+fn read_transcript_tail(path: &std::path::Path, cursor: u64) -> Option<(Vec<String>, u64)> {
+    use std::io::{Read as _, Seek as _};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = cursor.min(len);
+    file.seek(std::io::SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(TRANSCRIPT_SCAN_MAX_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let complete = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |at| at + 1);
+    let lines = String::from_utf8_lossy(&bytes[..complete])
+        .lines()
+        .map(str::to_string)
+        .collect();
+    Some((lines, start + complete as u64))
+}
+
+/// Watch the provider transcript for each printed delivery in
+/// `message_ids` until `deadline` (#1183). A delivery whose block appears as
+/// accepted hook context is recorded `AdmittedEffectPossible` (`injected`),
+/// and only then can a later assistant event acknowledge it. If that record
+/// cannot be persisted the delivery stays pending, so the deadline settles it
+/// `uncertain`. Deliveries with no evidence are left for that settlement.
+pub(crate) async fn await_boundary_mail_evidence(
+    store: &Arc<Mutex<Store>>,
+    pending: &PendingBoundaryDeliveries,
+    message_ids: &[Uuid],
+    deadline: tokio::time::Instant,
+    poll: std::time::Duration,
+) {
+    let mut open: Vec<Uuid> = message_ids.to_vec();
+    loop {
+        let mut still_open = Vec::new();
+        for message_id in open {
+            let Some(delivery) = pending.get(message_id) else {
+                continue;
+            };
+            let Some(evidence) = delivery.evidence.clone() else {
+                continue;
+            };
+            let Some((lines, cursor)) = read_transcript_tail(&evidence.path, evidence.cursor)
+            else {
+                still_open.push(message_id);
+                continue;
+            };
+            let accepted = lines.iter().any(|line| {
+                rsi_common::boundary_mail_hook::transcript_line_accepts_block(line, &delivery.block)
+            });
+            if !accepted {
+                pending.advance_cursor(message_id, cursor);
+                still_open.push(message_id);
+                continue;
+            }
+            let Some(delivery) = pending.take(message_id) else {
+                continue;
+            };
+            let recorded = if pending.take_injected_record_failure() {
+                Err(crate::error::DaemonError::Store(
+                    "injected boundary delivery record failure".into(),
+                ))
+            } else {
+                record(
+                    store,
+                    &delivery.fence,
+                    delivery.authority_id,
+                    BoundaryClassificationV1::AdmittedEffectPossible,
+                    None,
+                    delivery.provider_kind,
+                )
+                .await
+            };
+            if let Err(error) = recorded {
+                tracing::warn!(
+                    target: "agent_coordination",
+                    %message_id,
+                    %error,
+                    "boundary mail delivery could not be recorded; it stays pending and \
+                     the deadline settles it uncertain"
+                );
+                pending.insert(delivery);
+                still_open.push(message_id);
+            }
+        }
+        open = still_open;
+        if open.is_empty() || tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Settle `message_ids` that were handed to a hook but not confirmed
+/// (#1183): each still-pending one becomes `uncertain`. Called when the reply
+/// could not be written and when [`BOUNDARY_MAIL_CONFIRM_DEADLINE`] passes.
+pub(crate) async fn settle_unconfirmed_boundary_mail(
+    store: &Arc<Mutex<Store>>,
+    pending: &PendingBoundaryDeliveries,
+    message_ids: &[Uuid],
+) {
+    for &message_id in message_ids {
+        let Some(delivery) = pending.take(message_id) else {
+            continue;
+        };
+        let settled = store
+            .lock()
+            .await
+            .mark_unconfirmed_boundary_delivery_uncertain_v1(&delivery.fence, Uuid::new_v4());
+        match settled {
+            Ok(true) => tracing::info!(
+                target: "agent_coordination",
+                %message_id,
+                "boundary mail was not confirmed by the hook; settled uncertain"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                target: "agent_coordination",
+                %message_id,
+                %error,
+                "unconfirmed boundary mail could not be settled; it stays dispatching \
+                 and restart reconciliation classifies it uncertain"
+            ),
+        }
+    }
+}
+
 async fn claim_one(
     store: &Arc<Mutex<Store>>,
+    pending: &PendingBoundaryDeliveries,
+    session_id: Uuid,
     grant: Box<ArbitrationGrant>,
 ) -> Result<Option<BoundaryMail>> {
     let Some(invocation_id) = grant.request().expected_prior_model_invocation_id else {
@@ -375,9 +742,10 @@ async fn claim_one(
             authority_id,
             BoundaryClassificationV1::RejectedBeforeEffect,
             Some("agent_message_dispatch_marker_failed"),
-            &grant,
+            grant.request().provider_kind,
         )
-        .await;
+        .await
+        .ok();
         grant.release();
         return Ok(None);
     }
@@ -391,17 +759,16 @@ async fn claim_one(
     };
     let sender_session_id = Some(grant.request().owner_session_id);
     let message_id = fence.message_id;
-    // Recorded BEFORE the caller prints: the text is handed over from here on.
-    // A crash before this record leaves the attempt `dispatching` (uncertain).
-    record(
-        store,
-        &fence,
+    // NOT recorded here (#1183): the attempt stays `dispatching` until the hook
+    // confirms it printed the text. The claim already makes it at most once.
+    pending.insert(PendingBoundaryDelivery {
+        session_id,
+        fence,
         authority_id,
-        BoundaryClassificationV1::AdmittedEffectPossible,
-        None,
-        &grant,
-    )
-    .await;
+        provider_kind: grant.request().provider_kind,
+        block: rsi_common::boundary_mail_hook::render_mail_block(&sender_role, &text),
+        evidence: None,
+    });
     grant.release();
     Ok(Some(BoundaryMail {
         message_id,
@@ -417,11 +784,11 @@ async fn record(
     authority_id: Uuid,
     classification: BoundaryClassificationV1,
     error_class: Option<&'static str>,
-    grant: &ArbitrationGrant,
-) {
+    provider_kind: BoundaryProviderKindV1,
+) -> Result<()> {
     let admission = BoundaryAdmissionV1 {
-        provider_kind: grant.request().provider_kind,
-        capability_kind: grant.request().provider_kind.capability_kind(),
+        provider_kind,
+        capability_kind: provider_kind.capability_kind(),
         delivery_session_id: fence.delivery_session_id,
         session_generation: fence.delivery_session_generation,
         model_invocation_id: fence.delivery_model_invocation_id,
@@ -442,15 +809,15 @@ async fn record(
             authority_id,
         )
     };
-    if let Err(error) = outcome {
+    if let Err(error) = &outcome {
         tracing::warn!(
             target: "agent_coordination",
             message_id = %fence.message_id,
             error = %error,
-            "failed to record a boundary mail delivery; the attempt stays claimed/dispatching \
-             and reconciliation classifies it uncertain"
+            "failed to record a boundary mail delivery; the attempt stays claimed/dispatching"
         );
     }
+    outcome.map(|_| ())
 }
 
 #[cfg(test)]
@@ -465,9 +832,16 @@ mod tests {
         store: Arc<Mutex<Store>>,
         arbiter: Arc<AgentMessageArbiter>,
         active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
+        pending: PendingBoundaryDeliveries,
         owner: Uuid,
         target: Uuid,
+        /// The provider transcript of the target (#1183 evidence).
+        transcript: std::path::PathBuf,
+        _dir: tempfile::TempDir,
     }
+
+    /// The provider conversation id rsid recorded for the target.
+    const THREAD: &str = "thread-1183";
 
     fn message_state(store: &Store, message_id: Uuid) -> String {
         store
@@ -523,14 +897,24 @@ mod tests {
                 )
                 .expect("bind invocation");
         }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir
+            .path()
+            .join(format!("rollout-2026-10-05-{THREAD}.jsonl"));
+        std::fs::write(&transcript, "{\"type\":\"session_meta\"}\n").expect("transcript");
         let mut map = HashMap::new();
-        map.insert(target, tracked(row));
+        let mut tracked_row = tracked(row);
+        tracked_row.session.claude_session_id = Some(THREAD.to_string());
+        map.insert(target, tracked_row);
         Fixture {
             store: Arc::new(Mutex::new(store)),
             arbiter: Arc::new(AgentMessageArbiter::new()),
             active: Arc::new(RwLock::new(map)),
+            pending: PendingBoundaryDeliveries::default(),
             owner,
             target,
+            transcript,
+            _dir: dir,
         }
     }
 
@@ -557,10 +941,97 @@ mod tests {
             &fixture.store,
             &fixture.arbiter,
             &fixture.active,
+            &fixture.pending,
             fixture.target,
         )
         .await
         .expect("claim")
+    }
+
+    fn confirm_params(
+        fixture: &Fixture,
+        ids: &[Uuid],
+    ) -> rsi_common::boundary_mail_hook::ConfirmBoundaryMailParams {
+        rsi_common::boundary_mail_hook::ConfirmBoundaryMailParams {
+            message_ids: ids.to_vec(),
+            provider_session_id: Some(THREAD.to_string()),
+            transcript_path: Some(fixture.transcript.display().to_string()),
+        }
+    }
+
+    /// The hook printed `ids` (ConfirmBoundaryMail with its real locator).
+    async fn confirm(fixture: &Fixture, session_id: Uuid, ids: &[Uuid]) -> Vec<Uuid> {
+        confirm_boundary_mail(
+            &fixture.active,
+            &fixture.pending,
+            session_id,
+            &confirm_params(fixture, ids),
+        )
+        .await
+        .map(|response| response.confirmed)
+        .unwrap_or_default()
+    }
+
+    /// The provider accepted the hook context: Codex appends its developer
+    /// `hooks.additional_context` item to the rollout.
+    fn provider_accepts(fixture: &Fixture, mail: &BoundaryMail) {
+        use std::io::Write as _;
+        let block =
+            rsi_common::boundary_mail_hook::render_mail_block(&mail.sender_role, &mail.text);
+        let line = serde_json::json!({"type": "response_item", "payload": {
+            "type": "message", "role": "developer",
+            "content": [{"type": "input_text", "text": block}],
+            "internal_chat_message_metadata_passthrough":
+                {"content_item_kinds": ["hooks.additional_context"]}}});
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&fixture.transcript)
+            .expect("open transcript");
+        writeln!(file, "{line}").expect("append");
+    }
+
+    /// Run the evidence watcher briefly.
+    async fn watch(fixture: &Fixture, ids: &[Uuid]) {
+        await_boundary_mail_evidence(
+            &fixture.store,
+            &fixture.pending,
+            ids,
+            tokio::time::Instant::now() + std::time::Duration::from_millis(200),
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+    }
+
+    /// Claim, print, provider accepts: the full successful hand-off.
+    async fn deliver(fixture: &Fixture, mail: &BoundaryMail) {
+        assert_eq!(
+            confirm(fixture, fixture.target, &[mail.message_id]).await,
+            vec![mail.message_id]
+        );
+        provider_accepts(fixture, mail);
+        watch(fixture, &[mail.message_id]).await;
+    }
+
+    /// Persist a provider assistant event on the target; `insert_event` runs
+    /// the production acknowledgement pass (#46) over it.
+    async fn persist_assistant_event(fixture: &Fixture, sequence: i32) {
+        let guard = fixture.store.lock().await;
+        guard
+            .insert_event(&rsi_common::types::ConversationEvent {
+                id: 0,
+                session_id: fixture.target,
+                sequence,
+                event_type: rsi_common::types::EventType::Message,
+                role: Some(rsi_common::types::Role::Assistant),
+                content: "unrelated progress note".to_string(),
+                tool_name: None,
+                tool_input: None,
+                created_at: chrono::Utc::now(),
+                offload_id: None,
+                tool_use_id: None,
+                metadata: None,
+            })
+            .expect("insert event");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -577,12 +1048,201 @@ mod tests {
         assert_eq!(mail.sender_session_id, Some(fixture.owner));
         assert!(mail.text.contains("you are near your context wall"));
         assert!(mail.text.contains(&fixture.owner.to_string()));
+        // #1183: handed to the hook, printed, not yet delivered.
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "claimed");
+        assert_eq!(confirm(&fixture, fixture.target, &[id]).await, vec![id]);
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "claimed");
+        // Delivered once the provider transcript shows it accepted the context.
+        provider_accepts(&fixture, mail);
+        watch(&fixture, &[id]).await;
         assert_eq!(message_state(&*fixture.store.lock().await, id), "injected");
 
         // Delivered once: neither the next boundary nor the turn-end path can
         // claim it again.
         assert!(claim(&fixture).await.messages.is_empty());
         assert!(fixture.arbiter.roots_with_outstanding_grant().is_empty());
+    }
+
+    /// #1183 review: mail is `injected` only once the provider accepted the
+    /// hook context, and only then can a later assistant event acknowledge it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn accepted_boundary_mail_is_acknowledged_by_the_next_assistant_event() {
+        let fixture = fixture(true);
+        let id = send(&fixture, "kc", "check the gate log").await;
+        let claimed = claim(&fixture).await;
+        deliver(&fixture, &claimed.messages[0]).await;
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "injected");
+        persist_assistant_event(&fixture, 1).await;
+        assert_eq!(
+            message_state(&*fixture.store.lock().await, id),
+            "acknowledged"
+        );
+        // A second confirmation is a no-op.
+        assert!(confirm(&fixture, fixture.target, &[id]).await.is_empty());
+    }
+
+    /// #1183 review A: the hook printed and confirmed, but the provider timed
+    /// the hook out (or rejected it) and discarded the output, so the
+    /// transcript never shows it. The mail is never `injected` nor
+    /// acknowledged by the next assistant event; the deadline settles it
+    /// `uncertain`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn printed_mail_the_provider_discarded_settles_uncertain_never_acknowledged() {
+        let fixture = fixture(true);
+        let id = send(&fixture, "kd", "printed then discarded").await;
+        let claimed = claim(&fixture).await;
+        assert_eq!(confirm(&fixture, fixture.target, &[id]).await, vec![id]);
+        // Context for a DIFFERENT message, and the model quoting this one, are
+        // not evidence for this one.
+        provider_accepts(
+            &fixture,
+            &BoundaryMail {
+                text: "another message".into(),
+                ..claimed.messages[0].clone()
+            },
+        );
+        watch(&fixture, &[id]).await;
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "claimed");
+        persist_assistant_event(&fixture, 1).await;
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "claimed");
+
+        settle_unconfirmed_boundary_mail(&fixture.store, &fixture.pending, &[id]).await;
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "uncertain");
+        persist_assistant_event(&fixture, 2).await;
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "uncertain");
+    }
+
+    /// #1183 review B: the provider accepted the context but the delivery
+    /// record could not be persisted. The delivery stays pending (not lost
+    /// from tracking), so the deadline still settles it `uncertain`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn a_delivery_that_cannot_be_persisted_stays_pending_and_settles_uncertain() {
+        let fixture = fixture(true);
+        let id = send(&fixture, "kp", "persist me").await;
+        let claimed = claim(&fixture).await;
+        fixture.pending.fail_next_record();
+        deliver(&fixture, &claimed.messages[0]).await;
+        // The failed record left it pending; the next poll in this watch
+        // window recorded it. Prove the pending state survived the failure.
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "injected");
+
+        let id = send(&fixture, "kp2", "persist me too").await;
+        let claimed = claim(&fixture).await;
+        assert_eq!(confirm(&fixture, fixture.target, &[id]).await, vec![id]);
+        provider_accepts(&fixture, &claimed.messages[0]);
+        // Every record in this window fails: the delivery is still tracked.
+        fixture.pending.fail_next_record();
+        await_boundary_mail_evidence(
+            &fixture.store,
+            &fixture.pending,
+            &[id],
+            tokio::time::Instant::now(),
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "claimed");
+        assert_eq!(fixture.pending.len(), 1);
+        settle_unconfirmed_boundary_mail(&fixture.store, &fixture.pending, &[id]).await;
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "uncertain");
+        assert_eq!(fixture.pending.len(), 0);
+    }
+
+    /// #1183 review B: a confirmation whose transcript locator is not this
+    /// session's own provider conversation is refused with an error, and the
+    /// delivery stays pending for the deadline.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn an_unverifiable_confirmation_is_an_error_and_keeps_the_delivery_pending() {
+        let fixture = fixture(true);
+        let id = send(&fixture, "kv", "verify me").await;
+        claim(&fixture).await;
+        let other = fixture._dir.path().join("rollout-x-other-thread.jsonl");
+        std::fs::write(&other, "").expect("other transcript");
+        for (provider_session_id, path) in [
+            (Some("other-thread"), Some(other.display().to_string())),
+            (Some(THREAD), Some(other.display().to_string())),
+            (Some(THREAD), Some(format!("rollout-x-{THREAD}.jsonl"))),
+            (None, Some(fixture.transcript.display().to_string())),
+            (Some(THREAD), None),
+        ] {
+            let params = rsi_common::boundary_mail_hook::ConfirmBoundaryMailParams {
+                message_ids: vec![id],
+                provider_session_id: provider_session_id.map(str::to_string),
+                transcript_path: path.clone(),
+            };
+            let refused =
+                confirm_boundary_mail(&fixture.active, &fixture.pending, fixture.target, &params)
+                    .await;
+            assert!(refused.is_err(), "{provider_session_id:?} {path:?}");
+        }
+        assert_eq!(fixture.pending.len(), 1);
+        settle_unconfirmed_boundary_mail(&fixture.store, &fixture.pending, &[id]).await;
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "uncertain");
+    }
+
+    /// #1183 review: the hook claimed the mail and then died before printing.
+    /// An unrelated assistant event must NOT acknowledge it; the missing
+    /// confirmation settles it `uncertain` (visible, never re-sent), and a
+    /// confirmation arriving after that changes nothing.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn a_hook_crash_before_printing_is_settled_uncertain_never_acknowledged() {
+        let fixture = fixture(true);
+        let id = send(&fixture, "kx", "never printed").await;
+        assert_eq!(claim(&fixture).await.messages[0].message_id, id);
+
+        persist_assistant_event(&fixture, 1).await;
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "claimed");
+
+        // Deadline (or a reply that could not be written).
+        settle_unconfirmed_boundary_mail(&fixture.store, &fixture.pending, &[id]).await;
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "uncertain");
+        assert_eq!(fixture.pending.len(), 0);
+
+        assert!(confirm(&fixture, fixture.target, &[id]).await.is_empty());
+        persist_assistant_event(&fixture, 2).await;
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "uncertain");
+        assert!(claim(&fixture).await.messages.is_empty());
+        // Settling again (the deadline after an early settle) is a no-op.
+        settle_unconfirmed_boundary_mail(&fixture.store, &fixture.pending, &[id]).await;
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "uncertain");
+    }
+
+    /// A session can only confirm mail its own hook claimed, and a confirmed
+    /// delivery is no longer settled by the deadline.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn only_the_claiming_session_can_confirm_and_a_confirmed_delivery_survives_the_deadline()
+    {
+        let fixture = fixture(true);
+        let id = send(&fixture, "ko", "mine").await;
+        let claimed = claim(&fixture).await;
+        let claim_mail_for = |_: &Fixture, _: Uuid| claimed.messages[0].clone();
+        assert!(confirm(&fixture, fixture.owner, &[id]).await.is_empty());
+        assert!(
+            confirm(&fixture, fixture.target, &[Uuid::new_v4()])
+                .await
+                .is_empty()
+        );
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "claimed");
+        let mail = claim_mail_for(&fixture, id);
+        deliver(&fixture, &mail).await;
+        settle_unconfirmed_boundary_mail(&fixture.store, &fixture.pending, &[id]).await;
+        assert_eq!(message_state(&*fixture.store.lock().await, id), "injected");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn agent_message_ids_reads_only_agent_deliveries() {
+        let agent = Uuid::new_v4();
+        let reply = serde_json::json!({"messages": [
+            {"message_id": Uuid::new_v4(), "sender_role": "operator", "text": "a"},
+            {"message_id": agent, "sender_role": "manager", "text": "b"},
+        ]});
+        assert_eq!(agent_message_ids(&reply), vec![agent]);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]

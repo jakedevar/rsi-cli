@@ -6,8 +6,9 @@ description: Create detailed implementation plans autonomously through thorough 
 
 Turn a ticket, specification, or research document into an executable plan for
 the current rsi checkout. Produce a complete first draft with concrete files,
-ordering, and checks. Keep questions for the operator only when missing
-authority or an unresolved product choice changes the requested outcome.
+ordering, and checks. Send unresolved product choices to the portfolio manager.
+Escalate only real gates to the operator through the global manager: main or
+releases, real money, credentials, deleting user data.
 
 **Worker preamble (binding):** This command and any sub-agents it spawns MUST load and obey `.claude/commands/_shared/worker_preamble.md` with `role=planning` before acting. That file defines the read budget, return budget, forbidden-content rules, and failure-mode contract. The rules below COMPOSE ON TOP and may tighten (never loosen) any limit declared there.
 

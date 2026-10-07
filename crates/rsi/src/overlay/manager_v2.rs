@@ -1,6 +1,7 @@
 //! Operator policy and state surfaces over the shared, versioned manager API.
 pub mod board;
 pub mod catalog;
+pub mod decisions;
 pub mod policy;
 
 use crate::{app::App, modalkit_types::LcAction, types::OverlayState};
@@ -152,6 +153,7 @@ pub(super) async fn handle_key(app: &mut App, key: KeyEvent) {
                 ManagerInspectSectionV2::Health,
                 ManagerInspectSectionV2::MigrationAllocations,
                 ManagerInspectSectionV2::Satellites,
+                ManagerInspectSectionV2::Friction,
             ];
             let current = match section {
                 Some(ManagerSection::Inspect(s)) => {

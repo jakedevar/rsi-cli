@@ -2,6 +2,278 @@ use super::*;
 use rsi_common::harness_manager::*;
 use rsi_common::types::{Project, ScheduledJob, WakeMode};
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::significant_drop_tightening
+)]
+async fn manager_seat_succession_hands_over_job_reads_waits_and_cancellation() {
+    use crate::agent_jobs::JobRuntime;
+    use crate::store::agent_jobs::NewAgentJob;
+    use rsi_common::agent_jobs::{
+        AgentCancelJobRequestV1, AgentGetJobRequestV1, AgentJobResultV1, AgentListJobsRequestV1,
+        JobState, JobWake,
+    };
+    use rsi_common::wake_predicate::WakePredicate;
+
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<String>>);
+    impl JobRuntime for Recorder {
+        fn launch(&self, _: &crate::agent_jobs::LaunchSpec) -> std::result::Result<(), String> {
+            Ok(())
+        }
+        fn unit_active(&self, _: &str) -> bool {
+            false
+        }
+        fn stop_unit(&self, unit: &str) -> std::result::Result<(), String> {
+            self.0.lock().unwrap().push(unit.into());
+            Ok(())
+        }
+    }
+
+    for rotation in [true, false] {
+        let pilot = pilot().await;
+        let successor = Uuid::new_v4();
+        let make_job = |owner| {
+            let id = Uuid::new_v4();
+            NewAgentJob {
+                id,
+                owner_session_id: owner,
+                project_id: Some(pilot.config.project_id),
+                name: None,
+                params: serde_json::from_value(serde_json::json!({
+                    "kind":"build", "command":"check", "workspace":true
+                }))
+                .unwrap(),
+                cwd: pilot._directory.path().display().to_string(),
+                unit_name: format!("rsi-job-{id}"),
+                log_path: pilot
+                    ._directory
+                    .path()
+                    .join(format!("{id}.log"))
+                    .display()
+                    .to_string(),
+                status_path: pilot
+                    ._directory
+                    .path()
+                    .join(format!("{id}.status"))
+                    .display()
+                    .to_string(),
+                idempotency_key: None,
+                wake: JobWake::Owner,
+            }
+        };
+        let (live, queued, done, foreign) = (
+            make_job(pilot.owner),
+            make_job(pilot.owner),
+            make_job(pilot.owner),
+            make_job(pilot.leads[0]),
+        );
+        {
+            let store = pilot.manager.store.lock().await;
+            let mut row = store.get_session(pilot.owner).unwrap().unwrap();
+            row.id = successor;
+            row.status = SessionStatus::Completed;
+            if rotation {
+                row.continued_from = Some(pilot.owner);
+                row.rotation_depth += 1;
+            }
+            store.insert_session(&row).unwrap();
+            for job in [&live, &done, &foreign] {
+                store.insert_agent_job(job, chrono::Utc::now()).unwrap();
+            }
+            store
+                .insert_agent_job_in_state(&queued, chrono::Utc::now(), JobState::Queued)
+                .unwrap();
+            store
+                .settle_agent_job(
+                    done.id,
+                    JobState::Succeeded,
+                    &AgentJobResultV1::default(),
+                    false,
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+            // Rotating an ordinary leaf in a configured project transfers no jobs.
+            let mut leaf = store.get_session(pilot.leads[0]).unwrap().unwrap();
+            leaf.id = Uuid::new_v4();
+            leaf.continued_from = Some(pilot.leads[0]);
+            leaf.rotation_depth += 1;
+            store.insert_session(&leaf).unwrap();
+            store
+                .update_session_status(pilot.leads[0], SessionStatus::Archived)
+                .unwrap();
+            store
+                .record_harness_manager_rotation(pilot.leads[0], leaf.id)
+                .unwrap();
+            assert_eq!(
+                store
+                    .get_agent_job(foreign.id)
+                    .unwrap()
+                    .unwrap()
+                    .job
+                    .owner_session_id,
+                pilot.leads[0]
+            );
+        }
+        let control = pilot.manager.agent_control();
+        let predicate = || WakePredicate {
+            jobs_terminal: Some(vec![live.id, queued.id]),
+            sha_on_rolling: None,
+        };
+        assert!(
+            control
+                .agent_get_job(successor, AgentGetJobRequestV1 { job_id: live.id })
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("job_not_found")
+        );
+        assert!(
+            control
+                .arm_wake_when(successor, "wait".into(), None, predicate(), None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("wake_when_job_not_found")
+        );
+        let (existing, _) = control
+            .arm_wake_when(
+                pilot.owner,
+                "batch".into(),
+                None,
+                WakePredicate {
+                    jobs_terminal: Some(vec![live.id, done.id]),
+                    sha_on_rolling: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        {
+            let store = pilot.manager.store.lock().await;
+            if rotation {
+                store
+                    .update_session_status(pilot.owner, SessionStatus::Archived)
+                    .unwrap();
+                store
+                    .record_harness_manager_rotation(pilot.owner, successor)
+                    .unwrap();
+            } else {
+                store
+                    .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                        project_id: pilot.config.project_id,
+                        session_id: successor,
+                        epic_ids: Some(pilot.epics.to_vec()),
+                        group_ids: Vec::new(),
+                        expected_row_version: pilot.config.row_version,
+                    })
+                    .unwrap();
+            }
+            assert_eq!(
+                store
+                    .get_scheduled_job(&existing.id)
+                    .unwrap()
+                    .unwrap()
+                    .wake_session_id,
+                Some(successor)
+            );
+            assert_eq!(
+                store
+                    .get_agent_job(foreign.id)
+                    .unwrap()
+                    .unwrap()
+                    .job
+                    .owner_session_id,
+                pilot.leads[0]
+            );
+        }
+        assert_eq!(
+            control
+                .agent_get_job(successor, AgentGetJobRequestV1 { job_id: live.id })
+                .await
+                .unwrap()
+                .owner_session_id,
+            successor
+        );
+        assert_eq!(
+            control
+                .agent_list_jobs(successor, AgentListJobsRequestV1 { limit: None })
+                .await
+                .unwrap()
+                .jobs
+                .len(),
+            2
+        );
+        assert_eq!(
+            control
+                .agent_list_jobs(pilot.owner, AgentListJobsRequestV1 { limit: None })
+                .await
+                .unwrap()
+                .jobs[0]
+                .id,
+            done.id
+        );
+        control
+            .arm_wake_when(successor, "wait".into(), None, predicate(), None)
+            .await
+            .unwrap();
+        assert!(
+            control
+                .arm_wake_when(pilot.owner, "wait".into(), None, predicate(), None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("wake_when_job_not_found")
+        );
+
+        let runtime = std::sync::Arc::new(Recorder::default());
+        for caller in [pilot.owner, pilot.leads[1]] {
+            assert!(
+                control
+                    .agent_get_job(caller, AgentGetJobRequestV1 { job_id: live.id })
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("job_not_found")
+            );
+            assert!(
+                control
+                    .agent_cancel_job(
+                        caller,
+                        AgentCancelJobRequestV1 { job_id: live.id },
+                        runtime.clone()
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("job_not_found")
+            );
+        }
+        for job in [&live, &queued] {
+            let cancelled = control
+                .agent_cancel_job(
+                    successor,
+                    AgentCancelJobRequestV1 { job_id: job.id },
+                    runtime.clone(),
+                )
+                .await
+                .unwrap();
+            assert!(cancelled.cancelled);
+            assert_eq!(cancelled.job.owner_session_id, successor);
+            assert_eq!(cancelled.job.state, JobState::Failed);
+            assert_eq!(
+                cancelled.job.result.unwrap().refusal.as_deref(),
+                Some("job_cancelled")
+            );
+        }
+        assert_eq!(*runtime.0.lock().unwrap(), [live.unit_name]);
+    }
+}
+
 struct Pilot {
     manager: SessionManager,
     _directory: TempDir,
@@ -2275,6 +2547,8 @@ async fn enqueue_landing_source_admits_manager_and_lead_and_refuses_workers() {
         }
     }
     let request = |commit: &str, key: &str| AgentEnqueueLandingSourceRequestV1 {
+        project_id: None,
+        source_session_id: None,
         source_commit: commit.to_string(),
         test_filters: vec!["rsid=rolling_queue".into()],
         idempotency_key: key.into(),
@@ -2471,7 +2745,7 @@ async fn provider_status_admits_manager_and_lead_and_refuses_workers_without_a_k
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::significant_drop_tightening)]
-async fn a_draining_deploy_refuses_child_jobs_and_continuations_and_reports_them() {
+async fn a_draining_deploy_holds_child_jobs_refuses_continuations_and_reports_them() {
     use crate::agent_jobs::{JobRuntime, JobTools, LaunchSpec};
     use crate::daemon_info::DaemonInfoService;
     use crate::store::agent_deploys::DeployRow;
@@ -2512,16 +2786,28 @@ async fn a_draining_deploy_refuses_child_jobs_and_continuations_and_reports_them
         cargo_slot: "/x/cargo-slot".into(),
         lander: "/x/rsi-rolling-land".into(),
     };
-    let request = || AgentSubmitJobRequestV1 {
+    let request_named = |name: &str| AgentSubmitJobRequestV1 {
+        project_id: None,
+        sandbox_session_id: None,
         kind: JobKind::Build,
         params: serde_json::json!({"command": "check", "workspace": true}),
-        name: Some("check".into()),
+        name: Some(name.into()),
         idempotency_key: None,
         worktree: None,
         wake: None,
     };
+    let request = || request_named("check");
     let control = pilot.manager.agent_control();
     let recorder = std::sync::Arc::new(Recorder::default());
+
+    // A job already running when the deploy is requested keeps the deploy
+    // waiting.
+    let running = control
+        .agent_submit_job(worker, request(), recorder.clone(), tools())
+        .await
+        .unwrap();
+    assert_eq!(running.job.state, JobState::Running);
+    assert_eq!(recorder.0.lock().unwrap().len(), 1);
 
     // The deploy's caller is the appointed manager; its deploy is waiting.
     let deadline = chrono::Utc::now() + chrono::Duration::seconds(600);
@@ -2541,22 +2827,82 @@ async fn a_draining_deploy_refuses_child_jobs_and_continuations_and_reports_them
         .deploy_drain()
         .sync(Some(&live), true, chrono::Utc::now());
 
-    // A child's new job is refused with the typed code; nothing launches.
-    let refused = control
-        .agent_submit_job(worker, request(), recorder.clone(), tools())
+    // #1566: a child's new job is held, not refused: recorded `queued` with
+    // the reason, no unit launched, readable through AgentGetJob/ListJobs.
+    let held = control
+        .agent_submit_job(worker, request_named("held"), recorder.clone(), tools())
         .await
-        .unwrap_err();
-    assert!(refused.to_string().contains("deploy_draining"), "{refused}");
+        .unwrap();
+    assert_eq!(held.job.state, JobState::Queued);
+    assert_eq!(held.job.held.as_deref(), Some("deploy_draining"));
+    assert_eq!(held.job.started_at, None);
+    assert_eq!(recorder.0.lock().unwrap().len(), 1, "nothing launched");
+    let read = control
+        .agent_get_job(
+            worker,
+            rsi_common::agent_jobs::AgentGetJobRequestV1 {
+                job_id: held.job.id,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.state, JobState::Queued);
+    let listed = control
+        .agent_list_jobs(
+            worker,
+            rsi_common::agent_jobs::AgentListJobsRequestV1 { limit: None },
+        )
+        .await
+        .unwrap();
     assert!(
-        matches!(
-            &refused,
-            crate::error::DaemonError::StructuredRpc { rpc_code, data, .. }
-                if *rpc_code == crate::deploy_drain::DEPLOY_DRAINING_RPC_CODE
-                    && data["retryable"] == true
-        ),
-        "a structured, retryable refusal: {refused}"
+        listed
+            .jobs
+            .iter()
+            .any(|job| job.id == held.job.id && job.state == JobState::Queued)
     );
-    assert!(recorder.0.lock().unwrap().is_empty());
+    // The deploy still waits on the job that was already running, and the
+    // held job is not what it waits on.
+    let blockers = |owner| {
+        let manager = &pilot.manager;
+        async move {
+            manager
+                .store
+                .lock()
+                .await
+                .deploy_quiet_blockers_with(owner, false)
+                .unwrap()
+        }
+    };
+    assert!(blockers(pilot.owner).await.contains(&"job_running"));
+    pilot
+        .manager
+        .store
+        .lock()
+        .await
+        .settle_agent_job(
+            running.job.id,
+            JobState::Succeeded,
+            &rsi_common::agent_jobs::AgentJobResultV1::default(),
+            false,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    assert!(
+        !blockers(pilot.owner).await.contains(&"job_running"),
+        "a held job never keeps the deploy from its quiet point"
+    );
+    // While the hold is engaged the job loop starts nothing.
+    let job_runtime: std::sync::Arc<dyn JobRuntime> = recorder.clone();
+    let started = crate::agent_jobs::start_queued_jobs(
+        pilot.manager.store(),
+        &job_runtime,
+        &tools(),
+        &pilot.manager.deploy_drain(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(started, 0);
+    assert_eq!(recorder.0.lock().unwrap().len(), 1);
     // A child's continuation is refused the same way, before any effect.
     let continued = pilot
         .manager
@@ -2579,19 +2925,45 @@ async fn a_draining_deploy_refuses_child_jobs_and_continuations_and_reports_them
         .unwrap();
     assert!(info.deploy_drain.draining);
     assert_eq!(info.deploy_drain.deploy_id, Some(live.id));
-    assert_eq!(info.deploy_drain.refused_total, 2);
+    assert_eq!(
+        info.deploy_drain.refused_total, 1,
+        "only the continuation is refused; the job was held"
+    );
 
-    // The deploy settles: the same submit now runs.
+    // The deploy settles: the job loop launches the held job, and a fresh
+    // submit runs at once.
     pilot
         .manager
         .deploy_drain()
         .sync(None, true, chrono::Utc::now());
+    let started = crate::agent_jobs::start_queued_jobs(
+        pilot.manager.store(),
+        &job_runtime,
+        &tools(),
+        &pilot.manager.deploy_drain(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(started, 1);
+    assert_eq!(recorder.0.lock().unwrap().len(), 2);
+    let after = control
+        .agent_get_job(
+            worker,
+            rsi_common::agent_jobs::AgentGetJobRequestV1 {
+                job_id: held.job.id,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.state, JobState::Running);
+    assert_eq!(after.held, None);
+    assert!(after.started_at.is_some());
     let receipt = control
-        .agent_submit_job(worker, request(), recorder.clone(), tools())
+        .agent_submit_job(worker, request_named("fresh"), recorder.clone(), tools())
         .await
         .unwrap();
     assert_eq!(receipt.job.state, JobState::Running);
-    assert_eq!(recorder.0.lock().unwrap().len(), 1);
+    assert_eq!(recorder.0.lock().unwrap().len(), 3);
     let info = control
         .agent_get_daemon_info_with(pilot.owner, &service)
         .await
@@ -2709,6 +3081,8 @@ async fn submit_job_runs_in_the_callers_sandbox_and_reads_are_owner_scoped() {
         lander: "/x/rsi-rolling-land".into(),
     };
     let request = |worktree: Option<&std::path::Path>| AgentSubmitJobRequestV1 {
+        project_id: None,
+        sandbox_session_id: None,
         kind: JobKind::Build,
         params: serde_json::json!({"command": "check", "workspace": true}),
         name: Some("check".into()),
@@ -2887,6 +3261,8 @@ async fn landing_cloud_gate_and_cloud_sweep_jobs_need_the_manager_or_epic_lead()
     };
     let oid = "0123456789abcdef0123456789abcdef01234567";
     let request = |kind: JobKind, key: &str| AgentSubmitJobRequestV1 {
+        project_id: None,
+        sandbox_session_id: None,
         kind,
         params: if kind == JobKind::CloudSweep {
             serde_json::json!({"sha": oid})
@@ -2928,6 +3304,136 @@ async fn landing_cloud_gate_and_cloud_sweep_jobs_need_the_manager_or_epic_lead()
         assert_eq!(receipt.job.owner_session_id, caller);
     }
     assert_eq!(recorder.0.lock().unwrap().len(), 2);
+}
+
+/// #1337: a test job carries the operator's default timeout (stamped at
+/// submit, read live); anyone may ask for less, only the appointed manager or
+/// an Epic lead for more.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::significant_drop_tightening
+)]
+async fn test_jobs_get_the_default_timeout_and_only_managers_or_leads_raise_it() {
+    use crate::agent_jobs::{JobRuntime, JobTools, LaunchSpec};
+    use rsi_common::agent_jobs::{AgentSubmitJobRequestV1, JobKind, JobParams};
+
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<LaunchSpec>>);
+    impl JobRuntime for Recorder {
+        fn launch(&self, spec: &LaunchSpec) -> std::result::Result<(), String> {
+            self.0.lock().unwrap().push(spec.clone());
+            Ok(())
+        }
+        fn unit_active(&self, _unit: &str) -> bool {
+            true
+        }
+    }
+
+    let pilot = pilot().await;
+    let worker = Uuid::new_v4();
+    // tmpfs-fixture-ok: no sandbox is allocated (passes with TMPDIR on /dev/shm).
+    let sandboxes: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+    {
+        let store = pilot.manager.store.lock().await;
+        let mut row = bare_session(worker);
+        row.parent_id = Some(pilot.epics[0]);
+        row.session_kind = SessionKind::Task;
+        row.status = SessionStatus::Running;
+        row.project_id = store.get_session(pilot.owner).unwrap().unwrap().project_id;
+        store.insert_session(&row).unwrap();
+        for (id, dir) in [worker, pilot.leads[0], pilot.owner]
+            .into_iter()
+            .zip(&sandboxes)
+        {
+            store
+                .conn
+                .execute(
+                    "UPDATE sessions SET sandbox_root=?2 WHERE id=?1",
+                    rusqlite::params![id.to_string(), dir.path().display().to_string()],
+                )
+                .unwrap();
+        }
+    }
+    let tools = || JobTools {
+        cargo_slot: "/x/cargo-slot".into(),
+        lander: "/x/rsi-rolling-land".into(),
+    };
+    let request = |timeout: Option<u32>| {
+        let mut params = serde_json::json!({"package": "rsid", "filters": ["agent_jobs"]});
+        if let Some(minutes) = timeout {
+            params["timeout_minutes"] = minutes.into();
+        }
+        AgentSubmitJobRequestV1 {
+            project_id: None,
+            sandbox_session_id: None,
+            kind: JobKind::Test,
+            params,
+            name: None,
+            idempotency_key: None,
+            worktree: None,
+            wake: None,
+        }
+    };
+    let timeout_of = |params: &JobParams| match params {
+        JobParams::Test(test) => test.timeout_minutes,
+        _ => None,
+    };
+    let control = pilot.manager.agent_control();
+    let recorder = std::sync::Arc::new(Recorder::default());
+
+    // No timeout named: the operator default (20) is stamped on the job and
+    // the unit cap follows it.
+    let receipt = control
+        .agent_submit_job(worker, request(None), recorder.clone(), tools())
+        .await
+        .unwrap();
+    assert_eq!(timeout_of(&receipt.job.params), Some(20));
+    assert_eq!(
+        recorder.0.lock().unwrap()[0].command.runtime_max_secs,
+        20 * 60 + 5 * 60
+    );
+    // A worker may ask for less, never for more.
+    let lower = control
+        .agent_submit_job(worker, request(Some(10)), recorder.clone(), tools())
+        .await
+        .unwrap();
+    assert_eq!(timeout_of(&lower.job.params), Some(10));
+    let refused = control
+        .agent_submit_job(worker, request(Some(60)), recorder.clone(), tools())
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("job_timeout_not_authorized"),
+        "{refused}"
+    );
+    assert_eq!(recorder.0.lock().unwrap().len(), 2, "nothing launched");
+    // The Epic lead and the appointed manager may raise one job.
+    for caller in [pilot.leads[0], pilot.owner] {
+        let raised = control
+            .agent_submit_job(caller, request(Some(60)), recorder.clone(), tools())
+            .await
+            .unwrap();
+        assert_eq!(timeout_of(&raised.job.params), Some(60));
+    }
+    // The default is the operator's live setting.
+    pilot
+        .manager
+        .runtime_config
+        .update_field("job_test_timeout_mins", &serde_json::json!(90))
+        .unwrap();
+    let receipt = control
+        .agent_submit_job(worker, request(Some(60)), recorder.clone(), tools())
+        .await
+        .unwrap();
+    assert_eq!(timeout_of(&receipt.job.params), Some(60));
+    let receipt = control
+        .agent_submit_job(worker, request(None), recorder.clone(), tools())
+        .await
+        .unwrap();
+    assert_eq!(timeout_of(&receipt.job.params), Some(90));
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]

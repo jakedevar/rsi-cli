@@ -2,7 +2,7 @@
 //!
 //! Key handling is now delegated to the shared [`InputSurface`](crate::input_surface)
 //! via `overlay/mod.rs`. This module provides open/close/submit functions and
-//! maintains draft persistence for TaskRabbit and Blank prompts.
+//! maintains draft persistence for Blank prompts.
 
 use crate::app::{App, InteractiveLaunchOrigin, LaunchPlacement};
 use crate::input_surface::InputSurface;
@@ -36,7 +36,7 @@ async fn submit_prompt_with_placement(app: &mut App, placement: LaunchPlacement)
     // `typed` is the raw surface content, kept so a rejected ContinueSession can
     // restore the prompt verbatim — `content_for_send` collapses visual wraps.
     let (
-        mut query,
+        query,
         purpose,
         working_dir,
         model_override,
@@ -81,13 +81,6 @@ async fn submit_prompt_with_placement(app: &mut App, placement: LaunchPlacement)
         return false;
     }
 
-    // Append mandatory instructions for TaskRabbit submissions without exposing them in the textarea.
-    if matches!(purpose, PromptPurpose::TaskRabbit) {
-        query.push_str(
-            "\n\nMANDATORY: After completing all requested work, you must commit and push the changes to the repository before finishing.",
-        );
-    }
-
     // ContinueSession keeps its existing response-bearing path. Launch
     // purposes remain open until the App-owned task returns a semantic
     // LaunchSession response for this exact overlay identity.
@@ -107,24 +100,6 @@ async fn submit_prompt_with_placement(app: &mut App, placement: LaunchPlacement)
                 app.restore_continue_lines(session_id, typed);
             }
             return accepted;
-        }
-        PromptPurpose::TaskRabbit => {
-            let sandbox = sandbox_spec_from_bool(sandbox_enabled);
-            app.request_taskrabbit_launch(
-                &query,
-                Some(&working_dir),
-                model_override.as_deref(),
-                provider_override,
-                custom_provider_index,
-                sandbox,
-                InteractiveLaunchOrigin::LegacyPrompt {
-                    overlay_id,
-                    purpose,
-                    draft_lines: typed,
-                    corrected_preview,
-                },
-                placement,
-            )
         }
         PromptPurpose::Blank => {
             let sandbox = sandbox_spec_from_bool(sandbox_enabled);
@@ -172,9 +147,7 @@ pub(super) async fn submit_prompt_in_new_tab(app: &mut App) {
     let is_launch = matches!(
         &app.overlay,
         OverlayState::Prompt {
-            purpose: PromptPurpose::TaskRabbit
-                | PromptPurpose::Blank
-                | PromptPurpose::CreateTyped { .. },
+            purpose: PromptPurpose::Blank | PromptPurpose::CreateTyped { .. },
             ..
         }
     );
@@ -191,9 +164,7 @@ pub(super) async fn submit_prompt_in_new_split(app: &mut App) {
     let is_launch = matches!(
         &app.overlay,
         OverlayState::Prompt {
-            purpose: PromptPurpose::TaskRabbit
-                | PromptPurpose::Blank
-                | PromptPurpose::CreateTyped { .. },
+            purpose: PromptPurpose::Blank | PromptPurpose::CreateTyped { .. },
             ..
         }
     );
@@ -215,20 +186,6 @@ pub(super) fn close_overlay(app: &mut App) {
     }
     // Save draft based on purpose
     match &app.overlay {
-        OverlayState::Prompt {
-            surface,
-            purpose: PromptPurpose::TaskRabbit,
-            ..
-        } => {
-            let lines: Vec<String> = surface
-                .textarea
-                .lines()
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            let has_content = lines.iter().any(|l| !l.is_empty());
-            app.taskrabbit_draft = if has_content { lines } else { Vec::new() };
-        }
         OverlayState::Prompt {
             surface,
             purpose: PromptPurpose::Blank,
@@ -258,7 +215,7 @@ pub(super) async fn submit_input_overlay(app: &mut App) -> bool {
 async fn submit_input_overlay_with_placement(app: &mut App, placement: LaunchPlacement) -> bool {
     let idx = app.focused_input_idx;
     let (
-        mut query,
+        query,
         purpose,
         working_dir,
         model_override,
@@ -302,31 +259,7 @@ async fn submit_input_overlay_with_placement(app: &mut App, placement: LaunchPla
         return false;
     }
 
-    if matches!(purpose, PromptPurpose::TaskRabbit) {
-        query.push_str(
-            "\n\nMANDATORY: After completing all requested work, you must commit and push the changes to the repository before finishing.",
-        );
-    }
-
     match purpose.clone() {
-        PromptPurpose::TaskRabbit => {
-            let sandbox = sandbox_spec_from_bool(sandbox_enabled);
-            app.request_taskrabbit_launch(
-                &query,
-                Some(&working_dir),
-                model_override.as_deref(),
-                provider_override,
-                custom_provider_index,
-                sandbox,
-                InteractiveLaunchOrigin::StackedPrompt {
-                    overlay_id,
-                    purpose,
-                    draft_lines,
-                    corrected_preview,
-                },
-                placement,
-            )
-        }
         PromptPurpose::Blank => {
             let sandbox = sandbox_spec_from_bool(sandbox_enabled);
             app.request_blank_launch(
@@ -372,9 +305,7 @@ pub(super) async fn submit_input_overlay_in_new_tab(app: &mut App) {
     let is_launch = matches!(
         app.focused_input_overlay(),
         Some(OverlayState::Prompt {
-            purpose: PromptPurpose::TaskRabbit
-                | PromptPurpose::Blank
-                | PromptPurpose::CreateTyped { .. },
+            purpose: PromptPurpose::Blank | PromptPurpose::CreateTyped { .. },
             ..
         })
     );
@@ -390,9 +321,7 @@ pub(super) async fn submit_input_overlay_in_new_split(app: &mut App) {
     let is_launch = matches!(
         app.focused_input_overlay(),
         Some(OverlayState::Prompt {
-            purpose: PromptPurpose::TaskRabbit
-                | PromptPurpose::Blank
-                | PromptPurpose::CreateTyped { .. },
+            purpose: PromptPurpose::Blank | PromptPurpose::CreateTyped { .. },
             ..
         })
     );
@@ -414,20 +343,6 @@ pub(super) fn close_input_overlay(app: &mut App) {
     }
     // Save draft based on purpose
     match app.input_overlays.get(idx) {
-        Some(OverlayState::Prompt {
-            surface,
-            purpose: PromptPurpose::TaskRabbit,
-            ..
-        }) => {
-            let lines: Vec<String> = surface
-                .textarea
-                .lines()
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            let has_content = lines.iter().any(|l| !l.is_empty());
-            app.taskrabbit_draft = if has_content { lines } else { Vec::new() };
-        }
         Some(OverlayState::Prompt {
             surface,
             purpose: PromptPurpose::Blank,
@@ -497,50 +412,6 @@ pub fn open_continue_popup(app: &mut App, session_id: uuid::Uuid) {
         sandbox_enabled: false,
         launch: crate::types::PromptLaunchSettings::default(),
     };
-}
-
-/// Open the TaskRabbit prompt popup for one-shot tasks.
-/// Pushes to the input overlay stack for simultaneous display.
-pub fn open_taskrabbit_popup(app: &mut App) {
-    let working_dir = app
-        .current_project()
-        .and_then(|p| p.path.clone())
-        .or_else(|| {
-            app.selected_session_state()
-                .map(|s| s.session.working_dir.clone())
-        })
-        .unwrap_or_else(|| {
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
-        });
-
-    // Only restore draft when opening the first input overlay
-    let draft = if app.input_overlays.is_empty() && !app.taskrabbit_draft.is_empty() {
-        Some(app.taskrabbit_draft.clone())
-    } else {
-        None
-    };
-    let mut surface = make_overlay_surface(draft);
-    surface.textarea.set_block(Block::default());
-
-    let overlay = OverlayState::Prompt {
-        overlay_id: uuid::Uuid::new_v4(),
-        surface,
-        working_dir,
-        purpose: PromptPurpose::TaskRabbit,
-        available_commands: app.available_commands.clone(),
-        model_override: None,
-        provider_override: None,
-        model_dropdown: crate::types::ModelDropdownState::closed(
-            app.selected_provider,
-            app.available_models.clone(),
-            app.selected_model.as_deref(),
-        ),
-        sandbox_enabled: false,
-        launch: crate::types::PromptLaunchSettings::default(),
-    };
-
-    app.input_overlays.push(overlay);
-    app.focused_input_idx = app.input_overlays.len() - 1;
 }
 
 /// Phase 4: open a typed-leaf prompt popup (Story / Task / Bug …) with an

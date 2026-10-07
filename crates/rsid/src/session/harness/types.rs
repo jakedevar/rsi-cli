@@ -376,11 +376,22 @@ impl ToolResult {
     }
 
     /// Produce a block result without changing existing text-tool constructors.
+    ///
+    /// A failing result always carries `error_msg` (the visible block text), so
+    /// callers never see `success == false` with no message.
     pub fn from_blocks(blocks: Vec<ToolContentBlock>, is_error: bool) -> Self {
+        let error_msg = is_error.then(|| {
+            let text = visible_tool_text(&blocks);
+            if text.trim().is_empty() {
+                "tool failed without a message".to_string()
+            } else {
+                text
+            }
+        });
         Self {
             success: !is_error,
             output: encode_tool_blocks(&blocks),
-            error_msg: None,
+            error_msg,
         }
     }
 
@@ -401,6 +412,23 @@ fn is_false(value: &bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn failing_block_result_always_sets_error_msg() {
+        let failed = ToolResult::from_blocks(
+            vec![ToolContentBlock::Text {
+                text: "boom".into(),
+            }],
+            true,
+        );
+        assert!(!failed.success);
+        assert_eq!(failed.error_msg.as_deref(), Some("boom"));
+        let empty = ToolResult::from_blocks(Vec::new(), true);
+        assert!(empty.error_msg.as_deref().is_some_and(|m| !m.is_empty()));
+        let ok = ToolResult::from_blocks(Vec::new(), false);
+        assert!(ok.success && ok.error_msg.is_none());
+    }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]

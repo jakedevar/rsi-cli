@@ -70,11 +70,12 @@ pub struct PaneId(pub u64);
 /// Which zone of the session list is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SessionListZone {
-    TaskRabbit,
     /// Archived sessions zone.
     Archive,
     /// Sessions spawned by scheduled jobs.
     Jobs,
+    /// Default zone. `#[serde(other)]` also maps the removed `TaskRabbit`
+    /// zone (persisted by older builds) and any unknown value to Main.
     #[default]
     #[serde(other)]
     Main,
@@ -91,8 +92,6 @@ pub enum Pane {
         scroll_offset: usize,
         #[serde(default)]
         active_zone: SessionListZone,
-        #[serde(default)]
-        taskrabbit_selected_index: usize,
         #[serde(default)]
         archive_selected_index: usize,
         #[serde(default)]
@@ -114,8 +113,12 @@ pub enum Pane {
 pub struct ModelDropdownState {
     /// Whether the dropdown is currently visible.
     pub open: bool,
-    /// Currently highlighted index in the model list.
+    /// Currently highlighted source index in the unfiltered model list.
     pub selected_index: usize,
+    /// Transient filter, retained when cycling providers.
+    pub filter_query: String,
+    /// Printable keys edit the filter instead of invoking vim shortcuts.
+    pub filter_editing: bool,
     /// Active provider for this dropdown instance.
     pub provider: rsi_common::types::SessionProvider,
     /// Index into custom providers (None = built-in provider).
@@ -137,6 +140,8 @@ impl ModelDropdownState {
         Self {
             open: true,
             selected_index,
+            filter_query: String::new(),
+            filter_editing: false,
             provider,
             custom_provider_index: None,
             models,
@@ -156,13 +161,102 @@ impl ModelDropdownState {
 
     /// Toggle open/closed state.
     pub fn toggle(&mut self) {
-        self.open = !self.open;
+        if self.open {
+            self.close();
+        } else {
+            self.open = true;
+        }
     }
 
     /// Close the dropdown.
     pub fn close(&mut self) {
         self.open = false;
+        self.filter_query.clear();
+        self.filter_editing = false;
     }
+
+    /// Source indices matching every search term, in catalog order.
+    pub fn filtered_indices(&self) -> Vec<usize> {
+        let terms = self.filter_terms();
+        // #1407: discovered lists are filtered by the provider profile too.
+        let custom = self.custom_provider_index.is_some();
+        self.models
+            .iter()
+            .enumerate()
+            .filter(|(_, (id, _))| {
+                if custom {
+                    crate::provider_profile_view::custom_providers_offered()
+                } else {
+                    crate::provider_profile_view::model_offered(self.provider, id)
+                }
+            })
+            .filter(|(_, (id, label))| model_matches_terms(id, label, &terms))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Lowercased, whitespace-separated terms of the filter query.
+    pub fn filter_terms(&self) -> Vec<String> {
+        self.filter_query
+            .to_lowercase()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Highlight the first model that matches the current query.
+    pub fn select_first_match(&mut self) {
+        self.selected_index = self.filtered_indices().first().copied().unwrap_or(0);
+    }
+
+    /// Keep the highlighted model when visible, otherwise highlight first match.
+    pub fn reconcile_filter_selection(&mut self) {
+        let indices = self.filtered_indices();
+        if !indices.contains(&self.selected_index) {
+            self.selected_index = indices.first().copied().unwrap_or(0);
+        }
+    }
+
+    /// Refresh discovery without discarding the query or a surviving selection.
+    pub fn replace_models(&mut self, models: Vec<(String, String)>) {
+        let selected = self
+            .models
+            .get(self.selected_index)
+            .map(|(id, _)| id.clone());
+        self.models = models;
+        self.selected_index = selected
+            .and_then(|id| {
+                self.models
+                    .iter()
+                    .position(|(candidate, _)| *candidate == id)
+            })
+            .unwrap_or(0);
+        self.reconcile_filter_selection();
+    }
+}
+
+/// True when every lowercase term occurs in the model ID or display name.
+///
+/// A term also matches with punctuation and spacing ignored on both sides, so
+/// `opus45` finds `claude-opus-4-5` and `gpt5` finds `GPT 5`.
+pub fn model_matches_terms(id: &str, label: &str, terms: &[String]) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let fields = [id.to_lowercase(), label.to_lowercase()];
+    let compact_fields = fields.each_ref().map(|field| compact_alphanumeric(field));
+    terms.iter().all(|term| {
+        let compact_term = compact_alphanumeric(term);
+        fields.iter().any(|field| field.contains(term.as_str()))
+            || (!compact_term.is_empty()
+                && compact_fields
+                    .iter()
+                    .any(|field| field.contains(compact_term.as_str())))
+    })
+}
+
+fn compact_alphanumeric(text: &str) -> String {
+    text.chars().filter(|c| c.is_alphanumeric()).collect()
 }
 
 impl Default for ModelDropdownState {
@@ -170,6 +264,8 @@ impl Default for ModelDropdownState {
         Self {
             open: false,
             selected_index: 0,
+            filter_query: String::new(),
+            filter_editing: false,
             provider: rsi_common::types::SessionProvider::Claude,
             custom_provider_index: None,
             models: Vec::new(),
@@ -363,8 +459,6 @@ pub struct PromptCreatorState {
 /// A configurable field on session list cards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CardField {
-    /// 16-position context window fill bar (❯❯❯···)
-    ContextBar,
     /// "$X.XX" cost display in card header
     Cost,
     /// "Nt" turn count in card header
@@ -391,8 +485,7 @@ pub enum CardField {
 
 impl CardField {
     /// All card field variants in default display order.
-    pub const ALL: [CardField; 12] = [
-        CardField::ContextBar,
+    pub const ALL: [CardField; 11] = [
         CardField::Cost,
         CardField::TurnCount,
         CardField::RetryInfo,
@@ -409,7 +502,6 @@ impl CardField {
     /// Human-readable label for the settings UI.
     pub fn label(self) -> &'static str {
         match self {
-            CardField::ContextBar => "Context bar",
             CardField::Cost => "Cost",
             CardField::TurnCount => "Turn count",
             CardField::RetryInfo => "Retry info",
@@ -484,7 +576,7 @@ impl NavigatorOptionalColumn {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Age => "Navigator age",
-            Self::ModelEffort => "Navigator model / effort",
+            Self::ModelEffort => "Navigator model",
             Self::Retry => "Navigator retry",
             Self::Cost => "Navigator cost",
             Self::Work => "Navigator work",
@@ -665,7 +757,6 @@ impl Tab {
             selected_session: None,
             scroll_offset: 0,
             active_zone: SessionListZone::default(),
-            taskrabbit_selected_index: 0,
             archive_selected_index: 0,
             jobs_selected_index: 0,
         }
@@ -1437,8 +1528,6 @@ pub struct ModalGeometry {
 pub enum PromptPurpose {
     /// Continuing an existing session with a follow-up query.
     ContinueSession(uuid::Uuid),
-    /// Launching a one-shot TaskRabbit task.
-    TaskRabbit,
     /// General-purpose blank session — empty prompt, no pre-filled commands.
     Blank,
     /// Launching a typed leaf session (Story / Task / Bug …) under an optional
@@ -1556,8 +1645,6 @@ pub struct CreateEntityDraft {
 /// Categorizes the source/nature of a notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationKind {
-    TaskRabbitComplete,
-    TaskRabbitFailed,
     BugComplete,
     BugFailed,
     SessionLaunching,
@@ -1809,7 +1896,6 @@ mod tests {
                     selected_session: Some(uuid::Uuid::nil()),
                     scroll_offset: 0,
                     active_zone: Default::default(),
-                    taskrabbit_selected_index: 0,
                     archive_selected_index: 0,
                     jobs_selected_index: 0,
                 },
@@ -1829,7 +1915,6 @@ mod tests {
                         selected_session: None,
                         scroll_offset: 0,
                         active_zone: Default::default(),
-                        taskrabbit_selected_index: 0,
                         archive_selected_index: 0,
                         jobs_selected_index: 0,
                     },
@@ -1861,7 +1946,6 @@ mod tests {
                     selected_session: None,
                     scroll_offset: 0,
                     active_zone: Default::default(),
-                    taskrabbit_selected_index: 0,
                     archive_selected_index: 0,
                     jobs_selected_index: 0,
                 },
@@ -1998,7 +2082,6 @@ pub struct ZoneRenderState {
 #[derive(Debug, Default)]
 pub struct SessionListRenderState {
     pub main: ZoneRenderState,
-    pub taskrabbit: ZoneRenderState,
     pub archive: ZoneRenderState,
     pub jobs: ZoneRenderState,
     /// Full inner area of the list (below tab bar), updated each frame.
@@ -2645,8 +2728,13 @@ pub enum OverlayState {
     /// Operator appointment and versioned Epic scope for a project manager.
     HarnessManagerScope(Box<crate::overlay::harness_manager::HarnessManagerScopeState>),
     HarnessManagerV2(Box<crate::overlay::manager_v2::ManagerSurface>),
-    /// Read-only manager hierarchy tree (`:manager tree`, #890).
+    /// Manager hierarchy tree with in-tree operator actions (`:manager tree`, #890, #1214).
     ManagerTree(Box<crate::overlay::manager_tree::ManagerTreeState>),
+    /// Global manager workspace above every project (`gm`, #1213).
+    Fleet(Box<crate::overlay::fleet::FleetState>),
+    GlobalManagerWorkspace(
+        Box<crate::overlay::global_manager_workspace::GlobalManagerWorkspaceState>,
+    ),
     /// Theme picker popup for Catppuccin + custom palettes.
     ThemePicker {
         /// Currently highlighted theme index.
@@ -2666,15 +2754,6 @@ pub enum OverlayState {
             [u8; 3],
             crate::ui::theme_roles::ContrastAssessment,
         )>,
-    },
-    /// Color customizer overlay — lets the user set per-role message border colors via hex input.
-    ColorCustomizer {
-        /// Which field is focused: 0=assistant, 1=user, 2=tool_unselected, 3=tool_selected
-        focused_field: usize,
-        /// Current text input for each of the 4 fields (populated with active override hex on open).
-        inputs: Vec<String>,
-        /// Whether each field currently has a parse error.
-        errors: Vec<bool>,
     },
     /// Single-field hex editor for the text-area backfill color
     /// (`UserSettings::text_area_backfill_hex`).
@@ -2702,7 +2781,7 @@ pub enum OverlayState {
         /// Dropdown widget state for inline model selection.
         model_dropdown: ModelDropdownState,
         /// Whether sandbox mode is requested for this launch.
-        /// Only meaningful when `PromptPurpose::Blank | TaskRabbit`. Default: false.
+        /// Only meaningful when `PromptPurpose::Blank`. Default: false.
         sandbox_enabled: bool,
         /// Settings side of a launch prompt (flip state, selection and the
         /// planned manager appointment). Unused by ContinueSession prompts.
@@ -2720,11 +2799,11 @@ pub enum OverlayState {
     },
     /// Keybindings help popup.
     KeybindingsHelp {
-        /// Contextual actions or the complete command reference.
+        /// Contextual actions, complete command reference, or symbol legend.
         view: crate::overlay::keybindings_help::HelpView,
         /// Scroll offset in lines (0 = top of content).
         scroll_offset: usize,
-        /// Fuzzy filter query string.
+        /// Case-insensitive filter terms; every term must match a row.
         filter: String,
         /// Whether the search input is currently active (accepting text input).
         search_active: bool,
@@ -3160,6 +3239,9 @@ pub enum OverlayState {
         /// Current digit selection (None until the user types a digit).
         selected_rating: Option<u32>,
     },
+    /// Session-detail model/effort picker: queues a switch for the session's
+    /// next turn (Issue #681).
+    ModelSwitch(Box<crate::overlay::model_switch::ModelSwitchState>),
     /// Consolidated, read-only session info panel (F3) — id, provider/model,
     /// working dir, project, hierarchy, rating, label, tags, context usage.
     SessionInfoPanel {

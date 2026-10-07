@@ -337,7 +337,7 @@ pub static GLOBAL_KEY_INTERCEPTS: &[KeyEntry<GlobalGuard, GlobalEffect>] = &[
         chord: code(KeyCode::Char('h'), ModMatch::Contains(CTRL), "Ctrl-H"),
         guard: GlobalGuard::UnobstructedSessionList,
         effect: GlobalEffect::SessionListZonePrev,
-        label: "previous session-list zone (Main ← TaskRabbit ← Jobs ← Archive, wrapping)",
+        label: "previous session-list zone (Main ← Jobs ← Archive, wrapping)",
     },
     KeyEntry {
         chord: code(KeyCode::Char('h'), ModMatch::Contains(CTRL), "Ctrl-H"),
@@ -349,7 +349,7 @@ pub static GLOBAL_KEY_INTERCEPTS: &[KeyEntry<GlobalGuard, GlobalEffect>] = &[
         chord: code(KeyCode::Char('l'), ModMatch::Contains(CTRL), "Ctrl-L"),
         guard: GlobalGuard::UnobstructedSessionList,
         effect: GlobalEffect::SessionListZoneNext,
-        label: "next session-list zone (Main → TaskRabbit → Jobs → Archive, wrapping)",
+        label: "next session-list zone (Main → Jobs → Archive, wrapping)",
     },
     KeyEntry {
         chord: code(KeyCode::Char('l'), ModMatch::Contains(CTRL), "Ctrl-L"),
@@ -459,13 +459,13 @@ pub static GLOBAL_KEY_INTERCEPTS: &[KeyEntry<GlobalGuard, GlobalEffect>] = &[
         chord: code(KeyCode::Left, ModMatch::Exact(CTRL), "Ctrl-Left"),
         guard: GlobalGuard::Unobstructed,
         effect: GlobalEffect::FocusLeft,
-        label: "focus the pane to the left (zones: gs / gt / gj / ga)",
+        label: "focus the pane to the left (zones: gs / gj / ga)",
     },
     KeyEntry {
         chord: code(KeyCode::Right, ModMatch::Exact(CTRL), "Ctrl-Right"),
         guard: GlobalGuard::Unobstructed,
         effect: GlobalEffect::FocusRight,
-        label: "focus the pane to the right (zones: gs / gt / gj / ga)",
+        label: "focus the pane to the right (zones: gs / gj / ga)",
     },
     KeyEntry {
         chord: code(KeyCode::Down, ModMatch::Contains(SHIFT), "Shift-Down"),

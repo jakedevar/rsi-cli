@@ -1,8 +1,8 @@
 //! Shared symbol and color vocabulary for the session browser.
 //!
 //! One vocabulary spans the navigator list, the selected-session inspector and
-//! the live-activity pane: a glyph means the same thing everywhere it appears,
-//! and every glyph keeps a distinct *shape* so it still reads without color.
+//! the live-activity pane. Meanings belong to their field: a shape can recur in
+//! another column, so the help legend names each location explicitly.
 //!
 //! Rules of thumb:
 //! - closed sets of states (lifecycle, attention, provider) are symbols;
@@ -11,14 +11,16 @@
 //! - compaction never destroys identity: a shortened list value is always a
 //!   verbatim suffix of the canonical value, which the inspector shows in full.
 //!
-//! Every glyph here is a single-cell, text-presentation codepoint. Emoji-default
-//! codepoints (`⏱`, `⚠`, `✉`, …) are deliberately excluded because terminals
-//! disagree on their width and they break column alignment.
+//! Prefer single-cell, text-presentation codepoints: terminals disagree on
+//! emoji widths. The legend preserves existing marks and documents composite
+//! gauges without changing their presentation.
 
 use ratatui::style::Color;
 use rsi_common::types::{SessionProvider, SessionStatus};
 
 use super::theme;
+
+pub(crate) mod legend;
 
 // ---------------------------------------------------------------------------
 // Attention and flags
@@ -82,6 +84,10 @@ pub const DESCENDANTS: &str = "Σ";
 pub const GROUP_CONTAINER: &str = "▣";
 /// Epic container in the session list.
 pub const EPIC_CONTAINER: &str = "▲";
+/// Container with starting or running leaf descendants, in the status column.
+pub const CONTAINER_RUNNING: &str = "◉";
+/// Operator soft pause, when an interrupted session is shown in the navigator.
+pub const SOFT_PAUSE: &str = "⏸";
 
 /// Height glyphs for a one-cell effort gauge, lowest to highest.
 const EFFORT_LEVELS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];

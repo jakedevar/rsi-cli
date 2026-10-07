@@ -47,6 +47,34 @@ fn err(msg: impl Into<String>) -> ToolResult {
     }
 }
 
+/// Native controls bypass RpcServer, so mirror its best-effort refusal hook
+/// before rendering the existing tool error. Names come from the same catalog
+/// that registers the tools, never from model-supplied arguments.
+async fn note_native_refusal(
+    control: &AgentControlHandle,
+    caller: Uuid,
+    native_name: &str,
+    error: &DaemonError,
+) {
+    let method = rsi_common::agent_control_schema::agent_control_catalog_v1()
+        .iter()
+        .find(|descriptor| {
+            descriptor
+                .native_tool
+                .is_some_and(|tool| tool.name() == native_name)
+        })
+        .map(|descriptor| descriptor.method)
+        // The argument-free program guard is an AgentScheduleWake adapter.
+        .or_else(|| (native_name == "rsi_control_program_guard").then_some("AgentScheduleWake"));
+    if let Some(method) = method {
+        crate::friction::note(
+            &control.store,
+            crate::friction::agent_refusal_event(method, Some(caller), error),
+        )
+        .await;
+    }
+}
+
 /// Argument-free native program registration. Caller identity and the entire
 /// scheduled-job envelope are derived server-side.
 pub(crate) const PROGRAM_GUARD_INPUT_SCHEMA: &str =
@@ -142,6 +170,7 @@ pub(crate) fn agent_list_issue_events_from_args(
     crate::agent_issue_validation::decode_list_events(args)
 }
 
+#[cfg(test)]
 pub(crate) fn agent_issue_invalid_request_json(validation: AgentIssueValidationV1) -> String {
     crate::error::agent_issue_error_json(crate::error::agent_issue_invalid_request(validation))
 }
@@ -239,6 +268,13 @@ impl HarnessTool for RsiControlProgramGuardTool {
 
     async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
         if let Err(error) = validate_program_guard_args(&args) {
+            note_native_refusal(
+                &self.control,
+                self.caller_session_id,
+                self.name(),
+                &DaemonError::InvalidParam(error.clone()),
+            )
+            .await;
             return err(error);
         }
         match self
@@ -251,7 +287,11 @@ impl HarnessTool for RsiControlProgramGuardTool {
                 output: program_guard_registration_value(&outcome).to_string(),
                 error_msg: None,
             },
-            Err(error) => err(error.to_string()),
+            Err(error) => {
+                note_native_refusal(&self.control, self.caller_session_id, self.name(), &error)
+                    .await;
+                err(error.to_string())
+            }
         }
     }
 }
@@ -300,7 +340,16 @@ impl HarnessTool for RsiControlReserveSuccessorTool {
     async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
         let request = match reserve_successor_request_from_args(&args) {
             Ok(request) => request,
-            Err(error) => return err(error),
+            Err(error) => {
+                note_native_refusal(
+                    &self.control,
+                    self.caller_session_id,
+                    self.name(),
+                    &DaemonError::InvalidParam(error.clone()),
+                )
+                .await;
+                return err(error);
+            }
         };
         match self
             .control
@@ -313,7 +362,11 @@ impl HarnessTool for RsiControlReserveSuccessorTool {
                     .unwrap_or_else(|error| format!("serialization error: {error}")),
                 error_msg: None,
             },
-            Err(error) => err(error.to_string()),
+            Err(error) => {
+                note_native_refusal(&self.control, self.caller_session_id, self.name(), &error)
+                    .await;
+                err(error.to_string())
+            }
         }
     }
 }
@@ -349,12 +402,25 @@ impl HarnessTool for RsiControlSpawnTool {
     async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
         let request = match spawn_request_from_args(&args) {
             Ok(d) => d,
-            Err(e) => return err(e),
+            Err(e) => {
+                note_native_refusal(
+                    &self.control,
+                    self.caller_session_id,
+                    self.name(),
+                    &DaemonError::InvalidParam(e.clone()),
+                )
+                .await;
+                return err(e);
+            }
         };
         let outcome = self
             .control
             .agent_spawn_child(self.caller_session_id, request)
             .await;
+        if let AgentSpawnChildOutcome::Rejected(reason) = &outcome {
+            let error = DaemonError::InvalidParam(format!("agent_spawn_rejected:{reason:?}"));
+            note_native_refusal(&self.control, self.caller_session_id, self.name(), &error).await;
+        }
         let (success, message) = describe_spawn_outcome(&outcome);
         if success {
             ToolResult {
@@ -403,7 +469,16 @@ impl HarnessTool for RsiControlStatusTool {
     async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
         let target = match resolve_target_id(&args, self.caller_session_id) {
             Ok(t) => t,
-            Err(e) => return err(e),
+            Err(e) => {
+                note_native_refusal(
+                    &self.control,
+                    self.caller_session_id,
+                    self.name(),
+                    &DaemonError::InvalidParam(e.clone()),
+                )
+                .await;
+                return err(e);
+            }
         };
         match self
             .control
@@ -416,9 +491,22 @@ impl HarnessTool for RsiControlStatusTool {
                     output: json,
                     error_msg: None,
                 },
-                Err(e) => err(format!("failed to serialize session: {e}")),
+                Err(e) => {
+                    let message = format!("failed to serialize session: {e}");
+                    note_native_refusal(
+                        &self.control,
+                        self.caller_session_id,
+                        self.name(),
+                        &DaemonError::Json(e),
+                    )
+                    .await;
+                    err(message)
+                }
             },
-            Err(e) => err(e.to_string()),
+            Err(e) => {
+                note_native_refusal(&self.control, self.caller_session_id, self.name(), &e).await;
+                err(e.to_string())
+            }
         }
     }
 }
@@ -469,7 +557,16 @@ impl HarnessTool for RsiControlSendMessageTool {
     async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
         let request = match send_message_request_from_args(&args) {
             Ok(request) => request,
-            Err(e) => return err(e),
+            Err(e) => {
+                note_native_refusal(
+                    &self.control,
+                    self.caller_session_id,
+                    self.name(),
+                    &DaemonError::InvalidParam(e.clone()),
+                )
+                .await;
+                return err(e);
+            }
         };
         match self
             .control
@@ -482,9 +579,22 @@ impl HarnessTool for RsiControlSendMessageTool {
                     output,
                     error_msg: None,
                 },
-                Err(e) => err(format!("failed to serialize receipt: {e}")),
+                Err(e) => {
+                    let message = format!("failed to serialize receipt: {e}");
+                    note_native_refusal(
+                        &self.control,
+                        self.caller_session_id,
+                        self.name(),
+                        &DaemonError::Json(e),
+                    )
+                    .await;
+                    err(message)
+                }
             },
-            Err(e) => err(e.to_string()),
+            Err(e) => {
+                note_native_refusal(&self.control, self.caller_session_id, self.name(), &e).await;
+                err(e.to_string())
+            }
         }
     }
 }
@@ -523,7 +633,16 @@ impl HarnessTool for RsiControlProgressTool {
     async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
         let params = match progress_params_from_args(&args) {
             Ok(params) => params,
-            Err(e) => return err(e),
+            Err(e) => {
+                note_native_refusal(
+                    &self.control,
+                    self.caller_session_id,
+                    self.name(),
+                    &DaemonError::InvalidParam(e.clone()),
+                )
+                .await;
+                return err(e);
+            }
         };
         match self
             .control
@@ -536,9 +655,22 @@ impl HarnessTool for RsiControlProgressTool {
                     output,
                     error_msg: None,
                 },
-                Err(e) => err(format!("failed to serialize progress: {e}")),
+                Err(e) => {
+                    let message = format!("failed to serialize progress: {e}");
+                    note_native_refusal(
+                        &self.control,
+                        self.caller_session_id,
+                        self.name(),
+                        &DaemonError::Json(e),
+                    )
+                    .await;
+                    err(message)
+                }
             },
-            Err(e) => err(e.to_string()),
+            Err(e) => {
+                note_native_refusal(&self.control, self.caller_session_id, self.name(), &e).await;
+                err(e.to_string())
+            }
         }
     }
 }
@@ -559,11 +691,15 @@ impl RsiControlReadSessionEventsTool {
     }
 }
 
-/// The global manager verbs that have a native tool (#872 Slice B).
-pub(crate) const GLOBAL_NATIVE_VERBS: [AgentControlVerbV1; 3] = [
+/// The global manager verbs that have a native tool (#872 Slice B), plus
+/// the N-level routing verbs (#1238) and the node overview (#1240).
+pub(crate) const GLOBAL_NATIVE_VERBS: [AgentControlVerbV1; 6] = [
     AgentControlVerbV1::GlobalOverview,
     AgentControlVerbV1::GlobalSend,
     AgentControlVerbV1::ReportToGlobal,
+    AgentControlVerbV1::ReportUp,
+    AgentControlVerbV1::SendDown,
+    AgentControlVerbV1::ManagerOverview,
 ];
 
 /// Run one native global-manager verb (#872 Slice B). Authority is checked by
@@ -591,6 +727,21 @@ pub(crate) async fn execute_global_verb(
         AgentControlVerbV1::ReportToGlobal => serde_json::to_value(
             control
                 .agent_report_to_global(caller, serde_json::from_value(args).map_err(invalid)?)
+                .await?,
+        ),
+        AgentControlVerbV1::ReportUp => serde_json::to_value(
+            control
+                .agent_report_up(caller, serde_json::from_value(args).map_err(invalid)?)
+                .await?,
+        ),
+        AgentControlVerbV1::SendDown => serde_json::to_value(
+            control
+                .agent_send_down(caller, serde_json::from_value(args).map_err(invalid)?)
+                .await?,
+        ),
+        AgentControlVerbV1::ManagerOverview => serde_json::to_value(
+            control
+                .agent_manager_overview(caller, serde_json::from_value(args).map_err(invalid)?)
                 .await?,
         ),
         _ => {
@@ -645,7 +796,10 @@ impl HarnessTool for RsiControlGlobalTool {
                 output: value.to_string(),
                 error_msg: None,
             },
-            Err(e) => err(e.to_string()),
+            Err(e) => {
+                note_native_refusal(&self.control, self.caller_session_id, self.name(), &e).await;
+                err(e.to_string())
+            }
         }
     }
 }
@@ -688,7 +842,17 @@ impl HarnessTool for RsiControlQueryFailureSignaturesTool {
         let request: rsi_common::agent_failure_signatures::AgentQueryFailureSignaturesRequestV1 =
             match serde_json::from_value(args) {
                 Ok(request) => request,
-                Err(e) => return err(format!("invalid query_failure_signatures arguments: {e}")),
+                Err(e) => {
+                    let message = format!("invalid query_failure_signatures arguments: {e}");
+                    note_native_refusal(
+                        &self.control,
+                        self.caller_session_id,
+                        self.name(),
+                        &DaemonError::Json(e),
+                    )
+                    .await;
+                    return err(message);
+                }
             };
         match self
             .control
@@ -701,9 +865,22 @@ impl HarnessTool for RsiControlQueryFailureSignaturesTool {
                     output,
                     error_msg: None,
                 },
-                Err(e) => err(format!("failed to serialize signatures: {e}")),
+                Err(e) => {
+                    let message = format!("failed to serialize signatures: {e}");
+                    note_native_refusal(
+                        &self.control,
+                        self.caller_session_id,
+                        self.name(),
+                        &DaemonError::Json(e),
+                    )
+                    .await;
+                    err(message)
+                }
             },
-            Err(e) => err(e.to_string()),
+            Err(e) => {
+                note_native_refusal(&self.control, self.caller_session_id, self.name(), &e).await;
+                err(e.to_string())
+            }
         }
     }
 }
@@ -716,7 +893,8 @@ impl HarnessTool for RsiControlReadSessionEventsTool {
 
     fn description(&self) -> &str {
         "Read a bounded page of a session's conversation events (tail, or forward from \
-         after_sequence) plus its final assistant message and terminal reason. Scope: \
+         after_sequence) plus its final assistant message and terminal reason. Set \
+         final_message_full to return up to 32768 characters of the final message. Scope: \
          your own child, a child of an Epic you lead, or a session in your manager scope."
     }
 
@@ -730,7 +908,17 @@ impl HarnessTool for RsiControlReadSessionEventsTool {
         let request: rsi_common::agent_session_events::AgentReadSessionEventsRequestV1 =
             match serde_json::from_value(args) {
                 Ok(request) => request,
-                Err(e) => return err(format!("invalid read_session_events arguments: {e}")),
+                Err(e) => {
+                    let message = format!("invalid read_session_events arguments: {e}");
+                    note_native_refusal(
+                        &self.control,
+                        self.caller_session_id,
+                        self.name(),
+                        &DaemonError::Json(e),
+                    )
+                    .await;
+                    return err(message);
+                }
             };
         match self
             .control
@@ -743,9 +931,22 @@ impl HarnessTool for RsiControlReadSessionEventsTool {
                     output,
                     error_msg: None,
                 },
-                Err(e) => err(format!("failed to serialize events: {e}")),
+                Err(e) => {
+                    let message = format!("failed to serialize events: {e}");
+                    note_native_refusal(
+                        &self.control,
+                        self.caller_session_id,
+                        self.name(),
+                        &DaemonError::Json(e),
+                    )
+                    .await;
+                    err(message)
+                }
             },
-            Err(e) => err(e.to_string()),
+            Err(e) => {
+                note_native_refusal(&self.control, self.caller_session_id, self.name(), &e).await;
+                err(e.to_string())
+            }
         }
     }
 }
@@ -791,7 +992,16 @@ impl HarnessTool for RsiControlCreateIssueTool {
     async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
         let params = match agent_create_issue_from_args(&args) {
             Ok(params) => params,
-            Err(e) => return err(e),
+            Err(e) => {
+                note_native_refusal(
+                    &self.control,
+                    self.caller_session_id,
+                    self.name(),
+                    &DaemonError::InvalidParam(e.clone()),
+                )
+                .await;
+                return err(e);
+            }
         };
         match self
             .control
@@ -804,9 +1014,22 @@ impl HarnessTool for RsiControlCreateIssueTool {
                     output,
                     error_msg: None,
                 },
-                Err(e) => err(format!("failed to serialize issue result: {e}")),
+                Err(e) => {
+                    let message = format!("failed to serialize issue result: {e}");
+                    note_native_refusal(
+                        &self.control,
+                        self.caller_session_id,
+                        self.name(),
+                        &DaemonError::Json(e),
+                    )
+                    .await;
+                    err(message)
+                }
             },
-            Err(e) => err(e.to_string()),
+            Err(e) => {
+                note_native_refusal(&self.control, self.caller_session_id, self.name(), &e).await;
+                err(e.to_string())
+            }
         }
     }
 }
@@ -886,7 +1109,7 @@ impl HarnessTool for RsiControlIssueTool {
                 "Read one local Issue in the project owned by the Epic you currently lead."
             }
             IssueControlToolKind::Update => {
-                "CAS-update active Issue content as the current owning-Epic lead or manager with issue-coordinate authority."
+                "CAS-update active Issue content as the current owning-Epic lead or manager with issue-coordinate authority; a live Issue-bound worker may append to its own Issue's body only."
             }
             IssueControlToolKind::UpdateStatus => {
                 "CAS-update one Issue status as the current owning-Epic lead or manager with issue-coordinate authority."
@@ -915,7 +1138,12 @@ impl HarnessTool for RsiControlIssueTool {
                         .agent_list_issues(self.caller_session_id, params)
                         .await
                 }
-                Err(validation) => return err(agent_issue_invalid_request_json(validation)),
+                Err(validation) => {
+                    let error = crate::error::agent_issue_invalid_request(validation);
+                    note_native_refusal(&self.control, self.caller_session_id, self.name(), &error)
+                        .await;
+                    return err(crate::error::agent_issue_error_json(error));
+                }
             }
             .and_then(|value| serde_json::to_value(value).map_err(DaemonError::Json)),
             IssueControlToolKind::Get => match agent_get_issue_from_args(&args) {
@@ -924,7 +1152,12 @@ impl HarnessTool for RsiControlIssueTool {
                         .agent_get_issue(self.caller_session_id, params)
                         .await
                 }
-                Err(validation) => return err(agent_issue_invalid_request_json(validation)),
+                Err(validation) => {
+                    let error = crate::error::agent_issue_invalid_request(validation);
+                    note_native_refusal(&self.control, self.caller_session_id, self.name(), &error)
+                        .await;
+                    return err(crate::error::agent_issue_error_json(error));
+                }
             }
             .and_then(|value| serde_json::to_value(value).map_err(DaemonError::Json)),
             IssueControlToolKind::Update => match agent_update_issue_from_args(&args) {
@@ -933,7 +1166,12 @@ impl HarnessTool for RsiControlIssueTool {
                         .agent_update_issue(self.caller_session_id, params)
                         .await
                 }
-                Err(validation) => return err(agent_issue_invalid_request_json(validation)),
+                Err(validation) => {
+                    let error = crate::error::agent_issue_invalid_request(validation);
+                    note_native_refusal(&self.control, self.caller_session_id, self.name(), &error)
+                        .await;
+                    return err(crate::error::agent_issue_error_json(error));
+                }
             }
             .and_then(|value| serde_json::to_value(value).map_err(DaemonError::Json)),
             IssueControlToolKind::UpdateStatus => {
@@ -943,7 +1181,17 @@ impl HarnessTool for RsiControlIssueTool {
                             .agent_update_issue_status(self.caller_session_id, params)
                             .await
                     }
-                    Err(validation) => return err(agent_issue_invalid_request_json(validation)),
+                    Err(validation) => {
+                        let error = crate::error::agent_issue_invalid_request(validation);
+                        note_native_refusal(
+                            &self.control,
+                            self.caller_session_id,
+                            self.name(),
+                            &error,
+                        )
+                        .await;
+                        return err(crate::error::agent_issue_error_json(error));
+                    }
                 }
                 .and_then(|value| serde_json::to_value(value).map_err(DaemonError::Json))
             }
@@ -953,7 +1201,12 @@ impl HarnessTool for RsiControlIssueTool {
                         .agent_archive_issue(self.caller_session_id, params)
                         .await
                 }
-                Err(validation) => return err(agent_issue_invalid_request_json(validation)),
+                Err(validation) => {
+                    let error = crate::error::agent_issue_invalid_request(validation);
+                    note_native_refusal(&self.control, self.caller_session_id, self.name(), &error)
+                        .await;
+                    return err(crate::error::agent_issue_error_json(error));
+                }
             }
             .and_then(|value| serde_json::to_value(value).map_err(DaemonError::Json)),
             IssueControlToolKind::Restore => match agent_restore_issue_from_args(&args) {
@@ -962,7 +1215,12 @@ impl HarnessTool for RsiControlIssueTool {
                         .agent_restore_issue(self.caller_session_id, params)
                         .await
                 }
-                Err(validation) => return err(agent_issue_invalid_request_json(validation)),
+                Err(validation) => {
+                    let error = crate::error::agent_issue_invalid_request(validation);
+                    note_native_refusal(&self.control, self.caller_session_id, self.name(), &error)
+                        .await;
+                    return err(crate::error::agent_issue_error_json(error));
+                }
             }
             .and_then(|value| serde_json::to_value(value).map_err(DaemonError::Json)),
             IssueControlToolKind::ListEvents => match agent_list_issue_events_from_args(&args) {
@@ -971,7 +1229,12 @@ impl HarnessTool for RsiControlIssueTool {
                         .agent_list_issue_events(self.caller_session_id, params)
                         .await
                 }
-                Err(validation) => return err(agent_issue_invalid_request_json(validation)),
+                Err(validation) => {
+                    let error = crate::error::agent_issue_invalid_request(validation);
+                    note_native_refusal(&self.control, self.caller_session_id, self.name(), &error)
+                        .await;
+                    return err(crate::error::agent_issue_error_json(error));
+                }
             }
             .and_then(|value| serde_json::to_value(value).map_err(DaemonError::Json)),
         };
@@ -982,15 +1245,22 @@ impl HarnessTool for RsiControlIssueTool {
                     output,
                     error_msg: None,
                 },
-                Err(_) => err(crate::error::agent_issue_error_json(
-                    crate::error::agent_issue_error(
+                Err(_) => {
+                    let error = crate::error::agent_issue_error(
                         rsi_common::rpc::AgentIssueErrorCodeV1::StorageFailure,
                         None,
                         None,
-                    ),
-                )),
+                    );
+                    note_native_refusal(&self.control, self.caller_session_id, self.name(), &error)
+                        .await;
+                    err(crate::error::agent_issue_error_json(error))
+                }
             },
-            Err(error) => err(crate::error::agent_issue_error_json(error)),
+            Err(error) => {
+                note_native_refusal(&self.control, self.caller_session_id, self.name(), &error)
+                    .await;
+                err(crate::error::agent_issue_error_json(error))
+            }
         }
     }
 }
@@ -1144,7 +1414,7 @@ pub(crate) async fn execute_manager_tool(
             let request: rsi_common::harness_manager_v2::AgentManagerGetActionRequestV2 =
                 parse_manager_args(args)?;
             control
-                .agent_manager_get_action(caller, request)
+                .agent_manager_get_action_view(caller, request)
                 .await
                 .and_then(|value| serde_json::to_value(value).map_err(DaemonError::Json))
         }
@@ -1289,7 +1559,11 @@ impl HarnessTool for RsiControlTopologyTool {
                 output: value.to_string(),
                 error_msg: None,
             },
-            Err(error) => err(crate::session::topology_agent_verbs::error_json(error)),
+            Err(error) => {
+                note_native_refusal(&self.control, self.caller_session_id, self.name(), &error)
+                    .await;
+                err(crate::session::topology_agent_verbs::error_json(error))
+            }
         }
     }
 }
@@ -1335,7 +1609,11 @@ impl HarnessTool for RsiControlManagerTool {
                 output: value.to_string(),
                 error_msg: None,
             },
-            Err(error) => err(error.to_string()),
+            Err(error) => {
+                note_native_refusal(&self.control, self.caller_session_id, self.name(), &error)
+                    .await;
+                err(error.to_string())
+            }
         }
     }
 }
@@ -1368,7 +1646,16 @@ impl HarnessTool for RsiControlHaltTool {
     async fn execute(&self, args: serde_json::Value, _working_dir: &Path) -> ToolResult {
         let target = match resolve_target_id(&args, self.caller_session_id) {
             Ok(t) => t,
-            Err(e) => return err(e),
+            Err(e) => {
+                note_native_refusal(
+                    &self.control,
+                    self.caller_session_id,
+                    self.name(),
+                    &DaemonError::InvalidParam(e.clone()),
+                )
+                .await;
+                return err(e);
+            }
         };
         match self
             .control
@@ -1380,7 +1667,10 @@ impl HarnessTool for RsiControlHaltTool {
                 output: format!("halt requested for session {target}"),
                 error_msg: None,
             },
-            Err(e) => err(e.to_string()),
+            Err(e) => {
+                note_native_refusal(&self.control, self.caller_session_id, self.name(), &e).await;
+                err(e.to_string())
+            }
         }
     }
 }
@@ -1534,6 +1824,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn native_refusal_friction_matches_rpc_signature_and_preserves_error() {
+        let control = test_control_handle();
+        let caller = Uuid::new_v4();
+        let error = control
+            .agent_send_message(
+                caller,
+                AgentSendMessageRequestV1 {
+                    target_session_id: caller,
+                    message: "private message".into(),
+                    idempotency_key: "friction-refusal".into(),
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        let expected =
+            crate::friction::agent_refusal_event("AgentSendMessage", Some(caller), &error);
+        let tool = RsiControlSendMessageTool::new(control.clone(), caller);
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "target_session_id": caller, "message": "private message",
+                    "idempotency_key": "friction-refusal"
+                }),
+                Path::new("/tmp"),
+            )
+            .await;
+        assert!(!result.success);
+        assert_eq!(result.error_msg, Some(error.to_string()));
+        let rows = control
+            .store
+            .lock()
+            .await
+            .friction_rollup(&Default::default(), chrono::Utc::now())
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].signature, expected.signature);
+        assert_eq!((rows[0].occurrences, rows[0].sessions), (1, 1));
+
+        // Structured Issue failures retain their code before rendering JSON.
+        let issue_tool =
+            RsiControlIssueTool::new(control.clone(), caller, IssueControlToolKind::Get);
+        let result = issue_tool
+            .execute(serde_json::json!({}), Path::new("/tmp"))
+            .await;
+        assert!(!result.success);
+        let rows = control
+            .store
+            .lock()
+            .await
+            .friction_rollup(&Default::default(), chrono::Utc::now())
+            .unwrap()
+            .rows;
+        assert!(
+            rows.iter()
+                .any(|row| row.signature == "agent_refusal:AgentGetIssue:invalid_request")
+        );
     }
 
     /// The bound caller session id is a private field set at construction and

@@ -292,6 +292,11 @@ impl RpcServer {
         let params: LaunchSessionParams = serde_json::from_value(request.params.clone())
             .map_err(|e| DaemonError::InvalidParam(format!("Invalid params: {}", e)))?;
 
+        // TaskRabbit was removed as a launchable kind: refuse before any
+        // path resolution, custody or persistence side effect.
+        crate::session::hierarchy::refuse_removed_session_kind(params.session_kind)
+            .map_err(|message| DaemonError::InvalidParam(message.to_string()))?;
+
         // Validate and canonicalize working_dir before any background work.
         // This surfaces path errors as RPC responses (TUI notification) rather than
         // silent session failures.
@@ -649,13 +654,22 @@ impl RpcServer {
     ) -> Result<serde_json::Value> {
         let params: GetSessionParams = serde_json::from_value(request.params.clone())
             .map_err(|e| DaemonError::Rpc(format!("Invalid params: {e}")))?;
-        let level = self
+        let detail = self
             .session_manager
             .store()
             .lock()
             .await
-            .get_operator_pause(params.session_id)?;
-        Ok(serde_json::json!({"session_id": params.session_id, "pause_level": level}))
+            .get_operator_pause_detail(params.session_id)?;
+        // Every writer of the marker is operator-authority (operator
+        // interrupt, SetOperatorPause, or inheritance of one), so the setter
+        // is reported as the operator.
+        Ok(serde_json::json!({
+            "session_id": params.session_id,
+            "pause_level": detail.level,
+            "since": detail.since,
+            "set_by": if detail.since.is_some() { Some("operator") } else { None },
+            "held_succession": detail.held_succession,
+        }))
     }
 
     pub(super) async fn handle_cancel_retry(
@@ -682,6 +696,22 @@ impl RpcServer {
             .await?;
 
         Ok(serde_json::Value::Null)
+    }
+
+    /// #1176 operator-only: abandon a blocked rotation to a fresh
+    /// replacement session.
+    pub(super) async fn handle_abandon_blocked_rotation(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let params: rsi_common::rpc::AbandonBlockedRotationParams =
+            serde_json::from_value(request.params.clone())
+                .map_err(|e| DaemonError::Rpc(format!("Invalid params: {}", e)))?;
+        let receipt = self
+            .session_manager
+            .abandon_blocked_rotation(params)
+            .await?;
+        Ok(serde_json::to_value(receipt)?)
     }
 
     pub(super) async fn handle_delete_session(
@@ -929,6 +959,22 @@ impl RpcServer {
     ) -> Result<serde_json::Value> {
         let params: QueueSessionModelUpdateParams = serde_json::from_value(request.params.clone())
             .map_err(|e| DaemonError::Rpc(format!("Invalid params: {e}")))?;
+        // Refuse a model the operator launch-model allowlist or provider
+        // profile excludes now, not at the next turn boundary (the apply path
+        // vets it again, #692).
+        let provider = self
+            .session_manager
+            .store()
+            .lock()
+            .await
+            .session_model_switch_options(params.session_id)?
+            .provider;
+        if let Some(reason) = self
+            .runtime_config
+            .launch_model_refusal(provider, Some(params.new_model.trim()))
+        {
+            return Err(DaemonError::PolicyDenied(reason));
+        }
         let receipt = self
             .session_manager
             .store()
@@ -942,6 +988,22 @@ impl RpcServer {
                 &params.idempotency_key,
             )?;
         Ok(serde_json::to_value(receipt)?)
+    }
+
+    pub(super) async fn handle_get_session_model_switch_options(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let params: GetSessionParams = serde_json::from_value(request.params.clone())
+            .map_err(|e| DaemonError::Rpc(format!("Invalid params: {e}")))?;
+        let mut options = self
+            .session_manager
+            .store()
+            .lock()
+            .await
+            .session_model_switch_options(params.session_id)?;
+        options.model_allowlist = self.runtime_config.launch_model_allowlist.read().clone();
+        Ok(serde_json::to_value(options)?)
     }
 
     pub(super) async fn handle_continue_session(

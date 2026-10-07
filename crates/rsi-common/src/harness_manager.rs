@@ -162,6 +162,10 @@ pub struct ManagerNodeEscalationV1 {
     pub ruling: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// #1238: the newest hop of this escalation above its project root (it
+    /// is held there while that hop is `open`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub above_project: Option<crate::manager_tier_routing::ManagerTierEscalationHopV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,6 +373,11 @@ pub struct AgentManagerProgressRequestV1 {
     pub after_epic_id: Option<Uuid>,
     #[serde(default)]
     pub limit: Option<u16>,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl AgentManagerProgressRequestV1 {
@@ -452,6 +461,11 @@ pub struct AgentManagerProgressResultV1 {
     pub recent_requests: Vec<HarnessManagerRequestSummaryV1>,
     #[serde(default)]
     pub mail_capacity: HarnessManagerMailCapacityV1,
+    /// #1235: the daemon's current `{scope_version, policy_version}` fence of
+    /// the caller's manager principal in `config.project_id`, ready for the
+    /// fenced verbs. Absent when the project has no saved policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence: Option<crate::harness_manager_v2::ManagerFenceV2>,
 }
 
 const fn default_inbox_limit() -> u16 {
@@ -467,6 +481,14 @@ pub struct AgentManagerInboxRequestV1 {
     pub limit: u16,
     #[serde(default)]
     pub request_id: Option<Uuid>,
+    /// Independent cursor for notices; message paging remains unchanged.
+    #[serde(default)]
+    pub after_notice_sequence: i64,
+    #[serde(default)]
+    pub notice_kind: Option<String>,
+    /// Settle exact notices belonging to this seat, independently of paging.
+    #[serde(default)]
+    pub settle_notice_ids: Vec<Uuid>,
 }
 
 impl Default for AgentManagerInboxRequestV1 {
@@ -475,6 +497,9 @@ impl Default for AgentManagerInboxRequestV1 {
             after_sequence: 0,
             limit: default_inbox_limit(),
             request_id: None,
+            after_notice_sequence: 0,
+            notice_kind: None,
+            settle_notice_ids: Vec::new(),
         }
     }
 }
@@ -482,6 +507,19 @@ impl Default for AgentManagerInboxRequestV1 {
 impl AgentManagerInboxRequestV1 {
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.after_sequence < 0
+            || self.after_notice_sequence < 0
+            || self.notice_kind.as_deref().is_some_and(|kind| {
+                !matches!(
+                    kind,
+                    "session_state"
+                        | "message"
+                        | "action_result"
+                        | "operator_answer"
+                        | "ledger_change"
+                )
+            })
+            || self.settle_notice_ids.len() > usize::from(HARNESS_MANAGER_MAX_INBOX_PAGE)
+            || self.settle_notice_ids.iter().any(|id| id.is_nil())
             || self.limit == 0
             || self.limit > HARNESS_MANAGER_MAX_INBOX_PAGE
             || self.request_id.is_some_and(|id| id.is_nil())
@@ -691,6 +729,9 @@ pub struct HarnessManagerNoticeV1 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentManagerInboxResultV1 {
     pub messages: Vec<HarnessManagerMessageV1>,
+    /// Continuation token: pass it back as `after_sequence`. Set when more
+    /// messages remain or `more_notices` is true (notices settle as they are
+    /// returned, so the next call reads the next page).
     pub next_after_sequence: Option<i64>,
     /// Exact notice subjects settled by this retrieval. Added compatibly: old
     /// clients ignore the fields and missing fields decode as an empty page.
@@ -698,10 +739,23 @@ pub struct AgentManagerInboxResultV1 {
     pub notices: Vec<HarnessManagerNoticeV1>,
     #[serde(default)]
     pub more_notices: bool,
+    /// Pass back as `after_notice_sequence` with the same notice filters.
+    #[serde(default)]
+    pub next_after_notice_sequence: Option<i64>,
+    /// Authorized IDs explicitly settled by this call (including retries).
+    #[serde(default)]
+    pub settled_notice_ids: Vec<Uuid>,
     /// Durable seat observation for the appointed manager (#669); absent
     /// when the daemon has never observed the seat down.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager_seat: Option<ManagerSeatStateV1>,
+    /// #1266: tier mail this seat sent or was sent whose delivery failed or
+    /// is uncertain, with the reason. Never replayed automatically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub undelivered_tier_mail: Vec<crate::manager_tier_routing::UndeliveredTierMailV1>,
+    /// #1295: older failed or uncertain tier mail exists beyond this list.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub more_undelivered_tier_mail: bool,
 }
 
 pub const MANAGER_WORK_VIEW_MAX_PAGE: u16 = 32;
@@ -879,6 +933,36 @@ mod tests {
         assert!(result.notices.is_empty());
         assert!(!result.more_notices);
         assert_eq!(result.manager_seat, None);
+        assert_eq!(result.next_after_notice_sequence, None);
+        assert!(result.settled_notice_ids.is_empty());
+    }
+
+    #[test]
+    fn inbox_notice_controls_are_optional_and_bounded() {
+        let legacy: AgentManagerInboxRequestV1 = serde_json::from_value(json!({
+            "after_sequence": 7, "limit": 2, "request_id": null
+        }))
+        .unwrap();
+        assert_eq!(legacy.after_sequence, 7);
+        assert_eq!(legacy.after_notice_sequence, 0);
+        assert_eq!(legacy.notice_kind, None);
+        assert!(legacy.settle_notice_ids.is_empty());
+        assert!(legacy.validate().is_ok());
+        for value in [
+            json!({"after_notice_sequence": -1}),
+            json!({"notice_kind": "unknown"}),
+            json!({"settle_notice_ids": [Uuid::nil()]}),
+            json!({"settle_notice_ids": vec![Uuid::new_v4(); 33]}),
+        ] {
+            let invalid: AgentManagerInboxRequestV1 = serde_json::from_value(value).unwrap();
+            assert_eq!(invalid.validate(), Err("manager_invalid_inbox_page"));
+        }
+        let valid: AgentManagerInboxRequestV1 = serde_json::from_value(json!({
+            "after_notice_sequence": 42, "notice_kind": "ledger_change",
+            "settle_notice_ids": [Uuid::new_v4()]
+        }))
+        .unwrap();
+        assert!(valid.validate().is_ok());
     }
 
     #[test]
@@ -920,7 +1004,11 @@ mod tests {
             next_after_sequence: None,
             notices: vec![],
             more_notices: false,
+            next_after_notice_sequence: None,
+            settled_notice_ids: Vec::new(),
             manager_seat: Some(seat.clone()),
+            undelivered_tier_mail: vec![],
+            more_undelivered_tier_mail: false,
         };
         let decoded: AgentManagerInboxResultV1 =
             serde_json::from_value(serde_json::to_value(&inbox).unwrap()).unwrap();
@@ -963,10 +1051,15 @@ mod tests {
         assert!(serde_json::from_value::<AgentManagerSendRequestV1>(value).is_err());
         assert!(
             serde_json::from_value::<AgentManagerProgressRequestV1>(
-                json!({"project_id": Uuid::new_v4()})
+                json!({"manager_session_id": Uuid::new_v4()})
             )
             .is_err()
         );
+        // #1235: project_id is the global seat's target project, not identity.
+        let project = Uuid::new_v4();
+        let targeted: AgentManagerProgressRequestV1 =
+            serde_json::from_value(json!({"project_id": project})).unwrap();
+        assert_eq!(targeted.project_id, Some(project));
         assert!(
             serde_json::from_value::<AgentManagerReplyRequestV1>(
                 json!({"request_id": Uuid::new_v4(), "message": "ready",

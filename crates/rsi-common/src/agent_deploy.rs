@@ -10,10 +10,10 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Binaries the daemon may replace, by file name. `rsid` is mandatory; every
+/// Artifacts the daemon may replace, by file name. `rsid` is mandatory; every
 /// other member is deployed (and sha-verified) when present in the binaries
 /// directory and reported in the receipt's `skipped` list when absent (#1110).
-pub const DEPLOY_BINARIES: [&str; 8] = [
+pub const DEPLOY_BINARIES: [&str; 9] = [
     "rsid",
     "rsi",
     "rsi-rpc",
@@ -22,6 +22,7 @@ pub const DEPLOY_BINARIES: [&str; 8] = [
     "rsi-contract-validate",
     "rsi-rolling-land",
     "rsi-remote",
+    "rsid-supervisor.sh",
 ];
 
 /// Managed binaries a deploy did not carry: those named in `DEPLOY_BINARIES`
@@ -64,6 +65,18 @@ pub const DEPLOY_RESTART_BUDGET: &str = "deploy_restart_budget";
 /// A staged copy no longer matches its verified hash at swap time.
 pub const DEPLOY_STAGED_CHANGED: &str = "deploy_staged_copy_changed";
 pub const DEPLOY_IN_PROGRESS: &str = "deploy_already_in_progress";
+/// #1320/#1311: the settled reason of a deploy its owner cancelled while it
+/// waited (`cancel: true`); the deploy settles `failed` with this reason.
+pub const DEPLOY_CANCELLED: &str = "deploy_cancelled";
+/// A cancel arrived after the deploy started its restart: too late to stop.
+pub const DEPLOY_CANCEL_TOO_LATE: &str = "deploy_cancel_too_late";
+/// A cancel named no deploy of the caller under that idempotency key.
+pub const DEPLOY_NOT_FOUND: &str = "deploy_not_found";
+/// Default (seconds) of the operator setting `deploy_drain_hold_secs`: how
+/// long an agent deploy may hold new worker starts while it waits.
+pub const DEPLOY_DRAIN_HOLD_DEFAULT_SECS: u64 = 600;
+/// Upper bound of `deploy_drain_hold_secs` (a deploy waits at most this long).
+pub const DEPLOY_DRAIN_HOLD_MAX_SECS: u64 = DEPLOY_MAX_WAIT_SECS as u64;
 /// Satellite deploy: the satellite has no local session to own the deploy
 /// (its operator has declared no inbound scope root that exists).
 pub const SATELLITE_DEPLOY_OWNER_REQUIRED: &str = "satellite_deploy_owner_required";
@@ -133,9 +146,41 @@ pub struct AgentRequestDeployRequestV1 {
     /// (idempotency key included) is the record.
     #[serde(default)]
     pub peer_id: Option<crate::satellite::SatelliteUuidV1>,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
+    /// #1320/#1311: cancel the caller's own waiting deploy recorded under
+    /// `idempotency_key` (and `sha`) instead of requesting one. Stops its hold
+    /// on new launches at once; refused `deploy_cancel_too_late` once the
+    /// restart began. Not available with `peer_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel: Option<bool>,
+    /// #1461: once the operator's drain hold (`deploy_drain_hold_secs`) is over,
+    /// a worker still mid-turn no longer blocks the quiet point: the restart
+    /// interrupts it and the existing post-restart path resumes the turn with
+    /// a continue prompt. A landing and a local test/build/landing job still
+    /// block. Default false (workers block, as always).
+    /// The outcome lists the interrupted worker session ids and each one is an
+    /// andon friction event. Not available with `peer_id` or `cancel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupt_workers: Option<bool>,
 }
 
 impl AgentRequestDeployRequestV1 {
+    /// True for a cancel request.
+    #[must_use]
+    pub fn is_cancel(&self) -> bool {
+        self.cancel == Some(true)
+    }
+
+    /// True when workers mid-turn may be interrupted after the drain hold.
+    #[must_use]
+    pub fn interrupts_workers(&self) -> bool {
+        self.interrupt_workers == Some(true)
+    }
+
     /// # Errors
     /// A stable `deploy_*` code.
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -154,6 +199,18 @@ impl AgentRequestDeployRequestV1 {
             .max_wait_secs
             .is_some_and(|wait| wait == 0 || wait > DEPLOY_MAX_WAIT_SECS)
         {
+            return Err(DEPLOY_INVALID_REQUEST);
+        }
+        if self.is_cancel() {
+            // A cancel names an existing deploy; the source fields are ignored.
+            return if self.peer_id.is_some() || self.interrupts_workers() {
+                Err(DEPLOY_INVALID_REQUEST)
+            } else {
+                Ok(())
+            };
+        }
+        if self.interrupts_workers() && self.peer_id.is_some() {
+            // The satellite runs its own deploy flow, which has no such option.
             return Err(DEPLOY_INVALID_REQUEST);
         }
         match (self.binaries_dir.as_deref(), self.build) {
@@ -220,6 +277,17 @@ pub struct AgentRequestDeployReceiptV1 {
     pub skipped: Vec<String>,
     /// True when an earlier call with the same key already created this row.
     pub replayed: bool,
+    /// The settled reason (for example `deploy_cancelled`); absent while live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// #1461: the request accepted interrupting workers still mid-turn once
+    /// the drain hold is over.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupt_workers: bool,
+    /// #1461: worker session ids that were still mid-turn when the restart
+    /// began (each gets a continue prompt after it); empty until the restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interrupted_workers: Vec<Uuid>,
 }
 
 #[cfg(test)]
@@ -228,12 +296,15 @@ mod tests {
 
     fn request() -> AgentRequestDeployRequestV1 {
         AgentRequestDeployRequestV1 {
+            project_id: None,
             sha: "a".repeat(40),
             binaries_dir: Some("/tmp/bin".into()),
             build: None,
             idempotency_key: "k".into(),
             max_wait_secs: None,
             peer_id: None,
+            cancel: None,
+            interrupt_workers: None,
         }
     }
 
@@ -257,11 +328,91 @@ mod tests {
         let mut wait = request();
         wait.max_wait_secs = Some(DEPLOY_MAX_WAIT_SECS + 1);
         assert_eq!(wait.validate(), Err(DEPLOY_INVALID_REQUEST));
+        let mut cancel = request();
+        cancel.binaries_dir = None;
+        cancel.cancel = Some(true);
+        assert_eq!(cancel.validate(), Ok(()), "a cancel needs no source");
+        cancel.peer_id = Some(crate::satellite::SatelliteUuidV1(Uuid::new_v4()));
+        assert_eq!(cancel.validate(), Err(DEPLOY_INVALID_REQUEST));
         assert!(
             serde_json::from_value::<AgentRequestDeployRequestV1>(serde_json::json!({
                 "sha": "a".repeat(40), "binaries_dir": "/x", "idempotency_key": "k", "env": {}
             }))
             .is_err()
+        );
+    }
+
+    /// #1461: `interrupt_workers` is optional and off by default, travels on the
+    /// wire only when set, and is not available with a satellite deploy.
+    #[test]
+    fn interrupt_workers_is_optional_off_by_default_and_not_for_a_peer() {
+        let plain = request();
+        assert!(!plain.interrupts_workers());
+        assert!(
+            !serde_json::to_value(&plain)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("interrupt_workers")
+        );
+        let parsed: AgentRequestDeployRequestV1 = serde_json::from_value(serde_json::json!({
+            "sha": "a".repeat(40), "binaries_dir": "/x", "idempotency_key": "k",
+            "interrupt_workers": true
+        }))
+        .unwrap();
+        assert!(parsed.interrupts_workers());
+        assert_eq!(parsed.validate(), Ok(()));
+        let explicit_false: AgentRequestDeployRequestV1 =
+            serde_json::from_value(serde_json::json!({
+                "sha": "a".repeat(40), "binaries_dir": "/x", "idempotency_key": "k",
+                "interrupt_workers": false
+            }))
+            .unwrap();
+        assert!(!explicit_false.interrupts_workers());
+        let mut with_peer = parsed;
+        with_peer.peer_id = Some(crate::satellite::SatelliteUuidV1(Uuid::new_v4()));
+        assert_eq!(with_peer.validate(), Err(DEPLOY_INVALID_REQUEST));
+    }
+
+    #[test]
+    fn interrupt_workers_is_refused_with_cancel() {
+        let mut cancel = request();
+        cancel.cancel = Some(true);
+        assert_eq!(cancel.validate(), Ok(()));
+        cancel.interrupt_workers = Some(false);
+        assert_eq!(cancel.validate(), Ok(()));
+        cancel.interrupt_workers = Some(true);
+        assert_eq!(cancel.validate(), Err(DEPLOY_INVALID_REQUEST));
+    }
+
+    /// #1461: the receipt names the request and, once known, the interrupted
+    /// workers; a receipt that has neither keeps its old shape.
+    #[test]
+    fn the_receipt_names_interrupted_workers_only_when_there_are_some() {
+        let worker = Uuid::new_v4();
+        let mut receipt = AgentRequestDeployReceiptV1 {
+            deploy_id: Uuid::new_v4(),
+            state: DeployState::Staged,
+            sha: "a".repeat(40),
+            deadline_at: "2026-10-07T00:00:00.000000000Z".into(),
+            binaries: Vec::new(),
+            skipped: Vec::new(),
+            replayed: false,
+            reason: None,
+            interrupt_workers: false,
+            interrupted_workers: Vec::new(),
+        };
+        let value = serde_json::to_value(&receipt).unwrap();
+        assert!(value.get("interrupt_workers").is_none());
+        assert!(value.get("interrupted_workers").is_none());
+        receipt.interrupt_workers = true;
+        receipt.interrupted_workers = vec![worker];
+        let value = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(value["interrupt_workers"], true);
+        assert_eq!(value["interrupted_workers"], serde_json::json!([worker]));
+        assert_eq!(
+            serde_json::from_value::<AgentRequestDeployReceiptV1>(value).unwrap(),
+            receipt
         );
     }
 

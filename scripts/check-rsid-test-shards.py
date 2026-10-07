@@ -199,6 +199,96 @@ def mask_literals_and_comments(source: str, path: str) -> str:
     return "".join(masked)
 
 
+CFG_ATTR = re.compile(r"#!?\[\s*(cfg_attr|cfg)\s*\(")
+CFG_TOKEN = re.compile(r'\s*(?:"((?:[^"\\]|\\.)*)"|([A-Za-z_][A-Za-z_0-9]*)|(.))', re.S)
+
+
+def cfg_token(text: str, at: int) -> tuple[str | None, str | None, str | None, int]:
+    """One cfg token as (string literal, identifier, punctuation, end)."""
+    match = CFG_TOKEN.match(text, at)
+    if not match:
+        return None, None, None, len(text)
+    return match.group(1), match.group(2), match.group(3), match.end()
+
+
+def parse_cfg(text: str, position: int) -> tuple[bool, int]:
+    """Evaluate one cfg predicate of the unfeatured build; return (value, end).
+
+    The unfeatured library test build has `test-shard-mode` and every shard
+    feature off and is the build a focused gate runs (#1244). Predicates that
+    are not shard features (`test`, `unix`, other features) count as on, so
+    only the shard terms decide the answer.
+    """
+    _, ident, _, at = cfg_token(text, position)
+    if ident is None:
+        fail(f"cannot parse cfg predicate near {text[position:position + 40]!r}")
+    _, _, next_punct, after = cfg_token(text, at)
+    if ident in ("all", "any", "not") and next_punct == "(":
+        values = []
+        at = after
+        while True:
+            _, _, closing, peek = cfg_token(text, at)
+            if closing == ")":
+                at = peek
+                break
+            value, at = parse_cfg(text, at)
+            values.append(value)
+            _, _, separator, peek = cfg_token(text, at)
+            if separator == ",":
+                at = peek
+            elif separator != ")":
+                fail(f"cannot parse cfg predicate near {text[at:at + 40]!r}")
+        if ident == "all":
+            return all(values), at
+        if ident == "any":
+            return any(values), at
+        if len(values) != 1:
+            fail("cfg not() takes one predicate")
+        return not values[0], at
+    if next_punct == "=":
+        literal, _, _, end = cfg_token(text, after)
+        if literal is None:
+            fail(f"cannot parse cfg predicate near {text[after:after + 40]!r}")
+        if ident == "feature" and literal.startswith("test-shard-"):
+            return False, end
+        return True, end
+    return True, at
+
+
+def check_shard_cfg_attributes(path: Path) -> None:
+    """Reject a cfg that hides code from the unfeatured build by shard feature.
+
+    A focused gate runs one unfeatured lib test build (#1244), so any `cfg`
+    naming a shard feature must still hold with every shard feature off (the
+    canonical `any(not(feature = "test-shard-mode"), feature = "test-shard-X")`
+    does). An enclosing `#[cfg(feature = "test-shard-X")] mod` would compile
+    its tests only in that shard, so the focused gate could never run them (#1281).
+    """
+    relative = path.relative_to(ROOT).as_posix()
+    source = path.read_text(encoding="utf-8")
+    code = mask_literals_and_comments(source, relative)
+    for match in CFG_ATTR.finditer(code):
+        depth = 1
+        end = match.end()
+        while end < len(code) and depth:
+            depth += {"(": 1, ")": -1}.get(code[end], 0)
+            end += 1
+        if depth:
+            fail(f"{relative}: unterminated cfg attribute")
+        inner = source[match.end() : end - 1]
+        if "test-shard-" not in inner:
+            continue
+        line = source.count("\n", 0, match.start()) + 1
+        if match.group(1) == "cfg_attr":
+            fail(f"{relative}:{line}: cfg_attr must not name a test shard feature")
+        value, _ = parse_cfg(inner, 0)
+        if not value:
+            fail(
+                f"{relative}:{line}: shard-only cfg hides code from the unfeatured test build; "
+                'use any(not(feature = "test-shard-mode"), feature = "test-shard-...")'
+            )
+
+
 def extract_tests(path: Path) -> list[tuple[str, int, bool]]:
     relative = path.relative_to(ROOT).as_posix()
     source = path.read_text(encoding="utf-8")
@@ -290,6 +380,7 @@ def source_inventory(
         relative = path.relative_to(ROOT).as_posix()
         package = package_of(relative)
         is_bin = relative == "crates/rsid/src/main.rs" or relative.startswith("crates/rsid/src/bin/")
+        check_shard_cfg_attributes(path)
         raw_lines = path.read_text(encoding="utf-8").splitlines()
         excluded_ranges = host_excluded_line_ranges(raw_lines)
         for name, line, has_gate in extract_tests(path):

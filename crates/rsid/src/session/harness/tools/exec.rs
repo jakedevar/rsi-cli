@@ -942,6 +942,9 @@ impl HarnessTool for ExecCommandTool {
         if command.trim().is_empty() {
             return error_json("cmd must not be empty", "invalid_argument");
         }
+        if let Some(refusal) = rsi_common::kill_guard::broad_kill_refusal(command) {
+            return error_json(refusal, "broad_kill_refused");
+        }
         let yield_ms = clamped_yield_ms(
             args.get("yield_time_ms").and_then(Value::as_u64),
             DEFAULT_EXEC_YIELD_MS,

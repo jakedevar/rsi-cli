@@ -129,6 +129,13 @@ fn main() -> Result<()> {
             println!("{}", rsid::deploy::build_info_line());
             return Ok(());
         }
+        CliAction::RestoreDatabase(database, old_binary) => {
+            // Offline recovery only: take the same lease as daemon startup.
+            let socket = database.with_file_name("daemon.sock");
+            let _guard = DaemonInstanceGuard::acquire(&database, &socket)?;
+            rsid::deploy::restore_database_for_binary(&database, &old_binary)?;
+            return Ok(());
+        }
         CliAction::Invalid => {
             eprintln!("Usage: rsid [--help | --version]");
             std::process::exit(2);
@@ -169,6 +176,7 @@ enum CliAction {
     Help,
     Version,
     BuildInfo,
+    RestoreDatabase(std::path::PathBuf, std::path::PathBuf),
     Invalid,
 }
 
@@ -178,6 +186,9 @@ fn cli_action(args: &[std::ffi::OsString]) -> CliAction {
         [flag] if flag == "--help" || flag == "-h" => CliAction::Help,
         [flag] if flag == "--version" || flag == "-V" => CliAction::Version,
         [flag] if flag == "--build-info" => CliAction::BuildInfo,
+        [flag, database, old_binary] if flag == "--restore-pre-migration-db" => {
+            CliAction::RestoreDatabase(database.into(), old_binary.into())
+        }
         _ => CliAction::Invalid,
     }
 }
@@ -675,7 +686,8 @@ async fn run_daemon() -> Result<()> {
     // owner exactly once.
     tokio::spawn(rsid::agent_jobs::run_agent_jobs_loop(
         Arc::clone(session_manager.store()),
-        Arc::new(rsid::agent_jobs::SystemdJobRuntime::default()),
+        rsid::agent_jobs::platform_job_runtime(),
+        session_manager.deploy_drain(),
     ));
 
     // Restore has armed all retry candidates; now perform the one bounded C5
@@ -842,16 +854,11 @@ async fn run_daemon() -> Result<()> {
         tokio::sync::mpsc::channel::<(uuid::Uuid, rsid::stall_classifier::NudgeAction)>(64);
 
     // Spawn stall detection background task
-    let _stall_detector_handle = if config.stall_detection_enabled {
+    let _stall_detector_handle = {
         use rsid::reconciliation::StallAction;
-        // Only hand the detector the classifier sender when the classifier
-        // is also enabled, so the detector's branch is a true no-op when
-        // off (avoids per-tick gating + spurious `try_send` calls).
-        let detector_classifier_tx = if config.stall_classifier_enabled {
-            Some(stall_classifier_tx.clone())
-        } else {
-            None
-        };
+        // Keep the receiver wired even when disabled at boot. The detector
+        // and classifier read their runtime switches before doing work.
+        let detector_classifier_tx = Some(stall_classifier_tx.clone());
         Some(rsid::stall_detector::spawn_stall_detector(
             session_manager.active(),
             Arc::clone(&event_bus),
@@ -873,9 +880,6 @@ async fn run_daemon() -> Result<()> {
             detector_classifier_tx,
             Arc::clone(&runtime_config),
         ))
-    } else {
-        info!("Stall detection disabled");
-        None
     };
 
     // Spawn chain_driver background task — closes the master_improve convergence loop.
@@ -889,18 +893,16 @@ async fn run_daemon() -> Result<()> {
     tracing::info!("chain_driver background task spawned");
 
     // Spawn reconciliation loop background task
-    let reconciliation_heartbeat = config
-        .reconciliation_enabled
-        .then(rsid::watchdog::LoopHeartbeat::new);
-    let _reconciliation_handle = if config.reconciliation_enabled {
+    let reconciliation_heartbeat = Some(rsid::watchdog::LoopHeartbeat::new());
+    let _reconciliation_handle = {
         use rsid::reconciliation::{ReconciliationConfig, StallAction};
         info!(
             liveness_interval_secs = config.reconciliation_liveness_interval_secs,
             consistency_interval_secs = config.reconciliation_consistency_interval_secs,
-            "Reconciliation loop enabled"
+            "Reconciliation loop ready (runtime gated)"
         );
         Some(
-            rsid::reconciliation::spawn_reconciliation_loop_with_heartbeat(
+            rsid::reconciliation::spawn_reconciliation_loop_with_runtime(
                 session_manager.active(),
                 Arc::clone(session_manager.store()),
                 Arc::clone(&event_bus),
@@ -916,11 +918,9 @@ async fn run_daemon() -> Result<()> {
                 },
                 Some(session_manager.agent_control()),
                 reconciliation_heartbeat.clone(),
+                Some(Arc::clone(&runtime_config)),
             ),
         )
-    } else {
-        info!("Reconciliation loop disabled");
-        None
     };
 
     // Create exactly one runtime from durable policy before any model-capable
@@ -982,7 +982,7 @@ async fn run_daemon() -> Result<()> {
     // detector could receive a clone of the Sender. The classifier task
     // and the detector's classifier branch are both gated on the same
     // enabled flag.
-    let _stall_classifier_handle = if config.stall_classifier_enabled {
+    let _stall_classifier_handle = {
         let llm = rsid::stall_classifier::StallClassifierLlmClient::new(
             config.stall_classifier_api_url.clone(),
             config.stall_classifier_api_key.clone(),
@@ -1007,16 +1007,9 @@ async fn run_daemon() -> Result<()> {
             cooldown_secs = config.stall_classifier_cooldown_secs,
             max_per_session = config.stall_classifier_max_per_session,
             confidence_floor = config.stall_classifier_confidence_floor,
-            "Stall classifier enabled"
+            "Stall classifier ready (runtime gated)"
         );
         Some(handle)
-    } else {
-        // Drain the rx so Phase 2 sends never block on a full buffer when
-        // classifier is disabled and Sender is still held.
-        let mut rx = stall_classifier_rx;
-        tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        info!("Stall classifier disabled (RSI_STALL_CLASSIFIER_ENABLED=false)");
-        None
     };
     // Phase 4: nudge consumer loop. Receives `(session_id, NudgeAction)`
     // from the classifier and dispatches `Continue` verdicts through
@@ -1350,6 +1343,13 @@ async fn run_daemon() -> Result<()> {
     tokio::spawn(rsid::session::retention::run_retention_loop(Arc::clone(
         &session_manager,
     )));
+    // #1333: the andon files one kaizen Issue per repeating friction signature.
+    tokio::spawn(rsid::friction::run_andon_loop(Arc::clone(&session_manager)));
+    // #1337: the CPU-time andon per agent-owned process tree.
+    tokio::spawn(rsid::cpu_andon::run_cpu_andon_loop(
+        Arc::clone(&session_manager),
+        Arc::clone(&runtime_config),
+    ));
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1484,39 +1484,37 @@ async fn run_daemon() -> Result<()> {
                 if let Err(error) = succession_runtime.rotate_capped_coordinators().await {
                     warn!(error = %error, "Coordinator context cap pass deferred");
                 }
+                // #1254: finish worker batons a previous process recorded.
+                if let Err(error) = succession_runtime.deliver_pending_worker_batons().await {
+                    warn!(error = %error, "Worker baton pass deferred");
+                }
+                // #1294: write tier-mail outcomes whose first write failed;
+                // settle abandoned claims uncertain. Never redelivers.
+                if let Err(error) = succession_runtime.resettle_tier_mail().await {
+                    warn!(error = %error, "Tier mail settlement pass deferred");
+                }
             }
         });
     }
 
-    // Spawn stall-retry handler if RSI_RETRY_ON_STALL=true
-    if config.retry_on_stall {
+    // Subscribe at boot; the runtime switch gates every stall event.
+    {
         let session_manager_for_stall = Arc::clone(&session_manager);
+        let stall_runtime = Arc::clone(&runtime_config);
         let mut stall_rx = event_bus.subscribe();
         tokio::spawn(async move {
-            loop {
-                match stall_rx.recv().await {
-                    Ok(event) => {
-                        if let rsid::bus::DaemonEvent::SessionStalled { session_id, .. } =
-                            event.as_ref()
-                        {
-                            let session_id = *session_id;
-                            // interrupt_if_stall_retryable handles the flag + max_retries check
-                            if session_manager_for_stall
-                                .interrupt_if_stall_retryable(session_id)
-                                .await
-                            {
-                                info!(session_id = %session_id, "Stall-triggered retry interrupt sent");
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(lagged = n, "Stall-retry handler lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            while let Some(session_id) =
+                rsid::stall_detector::next_retryable_stall(&mut stall_rx, &stall_runtime).await
+            {
+                if session_manager_for_stall
+                    .interrupt_if_stall_retryable(session_id)
+                    .await
+                {
+                    info!(session_id = %session_id, "Stall-triggered retry interrupt sent");
                 }
             }
         });
-        info!("Stall-triggered retry handler started (RSI_RETRY_ON_STALL=true)");
+        info!("Stall-triggered retry handler ready (runtime gated)");
     }
 
     let authority_initialized_at = std::time::Instant::now();

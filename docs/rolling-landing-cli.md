@@ -53,6 +53,25 @@ publishing a candidate. A suspected lost hunk still runs the affected-crate
 test phase before the CLI refuses publication; the hunk evidence remains a
 review gate.
 
+Gate cost scales with the change (#1244). Each test guard runs on the
+candidate first; the base side is built and run only when that candidate run
+failed or did not prove a positive test count, so a green gate never builds the
+base. A red shared with the base still passes and a red the base lacks still
+fails after its isolated retry. When a candidate run was red and another run's
+base was skipped, the skipped bases are checked so a compile repair still needs
+every selected run green. Focused `rsid`/`rsid-store` filters run on one
+`cargo nextest` lib build of both packages without shard features (plus one
+static `check-rsid-test-shards.py --require-gates`); whole `shard:S` filters
+keep the shard script. An unfiltered rsid change runs `test(/^module::/)` for
+each touched top-level module that has tests, plus `cargo check`; a crate root,
+manifest or build-script change runs every shard. Every gate build uses the
+shard script's test profile (`CARGO_PROFILE_TEST_DEBUG=0`) and keeps its
+artifacts (`RSI_LANDER_KEEP_RSID_ARTIFACTS=1`), so the prebuild is reused. A
+filter that provably selects no test is refused before any build (#1243).
+Compile checks build into their own target and run beside the test prebuild.
+`gate_timing=` reports `base_skipped`, `checks_secs`, `candidate_secs` and
+`base_secs`.
+
 The CLI re-reads the remote again after guard work and before preparation. An
 ancestor-only fast-forward discovered there is a stale target, not an approved
 merge source: preparation fails closed before push, and the newer rolling tip is
@@ -73,6 +92,26 @@ tip needs its own verification. The candidate worktree is kept
 through this verification; the CLI never tears down a source worktree.
 Successful output includes `candidate_id`, `candidate_kind`,
 `fetched_target_id`, and `published_target_id`.
+
+When rolling cannot compile a selected test guard, the CLI can publish a
+compilation repair. Detection requires exit 101, an untruncated rustc source
+diagnostic and a `could not compile` summary; exit 101 alone also covers Cargo
+infrastructure errors and is insufficient. Nextest documents 101 as
+[`BUILD_FAILED`](https://nexte.st/rustdoc/nextest_metadata/enum.NextestExitCode.html#associatedconstant.BUILD_FAILED),
+distinct from test failures (100), metadata failures (102) and inventory
+creation failures (104).
+The base package/shard must be proven by its workspace manifests. Candidate
+compilation and every selected test must pass, with a positive test count.
+The receipt prints `base_test_baseline_unavailable=<base>:compile_failed:<command>`;
+this is unavailable comparison evidence, not an observed empty failure set,
+and is never written to either baseline failure cache. Candidate failures
+refuse as `baseline_compile_repair_candidate_failed`, without isolated retry,
+flake or untouched-module exceptions. Missing or zero-test candidate evidence
+refuses as `baseline_compile_repair_candidate_evidence_missing`; unproven base
+inventory refuses as `baseline_compile_repair_inventory_unknown`.
+Non-compilation infrastructure failures still refuse. Runnable baselines retain
+the normal failure comparison and isolated retries. Static, policy, migration,
+fast-forward and stale-tip re-gating checks still apply.
 
 A stale target (the remote advanced before or during the push) is retried on
 the newer tip. When the advance touches none of the candidate's paths, the

@@ -40,6 +40,10 @@ pub(crate) use crate::store_support::manager_gates::{
     check_manager_notice_program_gate, manager_notice_deferred, resumable_provider_session_id,
 };
 
+/// The stop reason of a session whose valid handoff a later tool call
+/// superseded (#97); its Failed finalization is andon friction (#1333).
+pub(crate) const TERMINAL_HANDOFF_SUPERSEDED_BY_TOOL: &str = "terminal_handoff_superseded_by_tool";
+
 #[cfg(test)]
 type FinalizerPause = (
     tokio::sync::oneshot::Sender<()>,
@@ -393,6 +397,15 @@ fn codex_websocket_recovery_context(session_id: Uuid, events: &[ConversationEven
     )
 }
 
+/// #1266: what one continuation did with the tier mail among its wake rows.
+#[derive(Debug, Default)]
+struct TierDeliveryProgress {
+    /// The effect claim moved the rows to `claimed`.
+    claimed: bool,
+    /// A provider may have received the delivery.
+    effect_possible: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ContinueSessionOutcome {
     Started,
@@ -438,6 +451,29 @@ static CONTINUE_MODEL_EFFORT_CONFIG_OBSERVATIONS: std::sync::LazyLock<
 static CONTINUE_MODEL_EFFORT_CONFIG_OBSERVATION_KEYS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// #1266: sessions whose next continuation fails model admission (after its
+/// effect claim, before any provider effect). Test-only.
+#[cfg(test)]
+static CONTINUE_ADMISSION_FAILURE_SESSIONS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<Uuid>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(test)]
+pub(crate) fn fail_next_continue_admission_for_test(session_id: Uuid) {
+    CONTINUE_ADMISSION_FAILURE_SESSIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(session_id);
+}
+
+#[cfg(test)]
+fn take_continue_admission_failure_for_test(session_id: Uuid) -> bool {
+    CONTINUE_ADMISSION_FAILURE_SESSIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&session_id)
+}
 
 #[cfg(test)]
 static CONTINUE_EXECUTION_SCRATCH_FAILURE_KEYS: std::sync::LazyLock<
@@ -1230,7 +1266,7 @@ impl SessionManager {
                 );
                 if effective_decision != decision
                     && tracked.session.stop_reason.as_deref()
-                        == Some("terminal_handoff_superseded_by_tool")
+                        == Some(TERMINAL_HANDOFF_SUPERSEDED_BY_TOOL)
                 {
                     // A newer lifecycle intent won after the handoff-order
                     // check. Its terminal reason must win as well.
@@ -1296,24 +1332,6 @@ impl SessionManager {
                 tracked.session.test_passed = probe.test_passed;
                 tracked.session.clippy_passed = probe.clippy_passed;
 
-                if matches!(
-                    tracked.session.session_kind,
-                    SessionKind::TaskRabbit | SessionKind::Bug
-                ) && final_status == SessionStatus::Completed
-                {
-                    let should_escalate = tracked
-                        .events
-                        .iter()
-                        .rev()
-                        .find(|e| e.role == Some(Role::Assistant))
-                        .map(|e| e.content.trim().ends_with("[TASKRABBIT_ESCALATE]"))
-                        .unwrap_or(false);
-
-                    if should_escalate {
-                        tracked.session.session_kind = SessionKind::Standard;
-                    }
-                }
-
                 (
                     Some(CompletedSession {
                         session: tracked.session,
@@ -1360,7 +1378,14 @@ impl SessionManager {
         let mut durable_terminal = false;
         let mut finalizer_persistence_ordered = false;
 
-        if let Some(completed_session) = session_data {
+        if let Some(mut completed_session) = session_data {
+            // Validate the current worker report before publishing terminal
+            // truth or waking its owner. No active-map lock spans Git IO.
+            super::worker_result_guard::result_sha::validate_terminal_report(
+                &mut completed_session,
+                &persistence,
+            )
+            .await;
             let sid = completed_session.session.id;
             let status = completed_session.session.status;
             let session_kind = completed_session.session.session_kind;
@@ -1417,6 +1442,26 @@ impl SessionManager {
                         "Final session persistence barrier failed; suppressing post-finalization rotation"
                     );
                 }
+            }
+            if durable_terminal
+                && let Some(event) =
+                    crate::friction::handoff_friction_event(sid, &completed_session.events)
+            {
+                Box::pin(crate::friction::note(&store, event)).await;
+            }
+            if durable_terminal
+                && status == SessionStatus::Failed
+                && session_clone.stop_reason.as_deref() == Some(TERMINAL_HANDOFF_SUPERSEDED_BY_TOOL)
+            {
+                // #1333 andon recording point: a valid handoff superseded by
+                // a later tool call ended this session Failed.
+                let event = rsi_common::friction::NewFrictionEventV1::new(
+                    rsi_common::friction::FrictionKind::Terminal,
+                    &[TERMINAL_HANDOFF_SUPERSEDED_BY_TOOL],
+                )
+                .session(Some(sid))
+                .evidence("session", sid);
+                Box::pin(crate::friction::note(&store, event)).await;
             }
             if let (Some(SandboxKind::GitWorktree), Some(root)) = (
                 session_clone.sandbox_kind,
@@ -1511,11 +1556,17 @@ impl SessionManager {
                 }
             }
 
+            // #1390: never start a background title call on a manager whose
+            // succession is queued; its settlement pins this row. Looked up
+            // only for an untitled session, the one refinement can touch.
+            let succession_queued = completed_session.session.title.is_none()
+                && super::title::manager_succession_holds_title(&store, session_id).await;
             if super::title::should_enqueue_title_refinement(
                 session_kind,
                 super::title::is_role_titled_epic_identity(&completed_session.session),
                 completed_session.events.len(),
                 completed_session.session.title.is_none(),
+                succession_queued,
             ) {
                 let context_events: Vec<&ConversationEvent> = completed_session
                     .events
@@ -1586,7 +1637,16 @@ impl SessionManager {
                                     cs.session.title = Some(result.title.clone());
                                 }
                             }
-                            if !result.description.is_empty() {
+                            // #1390: a succession queued while the title was
+                            // generating refuses the title fill above; leave
+                            // the description alone too.
+                            if !result.description.is_empty()
+                                && !super::title::manager_succession_holds_title(
+                                    &store_for_title,
+                                    session_id,
+                                )
+                                .await
+                            {
                                 if let Some(cs) =
                                     completed_for_title.write().await.get_mut(&session_id)
                                 {
@@ -2206,10 +2266,12 @@ impl SessionManager {
     /// Recover only claims that could not have reached a provider. This runs
     /// before startup restores live monitors or starts the dispatch tick.
     pub async fn reconcile_operator_messages_at_startup(&self) -> Result<(usize, usize)> {
-        self.store
-            .lock()
-            .await
-            .reconcile_operator_messages_at_startup()
+        let mut store = self.store.lock().await;
+        let (retryable, uncertain) = store.reconcile_operator_messages_at_startup()?;
+        // #1266: tier mail claimed by a continuation the restart cut short
+        // may have reached its provider: uncertain, never replayed.
+        let tier_uncertain = store.reconcile_tier_messages_at_startup()?;
+        Ok((retryable, uncertain + tier_uncertain))
     }
 
     /// #1017 slice 3: deliver a hub manager's message to one idle session.
@@ -2493,8 +2555,29 @@ impl SessionManager {
         } else {
             None
         };
-        let outcome =
-            Box::pin(self.continue_session_fenced_inner(session_id, query, intent, fence)).await?;
+        let wake_jobs = match &intent {
+            ContinuationIntent::ScheduledWake { job_ids } => Some(job_ids.clone()),
+            _ => None,
+        };
+        let mut tier_delivery = TierDeliveryProgress::default();
+        // #1294: in flight from before the claim until the outcome is
+        // recorded, so the recovery pass never sweeps a live claim.
+        let _in_flight = wake_jobs.as_deref().map(|jobs| self.tier_in_flight(jobs));
+        let result = Box::pin(self.continue_session_fenced_inner(
+            session_id,
+            query,
+            intent,
+            fence,
+            &mut tier_delivery,
+        ))
+        .await;
+        if tier_delivery.claimed
+            && let Some(jobs) = wake_jobs.as_deref()
+        {
+            self.settle_claimed_tier_mail(jobs, tier_delivery.effect_possible, &result)
+                .await;
+        }
+        let outcome = result?;
         if let Some(blocked) = blocked.as_ref()
             && matches!(outcome, ContinueSessionOutcome::Started)
         {
@@ -2558,6 +2641,7 @@ impl SessionManager {
         mut query: String,
         intent: ContinuationIntent,
         fence: Option<ContinuationFenceV1>,
+        tier_delivery: &mut TierDeliveryProgress,
     ) -> Result<ContinueSessionOutcome> {
         if self
             .restart_draining
@@ -2835,6 +2919,9 @@ impl SessionManager {
                 fence,
                 scheduled_wake_jobs.as_deref().unwrap_or_default(),
             )?;
+            // #1266: tier mail among the wake rows is now `claimed`; the
+            // caller settles it from this continuation's result.
+            tier_delivery.claimed = scheduled_wake_jobs.is_some();
         }
 
         // Acquire settlement-producer ownership before removing the completed
@@ -3080,6 +3167,7 @@ impl SessionManager {
                     .await
                     .mark_operator_message_effect_possible(id)?;
             }
+            tier_delivery.effect_possible = true;
             Box::pin(self.launch_effective_provider_replacement(
                 replacement_source,
                 query,
@@ -3535,14 +3623,12 @@ impl SessionManager {
 
             let active_task = completed_session.session.active_task.as_deref();
 
-            let (pipeline_project, pipeline_active_task) = if matches!(
-                completed_session.session.session_kind,
-                SessionKind::TaskRabbit | SessionKind::Bug
-            ) {
-                (None, active_task)
-            } else {
-                (project.as_ref(), active_task)
-            };
+            let (pipeline_project, pipeline_active_task) =
+                if matches!(completed_session.session.session_kind, SessionKind::Bug) {
+                    (None, active_task)
+                } else {
+                    (project.as_ref(), active_task)
+                };
 
             let pipeline = super::context_pipeline::ContextPipeline::new(
                 Arc::clone(&self.token_counter),
@@ -3857,6 +3943,17 @@ impl SessionManager {
         };
 
         let admission_request_for_recovery = admission_request.clone();
+        #[cfg(test)]
+        if take_continue_admission_failure_for_test(session_id) {
+            self.revoke_agent_token_for_session(session_id).await;
+            self.completed
+                .write()
+                .await
+                .insert(session_id, completed_session);
+            return Err(DaemonError::PolicyDenied(
+                "injected model admission refusal".into(),
+            ));
+        }
         let (admission_permit, recovered_capacity_admission) = if capacity_delivery.is_some() {
             match admit_capacity_invocation(&self.store, admission_request, self.event_bus()).await
             {
@@ -4228,6 +4325,7 @@ impl SessionManager {
                 .await
                 .mark_operator_message_effect_possible(id)?;
         }
+        tier_delivery.effect_possible = true;
         #[cfg(test)]
         let launch_result = if super::launch::take_capacity_provider_spawn_failure(session_id) {
             Err(DaemonError::Process(
@@ -5940,22 +6038,26 @@ impl SessionManager {
                         .claim_restart_intent(&intent, self.program_run_boot_id)?
                 };
                 if !claimed {
+                    self.publish_restart_refusal(intent.session_id).await?;
                     continue;
                 }
-                if resumable_provider_session_id(
-                    &self
-                        .store
-                        .lock()
-                        .await
-                        .get_session(intent.session_id)?
-                        .ok_or(DaemonError::SessionNotFound(intent.session_id))?,
-                )
-                .is_none()
+                let session = self
+                    .store
+                    .lock()
+                    .await
+                    .get_session(intent.session_id)?
+                    .ok_or(DaemonError::SessionNotFound(intent.session_id))?;
+                // App-server continuation currently replaces the provider and
+                // UUID rather than rebinding this exact restart invocation.
+                // Report that unsupported path instead of claiming delivery.
+                if session.provider == SessionProvider::CodexAppServer
+                    || resumable_provider_session_id(&session).is_none()
                 {
                     self.store
                         .lock()
                         .await
                         .fail_restart_intent(intent.id, "not_resumable")?;
+                    self.publish_restart_refusal(intent.session_id).await?;
                     continue;
                 }
                 if let Err(error) = self
@@ -5968,8 +6070,27 @@ impl SessionManager {
                         .lock()
                         .await
                         .fail_restart_intent(intent.id, "dispatch_failed")?;
+                    self.publish_restart_refusal(intent.session_id).await?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    async fn publish_restart_refusal(&self, session_id: Uuid) -> Result<()> {
+        let session = self.store.lock().await.get_session(session_id)?;
+        if let Some(session) = session
+            && let Some(reason) = session.stop_reason.as_deref()
+            && reason.starts_with("daemon_restart_resume:")
+        {
+            if let Some(completed) = self.completed.write().await.get_mut(&session_id) {
+                completed.session.stop_reason = session.stop_reason.clone();
+                completed.session.updated_at = session.updated_at;
+            }
+            self.event_bus.publish(DaemonEvent::SystemMessage {
+                level: "warn".into(),
+                message: format!("Restart continuation for {session_id} refused: {reason}"),
+            });
         }
         Ok(())
     }
@@ -6425,9 +6546,9 @@ mod d00_tests {
     }
 
     /// #1172: the replacement root's stripe used to be taken while holding the
-    /// Store, so a maintenance proof on a colliding stripe pinned every Store
+    /// Store, so a maintenance proof on the same root pinned every Store
     /// user for the whole proof. The fresh root's id is generated during the
-    /// allocation, so every stripe is held; the Continue waits Store-free and
+    /// allocation, so the fixture reserves and holds that exact root; Continue waits Store-free and
     /// still replaces the quarantined root once the proof ends.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6455,9 +6576,11 @@ mod d00_tests {
         install_continue_custody_config_observation_for_test(session_id, 0);
         super::super::launch::install_controller_candidate_test_process(session_id);
 
+        let (fresh_root, _reservation) =
+            crate::store::stripe_liveness_support::reserve_fresh_root(session_id);
         let run = crate::store::stripe_liveness_support::run_behind_held_stripes(
             &test.manager.store,
-            None,
+            Some(vec![fresh_root]),
             std::time::Duration::from_secs(3),
             test.manager
                 .continue_session_operator(session_id, "resume after quarantine".to_string()),
@@ -9644,6 +9767,52 @@ mod d00_tests {
                 "{error}"
             );
         }
+    }
+
+    /// Issue #1407: a continuation re-launches the stored provider and model,
+    /// so under `provider_profile = aws_only` one that is not Claude on a
+    /// Bedrock Claude model is refused before any effect.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn continue_refuses_a_non_bedrock_session_under_the_aws_only_profile() {
+        let test = test_manager();
+        let (session_id, _root) = insert_completed_continue_fixture(&test, true).await;
+        test.manager
+            .runtime_config
+            .update_field("provider_profile", &serde_json::json!("aws_only"))
+            .unwrap();
+        let sessions_before: i64 = test
+            .manager
+            .store
+            .lock()
+            .await
+            .conn
+            .query_row("SELECT COUNT(*) FROM model_invocations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let error = test
+            .manager
+            .continue_session(session_id, "continue under aws_only".to_string())
+            .await
+            .expect_err("a non-Bedrock session must refuse the continuation");
+        assert!(matches!(error, DaemonError::PolicyDenied(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("provider_profile_refused:"),
+            "{error}"
+        );
+        let sessions_after: i64 = test
+            .manager
+            .store
+            .lock()
+            .await
+            .conn
+            .query_row("SELECT COUNT(*) FROM model_invocations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(sessions_before, sessions_after, "no invocation is admitted");
+        assert!(test.manager.active.read().await.is_empty());
     }
 
     /// Binds the fixture session to a completed invocation and queues a model

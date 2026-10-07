@@ -2016,6 +2016,7 @@ async fn issue_writer_d04_link_issue_operator_cas_replay_changed_conflict_and_at
             .lock()
             .await
             .list_issue_events_v1(&rsi_common::types::IssueEventPageRequestV1 {
+                project_id: None,
                 issue_id: fault_issue.id,
                 after_sequence: 0,
                 limit: None,
@@ -2051,6 +2052,7 @@ async fn issue_writer_d04_link_issue_operator_cas_replay_changed_conflict_and_at
         .lock()
         .await
         .list_issue_events_v1(&rsi_common::types::IssueEventPageRequestV1 {
+            project_id: None,
             issue_id: issue.id,
             after_sequence: 0,
             limit: None,
@@ -2091,6 +2093,7 @@ async fn issue_writer_d04_link_issue_operator_cas_replay_changed_conflict_and_at
             .lock()
             .await
             .list_issue_events_v1(&rsi_common::types::IssueEventPageRequestV1 {
+                project_id: None,
                 issue_id: issue.id,
                 after_sequence: 0,
                 limit: None,
@@ -4715,7 +4718,10 @@ fn h1_v83_target_reclaim_removes_only_target_under_generation_fence() {
     );
     let target = root.join("target");
     std::fs::create_dir(&target).unwrap();
-    std::fs::write(target.join("artifact"), "keep sandbox").unwrap();
+    // Build output lives under a Cargo entry: unknown top-level content keeps the whole
+    // tree (#1429), which is not what these fixtures exercise.
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(target.join("debug").join("artifact"), "keep sandbox").unwrap();
     session.status = SessionStatus::Completed;
     session.working_dir = canonical.clone();
     session.sandbox_kind = Some(rsi_common::types::SandboxKind::GitWorktree);
@@ -4824,7 +4830,8 @@ fn h1_v83_target_reclaim_removes_only_target_under_generation_fence() {
     }
     std::fs::remove_file(&target).unwrap();
     std::fs::create_dir(&target).unwrap();
-    std::fs::write(target.join("artifact"), "keep sandbox").unwrap();
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(target.join("debug").join("artifact"), "keep sandbox").unwrap();
 
     // These are real Git/filesystem substitutions, not SQL fixture edits.
     // Each refusal leaves both the target and an unrelated external sentinel.
@@ -4939,7 +4946,8 @@ fn h1_v83_real_custody_fixture_with_static_identity(
     );
     let target = root.join("target");
     std::fs::create_dir(&target).unwrap();
-    std::fs::write(target.join("artifact"), "keep sandbox").unwrap();
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(target.join("debug").join("artifact"), "keep sandbox").unwrap();
     parent.status = status;
     parent.working_dir = canonical.clone();
     parent.sandbox_kind = Some(SandboxKind::GitWorktree);
@@ -7399,7 +7407,7 @@ fn h1_v83_malformed_reserved_successor_cannot_publish_or_transfer() {
         "canonical"
     );
     assert_eq!(
-        std::fs::read_to_string(fixture.target.join("artifact")).unwrap(),
+        std::fs::read_to_string(fixture.target.join("debug").join("artifact")).unwrap(),
         "keep sandbox"
     );
 }
@@ -23830,6 +23838,7 @@ fn agent_issue_verbs_resolve_display_number_within_the_project() {
         .agent_get_issue(
             lead,
             &AgentGetIssueRequestV1 {
+                project_id: None,
                 issue_id: None,
                 display_number: Some(issue.display_number),
             },
@@ -23838,6 +23847,7 @@ fn agent_issue_verbs_resolve_display_number_within_the_project() {
     assert_eq!(by_number.issue.id, issue.id);
 
     let edit = || AgentUpdateIssueRequestV1 {
+        project_id: None,
         issue_id: None,
         display_number: Some(issue.display_number),
         expected_row_version: issue.row_version,
@@ -23860,6 +23870,7 @@ fn agent_issue_verbs_resolve_display_number_within_the_project() {
         .agent_update_issue_status(
             lead,
             &AgentUpdateIssueStatusRequestV1 {
+                project_id: None,
                 issue_id: None,
                 display_number: Some(issue.display_number),
                 status: IssueStatus::Closed,
@@ -23875,6 +23886,7 @@ fn agent_issue_verbs_resolve_display_number_within_the_project() {
         .agent_get_issue(
             lead,
             &AgentGetIssueRequestV1 {
+                project_id: None,
                 issue_id: None,
                 display_number: Some(issue.display_number + 10_000),
             },
@@ -23885,6 +23897,7 @@ fn agent_issue_verbs_resolve_display_number_within_the_project() {
         .agent_get_issue(
             lead,
             &AgentGetIssueRequestV1 {
+                project_id: None,
                 issue_id: Some(Uuid::new_v4()),
                 display_number: None,
             },
@@ -23917,6 +23930,7 @@ fn agent_issue_target_requires_exactly_one_of_id_and_display_number() {
                 .agent_get_issue(
                     lead,
                     &AgentGetIssueRequestV1 {
+                        project_id: None,
                         issue_id,
                         display_number,
                     },
@@ -23928,6 +23942,7 @@ fn agent_issue_target_requires_exactly_one_of_id_and_display_number() {
                 .agent_update_issue(
                     lead,
                     &AgentUpdateIssueRequestV1 {
+                        project_id: None,
                         issue_id,
                         display_number,
                         expected_row_version: issue.row_version,
@@ -23948,6 +23963,7 @@ fn agent_issue_target_requires_exactly_one_of_id_and_display_number() {
                 .agent_update_issue_status(
                     lead,
                     &AgentUpdateIssueStatusRequestV1 {
+                        project_id: None,
                         issue_id,
                         display_number,
                         status: IssueStatus::Closed,
@@ -24081,6 +24097,7 @@ fn agent_get_issue_returns_dependency_graph_to_lead_and_issue_coordinate_manager
             .agent_get_issue(
                 caller,
                 &AgentGetIssueRequestV1 {
+                    project_id: None,
                     issue_id: Some(target.id),
                     display_number: None,
                 },
@@ -24133,6 +24150,7 @@ fn agent_get_issue_returns_dependency_graph_to_lead_and_issue_coordinate_manager
         .agent_get_issue(
             lead,
             &AgentGetIssueRequestV1 {
+                project_id: None,
                 issue_id: Some(target.id),
                 display_number: None,
             },
@@ -24164,6 +24182,7 @@ fn agent_get_issue_returns_dependency_graph_to_lead_and_issue_coordinate_manager
         .agent_get_issue(
             worker.id,
             &AgentGetIssueRequestV1 {
+                project_id: None,
                 issue_id: Some(target.id),
                 display_number: None,
             },
@@ -24197,6 +24216,7 @@ fn issue_v97_migration_backfills_deterministic_baseline_event() {
     assert!(issue.archived_at.is_none());
     let event = store
         .list_issue_events_v1(&rsi_common::types::IssueEventPageRequestV1 {
+            project_id: None,
             issue_id,
             after_sequence: 0,
             limit: None,
@@ -24815,6 +24835,7 @@ fn agent_issue_status_archive_restore_replay_and_history_are_atomic() {
         .agent_update_issue_status(
             caller,
             &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
+                project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
                 status: IssueStatus::InProgress,
@@ -24828,6 +24849,7 @@ fn agent_issue_status_archive_restore_replay_and_history_are_atomic() {
         .agent_update_issue_status(
             caller,
             &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
+                project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
                 status: IssueStatus::InProgress,
@@ -24842,6 +24864,7 @@ fn agent_issue_status_archive_restore_replay_and_history_are_atomic() {
         .agent_update_issue_status(
             caller,
             &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
+                project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
                 status: IssueStatus::Closed,
@@ -24854,6 +24877,7 @@ fn agent_issue_status_archive_restore_replay_and_history_are_atomic() {
         .agent_archive_issue(
             caller,
             &rsi_common::rpc::AgentArchiveIssueRequestV1 {
+                project_id: None,
                 issue_id: issue.id,
                 expected_row_version: closed.issue.row_version,
                 idempotency_key: "v97-archive".into(),
@@ -24872,6 +24896,7 @@ fn agent_issue_status_archive_restore_replay_and_history_are_atomic() {
         .agent_restore_issue(
             caller,
             &rsi_common::rpc::AgentRestoreIssueRequestV1 {
+                project_id: None,
                 issue_id: issue.id,
                 expected_row_version: archived.issue.row_version,
                 idempotency_key: "v97-restore".into(),
@@ -24884,6 +24909,7 @@ fn agent_issue_status_archive_restore_replay_and_history_are_atomic() {
         .agent_list_issue_events(
             caller,
             &rsi_common::types::IssueEventPageRequestV1 {
+                project_id: None,
                 issue_id: issue.id,
                 after_sequence: 0,
                 limit: None,
@@ -24937,6 +24963,7 @@ fn agent_issue_authority_hides_cross_project_target() {
         .agent_get_issue(
             caller,
             &rsi_common::rpc::AgentGetIssueRequestV1 {
+                project_id: None,
                 issue_id: Some(Uuid::new_v4()),
                 display_number: None,
             },
@@ -24946,6 +24973,7 @@ fn agent_issue_authority_hides_cross_project_target() {
         .agent_get_issue(
             caller,
             &rsi_common::rpc::AgentGetIssueRequestV1 {
+                project_id: None,
                 issue_id: Some(remote.id),
                 display_number: None,
             },
@@ -24957,6 +24985,7 @@ fn agent_issue_authority_hides_cross_project_target() {
             .agent_get_issue(
                 caller,
                 &rsi_common::rpc::AgentGetIssueRequestV1 {
+                    project_id: None,
                     issue_id: Some(local.id),
                     display_number: None
                 },
@@ -24984,6 +25013,7 @@ fn agent_issue_unknown_and_cross_project_are_equal_for_every_target_route() {
             .agent_get_issue(
                 caller,
                 &rsi_common::rpc::AgentGetIssueRequestV1 {
+                    project_id: None,
                     issue_id: Some(issue_id),
                     display_number: None,
                 },
@@ -24998,6 +25028,7 @@ fn agent_issue_unknown_and_cross_project_are_equal_for_every_target_route() {
             .agent_update_issue(
                 caller,
                 &rsi_common::rpc::AgentUpdateIssueRequestV1 {
+                    project_id: None,
                     issue_id: Some(issue_id),
                     display_number: None,
                     expected_row_version: 1,
@@ -25024,6 +25055,7 @@ fn agent_issue_unknown_and_cross_project_are_equal_for_every_target_route() {
             .agent_update_issue_status(
                 caller,
                 &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
+                    project_id: None,
                     issue_id: Some(issue_id),
                     display_number: None,
                     status: IssueStatus::InProgress,
@@ -25044,6 +25076,7 @@ fn agent_issue_unknown_and_cross_project_are_equal_for_every_target_route() {
             .agent_archive_issue(
                 caller,
                 &rsi_common::rpc::AgentArchiveIssueRequestV1 {
+                    project_id: None,
                     issue_id,
                     expected_row_version: 1,
                     idempotency_key: format!("v97-equality-archive-{suffix}"),
@@ -25062,6 +25095,7 @@ fn agent_issue_unknown_and_cross_project_are_equal_for_every_target_route() {
             .agent_restore_issue(
                 caller,
                 &rsi_common::rpc::AgentRestoreIssueRequestV1 {
+                    project_id: None,
                     issue_id,
                     expected_row_version: 1,
                     idempotency_key: format!("v97-equality-restore-{suffix}"),
@@ -25080,6 +25114,7 @@ fn agent_issue_unknown_and_cross_project_are_equal_for_every_target_route() {
             .agent_list_issue_events(
                 caller,
                 &rsi_common::types::IssueEventPageRequestV1 {
+                    project_id: None,
                     issue_id,
                     after_sequence: 0,
                     limit: None,
@@ -25179,6 +25214,7 @@ fn agent_issue_archive_excludes_restart_dispatch_but_preserves_direct_reconcilia
         .agent_update_issue_status(
             caller,
             &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
+                project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
                 status: IssueStatus::Closed,
@@ -25203,6 +25239,7 @@ fn agent_issue_archive_excludes_restart_dispatch_but_preserves_direct_reconcilia
         .agent_archive_issue(
             caller,
             &rsi_common::rpc::AgentArchiveIssueRequestV1 {
+                project_id: None,
                 issue_id: issue.id,
                 expected_row_version: closed.issue.row_version,
                 idempotency_key: "archive-dispatch".into(),
@@ -25229,6 +25266,7 @@ fn agent_issue_archive_excludes_restart_dispatch_but_preserves_direct_reconcilia
         .agent_restore_issue(
             caller,
             &rsi_common::rpc::AgentRestoreIssueRequestV1 {
+                project_id: None,
                 issue_id: issue.id,
                 expected_row_version: archived.issue.row_version,
                 idempotency_key: "restore-dispatch".into(),
@@ -25326,6 +25364,7 @@ fn issue_writer_runtime_failpoints_roll_back_projection_event_and_agent_key() {
                 .agent_update_issue(
                     caller,
                     &rsi_common::rpc::AgentUpdateIssueRequestV1 {
+                        project_id: None,
                         issue_id: Some(issue.id),
                         display_number: None,
                         expected_row_version: issue.row_version,
@@ -25345,6 +25384,7 @@ fn issue_writer_runtime_failpoints_roll_back_projection_event_and_agent_key() {
         assert_eq!(
             store
                 .list_issue_events_v1(&rsi_common::types::IssueEventPageRequestV1 {
+                    project_id: None,
                     issue_id: issue.id,
                     after_sequence: 0,
                     limit: None,
@@ -25415,6 +25455,7 @@ fn issue_writer_dynamic_receipts_cover_operator_system_and_session_paths() {
         .agent_update_issue(
             caller,
             &rsi_common::rpc::AgentUpdateIssueRequestV1 {
+                project_id: None,
                 issue_id: Some(ordinary.id),
                 display_number: None,
                 expected_row_version: ordinary.row_version,
@@ -25468,6 +25509,7 @@ fn issue_writer_dynamic_receipts_cover_operator_system_and_session_paths() {
     ] {
         let history = store
             .list_issue_events_v1(&rsi_common::types::IssueEventPageRequestV1 {
+                project_id: None,
                 issue_id: issue.id,
                 after_sequence: 0,
                 limit: None,
@@ -25545,6 +25587,7 @@ fn issue_writer_local_project_move_race_preserves_scope_and_attribution() {
     );
     let history = store
         .list_issue_events_v1(&rsi_common::types::IssueEventPageRequestV1 {
+            project_id: None,
             issue_id: issue.id,
             after_sequence: 0,
             limit: None,
@@ -25827,6 +25870,7 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
         .agent_update_issue(
             lead,
             &AgentUpdateIssueRequestV1 {
+                project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
                 expected_row_version: issue.row_version,
@@ -25857,6 +25901,7 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
         .agent_get_issue(
             manager.id,
             &AgentGetIssueRequestV1 {
+                project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
             },
@@ -25866,6 +25911,7 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
     assert!(manager_read.blocked_by.is_empty());
     assert!(manager_read.blocks.is_empty());
     let history = rsi_common::types::IssueEventPageRequestV1 {
+        project_id: None,
         issue_id: issue.id,
         after_sequence: 0,
         limit: None,
@@ -25896,6 +25942,7 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
         .agent_update_issue(
             manager.id,
             &AgentUpdateIssueRequestV1 {
+                project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
                 expected_row_version: issue.row_version,
@@ -25914,6 +25961,7 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
         .agent_update_issue_status(
             manager.id,
             &AgentUpdateIssueStatusRequestV1 {
+                project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
                 status: IssueStatus::Closed,
@@ -25926,6 +25974,7 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
         .agent_archive_issue(
             manager.id,
             &AgentArchiveIssueRequestV1 {
+                project_id: None,
                 issue_id: issue.id,
                 expected_row_version: closed.issue.row_version,
                 idempotency_key: "manager-archive".into(),
@@ -25936,6 +25985,7 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
         .agent_restore_issue(
             manager.id,
             &AgentRestoreIssueRequestV1 {
+                project_id: None,
                 issue_id: issue.id,
                 expected_row_version: archived.issue.row_version,
                 idempotency_key: "manager-restore".into(),
@@ -25969,6 +26019,7 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
         .agent_get_issue(
             manager.id,
             &AgentGetIssueRequestV1 {
+                project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
             },
@@ -26004,6 +26055,7 @@ fn agent_issue_authority_manager_coordinate_grant_reads_project_wide_and_mutates
         .agent_get_issue(
             manager.id,
             &AgentGetIssueRequestV1 {
+                project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
             },
@@ -26101,6 +26153,7 @@ fn agent_issue_lead_concurrent_cas_has_one_winner_alongside_manager_coordinate_g
         std::thread::spawn(move || {
             let store = Store::open(&path).unwrap();
             let request = AgentUpdateIssueRequestV1 {
+                project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
                 expected_row_version: issue.row_version,
@@ -26263,6 +26316,7 @@ fn seed_pre_manager_issue_history(store: &Store, lead: Uuid, project: Uuid) -> I
         .agent_update_issue(
             lead,
             &AgentUpdateIssueRequestV1 {
+                project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
                 expected_row_version: issue.row_version,
@@ -26281,6 +26335,7 @@ fn seed_pre_manager_issue_history(store: &Store, lead: Uuid, project: Uuid) -> I
         .agent_update_issue_status(
             lead,
             &AgentUpdateIssueStatusRequestV1 {
+                project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
                 status: IssueStatus::InProgress,
@@ -26607,6 +26662,7 @@ fn assert_manager_issue_mutation_contract(
         .agent_list_issue_events(
             manager.id,
             &rsi_common::types::IssueEventPageRequestV1 {
+                project_id: None,
                 issue_id: prior.id,
                 after_sequence: 0,
                 limit: None,
@@ -26663,6 +26719,7 @@ fn lead_set_status(store: &Store, lead: Uuid, issue: &Issue, status: IssueStatus
         .agent_update_issue_status(
             lead,
             &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
+                project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
                 status,
@@ -26684,6 +26741,7 @@ fn manager_issue_update_content_records_manager_actor_replays_and_refuses_stale_
             store.agent_update_issue(
                 caller,
                 &rsi_common::rpc::AgentUpdateIssueRequestV1 {
+                    project_id: None,
                     issue_id: Some(issue.id),
                     display_number: None,
                     expected_row_version: issue.row_version,
@@ -26722,6 +26780,7 @@ fn manager_issue_update_status_records_manager_actor_replays_and_refuses_stale_o
             store.agent_update_issue_status(
                 caller,
                 &rsi_common::rpc::AgentUpdateIssueStatusRequestV1 {
+                    project_id: None,
                     issue_id: Some(issue.id),
                     display_number: None,
                     status,
@@ -26744,6 +26803,7 @@ fn manager_issue_archive_records_manager_actor_replays_and_refuses_stale_or_revo
             store.agent_archive_issue(
                 caller,
                 &rsi_common::rpc::AgentArchiveIssueRequestV1 {
+                    project_id: None,
                     issue_id: issue.id,
                     expected_row_version: issue.row_version,
                     idempotency_key: key.into(),
@@ -26766,6 +26826,7 @@ fn manager_issue_restore_records_manager_actor_replays_and_refuses_stale_or_revo
                 .agent_archive_issue(
                     lead,
                     &rsi_common::rpc::AgentArchiveIssueRequestV1 {
+                        project_id: None,
                         issue_id: closed.id,
                         expected_row_version: closed.row_version,
                         idempotency_key: "lead-archive".into(),
@@ -26778,6 +26839,7 @@ fn manager_issue_restore_records_manager_actor_replays_and_refuses_stale_or_revo
             store.agent_restore_issue(
                 caller,
                 &rsi_common::rpc::AgentRestoreIssueRequestV1 {
+                    project_id: None,
                     issue_id: issue.id,
                     expected_row_version: issue.row_version,
                     idempotency_key: key.into(),
@@ -26816,6 +26878,7 @@ fn manager_issue_mutations_refuse_ordinary_worker_without_coordinator_grant() {
         .agent_update_issue(
             worker.id,
             &rsi_common::rpc::AgentUpdateIssueRequestV1 {
+                project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
                 expected_row_version: issue.row_version,
@@ -26865,6 +26928,7 @@ fn manager_issue_concurrent_cas_has_one_winner_and_one_stale_version() {
         std::thread::spawn(move || {
             let store = Store::open(&path).unwrap();
             let request = AgentUpdateIssueRequestV1 {
+                project_id: None,
                 issue_id: Some(issue.id),
                 display_number: None,
                 expected_row_version: issue.row_version,
@@ -27079,6 +27143,7 @@ fn agent_issue_manager_coordinate_is_bound_to_its_own_project() {
         store.agent_get_issue(
             caller,
             &rsi_common::rpc::AgentGetIssueRequestV1 {
+                project_id: None,
                 issue_id: Some(issue_id),
                 display_number: None,
             },
@@ -27181,6 +27246,7 @@ fn agent_issue_two_connection_lead_transfer_race_has_one_serialized_authority_or
         store.agent_update_issue(
             old_lead,
             &rsi_common::rpc::AgentUpdateIssueRequestV1 {
+                project_id: None,
                 issue_id: Some(mutation_issue.id),
                 display_number: None,
                 expected_row_version: mutation_issue.row_version,
@@ -27208,6 +27274,7 @@ fn agent_issue_two_connection_lead_transfer_race_has_one_serialized_authority_or
     let final_issue = store.get_issue(issue.id).unwrap().unwrap();
     let event_count = store
         .list_issue_events_v1(&rsi_common::types::IssueEventPageRequestV1 {
+            project_id: None,
             issue_id: issue.id,
             after_sequence: 0,
             limit: None,
@@ -28844,6 +28911,7 @@ fn issue_writer_c5_automatic_insert_and_pending_resolution_are_one_replay_safe_t
     );
     let history = store
         .list_issue_events_v1(&rsi_common::types::IssueEventPageRequestV1 {
+            project_id: None,
             issue_id: id,
             after_sequence: 0,
             limit: None,
@@ -28878,6 +28946,7 @@ fn issue_writer_c5_automatic_insert_and_pending_resolution_are_one_replay_safe_t
     assert_eq!(
         store
             .list_issue_events_v1(&rsi_common::types::IssueEventPageRequestV1 {
+                project_id: None,
                 issue_id: id,
                 after_sequence: 0,
                 limit: None,
@@ -35620,7 +35689,13 @@ fn v100_historical_zero_context_window_is_readable_but_never_resolved() {
 /// rewind, so adding a migration without teaching the fixtures how to undo it
 /// fails the migration-chain tests immediately, with a message naming the fix —
 /// instead of silently suppressing chain coverage the way issue #26 did.
-const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 152;
+const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 160;
+const FLEET_INDEX_SCHEMA_VERSION: i32 = 153;
+const FLEET_INDEX_NAMES: [&str; 3] = [
+    "idx_fleet_invocations_created",
+    "idx_fleet_active_sessions",
+    "idx_fleet_session_invocations",
+];
 /// #12: provisional schema version of `session_wake_origins`.
 const WAKE_ORIGINS_SCHEMA_VERSION: i32 = 152;
 /// #1000: provisional schema version of `sessions.total_prompt_tokens`.
@@ -35820,6 +35895,90 @@ pub(crate) fn rewind_post_v121_tail_to(connection: &Connection, target: i32) {
         target <= active,
         "cannot rewind forward from V{active} to V{target}"
     );
+    if active >= 160 && target < 160 {
+        // The nullable queue delivery column stays for current accessors;
+        // its add-if-absent migration safely replays over the fixture.
+        connection
+            .pragma_update(None, "user_version", 159)
+            .expect("restore version before queue wake succession");
+    }
+    if active >= 159 && target < 159 {
+        // #1566: back to V158. The widened `agent_jobs` state CHECK and the
+        // `started_at` column stay (the V159 step rebuilds the table, so a
+        // re-run is harmless), like the V158 columns below.
+        connection
+            .pragma_update(None, "user_version", 158)
+            .expect("restore version before #1566");
+    }
+    if active >= 158 && target < 158 {
+        // #1461: back to V157. The two `agent_deploys` interrupt columns stay
+        // (the V158 step adds them only when absent, like `total_prompt_tokens`),
+        // so a deploy fixture keeps writing rows through the current accessors.
+        connection
+            .pragma_update(None, "user_version", 157)
+            .expect("restore version before #1461");
+    }
+    if active >= super::friction::FRICTION_SCHEMA_VERSION
+        && target < super::friction::FRICTION_SCHEMA_VERSION
+    {
+        // #1333: back to V156 (friction telemetry, the andon).
+        connection
+            .execute_batch(super::friction::REWIND_SQL)
+            .expect("rewind #1333 friction telemetry");
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                super::friction::FRICTION_SCHEMA_VERSION - 1,
+            )
+            .expect("restore version before #1333");
+    }
+    if active >= super::portfolio_nodes::delegation::PORTFOLIO_APPOINTMENT_SCHEMA_VERSION
+        && target < super::portfolio_nodes::delegation::PORTFOLIO_APPOINTMENT_SCHEMA_VERSION
+    {
+        // #1239: back below V156 (delegated appointments).
+        connection
+            .execute_batch(super::portfolio_nodes::delegation::REWIND_SQL)
+            .expect("rewind #1239 portfolio appointments");
+        connection
+            .pragma_update(
+                None,
+                "user_version",
+                // The schema step below V156 (V155 when S4's step exists).
+                super::MIGRATION_STEPS
+                    .iter()
+                    .map(|&(step, _)| step)
+                    .filter(|&step| {
+                        step < super::portfolio_nodes::delegation::PORTFOLIO_APPOINTMENT_SCHEMA_VERSION
+                    })
+                    .max()
+                    .expect("a schema step precedes V156"),
+            )
+            .expect("restore version before #1239");
+    }
+    if active >= super::manager_tier_routing::TIER_ROUTING_SCHEMA_VERSION
+        && target < super::manager_tier_routing::TIER_ROUTING_SCHEMA_VERSION
+    {
+        // #1238: back to V154 (N-level tier routing).
+        super::manager_tier_routing::rewind_to_v154(connection).expect("rewind #1238 tier routing");
+    }
+    if active >= super::portfolio_nodes::PORTFOLIO_NODE_SCHEMA_VERSION
+        && target < super::portfolio_nodes::PORTFOLIO_NODE_SCHEMA_VERSION
+    {
+        // #1236: back to V153 (portfolio node identity).
+        super::portfolio_nodes::rewind_to_v153(connection)
+            .expect("rewind #1236 portfolio node identity");
+    }
+    if active >= FLEET_INDEX_SCHEMA_VERSION && target < FLEET_INDEX_SCHEMA_VERSION {
+        for name in FLEET_INDEX_NAMES {
+            connection
+                .execute_batch(&format!("DROP INDEX {name}"))
+                .expect("rewind fleet index");
+        }
+        connection
+            .pragma_update(None, "user_version", FLEET_INDEX_SCHEMA_VERSION - 1)
+            .expect("rewind fleet schema version");
+    }
     if active >= WAKE_ORIGINS_SCHEMA_VERSION && target < WAKE_ORIGINS_SCHEMA_VERSION {
         // Issue #12: back to V151 (drop the wake-origin provenance catalog).
         connection
@@ -39731,6 +39890,97 @@ fn assert_fixture_matches_claimed_version(connection: &Connection, target_versio
         target_version >= TOTAL_PROMPT_TOKENS_REWIND_VERSION,
         "fixture V{target_version} has incorrect #1000 total_prompt_tokens presence"
     );
+    for name in FLEET_INDEX_NAMES {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            exists,
+            target_version >= FLEET_INDEX_SCHEMA_VERSION,
+            "fleet index {name} at schema {target_version}"
+        );
+    }
+    // #1236: V154 objects (the per-node index and the identity trigger keep
+    // V150's names, so the #872 probe above covers them).
+    for (kind, name) in super::portfolio_nodes::CATALOG_OBJECTS {
+        if super::global_manager::CATALOG_OBJECTS.contains(&(kind, name)) {
+            continue;
+        }
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .expect("probe #1236 portfolio catalog object");
+        assert_eq!(
+            present,
+            target_version >= super::portfolio_nodes::PORTFOLIO_NODE_SCHEMA_VERSION,
+            "fixture V{target_version} has incorrect #1236 {kind} `{name}` presence"
+        );
+    }
+    // #1238: V155 objects.
+    for (kind, name) in super::manager_tier_routing::CATALOG_OBJECTS {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .expect("probe #1238 tier routing catalog object");
+        assert_eq!(
+            present,
+            target_version >= super::manager_tier_routing::TIER_ROUTING_SCHEMA_VERSION,
+            "fixture V{target_version} has incorrect #1238 {kind} `{name}` presence"
+        );
+    }
+    // #1333: V157 friction telemetry.
+    for (kind, name) in super::friction::CATALOG_OBJECTS {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .expect("probe #1333 friction catalog object");
+        assert_eq!(
+            present,
+            target_version >= super::friction::FRICTION_SCHEMA_VERSION,
+            "fixture V{target_version} has incorrect #1333 {kind} `{name}` presence"
+        );
+    }
+    // #1239: V156 delegated appointments.
+    for (kind, name) in super::portfolio_nodes::delegation::CATALOG_OBJECTS {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .expect("probe #1239 appointment catalog object");
+        assert_eq!(
+            present,
+            target_version
+                >= super::portfolio_nodes::delegation::PORTFOLIO_APPOINTMENT_SCHEMA_VERSION,
+            "fixture V{target_version} has incorrect #1239 {kind} `{name}` presence"
+        );
+    }
+    let node_column: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('global_manager_grants') WHERE name = 'node_id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    assert_eq!(
+        node_column == 1,
+        target_version >= super::portfolio_nodes::PORTFOLIO_NODE_SCHEMA_VERSION,
+        "fixture V{target_version} has incorrect #1236 global_manager_grants.node_id presence"
+    );
 }
 
 /// Assert that the migration steps from V77 up **actually executed** during the
@@ -39749,6 +39999,65 @@ fn assert_fixture_matches_claimed_version(connection: &Connection, target_versio
 /// that stopped short cannot produce a matching value.
 #[allow(clippy::expect_used)]
 pub(crate) fn assert_post_v77_chain_replayed(connection: &Connection) {
+    let queue_wake_column: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('rolling_queue_entries') WHERE name='wake_session_id')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(queue_wake_column, "queue wake succession column replayed");
+    for (kind, name) in super::friction::CATALOG_OBJECTS {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(exists, "#1333 friction replay: {kind} {name}");
+    }
+    for (kind, name) in super::manager_tier_routing::CATALOG_OBJECTS {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(exists, "#1238 tier routing replay: {kind} {name}");
+    }
+    for (kind, name) in super::portfolio_nodes::delegation::CATALOG_OBJECTS {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(exists, "#1239 appointment replay: {kind} {name}");
+    }
+    for (kind, name) in super::portfolio_nodes::CATALOG_OBJECTS {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                [kind, name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(exists, "#1236 portfolio replay: {kind} {name}");
+    }
+    for name in FLEET_INDEX_NAMES {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(exists, "fleet index replay: {name}");
+    }
+
     let version: i32 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read user_version after replay");

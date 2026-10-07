@@ -844,6 +844,7 @@ fn fenced_req(
     policy_version: i64,
 ) -> AgentManagerUpdateRequestV2 {
     AgentManagerUpdateRequestV2 {
+        project_id: None,
         fence: ManagerFenceV2 {
             scope_version,
             policy_version,
@@ -3788,6 +3789,7 @@ fn seed_creations(store: &Store, f: &Fixture, count: usize, review_linked: bool)
                         model: "test".into(),
                         effort: None,
                     },
+                    sandbox_source: None,
                 },
                 ManagerActionStateV2::Succeeded,
                 Some(f.source),

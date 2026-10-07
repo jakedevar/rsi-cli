@@ -1,13 +1,12 @@
 ---
 source: crates/rsi/tests/tui_integration.rs
-assertion_line: 2117
 expression: "support::buffer_to_snapshot(&buffer)"
 ---
- ● 0
- All projects / Sessions ┌────────────────────────────────────────────────┐               1 session
-  #   ∞  S  !  FUNCTION  │ cwd: /tmp/rsi-s-input  default                 │   MODEL                ▮
+ ● 0 running                                                                       default ✻ Claude
+ All projects / Sessions ┌────────────────────────────────────────────────┐Longest idle · 1 session
+  #   ∞  S  !  FUNCTION  │ cwd: /tmp/rsi-s-input  default                 │E    MODEL
  RECENT ─────────────────│                                                │─────────────────────────
-▌        ✓     query 0   │ line 03                                        │ ✻
+▌        ✓     query 0   │ line 03                                        │1m ✻
                          │ line 04                                        │
                          │ line 05                                        │
                          │ line 06                                        │

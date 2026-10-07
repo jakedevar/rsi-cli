@@ -9,9 +9,11 @@ use rsi_common::harness_manager_v2::*;
 use rsi_common::types::Project;
 
 mod fence;
+mod host_load;
 mod launch_liveness;
 mod lead_wakes;
 mod recovery;
+mod tier_mail;
 
 const OBSERVED_INTERRUPTED_PROGRAM_TEXT: &str = "The fresh re-review is terminal. I’m re-registering the program guard first, then I’ll validate its one-file commit and stored strict handoff. Zero findings will open V13; any finding returns to the exact implementer.";
 
@@ -1116,6 +1118,18 @@ async fn pilot() -> Pilot {
                 policy: policy.clone(),
             })
             .unwrap();
+        // #1443: the lead acts after the seat appointment. A lead idle since
+        // before it is stale and Execute intent never wakes it by itself.
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET updated_at=?2 WHERE id=?1",
+                rusqlite::params![
+                    lead.to_string(),
+                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                ],
+            )
+            .unwrap();
     }
     Pilot {
         manager,
@@ -1141,6 +1155,7 @@ impl Pilot {
     }
     fn request(&self, key: &str, operation: ManagerActionV2) -> AgentManagerControlRequestV2 {
         AgentManagerControlRequestV2 {
+            project_id: None,
             fence: ManagerFenceV2 {
                 scope_version: 1,
                 policy_version: 1,
@@ -1183,6 +1198,7 @@ impl Pilot {
 
 fn prepared_resume(p: &Pilot) -> AgentManagerPrepareControlRequestV2 {
     AgentManagerPrepareControlRequestV2 {
+        project_id: None,
         operation: PreparedManagerActionV2::ResumeLead {
             epic_id: p.epic,
             message: "continue prepared work".into(),
@@ -1221,6 +1237,7 @@ async fn prepared_manager_action_is_preflight_only_then_commits_once() {
     }
 
     let request = AgentManagerCommitPreparedControlRequestV2 {
+        project_id: None,
         prepared_id: prepared.prepared_id,
         target_digest: prepared.target_digest.clone(),
         idempotency_key: "prepared-commit-once".into(),
@@ -1275,6 +1292,7 @@ async fn prepared_manager_action_is_preflight_only_then_commits_once() {
             .agent_manager_get_action(
                 p.owner,
                 AgentManagerGetActionRequestV2 {
+                    project_id: None,
                     operation_id: first.operation_id,
                 },
             )
@@ -1289,6 +1307,7 @@ async fn prepared_manager_action_is_preflight_only_then_commits_once() {
             .agent_manager_get_action(
                 p.lead,
                 AgentManagerGetActionRequestV2 {
+                    project_id: None,
                     operation_id: first.operation_id,
                 },
             )
@@ -1377,6 +1396,7 @@ async fn prepared_manager_action_refuses_changed_lead_without_journal_effect() {
         .commit_prepared_manager_action(
             p.owner,
             AgentManagerCommitPreparedControlRequestV2 {
+                project_id: None,
                 prepared_id: prepared.prepared_id,
                 target_digest: prepared.target_digest,
                 idempotency_key: "prepared-stale-lead".into(),
@@ -1420,6 +1440,7 @@ async fn prepared_replace_lead_without_current_lead_names_create_session_path() 
         .prepare_manager_action(
             p.owner,
             AgentManagerPrepareControlRequestV2 {
+                project_id: None,
                 operation: PreparedManagerActionV2::ReplaceLead {
                     epic_id: p.epic,
                     query: "lead the epic".into(),
@@ -1465,6 +1486,7 @@ async fn prepared_manager_action_refuses_changed_scope_and_policy_without_journa
         .commit_prepared_manager_action(
             p.owner,
             AgentManagerCommitPreparedControlRequestV2 {
+                project_id: None,
                 prepared_id: scope_prepared.prepared_id,
                 target_digest: scope_prepared.target_digest,
                 idempotency_key: "prepared-stale-scope".into(),
@@ -1544,6 +1566,7 @@ async fn prepared_manager_action_refuses_changed_scope_and_policy_without_journa
         .commit_prepared_manager_action(
             p.owner,
             AgentManagerCommitPreparedControlRequestV2 {
+                project_id: None,
                 prepared_id: policy_prepared.prepared_id,
                 target_digest: policy_prepared.target_digest,
                 idempotency_key: "prepared-stale-policy".into(),
@@ -1597,6 +1620,7 @@ async fn prepared_manager_action_reports_runtime_blocker_without_queueing() {
         .commit_prepared_manager_action(
             p.owner,
             AgentManagerCommitPreparedControlRequestV2 {
+                project_id: None,
                 prepared_id: prepared.prepared_id,
                 target_digest: prepared.target_digest,
                 idempotency_key: "prepared-blocked".into(),
@@ -1815,6 +1839,7 @@ async fn prepared_manager_action_attributes_the_live_rotated_manager() {
         .commit_prepared_manager_action(
             successor,
             AgentManagerCommitPreparedControlRequestV2 {
+                project_id: None,
                 prepared_id: prepared.prepared_id,
                 target_digest: prepared.target_digest,
                 idempotency_key: "rotated-manager-prepared".into(),
@@ -1849,6 +1874,7 @@ async fn prepared_manager_action_attributes_the_live_rotated_manager() {
             .manager_action_receipt_for_caller(
                 successor,
                 AgentManagerGetActionRequestV2 {
+                    project_id: None,
                     operation_id: receipt.operation_id,
                 },
             )
@@ -1900,6 +1926,7 @@ async fn manager_actions_empty_launch_list_admits_all_providers_and_retains_crea
                     model: format!("configured-model-{i}"),
                     effort: (i % 2 == 0).then(|| "high".into()),
                 },
+                sandbox_source: None,
             },
         );
         request.fence.policy_version = 2;
@@ -1948,6 +1975,7 @@ async fn manager_actions_empty_launch_list_admits_all_providers_and_retains_crea
                 model: "another-configured-model".into(),
                 effort: Some("medium".into()),
             },
+            sandbox_source: None,
         },
     );
     request.fence.policy_version = 3;
@@ -1998,6 +2026,7 @@ async fn manager_actions_empty_launch_list_retains_model_and_effort_validation()
                     model,
                     effort,
                 },
+                sandbox_source: None,
             },
         );
         request.fence.policy_version = 2;
@@ -2033,6 +2062,7 @@ async fn manager_actions_populated_launch_list_requires_exact_provider_model_and
                 kind: SessionKind::Task,
                 query: "requires exact configured choice".into(),
                 launch,
+                sandbox_source: None,
             },
         );
         let error = p
@@ -2051,6 +2081,7 @@ async fn manager_actions_populated_launch_list_requires_exact_provider_model_and
                 kind: SessionKind::Task,
                 query: "exact configured choice".into(),
                 launch: allowed,
+                sandbox_source: None,
             },
         )
         .await;
@@ -2082,6 +2113,7 @@ async fn manager_actions_container_atomic_enrollment_replay_and_nonempty_refusal
         .agent_manager_inspect(
             p.owner,
             AgentManagerInspectRequestV2 {
+                project_id: None,
                 section: ManagerInspectSectionV2::Actions,
                 epic_id: None,
                 cursor: None,
@@ -2135,6 +2167,7 @@ async fn manager_actions_container_atomic_enrollment_replay_and_nonempty_refusal
         .agent_manager_inspect(
             p.owner,
             AgentManagerInspectRequestV2 {
+                project_id: None,
                 section: ManagerInspectSectionV2::Actions,
                 epic_id: Some(id),
                 cursor: None,
@@ -3394,6 +3427,7 @@ async fn manager_actions_fresh_provider_custody_and_explicit_assignment() {
                 kind: SessionKind::Feature,
                 query: "implement scoped work".into(),
                 launch: p.policy.allowed_launches[0].clone(),
+                sandbox_source: None,
             },
         )
         .await;
@@ -3515,15 +3549,15 @@ fn advance_origin_rolling(p: &Pilot, origin: &std::path::Path) -> String {
     git(&scratch, &["rev-parse", "HEAD"])
 }
 
-/// #1144 (supersedes #913): a manager-created session whose source is an
-/// unsandboxed container (an Epic) is allocated from the EXACT commit pinned
-/// at prepare time, never from a newer fetched origin `rolling` tip, and never
-/// moves a checkout ref.
+/// #1195 (supersedes #1144/#913): a manager-created session under an
+/// unsandboxed container (an Epic) branches from the freshly fetched origin
+/// `rolling` tip, not the lagging shared checkout, and never moves a checkout
+/// ref.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 #[allow(clippy::large_futures, clippy::significant_drop_tightening)]
-async fn manager_actions_unsandboxed_source_forks_from_frozen_pin_when_origin_is_newer() {
+async fn manager_actions_unsandboxed_source_forks_from_fresh_origin_rolling_when_origin_is_newer() {
     let p = pilot().await;
     let origin = rolling_checkout_with_origin(&p);
     let stale = git(&p.repo, &["rev-parse", "HEAD"]);
@@ -3538,6 +3572,7 @@ async fn manager_actions_unsandboxed_source_forks_from_frozen_pin_when_origin_is
                 kind: SessionKind::Task,
                 query: "fork from the verified origin tip".into(),
                 launch: p.policy.allowed_launches[0].clone(),
+                sandbox_source: None,
             },
         )
         .await;
@@ -3557,8 +3592,7 @@ async fn manager_actions_unsandboxed_source_forks_from_frozen_pin_when_origin_is
         .unwrap()
         .sandbox_root
         .unwrap();
-    assert_eq!(git(&root, &["rev-parse", "HEAD"]), stale);
-    assert_ne!(git(&root, &["rev-parse", "HEAD"]), fresh);
+    assert_eq!(git(&root, &["rev-parse", "HEAD"]), fresh);
     assert_eq!(git(&p.repo, &["rev-parse", "refs/heads/rolling"]), stale);
     assert_eq!(
         git(&p.repo, &["rev-parse", "refs/remotes/origin/rolling"]),
@@ -4033,6 +4067,7 @@ async fn queued_last_slot_actions(
             kind: SessionKind::Task,
             query: "complete independent child work".into(),
             launch: child_launch,
+            sandbox_source: None,
         },
     );
     child_request.fence.policy_version = 2;
@@ -4080,9 +4115,10 @@ async fn due_child_creation_keeps_priority_after_restart() {
 #[tokio::test]
 async fn stale_child_source_fails_closed_then_recovery_can_claim() {
     let (p, recovery, child) = queued_last_slot_actions(SessionProvider::Claude, 1).await;
-    // #1144: a clean but unpublished commit after admission is no verified
-    // published fast-forward, so the source gate refuses it; restoring the
-    // pinned commit passes again, and a rewrite refuses.
+    // #1195 (supersedes #1144 here): the shared checkout's own HEAD is no
+    // longer the child's source, so an unpublished commit after admission
+    // does not refuse. A parent source that moved to another checkout still
+    // fails closed; restoring it passes again.
     std::fs::write(p.repo.join("source"), "source changed after admission\n").unwrap();
     git(&p.repo, &["add", "source"]);
     git(
@@ -4091,21 +4127,49 @@ async fn stale_child_source_fails_closed_then_recovery_can_claim() {
     );
     let claim = p.claim().await;
     assert_eq!(claim.id(), child.operation_id);
+    p.manager
+        .check_manager_action_runtime(&claim, true)
+        .await
+        .unwrap();
+    let moved = p.repo.parent().unwrap().join("moved-checkout");
+    git(
+        p.repo.parent().unwrap(),
+        &[
+            "clone",
+            "-q",
+            p.repo.to_str().unwrap(),
+            moved.to_str().unwrap(),
+        ],
+    );
+    let set_parent_dir = |dir: &std::path::Path| {
+        let dir = dir.to_str().unwrap().to_owned();
+        let epic = p.epic.to_string();
+        let store = p.manager.store.clone();
+        async move {
+            store
+                .lock()
+                .await
+                .conn
+                .execute(
+                    "UPDATE sessions SET working_dir=?1 WHERE id=?2",
+                    rusqlite::params![dir, epic],
+                )
+                .unwrap();
+        }
+    };
+    set_parent_dir(&moved).await;
     let error = p
         .manager
         .check_manager_action_runtime(&claim, true)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("manager_v2_source_changed"));
-    git(&p.repo, &["reset", "-q", "--hard", "HEAD~1"]);
+    set_parent_dir(&p.repo).await;
     p.manager
         .check_manager_action_runtime(&claim, true)
         .await
         .unwrap();
-    git(
-        &p.repo,
-        &["commit", "--amend", "-qm", "rewrite source after admission"],
-    );
+    set_parent_dir(&moved).await;
     let error = p
         .manager
         .check_manager_action_runtime(&claim, true)
@@ -4489,7 +4553,7 @@ async fn manager_actions_codex_app_server_establishment_precedes_assignment() {
     let mut p = pilot().await;
     let choice = ManagerLaunchChoiceV2 {
         provider: SessionProvider::CodexAppServer,
-        model: "gpt-5.4".into(),
+        model: "gpt-6-astra".into(),
         effort: None,
     };
     p.policy.allowed_launches.push(choice.clone());
@@ -4575,6 +4639,7 @@ async fn manager_actions_resource_decision_holds_and_queued_policy_changes_are_f
                 kind: SessionKind::Feature,
                 query: "work".into(),
                 launch: p.policy.allowed_launches[0].clone(),
+                sandbox_source: None,
             },
         )
         .await;
@@ -4871,6 +4936,7 @@ async fn manager_actions_live_reassignment_settles_old_incarnation_and_reaper_fa
                 kind: SessionKind::Feature,
                 query: "new work".into(),
                 launch: p.policy.allowed_launches[0].clone(),
+                sandbox_source: None,
             },
         )
         .await
@@ -4941,6 +5007,7 @@ async fn manager_actions_cancelled_reconciler_retains_uncertain_claim_without_se
                 kind: SessionKind::Feature,
                 query: "work".into(),
                 launch: p.policy.allowed_launches[0].clone(),
+                sandbox_source: None,
             },
         )
         .await;
@@ -5020,7 +5087,7 @@ async fn manager_actions_deferred_revocation_settles_starting_candidate_without_
     let mut p = pilot().await;
     let choice = ManagerLaunchChoiceV2 {
         provider: SessionProvider::CodexAppServer,
-        model: "gpt-5.4".into(),
+        model: "manager-scripted-provider".into(),
         effort: None,
     };
     p.policy.allowed_launches.push(choice.clone());
@@ -5043,6 +5110,7 @@ async fn manager_actions_deferred_revocation_settles_starting_candidate_without_
             kind: SessionKind::Feature,
             query: "work".into(),
             launch: choice,
+            sandbox_source: None,
         },
     );
     request.fence.policy_version = 2;
@@ -5414,6 +5482,12 @@ mod operator_delegation;
 
 #[path = "manager_issue_worker.rs"]
 mod issue_worker;
+
+#[path = "manager_sandbox_source.rs"]
+mod sandbox_source;
+
+#[path = "manager_global_pm_verbs.rs"]
+mod global_pm_verbs;
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
@@ -5950,6 +6024,7 @@ fn pilot_worker(p: &Pilot, query: &str) -> ManagerActionV2 {
         kind: SessionKind::Task,
         query: query.into(),
         launch: p.policy.allowed_launches[0].clone(),
+        sandbox_source: None,
     }
 }
 
@@ -6037,8 +6112,9 @@ async fn creation_budget_charges_queued_and_uncertain_but_not_uncreated_blocked_
     )
     .await;
     assert_eq!(pilot_created_usage(&p).await, 2);
-    // A root succession keeps its charge even when blocked before its
-    // candidate existed: its root occurrence is counted exactly once.
+    // #1390: a root succession blocked before its candidate existed is free
+    // like any other uncreated refusal, so a retried succession does not burn
+    // the budget; one that may have created its candidate stays charged.
     pilot_seed(
         &p,
         ManagerActionV2::SucceedManager {
@@ -6054,6 +6130,25 @@ async fn creation_budget_charges_queued_and_uncertain_but_not_uncreated_blocked_
             },
         },
         ManagerActionStateV2::Blocked,
+        Some(Uuid::new_v4()),
+    )
+    .await;
+    assert_eq!(pilot_created_usage(&p).await, 2);
+    pilot_seed(
+        &p,
+        ManagerActionV2::SucceedManager {
+            expected: ManagerSuccessionFenceV2 {
+                authority_epoch: 1,
+                custody_generation: None,
+            },
+            launch: p.policy.allowed_launches[0].clone(),
+            handoff: ManagerCommittedHandoffV2 {
+                source_commit: "a".repeat(40),
+                relative_path: "thoughts/handoff.md".into(),
+                blob_oid: "b".repeat(40),
+            },
+        },
+        ManagerActionStateV2::Uncertain,
         Some(Uuid::new_v4()),
     )
     .await;
@@ -6188,6 +6283,7 @@ async fn manager_created_worker_reads_its_work_and_ownership_view() {
                 kind: SessionKind::Task,
                 query: "implement the granted slice".into(),
                 launch: p.policy.allowed_launches[0].clone(),
+                sandbox_source: None,
             },
         )
         .await;
@@ -6234,6 +6330,7 @@ async fn manager_created_worker_reads_its_work_and_ownership_view() {
             .agent_manager_update(
                 p.owner,
                 AgentManagerUpdateRequestV2 {
+                    project_id: None,
                     fence: ManagerFenceV2 {
                         scope_version: 1,
                         policy_version: 1,
@@ -6631,6 +6728,7 @@ async fn manager_retry_lead_policy_stop_applies_with_auto_retry_disabled() {
             .agent_manager_control(
                 p.owner,
                 AgentManagerControlRequestV2 {
+                    project_id: None,
                     fence: ManagerFenceV2 {
                         scope_version: 1,
                         policy_version: 2,
@@ -6964,6 +7062,7 @@ async fn manager_declines_its_own_stale_request_and_frees_capacity() {
         .agent_manager_update(
             p.owner,
             AgentManagerUpdateRequestV2 {
+                project_id: None,
                 fence: ManagerFenceV2 {
                     scope_version: 1,
                     policy_version: 1,
@@ -7046,6 +7145,267 @@ async fn a_draining_deploy_keeps_manager_creates_queued_unclaimed_across_a_resta
         .deploy_drain()
         .sync(None, true, chrono::Utc::now());
     assert_eq!(p.claim().await.id(), child.operation_id);
+}
+
+/// #1311/#1320: a manager create held by a draining deploy says so in
+/// AgentManagerGetAction (reason and release time), and once the deploy's
+/// hold window passes it is claimed while the deploy still waits for a lull.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn a_held_create_reports_why_and_is_claimed_once_the_hold_window_passes() {
+    let (p, _recovery, child) = queued_last_slot_actions(SessionProvider::Claude, 1).await;
+    let now = chrono::Utc::now();
+    let live = crate::store::agent_deploys::DeployRow {
+        id: Uuid::new_v4(),
+        owner_session_id: Some(Uuid::new_v4()),
+        sha: "0".repeat(40),
+        manifest: Vec::new(),
+        state: rsi_common::agent_deploy::DeployState::Staged,
+        reason: None,
+        deadline_at: now + chrono::Duration::seconds(3600),
+        operator: false,
+        forced: false,
+    };
+    let hold_end = now + chrono::Duration::seconds(600);
+    let drain = p.manager.deploy_drain();
+    drain.sync_until(Some(&live), Some(hold_end), true, now);
+    let view = |id| {
+        let control = p.manager.agent_control();
+        let owner = p.owner;
+        async move {
+            control
+                .agent_manager_get_action_view(
+                    owner,
+                    AgentManagerGetActionRequestV2 {
+                        project_id: None,
+                        operation_id: id,
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let held = view(child.operation_id).await;
+    assert_eq!(held.receipt.state, ManagerActionStateV2::Queued);
+    let reason = held.held.expect("a held create names its hold");
+    assert_eq!(reason.reason, crate::deploy_drain::DEPLOY_DRAINING);
+    assert_eq!(reason.deploy_id, Some(live.id));
+    assert_eq!(
+        reason.release_by,
+        Some(hold_end.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)),
+        "the hold window, not the deploy's own deadline"
+    );
+    assert!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .claim_manager_action_holding(p.manager.program_run_boot_id, drain.is_draining())
+            .unwrap()
+            .is_none(),
+        "held inside the window"
+    );
+    let wire = serde_json::to_value(view(child.operation_id).await).unwrap();
+    assert_eq!(wire["state"], "queued", "the receipt fields stay top level");
+    assert_eq!(wire["held"]["reason"], "deploy_draining");
+
+    // The hold window has passed; the deploy is still waiting for a lull.
+    drain.sync_until(
+        Some(&live),
+        Some(now - chrono::Duration::seconds(1)),
+        true,
+        now,
+    );
+    assert!(!drain.is_draining());
+    assert!(drain.status().waiting, "the deploy keeps waiting unheld");
+    let free = view(child.operation_id).await;
+    assert_eq!(free.held, None);
+    assert!(
+        serde_json::to_value(&free).unwrap().get("held").is_none(),
+        "absent when nothing holds it"
+    );
+    let claimed = p
+        .manager
+        .store
+        .lock()
+        .await
+        .claim_manager_action_holding(p.manager.program_run_boot_id, drain.is_draining())
+        .unwrap()
+        .expect("the create is claimed while the deploy still waits");
+    assert_eq!(claimed.id(), child.operation_id);
+}
+
+/// #1335: hold a create behind a deploy whose hold window ends at `release`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+fn hold_deploy_until(
+    p: &Pilot,
+    release: chrono::DateTime<chrono::Utc>,
+) -> crate::store::agent_deploys::DeployRow {
+    let now = chrono::Utc::now();
+    let live = crate::store::agent_deploys::DeployRow {
+        id: Uuid::new_v4(),
+        owner_session_id: Some(Uuid::new_v4()),
+        sha: "0".repeat(40),
+        manifest: Vec::new(),
+        state: rsi_common::agent_deploy::DeployState::Staged,
+        reason: None,
+        deadline_at: now + chrono::Duration::seconds(3600),
+        operator: false,
+        forced: false,
+    };
+    p.manager
+        .deploy_drain()
+        .sync_until(Some(&live), Some(release), true, now);
+    live
+}
+
+/// #1335: the queuing manager seat hands over to a rotation successor while
+/// its create is held; with `successor` false it is retired with none.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+async fn rotate_manager_seat(p: &Pilot, successor: bool) -> Option<Uuid> {
+    let store = p.manager.store.lock().await;
+    let next = successor.then(|| {
+        let id = Uuid::new_v4();
+        let mut session = bare_session(id);
+        session.project_id = Some(p.project);
+        session.working_dir = p.repo.clone();
+        session.session_kind = SessionKind::Standard;
+        session.continued_from = Some(p.owner);
+        session.rotation_depth = 1;
+        session.provider = SessionProvider::Claude;
+        session.model = Some("manager-scripted-provider".into());
+        store.insert_session(&session).unwrap();
+        id
+    });
+    store
+        .update_session_status(p.owner, SessionStatus::Archived)
+        .unwrap();
+    if let Some(next) = next {
+        store
+            .record_harness_manager_rotation(p.owner, next)
+            .unwrap();
+        assert_eq!(store.manager_lineage_tip(p.owner).unwrap(), next);
+    }
+    next
+}
+
+/// #1335 reproduction (action e0ea56da): a create queued by seat A under a
+/// deploy drain, A rotates to B while it is held, the drain's hold window
+/// times out. The action used to re-prove its authority as the archived A
+/// (`manager_current_session_required`) and settle `blocked` with the
+/// fallback `manager_v2_lifecycle_unconfirmed`. A rotation keeps the
+/// appointment, so the create now launches under the successor seat.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_held_across_a_drain_timeout_and_a_seat_rotation_launches() {
+    let p = pilot().await;
+    let live = hold_deploy_until(&p, chrono::Utc::now() + chrono::Duration::seconds(600));
+    let receipt = p
+        .admit(
+            "held-across-rotation",
+            ManagerActionV2::CreateSession {
+                parent_id: p.epic,
+                kind: SessionKind::Task,
+                query: "worker for a held Issue".into(),
+                launch: p.policy.allowed_launches[0].clone(),
+                sandbox_source: None,
+            },
+        )
+        .await;
+    let child = receipt.target_session_id.unwrap();
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    assert_eq!(
+        p.receipt(receipt.operation_id).await.state,
+        ManagerActionStateV2::Queued,
+        "held by the drain"
+    );
+
+    let successor = rotate_manager_seat(&p, true).await.unwrap();
+    // The hold window times out while the deploy keeps waiting.
+    let drain = p.manager.deploy_drain();
+    drain.sync_until(
+        Some(&live),
+        Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
+        true,
+        chrono::Utc::now(),
+    );
+    assert!(!drain.is_draining());
+
+    let process = super::super::launch::install_controller_candidate_test_process(child);
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    let settled = p.receipt(receipt.operation_id).await;
+    assert_eq!(
+        settled.state,
+        ManagerActionStateV2::Succeeded,
+        "{settled:?}"
+    );
+    assert_eq!(settled.outcome.as_deref(), Some("session_established"));
+    assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 1);
+    // The successor seat holds the action: it reads the receipt.
+    assert_eq!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .manager_action_receipt_for_caller(
+                successor,
+                AgentManagerGetActionRequestV2 {
+                    project_id: None,
+                    operation_id: receipt.operation_id,
+                },
+            )
+            .unwrap()
+            .state,
+        ManagerActionStateV2::Succeeded
+    );
+}
+
+/// #1335: with no successor to inherit it, the held create is refused with a
+/// clear class (`manager_v2_actor_seat_retired`, revoked) instead of the
+/// `manager_v2_lifecycle_unconfirmed` fallback, and the refusal is queued as
+/// a manager notice.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_create_whose_seat_retired_without_a_successor_is_revoked_clearly() {
+    let p = pilot().await;
+    let live = hold_deploy_until(&p, chrono::Utc::now() + chrono::Duration::seconds(600));
+    let receipt = p
+        .admit(
+            "held-seat-retired",
+            ManagerActionV2::CreateSession {
+                parent_id: p.epic,
+                kind: SessionKind::Task,
+                query: "worker for a held Issue".into(),
+                launch: p.policy.allowed_launches[0].clone(),
+                sandbox_source: None,
+            },
+        )
+        .await;
+    assert_eq!(rotate_manager_seat(&p, false).await, None);
+    p.manager.deploy_drain().sync_until(
+        Some(&live),
+        Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
+        true,
+        chrono::Utc::now(),
+    );
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    let settled = p.receipt(receipt.operation_id).await;
+    assert_eq!(settled.state, ManagerActionStateV2::Revoked, "{settled:?}");
+    assert_eq!(
+        settled.outcome.as_deref(),
+        Some("manager_v2_actor_seat_retired")
+    );
+    let store = p.manager.store.lock().await;
+    let noticed: String = store
+        .conn
+        .query_row(
+            "SELECT json_extract(receipt_json,'$.outcome') FROM harness_manager_action_notice_queue
+             WHERE operation_id=?1 ORDER BY operation_row_version DESC LIMIT 1",
+            [receipt.operation_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(noticed, "manager_v2_actor_seat_retired");
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
@@ -7155,6 +7515,7 @@ fn create_session_op(i: usize) -> ManagerActionV2 {
             model: "configured-model".into(),
             effort: None,
         },
+        sandbox_source: None,
     }
 }
 
@@ -7220,6 +7581,20 @@ async fn admit_create_session_with(
     parent_id: Uuid,
     provider: SessionProvider,
 ) -> ManagerActionReceiptV2 {
+    admit_create_session_with_model(p, key, i, parent_id, provider, "manager-scripted-provider")
+        .await
+}
+
+/// As [`admit_create_session_with`], launching `model`. A fixture that needs the
+/// launch to get past #1506 model validation names the scripted-provider model.
+async fn admit_create_session_with_model(
+    p: &Pilot,
+    key: &str,
+    i: usize,
+    parent_id: Uuid,
+    provider: SessionProvider,
+    model: &str,
+) -> ManagerActionReceiptV2 {
     let ManagerActionV2::CreateSession {
         kind,
         query,
@@ -7230,6 +7605,7 @@ async fn admit_create_session_with(
         unreachable!()
     };
     launch.provider = provider;
+    launch.model = model.into();
     let mut request = p.request(
         key,
         ManagerActionV2::CreateSession {
@@ -7237,6 +7613,7 @@ async fn admit_create_session_with(
             kind,
             query,
             launch,
+            sandbox_source: None,
         },
     );
     request.fence.policy_version = 2;
@@ -7430,14 +7807,16 @@ async fn deadline_during_create_leaves_no_orphan(
         p.manager.run_claimed_manager_action(claim).await.unwrap(),
         "the timed-out action settles"
     );
-    assert!(
-        matches!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), reached).await,
-            Ok(Ok(()))
-        ),
-        "the launch stalled at the intended phase"
+    let reached_phase = matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), reached).await,
+        Ok(Ok(()))
     );
     let settled = p.receipt(receipt.operation_id).await;
+    assert!(
+        reached_phase,
+        "the launch stalled at the intended phase: {:?} {:?}",
+        settled.state, settled.outcome
+    );
     assert!(
         matches!(
             settled.state,

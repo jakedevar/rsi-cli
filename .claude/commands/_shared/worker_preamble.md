@@ -1,5 +1,5 @@
 ---
-version: 23
+version: 26
 role_variants: [research, planning, implementation]
 ---
 
@@ -9,7 +9,7 @@ Finish the assigned deliverable, verify it, commit scoped changes, and return co
 
 For durable follow-ups outside this deliverable, use `AgentCreateIssue` or its native equivalent; the full authority and payload contract is in `.agents/skills/rsi-agent-control/SKILL.md`.
 
-Kaizen: improve the line, never stop it. Every agent may log improvements. When you notice a defect outside your task, friction, waste, a repeated manual step, or a better way (in code, tests, tools, prompts, process or the harness itself), file one Issue with `AgentCreateIssue`: label `kaizen`, 3-6 lines (what you saw, evidence, suggested change). Then continue your task. Do not fix it inside this deliverable. Managers dedupe and prioritize.
+Kaizen: improve the line, never stop it. When you hit a structural or process problem (a wrong-seeming refusal, stale guidance, a missing tool, a repeated step, waste, a flaky gate, operator friction), file one `kaizen` Issue and keep working; what to file and how to dedupe is "Improve the line" in your `AgentGetAuthorityCatalog` guidance.
 
 An operator-direct, parentless session may answer plainly. If either condition is unknown, use the worker return contract; an explicit operator return format still applies.
 
@@ -19,13 +19,15 @@ Tag load-bearing claims `[observed]` for this pass's result, `[source]` for cite
 
 ## Return
 
-The first nonblank final line to a master must begin `PIPELINE HANDOFF — `; `rsi-contract-validate` parses it. Follow the including command's return schema.
+The first nonblank final line to a master is `PIPELINE HANDOFF — <STAGE>:` (em dash, uppercase stage, trailing colon); `rsi-contract-validate` parses it. Use the including command's stage and body schema; Issue implementation workers use `IMPLEMENTATION`, reviewers use `REVIEW`. Put `RESULT` or `REVIEW` fields on the next line when required by the worker contract.
 
 Return budget: research ≤250 tokens; planning ≤400; implementation ≤300. Use the lowest cap when the role is unclear.
 
 Echo the including command's `capability_class` (`architect`, `implementer`, or `lookup_fast`) in one return field; omit it if undeclared.
 
 Keep returns to results, evidence paths, tests, commit, and blockers; omit code and repeated instructions. See `docs/agents/worker-contract.md`.
+
+End every handoff with `Friction: none | #N[, #M] | <one line, not filed because ...>`: the kaizen Issues you filed, or the problem you could not file.
 
 ## Stage contract
 
@@ -34,6 +36,8 @@ Inputs name a static artifact or a code-discovery budget (`rg`/glob), or both.
 `rsi-contract-validate` checks the shape; see `docs/agents/worker-contract.md`.
 
 ## Verification
+
+Scope verification to touched modules using `scripts/check-touched-shards` filters. Stop and report runs exceeding twice their expected time or 30 minutes, whichever comes first (30 minutes if unknown); stop only your own processes or units. No repeated timeout restarts or long sleep-poll loops.
 
 Emit verification items in the handoff as the including command requires; see `docs/agents/verification.md` for buckets, manifest ownership, and cross-stage linkage.
 

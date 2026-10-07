@@ -100,6 +100,11 @@ pub(super) struct Fake {
     /// One-shot suspension between a resolution's key pre-check and its
     /// recording transaction: `(entered, go)`.
     pub(super) record_hold: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    /// #1417: while set, the host-load admission holds every launch.
+    hold_launches: AtomicBool,
+    /// Every `launch_held` question the executor asked: `(agent_requested,
+    /// attempt id)`.
+    launch_asks: StdMutex<Vec<(bool, Uuid)>>,
 }
 
 impl NodeEffects for Fake {
@@ -262,12 +267,25 @@ impl NodeEffects for Fake {
         self.runs.lock().unwrap().remove(&attempt_id);
     }
 
-    fn kill_stale_group(&self, pgid: i32) {
+    fn kill_stale_group(&self, pgid: i32, _sandbox: Option<&std::path::Path>) {
         self.world.lock().unwrap().killed_groups.push(pgid);
     }
 
     fn build_node_cap(&self) -> u32 {
         self.build_cap.load(Ordering::SeqCst)
+    }
+
+    fn launch_held(
+        &self,
+        agent_requested: bool,
+        _since: chrono::DateTime<chrono::Utc>,
+        attempt: &AttemptRow,
+    ) -> bool {
+        self.launch_asks
+            .lock()
+            .unwrap()
+            .push((agent_requested, attempt.id));
+        self.hold_launches.load(Ordering::SeqCst)
     }
 }
 
@@ -515,6 +533,8 @@ fn boot(db: &Path, sandboxes: &Path, world: &Arc<StdMutex<World>>) -> Executor<F
         runs: Arc::default(),
         build_cap: std::sync::atomic::AtomicU32::new(2),
         record_hold: StdMutex::new(None),
+        hold_launches: AtomicBool::new(false),
+        launch_asks: StdMutex::new(Vec::new()),
     };
     Executor::new(store, Arc::new(fake), boot_id, Arc::default())
 }
@@ -1285,6 +1305,53 @@ async fn t2_a2_reserved_attempt_relaunches_with_same_dedup_key() {
     assert_eq!(running.boot_id, Some(harness.executor.boot_id));
 }
 
+/// #1417: a launch the host-load admission holds leaves the attempt `Reserved`
+/// (nothing written, nothing launched) and is asked again on every advance; once
+/// the hold clears the same attempt launches with its reserved dedup key.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn t2_a2_host_load_hold_keeps_a_reserved_attempt_unlaunched_until_released() {
+    let harness = Harness::new();
+    let effects = Arc::clone(&harness.executor.effects);
+    effects.hold_launches.store(true, Ordering::SeqCst);
+    let execution = harness.start(workflow(&["A"], &[])).await;
+
+    for _ in 0..3 {
+        assert_eq!(
+            harness.executor.advance(execution).await.unwrap(),
+            Step::Wait,
+            "a held launch waits for the next tick"
+        );
+        let attempts = harness.attempts(execution).await;
+        assert_eq!(attempts.len(), 1, "held, not retried or re-reserved");
+        assert_eq!(attempts[0].status, AttemptStatus::Reserved);
+        assert!(harness.launches().is_empty(), "nothing launched while held");
+    }
+    let reserved = harness.attempt(execution, "A", 0, 1).await;
+    {
+        let asks = effects.launch_asks.lock().unwrap();
+        assert!(asks.len() >= 3, "asked again on every advance: {asks:?}");
+        assert!(
+            asks.iter().all(|(agent, id)| !agent && *id == reserved.id),
+            "an operator execution is asked as not agent-requested: {asks:?}"
+        );
+    }
+
+    effects.hold_launches.store(false, Ordering::SeqCst);
+    assert_eq!(
+        harness.executor.advance(execution).await.unwrap(),
+        Step::Wait
+    );
+    let launches = harness.launches();
+    assert_eq!(launches.len(), 1);
+    assert_eq!(launches[0].0, reserved.dedup_key);
+    assert_eq!(launches[0].1, reserved.session_id);
+    assert_eq!(
+        harness.attempt(execution, "A", 0, 1).await.status,
+        AttemptStatus::Running
+    );
+}
+
 /// T2-A3: recovery run twice (and a relaunch race) launches once; an
 /// admitted launch without a session settles `lost` and is replaced by a new
 /// uncharged attempt, never relaunched under the admitted key.
@@ -1314,6 +1381,13 @@ async fn t2_a3_recovery_twice_launches_once() {
         admit_invocation(&store, first.session_id, &first.dedup_key).unwrap();
     }
     harness.restart();
+    // A busy host must not park lost-launch settlement or its retry behind
+    // admission for new workers.
+    harness
+        .executor
+        .effects
+        .hold_launches
+        .store(true, Ordering::SeqCst);
     recover_after_restart(&harness.executor, 8, std::time::Duration::from_secs(30))
         .await
         .unwrap();
@@ -1335,6 +1409,42 @@ async fn t2_a3_recovery_twice_launches_once() {
         keys.iter().filter(|key| **key == first.dedup_key).count(),
         0,
         "the admitted key never produces a session"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn host_load_does_not_hold_recovery_of_an_unadmitted_launching_attempt() {
+    let harness = Harness::new();
+    let execution = harness.start(workflow(&["A"], &[])).await;
+    let reserved = reserve_only(&harness, execution, "A").await;
+    {
+        let store = harness.executor.store.lock().await;
+        rows::mark_launching(&store, reserved.id, harness.executor.boot_id).unwrap();
+    }
+    harness
+        .executor
+        .effects
+        .hold_launches
+        .store(true, Ordering::SeqCst);
+    assert_eq!(
+        harness.executor.advance(execution).await.unwrap(),
+        Step::Wait
+    );
+    assert_eq!(
+        harness.attempt(execution, "A", 0, 1).await.status,
+        AttemptStatus::Running
+    );
+    assert_eq!(harness.launches()[0].0, reserved.dedup_key);
+    assert!(
+        harness
+            .executor
+            .effects
+            .launch_asks
+            .lock()
+            .unwrap()
+            .is_empty(),
+        "recovery bypasses new-work admission"
     );
 }
 

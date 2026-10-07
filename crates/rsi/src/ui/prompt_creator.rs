@@ -245,33 +245,7 @@ fn render_model_dropdown(
     area: Rect,
     dropdown: &crate::types::ModelDropdownState,
 ) {
-    let max_items = area.height.saturating_sub(1) as usize;
-    let items: Vec<Line> = dropdown
-        .models
-        .iter()
-        .enumerate()
-        .take(max_items)
-        .map(|(i, (id, label))| {
-            let is_selected = i == dropdown.selected_index;
-            let prefix = if is_selected { "▸ " } else { "  " };
-            let display = if label.is_empty() || label == id {
-                id.clone()
-            } else {
-                format!("{label} ({id})")
-            };
-            Line::from(vec![Span::styled(
-                format!("{prefix}{display}"),
-                Style::default().fg(if is_selected {
-                    theme::text()
-                } else {
-                    theme::subtext0()
-                }),
-            )])
-        })
-        .collect();
-
-    let paragraph = Paragraph::new(items);
-    frame.render_widget(paragraph, area);
+    crate::ui::widget::model_dropdown::render_model_dropdown_content(frame, area, dropdown, None);
 }
 
 /// Center an area horizontally at a given percentage width.

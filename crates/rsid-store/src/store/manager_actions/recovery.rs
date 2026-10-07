@@ -204,6 +204,12 @@ impl Store {
         ) {
             Ok(receipt) => {
                 tx.commit()?;
+                // #1553: an uncertain Issue-worker launch settled without a worker.
+                if let Err(error) =
+                    self.note_issue_worker_launch_ended(operation, receipt.state, outcome)
+                {
+                    tracing::warn!(operation_id = %receipt.operation_id, %error, "issue worker launch note not appended");
+                }
                 Ok(Some(receipt))
             }
             Err(error)

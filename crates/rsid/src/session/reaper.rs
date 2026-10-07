@@ -2123,7 +2123,8 @@ struct LockedReproofSlot {
     repository: std::path::PathBuf,
 }
 
-static LOCKED_REPROOF_SLOTS: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+static LOCKED_REPROOF_SLOTS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
 
 impl LockedReproofSlot {
     fn claim(repository: &Path) -> crate::error::Result<Self> {
@@ -2373,7 +2374,7 @@ impl SyntheticQuarantineHolderProc {
             &self.namespace_root,
             &self.namespace_root,
         );
-        std::fs::set_permissions(process.join("fd"), std::fs::Permissions::from_mode(0))
+        std::fs::set_permissions(process.join("fd"), std::fs::Permissions::from_mode(0o000))
             .expect("synthetic unreadable fd inventory");
     }
 }
@@ -3781,6 +3782,22 @@ fn process_mountinfo_holds_tree(
         let minor = minor.get(1..).ok_or_else(malformed_proc_mount)?;
         validate_proc_mount_decimal(major)?;
         validate_proc_mount_decimal(minor)?;
+        // A path that cannot be resolved is excused only when the record's
+        // superblock cannot serve the tree: a bind mount of any tree
+        // directory shares the tree's device (#1226). systemd masks
+        // `/run/credentials` in a sandboxed unit's namespace with a mode-000
+        // directory, so its credential mounts are never resolvable.
+        let may_hold_tree = match (
+            std::str::from_utf8(major)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok()),
+            std::str::from_utf8(minor)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok()),
+        ) {
+            (Some(major), Some(minor)) => tree.mount_device_may_hold_tree(major, minor),
+            _ => true,
+        };
         if options.is_empty() {
             return Err(malformed_proc_mount());
         }
@@ -3833,7 +3850,7 @@ fn process_mountinfo_holds_tree(
                 }
             }
             NamespaceMountPathMetadata::PermissionDenied => {
-                observation.resolution_permission_denied = true;
+                observation.resolution_permission_denied |= may_hold_tree;
             }
             NamespaceMountPathMetadata::NotFound => {
                 return Err(crate::error::DaemonError::Process(
@@ -3852,7 +3869,7 @@ fn process_mountinfo_holds_tree(
                 }
             }
             Ok(NamespaceMountPathMetadata::PermissionDenied) => {
-                observation.resolution_permission_denied = true;
+                observation.resolution_permission_denied |= may_hold_tree;
             }
             Ok(NamespaceMountPathMetadata::NotFound) => {}
             Err(error) => return Err(error),
@@ -3900,10 +3917,13 @@ struct NamespacePathIdentity {
 /// automount point reports its own trigger directory, and a mounted one
 /// reports the mounted root as before.
 fn namespace_path_identity(path: &Path) -> std::io::Result<NamespacePathIdentity> {
-    let stat = nix::sys::stat::fstatat(None, path, nix::fcntl::AtFlags::AT_NO_AUTOMOUNT)
-        .map_err(std::io::Error::from)?;
+    #[cfg(target_os = "linux")]
+    let flags = nix::fcntl::AtFlags::AT_NO_AUTOMOUNT;
+    #[cfg(not(target_os = "linux"))]
+    let flags = nix::fcntl::AtFlags::empty();
+    let stat = nix::sys::stat::fstatat(None, path, flags).map_err(std::io::Error::from)?;
     Ok(NamespacePathIdentity {
-        device: stat.st_dev,
+        device: stat.st_dev as u64,
         inode: stat.st_ino,
     })
 }
@@ -4211,7 +4231,36 @@ fn kill_startup_provider_orphans(
         if final_start_time != identity.start_time || matches!(final_state, b'Z' | b'X' | b'x') {
             continue;
         }
-        match rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL) {
+        // #1227: name every process this /proc scan kills, and why.
+        let target = crate::process_control::SignalTarget::describe(identity.pid);
+        let reason = format!(
+            "orphan stamped with session {} (invocation {})",
+            identity
+                .stamps
+                .session_id
+                .map_or_else(|| "-".to_string(), |id| id.to_string()),
+            identity
+                .stamps
+                .invocation_id
+                .map_or_else(|| "-".to_string(), |id| id.to_string()),
+        );
+        let record = crate::process_control::SignalRecord {
+            pid: identity.pid,
+            pgid: None,
+            signal: "SIGKILL",
+            reason: &reason,
+            target: &target,
+        };
+        let sent = rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL);
+        crate::process_control::log_signal(
+            &record,
+            std::panic::Location::caller(),
+            &match &sent {
+                Ok(()) => "sent".to_string(),
+                Err(error) => format!("failed: {error}"),
+            },
+        );
+        match sent {
             Ok(()) => signaled.push(identity),
             Err(rustix::io::Errno::SRCH) => {}
             Err(error) => {
@@ -5383,17 +5432,57 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn bounded_proc_open_and_reader_treat_task_disappearance_as_absent() {
+        let enoent = io::Error::from_raw_os_error(nix::libc::ENOENT);
+        assert!(
+            normalize_proc_open::<File>(Err(enoent))
+                .expect("missing proc entry")
+                .is_none()
+        );
+        assert_eq!(
+            read_bounded_proc_reader(VanishedProcReader(nix::libc::ENOENT), 16)
+                .expect("missing proc reader"),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn linux_bounded_proc_open_and_reader_treat_esrch_as_absent() {
         let esrch = io::Error::from_raw_os_error(nix::libc::ESRCH);
         assert!(
             normalize_proc_open::<File>(Err(esrch))
                 .expect("proc open must recognize ESRCH as task disappearance")
                 .is_none()
         );
-        for errno in [nix::libc::ENOENT, nix::libc::ESRCH] {
+        assert_eq!(
+            read_bounded_proc_reader(VanishedProcReader(nix::libc::ESRCH), 16)
+                .expect("a vanished Linux proc task is an absent inventory entry"),
+            None
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn bounded_proc_open_and_reader_preserve_inventory_errors() {
+        #[cfg(target_os = "linux")]
+        let errors = [nix::libc::EACCES, nix::libc::EIO];
+        // ESRCH is only recognized as disappearance for Linux procfs. Other
+        // targets must preserve the error rather than invent a process proof.
+        #[cfg(not(target_os = "linux"))]
+        let errors = [nix::libc::EACCES, nix::libc::EIO, nix::libc::ESRCH];
+        for errno in errors {
+            assert_eq!(
+                normalize_proc_open::<File>(Err(io::Error::from_raw_os_error(errno)))
+                    .expect_err("inventory open failure must propagate")
+                    .raw_os_error(),
+                Some(errno)
+            );
             assert_eq!(
                 read_bounded_proc_reader(VanishedProcReader(errno), 16)
-                    .expect("a vanished proc task is an absent inventory entry"),
-                None
+                    .expect_err("inventory read failure must propagate")
+                    .raw_os_error(),
+                Some(errno)
             );
         }
     }
@@ -5469,6 +5558,9 @@ mod tests {
             .expect("insert durable running invocation");
     }
 
+    // Even synthetic holder inventories use the production tree proof, which
+    // requires Linux /proc/self/mountinfo. Keep that prerequisite explicit.
+    #[cfg(target_os = "linux")]
     fn holder_tree_fixture() -> (tempfile::TempDir, QuarantineTreeProof, PathBuf) {
         let temp = tempfile::tempdir().expect("holder tree fixture");
         let tree_root = temp.path().join("quarantine");
@@ -5550,6 +5642,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_test_proc_context_drives_wrapper_and_fixture_holder() {
@@ -5649,6 +5742,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_proof_detects_divergent_namespace_holders() {
@@ -5724,6 +5818,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn io_uring_fdinfo_proof_fails_closed_on_ambiguous_or_bounded_inventory() {
@@ -5779,6 +5874,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_fd_target_reuse_fails_the_pass() {
@@ -5832,6 +5928,7 @@ mod tests {
         assert!(error.to_string().contains("fd identity changed"), "{error}");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_tolerates_fd_churn_on_devices_outside_the_tree() {
@@ -5903,6 +6000,7 @@ mod tests {
         assert!(error.to_string().contains("through fd"), "{error}");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_refuses_fd_reuse_as_io_uring_during_the_pass() {
@@ -5933,6 +6031,7 @@ mod tests {
         .expect_err("fd reuse as an io_uring during the pass must fail closed");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_accepts_fd_closed_before_initial_read() {
@@ -5961,6 +6060,7 @@ mod tests {
         .expect("a descriptor proven closed before its initial read is not incomplete inventory");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_accepts_fd_closed_after_identity_read() {
@@ -5989,6 +6089,7 @@ mod tests {
         .expect("a descriptor proven closed during revalidation is not incomplete inventory");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_accepts_fd_closed_between_revalidation_reads() {
@@ -6017,6 +6118,7 @@ mod tests {
         .expect("a final both-ENOENT observation must confirm the fd closed");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_accepts_fd_closed_after_missing_revalidation_target() {
@@ -6060,6 +6162,7 @@ mod tests {
         .expect("a final both-ENOENT observation must confirm the reopened fd closed");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_partial_close_reuse_to_nonholder_fails() {
@@ -6098,6 +6201,7 @@ mod tests {
         assert!(error.to_string().contains("live or was reused"), "{error}");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_partial_close_reuse_to_holder_is_holder_winning() {
@@ -6134,6 +6238,7 @@ mod tests {
         assert!(error.to_string().contains("through fd"), "{error}");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_confirmed_close_preserves_prior_fdinfo_failure() {
@@ -6165,6 +6270,7 @@ mod tests {
         assert!(error.to_string().contains("io_uring fdinfo"), "{error}");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_fd_number_reuse_opened_to_holder_is_holder_winning() {
@@ -6196,6 +6302,7 @@ mod tests {
         assert!(error.to_string().contains("through fd"), "{error}");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_proof_requires_two_empty_passes_and_stable_task_namespace() {
@@ -6255,6 +6362,7 @@ mod tests {
         assert_eq!(divergent_proof, first_proof);
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_proof_rejects_mount_namespace_drift() {
@@ -6285,6 +6393,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_proof_never_resolves_an_autofs_trigger_directory() {
@@ -6339,6 +6448,69 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn quarantine_holder_proof_excuses_an_unresolvable_mount_of_another_superblock() {
+        // #1226: systemd masks /run/credentials with a mode-000 directory in
+        // a sandboxed unit's namespace, so its credential tmpfs mounts never
+        // resolve. A mount of another superblock cannot expose the tree; a
+        // mount of the tree's own device under the same mask still retains.
+        // SAFETY: `geteuid` has no preconditions and cannot mutate state.
+        if unsafe { nix::libc::geteuid() } == 0 {
+            return; // root ignores the mode-000 mask the fixture relies on
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (_tree_temp, tree, _file) = holder_tree_fixture();
+        let proc_temp = tempfile::tempdir().expect("fake proc root");
+        let (uid, namespace_root) = initialize_fake_holder_proc(proc_temp.path());
+        let process =
+            write_fake_holder_process(proc_temp.path(), 405, &namespace_root, &namespace_root);
+        let masked = namespace_root.join("run/credentials");
+        std::fs::create_dir_all(masked.join("systemd-journald.service"))
+            .expect("masked credential mountpoint");
+        std::fs::set_permissions(&masked, std::fs::Permissions::from_mode(0o000))
+            .expect("mask credential directory");
+        let rootfs = "1 0 00:00 / / rw - rootfs rootfs rw\n";
+        let prove = |device: String| {
+            std::fs::write(
+                process.join("mountinfo"),
+                format!(
+                    "{rootfs}2 1 {device} / /run/credentials/systemd-journald.service \
+                     ro,nosuid shared:9 - tmpfs tmpfs ro,mode=700\n"
+                ),
+            )
+            .expect("fake mountinfo with a masked mount");
+            prove_quarantine_has_no_untrusted_same_uid_holders_at(
+                proc_temp.path(),
+                uid,
+                &tree,
+                QuarantineHolderScanLimits::default(),
+            )
+        };
+
+        let tree_device = tree.root_identity().device();
+        let foreign = (nix::libc::major(tree_device) ^ 0x7ff) & 0xfff;
+        let other_superblock = prove(format!("{foreign}:999999"));
+        let tree_superblock = prove(format!(
+            "{}:{}",
+            nix::libc::major(tree_device),
+            nix::libc::minor(tree_device)
+        ));
+        std::fs::set_permissions(&masked, std::fs::Permissions::from_mode(0o700))
+            .expect("unmask credential directory for cleanup");
+        other_superblock.expect("an unresolvable mount of another superblock cannot hold the tree");
+        let error =
+            tree_superblock.expect_err("an unresolvable mount of the tree's superblock retains it");
+        assert!(
+            error
+                .to_string()
+                .contains("mount namespace path resolution denied for pid 405"),
+            "{error}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_proof_fails_closed_on_proc_denial_and_work_bounds() {
@@ -6413,6 +6585,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_scans_live_siblings_after_leader_zombie() {
@@ -6449,6 +6622,7 @@ mod tests {
         assert!(error.to_string().contains("tid 405"), "{error}");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn quarantine_holder_rejects_ambiguous_task_group_binding() {
@@ -6476,6 +6650,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn trusted_systemd_permission_exemptions_are_explicit_and_holder_losing() {
@@ -6655,6 +6830,7 @@ mod tests {
         .expect("restore maps fixture");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
     fn sshd_session_login_does_not_block_holder_proof_but_lookalikes_still_refuse() {
@@ -7301,6 +7477,31 @@ mod tests {
         assert_eq!(
             reap_startup_settlement_orphans_checked(&[session_id])
                 .expect("non-Linux settlement entry point"),
+            0
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn non_linux_startup_and_runtime_reapers_succeed_without_proc_inventory() {
+        let session_id = Uuid::new_v4();
+        let store = crate::store::Store::open_in_memory().expect("startup ownership store");
+        assert_eq!(
+            reap_startup_process_ownership_checked(&store).expect("non-Linux startup reaper"),
+            0
+        );
+        assert_eq!(
+            reap_startup_provider_orphans_checked(&[session_id])
+                .expect("non-Linux provider reaper"),
+            0
+        );
+        assert_eq!(
+            reap_orphans_for_session(session_id).expect("non-Linux runtime reaper"),
+            0
+        );
+        assert_eq!(
+            reap_capacity_orphans_checked(session_id).expect("non-Linux capacity reaper"),
             0
         );
     }

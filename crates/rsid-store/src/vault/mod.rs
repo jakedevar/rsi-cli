@@ -54,6 +54,11 @@ pub const MAX_SECRET_BYTES: usize = 4096;
 pub struct VaultSettings {
     pub env_compat: AtomicBool,
     pub check_ttl_secs: AtomicU64,
+    /// Issue #1407: the operator's AWS region for Bedrock (daemon setting
+    /// `bedrock_region`; empty = environment / `aws configure` fallback).
+    /// Not a secret; kept here because every Bedrock call resolves the region
+    /// next to the vault credential.
+    pub bedrock_region: parking_lot::RwLock<String>,
 }
 
 impl Default for VaultSettings {
@@ -61,6 +66,7 @@ impl Default for VaultSettings {
         Self {
             env_compat: AtomicBool::new(true),
             check_ttl_secs: AtomicU64::new(DEFAULT_CHECK_TTL_SECS),
+            bedrock_region: parking_lot::RwLock::new(String::new()),
         }
     }
 }
@@ -74,6 +80,13 @@ impl VaultSettings {
     #[must_use]
     pub fn check_ttl_secs(&self) -> u64 {
         self.check_ttl_secs.load(Ordering::Acquire)
+    }
+
+    /// The operator-set Bedrock region, or `None` when unset.
+    #[must_use]
+    pub fn bedrock_region(&self) -> Option<String> {
+        let region = self.bedrock_region.read();
+        (!region.is_empty()).then(|| region.clone())
     }
 }
 
@@ -371,6 +384,30 @@ impl VaultHandle {
     #[must_use]
     pub fn dir(&self) -> Option<&Path> {
         self.inner.dir.as_deref()
+    }
+
+    /// Every secret value this vault holds or could resolve without a
+    /// generator: provider and MCP entries plus every set credential env var
+    /// ([`slots::scrubbed_env_var_names`] and the AWS static-credential vars).
+    /// Used only to prove a portable export carries none of them (#1406).
+    #[must_use]
+    pub fn known_secret_values(&self) -> Vec<SecretString> {
+        let mut secrets = Vec::new();
+        {
+            let file = self.inner.file.lock();
+            secrets.extend(file.entries.values().map(|entry| entry.secret.clone()));
+            secrets.extend(file.mcp_entries.values().map(|entry| entry.secret.clone()));
+        }
+        for name in
+            slots::scrubbed_env_var_names().chain(slots::AWS_SECRET_ENV_VARS.iter().copied())
+        {
+            if let Some(value) = (self.inner.env)(name)
+                && !value.trim().is_empty()
+            {
+                secrets.push(SecretString::new(value));
+            }
+        }
+        secrets
     }
 
     fn now(&self) -> DateTime<Utc> {

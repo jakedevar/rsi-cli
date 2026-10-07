@@ -2,16 +2,26 @@
 use serde_json::{Value, json};
 use std::sync::LazyLock;
 
-pub(super) static INSPECT: LazyLock<String> = LazyLock::new(|| inspect().to_string());
-pub(super) static UPDATE: LazyLock<String> = LazyLock::new(|| update().to_string());
+pub(super) static INSPECT: LazyLock<String> =
+    LazyLock::new(|| with_project_id(inspect()).to_string());
+pub(super) static UPDATE: LazyLock<String> =
+    LazyLock::new(|| with_project_id(update()).to_string());
 pub(super) static SUBMIT_REVIEW: LazyLock<String> = LazyLock::new(|| submit_review().to_string());
-pub(super) static CONTROL: LazyLock<String> = LazyLock::new(|| control().to_string());
+pub(super) static CONTROL: LazyLock<String> =
+    LazyLock::new(|| with_project_id(control()).to_string());
 pub(super) static PREPARE_CONTROL: LazyLock<String> =
-    LazyLock::new(|| prepare_control().to_string());
+    LazyLock::new(|| with_project_id(prepare_control()).to_string());
 pub(super) static COMMIT_PREPARED_CONTROL: LazyLock<String> =
-    LazyLock::new(|| commit_prepared_control().to_string());
-pub(super) static GET_ACTION: LazyLock<String> = LazyLock::new(|| get_action().to_string());
+    LazyLock::new(|| with_project_id(commit_prepared_control()).to_string());
+pub(super) static GET_ACTION: LazyLock<String> =
+    LazyLock::new(|| with_project_id(get_action()).to_string());
 
+/// #1235: the optional target project of a global manager seat.
+pub(super) fn with_project_id(mut schema: Value) -> Value {
+    schema["properties"]["project_id"] = json!({"type":["string","null"],"format":"uuid","default":null,
+        "description":"Global manager only: the granted project to act in; omit for your own project"});
+    schema
+}
 fn object(fields: &[(&str, Value)], required: &[&str]) -> Value {
     json!({"type":"object", "additionalProperties":false,
         "properties":fields.iter().map(|(k,v)| (k.to_string(),v.clone())).collect::<serde_json::Map<_,_>>(),
@@ -111,6 +121,24 @@ fn launch() -> Value {
         &["provider", "model"],
     )
 }
+/// #1195: `{"rolling":{}}` (the default), `{"commit":"<40-hex>"}` or
+/// `{"path":"<absolute registered worktree>"}`.
+pub(super) fn sandbox_source() -> Value {
+    json!({
+        "description": "Where the worker's sandbox branches from. Omitted or {\"rolling\":{}}: the freshly fetched origin/rolling tip at launch. {\"commit\":\"<40 lowercase hex>\"}: that commit of the project repository. {\"path\":\"<absolute path>\"}: the HEAD commit of that registered worktree of the project repository (for example your own sandbox_root), pinned when the action is admitted; uncommitted changes are not used and the receipt reports source_dirty.",
+        "oneOf": [
+            object(&[("rolling", object(&[], &[]))], &["rolling"]),
+            object(
+                &[("commit", json!({"type":"string","pattern":"^[0-9a-f]{40}$"}))],
+                &["commit"],
+            ),
+            object(
+                &[("path", json!({"type":"string","minLength":1,"maxLength":4096,"pattern":"^/"}))],
+                &["path"],
+            ),
+        ]
+    })
+}
 fn stage() -> Value {
     enumeration(&[
         "planning",
@@ -172,6 +200,8 @@ fn inspect() -> Value {
         "health",
         "migration_allocations",
         "satellites",
+        "friction",
+        "rulings",
     ]);
     section["default"] = json!("overview");
     let mut limit = integer(1, 64);
@@ -262,6 +292,7 @@ fn control() -> Value {
             ),
             ("query", string()),
             ("launch", launch()),
+            ("sandbox_source", optional(sandbox_source())),
         ],
         &["parent_id", "kind", "query", "launch"],
     ));
@@ -467,6 +498,7 @@ fn prepare_control() -> Value {
             ),
             ("query", string()),
             ("launch", launch()),
+            ("sandbox_source", optional(sandbox_source())),
         ],
         &["parent_id", "kind", "query", "launch"],
     ));
@@ -618,6 +650,8 @@ fn update() -> Value {
         "accept",
         "integration",
         "decision",
+        "decision_ruling",
+        "decision_withdraw",
     ] {
         let mut fields = vec![
             ("key", string()),
@@ -756,9 +790,39 @@ fn update() -> Value {
                     ("question", string()),
                     ("request_id", optional(uuid())),
                     ("work_key", optional(string())),
+                    (
+                        "gate",
+                        optional(enumeration(&[
+                            "main_or_release",
+                            "spend",
+                            "credentials",
+                            "data_deletion",
+                            "human_approval",
+                        ])),
+                    ),
+                    (
+                        "options",
+                        array(object(
+                            &[
+                                ("label", string()),
+                                ("detail", optional(string())),
+                                ("recommended", boolean()),
+                            ],
+                            &["label"],
+                        )),
+                    ),
                 ],
                 vec!["epic_id", "question"],
             ),
+            "decision_ruling" => (
+                vec![
+                    ("target_digest", string()),
+                    ("answer", string()),
+                    ("owner_manager_session_id", optional(uuid())),
+                ],
+                vec!["target_digest", "answer"],
+            ),
+            "decision_withdraw" => (vec![("reason", string())], vec!["reason"]),
             _ => unreachable!(),
         };
         fields.extend(extra);

@@ -1231,15 +1231,24 @@ fn cycle_provider(app: &mut App, forward: bool) {
         ..
     } = &mut app.overlay
     {
+        // #1407: cycle only the providers the provider profile offers.
+        let cycle: Vec<_> = PROVIDER_CYCLE
+            .iter()
+            .copied()
+            .filter(|candidate| crate::provider_profile_view::provider_offered(*candidate))
+            .collect();
+        if cycle.is_empty() {
+            return;
+        }
         let current_idx = provider
             .as_ref()
-            .and_then(|p| PROVIDER_CYCLE.iter().position(|q| q == p));
+            .and_then(|p| cycle.iter().position(|q| q == p));
         let next_idx = match current_idx {
-            Some(idx) if forward => (idx + 1) % PROVIDER_CYCLE.len(),
-            Some(idx) => (idx + PROVIDER_CYCLE.len() - 1) % PROVIDER_CYCLE.len(),
+            Some(idx) if forward => (idx + 1) % cycle.len(),
+            Some(idx) => (idx + cycle.len() - 1) % cycle.len(),
             None => 0,
         };
-        *provider = Some(PROVIDER_CYCLE[next_idx]);
+        *provider = Some(cycle[next_idx]);
         // Provider, model, and effort are one form-local tuple. Do not carry
         // a model/effort selection into a provider that did not supply it.
         *model = None;
@@ -3178,14 +3187,24 @@ mod tests {
             }
             _ => panic!("overlay shape lost"),
         }
-        // Inject a stub model list + select index 0.
+        // Inject a catalog and filter to a model after the first source row.
         if let OverlayState::CreateEntityForm {
             model_dropdown: Some(state),
             ..
         } = &mut app.overlay
         {
-            state.models = vec![("opus-4".to_string(), "Opus 4".to_string())];
+            state.models = vec![
+                ("other".into(), "Other".into()),
+                ("opus-4".to_string(), "Opus 4".to_string()),
+            ];
             state.selected_index = 0;
+        }
+        for c in "/opus".chars() {
+            handle_create_entity_form_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            )
+            .await;
         }
         // Press Enter — dropdown intercept handler should commit and close.
         let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
@@ -3204,6 +3223,44 @@ mod tests {
             }
             _ => panic!("overlay shape lost"),
         }
+    }
+
+    /// Browsing providers in the form's picker then Esc leaves the form's
+    /// model/provider and the global default exactly as they were.
+    #[tokio::test]
+    async fn model_dropdown_esc_after_browsing_keeps_form_and_default() {
+        let mut app = test_app();
+        let epic_id = uuid::Uuid::new_v4();
+        open_task_in_normal_mode(&mut app, epic_id).await;
+        let default_provider = app.selected_provider;
+        let default_model = app.selected_model.clone();
+        let (form_model, form_provider) = match &app.overlay {
+            OverlayState::CreateEntityForm {
+                model, provider, ..
+            } => (model.clone(), *provider),
+            _ => panic!("overlay shape lost"),
+        };
+
+        for code in [KeyCode::Char('m'), KeyCode::Tab, KeyCode::Tab, KeyCode::Esc] {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            handle_create_entity_form_key(&mut app, key).await;
+        }
+
+        match &app.overlay {
+            OverlayState::CreateEntityForm {
+                model,
+                provider,
+                model_dropdown,
+                ..
+            } => {
+                assert!(model_dropdown.is_none(), "Esc closes the dropdown");
+                assert_eq!(*model, form_model);
+                assert_eq!(*provider, form_provider);
+            }
+            _ => panic!("overlay shape lost"),
+        }
+        assert_eq!(app.selected_provider, default_provider);
+        assert_eq!(app.selected_model, default_model);
     }
 
     // ═══════════════════════════════════════════════════════════════════════

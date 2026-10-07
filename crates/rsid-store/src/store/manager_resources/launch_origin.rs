@@ -13,6 +13,8 @@ pub(super) enum LaunchReservation {
     Child(AgentSpawnRequestRecord),
     Successor(AgentSuccessorReservation),
     ManagerSuccessor(super::super::manager_successions::ManagerSuccessionClaim),
+    /// #1314: a delegated appointment's reserved seat.
+    Appointment,
 }
 
 impl Store {
@@ -30,6 +32,29 @@ impl Store {
             policy_required: true,
             reservation: Some(LaunchReservation::ManagerSuccessor(claim.clone())),
         })
+    }
+
+    /// #1314: the launch origin of a delegated appointment's reserved seat
+    /// (`AgentManagerAppointChild`, `AgentGlobalAppointManager`). The seat
+    /// is a root session, so no parent scope accounts for it: Model Control
+    /// admission gates it as its grantor's creation and records the
+    /// reservation in the grantor's ledger.
+    pub fn manager_v2_appointment_origin(
+        &self,
+        session_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> Result<ManagerResourceLaunchOrigin> {
+        let origin = ManagerResourceLaunchOrigin {
+            session_id,
+            parent_id: None,
+            project_id,
+            kind: SessionKind::Standard,
+            scope: None,
+            policy_required: false,
+            reservation: Some(LaunchReservation::Appointment),
+        };
+        origin.validate_reservation(self, None)?;
+        Ok(origin)
     }
 
     pub fn manager_v2_bind_child_origin(
@@ -70,6 +95,10 @@ impl ManagerResourceLaunchOrigin {
         }
     }
 
+    pub(crate) fn is_appointment(&self) -> bool {
+        matches!(self.reservation, Some(LaunchReservation::Appointment))
+    }
+
     pub(super) fn validate_reservation(
         &self,
         store: &Store,
@@ -100,6 +129,23 @@ impl ManagerResourceLaunchOrigin {
                             != Some(root.invocation_fingerprint()?.as_str())
                     {
                         return Err(refused("manager_succession_invocation_changed"));
+                    }
+                }
+            }
+            Some(LaunchReservation::Appointment) => {
+                let appointment = store.launched_appointment_for_session(self.session_id)?;
+                if Some(appointment.launch_project_id) != self.project_id
+                    || self.parent_id.is_some()
+                    || self.kind != SessionKind::Standard
+                {
+                    return Err(refused("manager_appointment_launch_changed"));
+                }
+                if let Some((request, _)) = admission {
+                    let key = format!("global.appoint:{}", self.session_id);
+                    if request.purpose != ModelInvocationPurpose::SessionLaunchFresh
+                        || request.dedup_key.as_deref() != Some(key.as_str())
+                    {
+                        return Err(refused("manager_appointment_launch_changed"));
                     }
                 }
             }

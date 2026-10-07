@@ -301,10 +301,9 @@ impl App {
     }
 
     /// Move selection down in a session list pane, or scroll down in detail pane.
-    /// Zone-aware: j/k stays within the active zone (Main or TaskRabbit).
+    /// Zone-aware: j/k stays within the active zone (Main, Archive or Jobs).
     pub fn nav_down(&mut self) {
         let main_len = self.filtered_session_order.len();
-        let tr_len = self.filtered_taskrabbit_order.len();
         let arc_len = self.filtered_archived_order.len();
         let jobs_len = self.filtered_jobs_order.len();
 
@@ -316,7 +315,6 @@ impl App {
                     selected_index,
                     selected_session,
                     active_zone,
-                    taskrabbit_selected_index,
                     archive_selected_index,
                     jobs_selected_index,
                     ..
@@ -327,15 +325,6 @@ impl App {
                         }
                         *selected_session =
                             self.filtered_session_order.get(*selected_index).copied();
-                    }
-                    crate::types::SessionListZone::TaskRabbit => {
-                        if *taskrabbit_selected_index + 1 < tr_len {
-                            *taskrabbit_selected_index += 1;
-                        }
-                        *selected_session = self
-                            .filtered_taskrabbit_order
-                            .get(*taskrabbit_selected_index)
-                            .copied();
                     }
                     crate::types::SessionListZone::Archive => {
                         if *archive_selected_index + 1 < arc_len {
@@ -378,7 +367,7 @@ impl App {
     }
 
     /// Move selection up in a session list pane, or scroll up in detail pane.
-    /// Zone-aware: j/k stays within the active zone (Main or TaskRabbit).
+    /// Zone-aware: j/k stays within the active zone (Main, Archive or Jobs).
     pub fn nav_up(&mut self) {
         let focused = self.interaction_pane_id();
         let tab = &mut self.tabs[self.active_tab];
@@ -388,7 +377,6 @@ impl App {
                     selected_index,
                     selected_session,
                     active_zone,
-                    taskrabbit_selected_index,
                     archive_selected_index,
                     jobs_selected_index,
                     ..
@@ -399,15 +387,6 @@ impl App {
                         }
                         *selected_session =
                             self.filtered_session_order.get(*selected_index).copied();
-                    }
-                    crate::types::SessionListZone::TaskRabbit => {
-                        if *taskrabbit_selected_index > 0 {
-                            *taskrabbit_selected_index -= 1;
-                        }
-                        *selected_session = self
-                            .filtered_taskrabbit_order
-                            .get(*taskrabbit_selected_index)
-                            .copied();
                     }
                     crate::types::SessionListZone::Archive => {
                         if *archive_selected_index > 0 {
@@ -560,7 +539,6 @@ impl App {
             selected_index,
             selected_session,
             active_zone,
-            taskrabbit_selected_index,
             archive_selected_index,
             jobs_selected_index,
             ..
@@ -572,15 +550,6 @@ impl App {
                         *selected_index -= 1;
                     }
                     *selected_session = self.filtered_session_order.get(*selected_index).copied();
-                }
-                crate::types::SessionListZone::TaskRabbit => {
-                    if *taskrabbit_selected_index > 0 {
-                        *taskrabbit_selected_index -= 1;
-                    }
-                    *selected_session = self
-                        .filtered_taskrabbit_order
-                        .get(*taskrabbit_selected_index)
-                        .copied();
                 }
                 crate::types::SessionListZone::Archive => {
                     if *archive_selected_index > 0 {
@@ -606,7 +575,6 @@ impl App {
     /// Used by Right arrow key in session detail view.
     pub fn nav_list_down(&mut self) {
         let main_len = self.filtered_session_order.len();
-        let tr_len = self.filtered_taskrabbit_order.len();
         let arc_len = self.filtered_archived_order.len();
         let jobs_len = self.filtered_jobs_order.len();
 
@@ -630,7 +598,6 @@ impl App {
             selected_index,
             selected_session,
             active_zone,
-            taskrabbit_selected_index,
             archive_selected_index,
             jobs_selected_index,
             ..
@@ -642,15 +609,6 @@ impl App {
                         *selected_index += 1;
                     }
                     *selected_session = self.filtered_session_order.get(*selected_index).copied();
-                }
-                crate::types::SessionListZone::TaskRabbit => {
-                    if *taskrabbit_selected_index + 1 < tr_len {
-                        *taskrabbit_selected_index += 1;
-                    }
-                    *selected_session = self
-                        .filtered_taskrabbit_order
-                        .get(*taskrabbit_selected_index)
-                        .copied();
                 }
                 crate::types::SessionListZone::Archive => {
                     if *archive_selected_index + 1 < arc_len {
@@ -738,26 +696,13 @@ impl App {
         };
 
         // Determine which zone and index the session belongs to
-        let (zone, main_idx, tr_idx, arc_idx, sel) = if let Some(pos) = self
+        let (zone, main_idx, arc_idx, sel) = if let Some(pos) = self
             .filtered_session_order
             .iter()
             .position(|x| *x == session_id)
         {
             (
                 crate::types::SessionListZone::Main,
-                pos,
-                0,
-                0,
-                Some(session_id),
-            )
-        } else if let Some(pos) = self
-            .filtered_taskrabbit_order
-            .iter()
-            .position(|x| *x == session_id)
-        {
-            (
-                crate::types::SessionListZone::TaskRabbit,
-                0,
                 pos,
                 0,
                 Some(session_id),
@@ -770,7 +715,6 @@ impl App {
             (
                 crate::types::SessionListZone::Archive,
                 0,
-                0,
                 pos,
                 Some(session_id),
             )
@@ -778,10 +722,9 @@ impl App {
             let first = self
                 .filtered_session_order
                 .first()
-                .or(self.filtered_taskrabbit_order.first())
                 .or(self.filtered_archived_order.first())
                 .copied();
-            (Default::default(), 0, 0, 0, first)
+            (Default::default(), 0, 0, first)
         };
 
         if let Some(pane) = self.tabs[self.active_tab].layout.find_pane_mut(focused) {
@@ -790,7 +733,6 @@ impl App {
                 selected_session: sel,
                 scroll_offset: 0,
                 active_zone: zone,
-                taskrabbit_selected_index: tr_idx,
                 archive_selected_index: arc_idx,
                 jobs_selected_index: 0,
             };
@@ -816,7 +758,6 @@ impl App {
             self.last_viewed_session = self
                 .filtered_session_order
                 .first()
-                .or(self.filtered_taskrabbit_order.first())
                 .or(self.filtered_archived_order.first())
                 .copied();
         }
@@ -824,7 +765,6 @@ impl App {
         let first_session = self
             .filtered_session_order
             .first()
-            .or(self.filtered_taskrabbit_order.first())
             .or(self.filtered_archived_order.first())
             .copied();
         for tab in &mut self.tabs {
@@ -838,7 +778,6 @@ impl App {
                         selected_session: first_session,
                         scroll_offset: 0,
                         active_zone: Default::default(),
-                        taskrabbit_selected_index: 0,
                         archive_selected_index: 0,
                         jobs_selected_index: 0,
                     };
@@ -871,7 +810,6 @@ impl App {
                     if let Pane::SessionList {
                         selected_index,
                         selected_session,
-                        taskrabbit_selected_index,
                         archive_selected_index,
                         jobs_selected_index,
                         ..
@@ -881,10 +819,6 @@ impl App {
                             crate::types::SessionListZone::Main => {
                                 *selected_index = 0;
                                 *selected_session = self.filtered_session_order.first().copied();
-                            }
-                            crate::types::SessionListZone::TaskRabbit => {
-                                *taskrabbit_selected_index = 0;
-                                *selected_session = self.filtered_taskrabbit_order.first().copied();
                             }
                             crate::types::SessionListZone::Archive => {
                                 *archive_selected_index = 0;
@@ -916,7 +850,6 @@ impl App {
     /// Jump to last item in session list (zone-aware).
     pub fn jump_to_bottom(&mut self) {
         let main_len = self.filtered_session_order.len();
-        let tr_len = self.filtered_taskrabbit_order.len();
         let arc_len = self.filtered_archived_order.len();
         let jobs_len = self.filtered_jobs_order.len();
 
@@ -934,7 +867,6 @@ impl App {
                     if let Pane::SessionList {
                         selected_index,
                         selected_session,
-                        taskrabbit_selected_index,
                         archive_selected_index,
                         jobs_selected_index,
                         ..
@@ -945,13 +877,6 @@ impl App {
                                 if main_len > 0 {
                                     *selected_index = main_len - 1;
                                     *selected_session = self.filtered_session_order.last().copied();
-                                }
-                            }
-                            crate::types::SessionListZone::TaskRabbit => {
-                                if tr_len > 0 {
-                                    *taskrabbit_selected_index = tr_len - 1;
-                                    *selected_session =
-                                        self.filtered_taskrabbit_order.last().copied();
                                 }
                             }
                             crate::types::SessionListZone::Archive => {

@@ -12,7 +12,8 @@ use crate::error::{DaemonError, Result};
 use rsi_common::agent_session_events::{
     AGENT_READ_EVENT_FIELD_MAX_CHARS, AGENT_READ_EVENTS_SCOPE_DENIED, AgentFinalMessageV1,
     AgentReadSessionEventsRequestV1, AgentReadSessionEventsResultV1, AgentSessionEventV1,
-    FINAL_MESSAGE_MAX_CHARS, clip_chars, is_provider_diagnostic_metadata,
+    FINAL_MESSAGE_FULL_MAX_CHARS, FINAL_MESSAGE_MAX_CHARS, clip_chars,
+    is_provider_diagnostic_metadata,
 };
 use rsi_common::types::{ConversationEvent, SessionStatus};
 use uuid::Uuid;
@@ -108,7 +109,13 @@ impl AgentControlHandle {
             limit,
             request.event_types.as_deref(),
         )?;
-        let final_event = store.last_assistant_message_event(tip_id)?;
+        let mut final_event = store.last_assistant_message_event(tip_id)?;
+        if let Some(event) = final_event.as_mut()
+            && let Some(report) =
+                super::worker_result_guard::result_sha::normalized_report(&store, event)?
+        {
+            event.content = report;
+        }
         drop(store);
 
         let mut projected: Vec<AgentSessionEventV1> =
@@ -150,7 +157,12 @@ impl AgentControlHandle {
         }
 
         let final_message = final_event.map(|event| {
-            let (content, clipped) = clip_chars(&event.content, FINAL_MESSAGE_MAX_CHARS);
+            let max_chars = if request.final_message_full {
+                FINAL_MESSAGE_FULL_MAX_CHARS
+            } else {
+                FINAL_MESSAGE_MAX_CHARS
+            };
+            let (content, clipped) = clip_chars(&event.content, max_chars);
             truncated |= clipped;
             AgentFinalMessageV1 {
                 sequence: event.sequence,
@@ -187,6 +199,35 @@ mod tests {
     use std::sync::Arc;
 
     type SharedStore = Arc<tokio::sync::Mutex<Store>>;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn result_sha_final_message_projects_verified_hash_and_keeps_raw_event() {
+        let (control, store, parent, child) = worker_with_events(2).await;
+        let raw = "RESULT 1234567 status=green";
+        let full = "1234567890123456789012345678901234567890";
+        {
+            let store = store.lock().await;
+            let event = store.last_assistant_message_event(child).unwrap().unwrap();
+            store.update_event_content(event.id, raw).unwrap();
+            store.insert_session_diagnostic(&rsi_common::types::NewSessionDiagnosticV1 {
+                session_id: child,
+                timestamp: Utc::now(),
+                level: rsi_common::types::SessionDiagnosticLevelV1::Warn,
+                message: "worker_result_sha_validation".into(),
+                fields: Some(serde_json::json!({"event_sequence":event.sequence,"replacements":[{"reported":"1234567","resolved":full}]})),
+            }).unwrap();
+        }
+        let page = control
+            .agent_read_session_events(parent, req(child))
+            .await
+            .unwrap();
+        assert_eq!(
+            page.final_message.unwrap().content,
+            format!("RESULT {full} status=green")
+        );
+        assert_eq!(page.events[1].content, raw);
+    }
 
     async fn insert(
         store: &SharedStore,
@@ -235,6 +276,7 @@ mod tests {
             limit: None,
             event_types: None,
             max_bytes: None,
+            final_message_full: false,
         }
     }
 
@@ -468,6 +510,43 @@ mod tests {
         assert_eq!(page.events.len(), 1, "a 3KB budget fits one clipped event");
         assert!(page.truncated && page.has_earlier);
         assert_eq!(page.events[0].sequence, 4, "the tail keeps the newest");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn full_final_message_opt_in_raises_the_content_cap() {
+        let (control, store, parent, child) = worker_with_events(0).await;
+        let content = "handoff detail ".repeat(1_000);
+        event(
+            &store,
+            child,
+            1,
+            EventType::Message,
+            Some(Role::Assistant),
+            &content,
+        )
+        .await;
+
+        let default_page = control
+            .agent_read_session_events(parent, req(child))
+            .await
+            .unwrap();
+        let default_message = default_page.final_message.unwrap();
+        assert_eq!(
+            default_message.content.chars().count(),
+            FINAL_MESSAGE_MAX_CHARS
+        );
+        assert!(default_message.truncated);
+
+        let mut full = req(child);
+        full.final_message_full = true;
+        let full_page = control
+            .agent_read_session_events(parent, full)
+            .await
+            .unwrap();
+        let full_message = full_page.final_message.unwrap();
+        assert_eq!(full_message.content, content);
+        assert!(!full_message.truncated);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]

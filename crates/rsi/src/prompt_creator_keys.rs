@@ -158,45 +158,29 @@ fn handle_editor_key(app: &mut App, key: KeyEvent) -> bool {
 
 /// Handle keys when the model dropdown is open.
 fn handle_model_dropdown_key(app: &mut App, key: KeyEvent) -> bool {
-    match key.code {
-        KeyCode::Char('j') | KeyCode::Down => {
-            if let Some(ref mut dropdown) = app.prompt_creator_state.model_dropdown {
-                if dropdown.selected_index + 1 < dropdown.models.len() {
-                    dropdown.selected_index += 1;
-                }
-            }
-            true
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            if let Some(ref mut dropdown) = app.prompt_creator_state.model_dropdown {
-                if dropdown.selected_index > 0 {
-                    dropdown.selected_index -= 1;
-                }
-            }
-            true
-        }
-        KeyCode::Enter => {
-            let selected = app
-                .prompt_creator_state
-                .model_dropdown
-                .as_ref()
-                .and_then(|d| d.models.get(d.selected_index).cloned());
-            if let Some((model_id, _)) = selected {
-                app.prompt_creator_state.selected_model = Some(model_id);
-                if let Some(ref mut dropdown) = app.prompt_creator_state.model_dropdown {
-                    dropdown.close();
-                }
-            }
-            true
-        }
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('m') => {
-            if let Some(ref mut dropdown) = app.prompt_creator_state.model_dropdown {
-                dropdown.close();
-            }
-            true
-        }
-        _ => true,
+    use crate::widget::model_dropdown::{
+        ModelDropdownAction, handle_model_dropdown_key_with_providers,
+    };
+    let Some(dropdown) = app.prompt_creator_state.model_dropdown.as_mut() else {
+        return true;
+    };
+    // Prompt creator owns a fixed model catalog; retain its m-to-close shortcut.
+    if !dropdown.filter_editing && key.code == KeyCode::Char('m') {
+        dropdown.close();
+        return true;
     }
+    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        return true;
+    }
+    match handle_model_dropdown_key_with_providers(dropdown, &key, &[], &[]) {
+        ModelDropdownAction::Selected(model_id) => {
+            app.prompt_creator_state.selected_model = Some(model_id);
+            dropdown.close();
+        }
+        ModelDropdownAction::Dismissed => dropdown.close(),
+        _ => {}
+    }
+    true
 }
 
 /// Close the prompt creator and restore the previous pane.
@@ -215,7 +199,6 @@ pub fn close_prompt_creator(app: &mut App) {
                 selected_session: None,
                 scroll_offset: 0,
                 active_zone: Default::default(),
-                taskrabbit_selected_index: 0,
                 archive_selected_index: 0,
                 jobs_selected_index: 0,
             };
@@ -268,6 +251,41 @@ mod tests {
     use crate::client::DaemonClient;
     use crate::types::PopupMode;
     use std::path::PathBuf;
+
+    #[test]
+    fn model_dropdown_prompt_creator_search_selects_and_captures_m() {
+        let mut app = App::new(DaemonClient::new(PathBuf::from("/tmp/test.sock")));
+        app.prompt_creator_state.model_dropdown = Some(crate::types::ModelDropdownState::new(
+            rsi_common::types::SessionProvider::Claude,
+            vec![
+                ("first".into(), "First".into()),
+                ("model-2".into(), "Model Two".into()),
+            ],
+            None,
+        ));
+        for c in "/model-2".chars() {
+            assert!(handle_prompt_creator_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+            ));
+        }
+        let dropdown = app.prompt_creator_state.model_dropdown.as_ref().unwrap();
+        assert!(dropdown.open);
+        assert_eq!(dropdown.filter_query, "model-2");
+        assert_eq!(dropdown.selected_index, 1);
+        handle_prompt_creator_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.prompt_creator_state.selected_model.as_deref(),
+            Some("model-2")
+        );
+        assert!(
+            !app.prompt_creator_state
+                .model_dropdown
+                .as_ref()
+                .unwrap()
+                .open
+        );
+    }
 
     #[test]
     fn plain_enter_inserts_newline_in_prompt_editor_with_submit_setting() {

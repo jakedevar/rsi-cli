@@ -160,12 +160,11 @@ fn snapshots(store: &Store, ids: &[Uuid]) -> Vec<JobSnapshot> {
         .collect()
 }
 
-/// True when `sha` is an ancestor of `origin/rolling` in `repo_dir`. A missing
-/// repository is `Err`; a missing commit or ref is simply "not yet".
-fn sha_on_rolling(repo_dir: &str, sha: &str) -> Result<bool, ()> {
-    if !std::path::Path::new(repo_dir).is_dir() {
-        return Err(());
-    }
+/// Upper bound on one `git fetch` of `origin rolling` made for a pending
+/// `sha_on_rolling` probe (#1463).
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+fn is_ancestor_of_origin_rolling(repo_dir: &str, sha: &str) -> Result<bool, ()> {
     let status = std::process::Command::new("git")
         .args([
             "-C",
@@ -181,6 +180,59 @@ fn sha_on_rolling(repo_dir: &str, sha: &str) -> Result<bool, ()> {
         .status()
         .map_err(|_| ())?;
     Ok(status.success())
+}
+
+/// Refresh the local `origin/rolling` tracking ref, bounded by `timeout`.
+/// Rolling can advance (the lander publishes straight to the remote) without
+/// anything fetching into this repository, so the local ref alone goes stale
+/// (#1463). Best effort: a failed or timed-out fetch leaves the old ref.
+fn fetch_origin_rolling(repo_dir: &str, timeout: std::time::Duration) {
+    let Ok(mut child) = std::process::Command::new("git")
+        .args([
+            "-C",
+            repo_dir,
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "origin",
+            "rolling",
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
+    }
+}
+
+/// True when `sha` is an ancestor of `origin/rolling` in `repo_dir`, checking
+/// the local tracking ref first and then a freshly fetched one. A missing
+/// repository is `Err`; a missing commit or ref is simply "not yet".
+fn sha_on_rolling(repo_dir: &str, sha: &str) -> Result<bool, ()> {
+    if !std::path::Path::new(repo_dir).is_dir() {
+        return Err(());
+    }
+    if is_ancestor_of_origin_rolling(repo_dir, sha)? {
+        return Ok(true);
+    }
+    fetch_origin_rolling(repo_dir, FETCH_TIMEOUT);
+    is_ancestor_of_origin_rolling(repo_dir, sha)
 }
 
 /// Evaluate one predicate wake. `manual` (an operator trigger) delivers a

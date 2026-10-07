@@ -58,8 +58,13 @@ impl AgentControlHandle {
             store.provider_launch_stats(now)?
         };
         // The store lock is released before any provider call.
-        Ok(service
+        let mut report = service
             .report(vault, &stats, request.provider.as_deref(), now)
-            .await)
+            .await;
+        // #1407: report the operator provider profile and what it refuses.
+        if let Some(config) = self.spawn_coordinator.runtime_config() {
+            report.apply_provider_profile(config.provider_profile());
+        }
+        Ok(report)
     }
 }

@@ -12,6 +12,8 @@ use std::{
 };
 use termwright::prelude::*;
 
+#[path = "e2e_tui/manager_decisions.rs"]
+mod manager_decisions;
 #[path = "e2e_tui/manager_presets.rs"]
 mod manager_presets;
 #[path = "e2e_tui/manager_surface.rs"]
@@ -92,6 +94,58 @@ async fn select_settings_row(term: &Terminal, target: &str, max_steps: usize) ->
             })?;
     }
     unreachable!("bounded settings traversal always returns")
+}
+
+/// Reach Settings > Providers & Sandboxes > Sandbox Storage and focus its
+/// items. The rail lists groups and each group carries section tabs (`j` moves
+/// groups, `]` moves tabs); both orders come from the registry so a reordered
+/// page stays reachable. A first open lands on the first group's first tab;
+/// a reopen remembers the last tab, so navigation is skipped when the
+/// breadcrumb already names Sandbox Storage.
+async fn focus_sandbox_storage_settings(term: &Terminal) -> E2eResult<()> {
+    use rsi::settings_registry::{SettingsGroup, SettingsSection};
+    let group = SettingsSection::SandboxStorage.group();
+    let group_index = SettingsGroup::ALL
+        .iter()
+        .position(|candidate| *candidate == group)
+        .ok_or_else(|| test_error("Sandbox Storage group missing from registry"))?;
+    let tab_index = SettingsSection::ALL
+        .iter()
+        .filter(|section| section.group() == group)
+        .position(|section| *section == SettingsSection::SandboxStorage)
+        .ok_or_else(|| test_error("Sandbox Storage tab missing from its group"))?;
+    let already_there = term.screen().await.text().contains("›  Sandbox Storage");
+    if !already_there {
+        for _ in 0..group_index {
+            term.send_key(Key::Char('j'))
+                .await
+                .map_err(|error| test_error(format!("select settings group: {error:?}")))?;
+        }
+        for _ in 0..tab_index {
+            term.send_key(Key::Char(']'))
+                .await
+                .map_err(|error| test_error(format!("select settings tab: {error:?}")))?;
+        }
+    }
+    term.send_key(Key::Char('h'))
+        .await
+        .map_err(|error| test_error(format!("focus settings rail: {error:?}")))?;
+    term.send_key(Key::Char('l'))
+        .await
+        .map_err(|error| test_error(format!("enter Sandbox Storage: {error:?}")))?;
+    // A reopen also remembers the selected row, so only the page is asserted;
+    // callers move to their row with `select_settings_row`.
+    if let Err(error) = term
+        .expect("Sandbox storage  ·")
+        .timeout(Duration::from_secs(5))
+        .await
+    {
+        let screen = term.screen().await.text();
+        return Err(test_error(format!(
+            "Sandbox Storage items not focused: {error:?}; screen:\n{screen}"
+        )));
+    }
+    Ok(())
 }
 
 const GROUP_NAME: &str = "E2E Group";
@@ -324,7 +378,7 @@ async fn test_e2e_startup_readiness_withheld_rpc() -> E2eResult<()> {
 
     let temp_dir = tempfile::Builder::new()
         .prefix("rsi-e2e-startup-held-")
-        .tempdir()?;
+        .tempdir_in("/tmp")?;
     let home_dir = temp_dir.path().join("home");
     let dot_rsi = home_dir.join(".rsi");
     fs::create_dir_all(&dot_rsi)?;
@@ -385,7 +439,7 @@ async fn test_e2e_startup_readiness_withheld_rpc() -> E2eResult<()> {
         term.send_key(Key::Char(' '))
             .await
             .map_err(|error| test_error(format!("blank-prompt leader: {error:?}")))?;
-        term.send_key(Key::Char('m'))
+        term.send_key(Key::Char('N'))
             .await
             .map_err(|error| test_error(format!("open blank prompt: {error:?}")))?;
         term.type_str("startup draft stays here")
@@ -471,16 +525,39 @@ async fn test_e2e_codex_capability_display() -> E2eResult<()> {
 
 impl E2eHarness {
     fn new() -> E2eResult<Self> {
-        let temp_dir = tempfile::Builder::new().prefix("rsi-e2e-tui-").tempdir()?;
+        let temp_dir = tempfile::Builder::new()
+            .prefix("rsi-e2e-tui-")
+            .tempdir_in("/tmp")?;
         let temp_path = temp_dir.path();
 
         let home_dir = temp_path.join("home");
         let dot_rsi = home_dir.join(".rsi");
         fs::create_dir_all(&dot_rsi)?;
+        let scope_settings = std::env::var_os("HOME")
+            .and_then(|home| fs::read_to_string(PathBuf::from(home).join(".rsi/rsid-scope.env")).ok())
+            .map(|contents| {
+                contents
+                    .lines()
+                    .filter(|line| line.starts_with("worker_scope_"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|settings| settings.lines().count() == 4)
+            .unwrap_or_else(|| {
+                let (high, max) = rsi_common::worker_memory::default_limits_mib();
+                format!(
+                    "worker_scope_memory_high_mib={high}\nworker_scope_memory_max_mib={max}\nworker_scope_memory_swap_max_mib=0\nworker_scope_cpu_weight=20"
+                )
+            });
+        fs::write(
+            dot_rsi.join("rsid-scope.env"),
+            format!("{scope_settings}\n"),
+        )?;
 
         let socket_path = dot_rsi.join("daemon.sock");
-        // Keep the short-lived socket in /tmp, but put sandbox storage on the
-        // repository filesystem. The storage scenario intentionally drives
+        // Keep the short-lived socket under this short /tmp home, whatever
+        // sandbox-scoped TMPDIR the test process inherits. Put sandbox
+        // storage on the repository filesystem. The storage scenario drives
         // pressure-mode reclaim; an almost-empty tmpfs would make that branch
         // host-dependent even with the minimum valid pressure thresholds.
         let sandbox_temp_dir = tempfile::Builder::new()
@@ -789,9 +866,7 @@ impl E2eHarness {
                 .await
                 .map_err(|error| test_error(format!("return from category help: {error:?}")))?;
 
-            term.send_key(Key::Char('j'))
-                .await
-                .map_err(|error| test_error(format!("select Theme & Colors: {error:?}")))?;
+            // Settings opens on its first group, Appearance > Theme & Colors.
             term.expect("Theme & Colors")
                 .timeout(Duration::from_secs(5))
                 .await
@@ -1055,9 +1130,9 @@ impl E2eHarness {
                 .await
                 .map_err(|error| test_error(format!("pre-Issues pane not restored: {error:?}")))?;
 
-            term.send_key(Key::Char('g'))
+            term.send_key(Key::Char(' '))
                 .await
-                .map_err(|error| test_error(format!("schedule prefix: {error:?}")))?;
+                .map_err(|error| test_error(format!("schedule leader: {error:?}")))?;
             term.send_key(Key::Char('K'))
                 .await
                 .map_err(|error| test_error(format!("open Scheduled Jobs: {error:?}")))?;
@@ -1355,30 +1430,7 @@ impl E2eHarness {
             term.send_key(Key::Char('h'))
                 .await
                 .map_err(|error| test_error(format!("focus settings categories: {error:?}")))?;
-            for category in [
-                "Theme & Colors",
-                "Session Defaults",
-                "API Models",
-                "List Fields",
-                "Daemon Features",
-            ] {
-                term.send_key(Key::Char('j'))
-                    .await
-                    .map_err(|error| test_error(format!("select Daemon Features: {error:?}")))?;
-                term.expect(&format!("▶ {category}"))
-                    .timeout(Duration::from_secs(5))
-                    .await
-                    .map_err(|error| {
-                        test_error(format!("settings category {category:?} missing: {error:?}"))
-                    })?;
-            }
-            term.expect("▶ Daemon Features")
-                .timeout(Duration::from_secs(5))
-                .await
-                .map_err(|error| test_error(format!("Daemon Features missing: {error:?}")))?;
-            term.send_key(Key::Char('l'))
-                .await
-                .map_err(|error| test_error(format!("enter Daemon Features: {error:?}")))?;
+            focus_sandbox_storage_settings(&term).await?;
             term.expect("Sandbox storage")
                 .timeout(Duration::from_secs(5))
                 .await
@@ -1675,24 +1727,7 @@ impl E2eHarness {
                 .await
                 .map_err(|error| test_error(format!("settings did not open: {error:?}")))?;
 
-            for _ in 0..5 {
-                term.send_key(Key::Char('j'))
-                    .await
-                    .map_err(|error| test_error(format!("select Daemon Features: {error:?}")))?;
-            }
-            term.expect("▶ Daemon Features")
-                .timeout(Duration::from_secs(5))
-                .await
-                .map_err(|error| test_error(format!("Daemon Features not selected: {error:?}")))?;
-            term.send_key(Key::Char('l'))
-                .await
-                .map_err(|error| test_error(format!("enter Daemon Features: {error:?}")))?;
-            term.expect("▌ Model control mode")
-                .timeout(Duration::from_secs(5))
-                .await
-                .map_err(|error| {
-                    test_error(format!("Daemon Features items not focused: {error:?}"))
-                })?;
+            focus_sandbox_storage_settings(&term).await?;
 
             // Move to the TTL row and prove the daemon's non-preset value was
             // injected and selected exactly rather than displayed as a preset.
@@ -1717,7 +1752,9 @@ impl E2eHarness {
             term.send_key(Key::Char(' '))
                 .await
                 .map_err(|error| test_error(format!("run preview: {error:?}")))?;
-            term.expect("1 eligible /")
+            // The row value is width-truncated beside the detail pane, so the
+            // exact counts are asserted on the status line the pass emits.
+            term.expect("Preview: 1 eligible of 1 checked")
                 .timeout(Duration::from_secs(5))
                 .await
                 .map_err(|error| {
@@ -1747,26 +1784,7 @@ impl E2eHarness {
                 .timeout(Duration::from_secs(5))
                 .await
                 .map_err(|error| test_error(format!("settings did not reopen: {error:?}")))?;
-            for _ in 0..5 {
-                term.send_key(Key::Char('j'))
-                    .await
-                    .map_err(|error| test_error(format!("reselect Daemon Features: {error:?}")))?;
-            }
-            term.expect("▶ Daemon Features")
-                .timeout(Duration::from_secs(5))
-                .await
-                .map_err(|error| {
-                    test_error(format!("Daemon Features not reselected: {error:?}"))
-                })?;
-            term.send_key(Key::Char('l'))
-                .await
-                .map_err(|error| test_error(format!("reenter Daemon Features: {error:?}")))?;
-            term.expect("▌ Model control mode")
-                .timeout(Duration::from_secs(5))
-                .await
-                .map_err(|error| {
-                    test_error(format!("Daemon Features items not refocused: {error:?}"))
-                })?;
+            focus_sandbox_storage_settings(&term).await?;
             select_settings_row(&term, "Reclaim sandbox caches now", 64).await?;
             term.expect("▌ Reclaim sandbox caches now")
                 .timeout(Duration::from_secs(5))
@@ -1903,8 +1921,12 @@ impl E2eHarness {
                 ) && let Some(root) = &session.sandbox_root
                 {
                     let target = root.join("target");
-                    fs::create_dir(&target)?;
-                    fs::write(target.join("artifact.bin"), vec![0x69_u8; 64 * 1024])?;
+                    // The daemon already holds `target/` for execution scratch.
+                    // Reclaim recognizes only Cargo's own entries at the top
+                    // level (#1429/#1575), so the artifact sits under `debug/`.
+                    let debug = target.join("debug");
+                    fs::create_dir_all(&debug)?;
+                    fs::write(debug.join("artifact.bin"), vec![0x69_u8; 64 * 1024])?;
                     if let Some(minimum_age) = minimum_age {
                         let minimum_age_secs = i64::try_from(minimum_age.as_secs())?;
                         let age_deadline = Instant::now() + minimum_age + Duration::from_secs(2);
@@ -1996,7 +2018,7 @@ impl E2eHarness {
     }
 
     /// Descend Root -> Group -> Epic, open the Task create-entity modal via the
-    /// `gT` chord, fill name + tag, submit, then assert the daemon persisted a
+    /// `<Space>gT` chord, fill name + tag, submit, then assert the daemon persisted a
     /// Task session whose launch fields match the unified builder's output.
     async fn drive_modal_create_scenario(&mut self) -> E2eResult<()> {
         const MODAL_NAME: &str = "PARITYMODALSESSION";
@@ -2028,7 +2050,7 @@ impl E2eHarness {
                 .await
                 .map_err(|e| test_error(format!("no {GROUP_NAME} on root: {e:?}")))?;
 
-            // Descend into the Epic so `gT` creates a Task under it (Task is a
+            // Descend into the Epic so `<Space>gT` creates a Task under it (Task is a
             // legal child of Epic; illegal at root).
             term.enter()
                 .await
@@ -2045,14 +2067,17 @@ impl E2eHarness {
                 .await
                 .map_err(|e| test_error(format!("no Epic screen: {e:?}")))?;
 
-            // `gT` opens the Task create-entity modal under the Epic, focused on
+            // `<Space>gT` opens the Task create-entity modal under the Epic, focused on
             // the Name field already in insert mode.
-            term.send_key(Key::Char('g'))
-                .await
-                .map_err(|e| test_error(format!("press 'g' (gT chord): {e:?}")))?;
-            term.send_key(Key::Char('T'))
-                .await
-                .map_err(|e| test_error(format!("press 'T' (gT chord): {e:?}")))?;
+            for (key, label) in [
+                (Key::Char(' '), "Space"),
+                (Key::Char('g'), "g"),
+                (Key::Char('T'), "T"),
+            ] {
+                term.send_key(key)
+                    .await
+                    .map_err(|e| test_error(format!("press {label} (<Space>gT chord): {e:?}")))?;
+            }
             for ch in MODAL_NAME.chars() {
                 term.send_key(Key::Char(ch))
                     .await
@@ -2291,7 +2316,7 @@ impl E2eHarness {
             format!("stub_bin={}", self.bin_dir.display()),
             format!("rsi_bin={}", self.rsi_bin),
             format!("rsid_bin={}", self.rsid_bin_path.display()),
-            "RSI_DAEMON_SOCKET_PATH=<temp>/home/.rsi/daemon.sock".to_string(),
+            "RSI_DAEMON_SOCKET_PATH=<short-temp>/home/.rsi/daemon.sock".to_string(),
             "RSI_SANDBOX_BASE=<temp>/home/.rsi/sandboxes".to_string(),
             "RSI_TUI_NO_AUTO_START_DAEMON=1".to_string(),
             "RSI_MEMORY_ENABLED=false".to_string(),

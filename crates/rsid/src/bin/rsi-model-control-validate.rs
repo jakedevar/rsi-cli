@@ -1072,6 +1072,26 @@ fn execute(execution: CliExecutionCapability) {
 
         let cases = [
             (
+                "crates/rsid/src/scheduler/wake_when.rs",
+                "let Ok(mut child) = std::process::Command::new(\"git\")",
+                "let Ok(mut child) = std::process::Command::new(\"claude\")",
+            ),
+            (
+                "crates/rsid/src/scheduler/wake_when.rs",
+                "    let deadline = std::time::Instant::now() + timeout;",
+                "    let _extra = std::process::Command::new(\"git\").spawn();\n    let deadline = std::time::Instant::now() + timeout;",
+            ),
+            (
+                "crates/rsid/src/bin/rsi-rolling-land.rs",
+                "let mut command = remote_git_command(repo, &[\"ls-remote\", remote, \"refs/heads/rolling\"]);",
+                "let mut command = TokioCommand::new(\"claude\");",
+            ),
+            (
+                "crates/rsid/src/bin/rsi-rolling-land/test_impact.rs",
+                "let mut child = Command::new(\"git\")",
+                "let mut child = Command::new(\"claude\")",
+            ),
+            (
                 "crates/rsid/src/bin/rsi-rolling-land/canary_runner.rs",
                 "canary::runner_command(&exe, root, wrapper.as_deref())",
                 "std::process::Command::new(\"claude\")",
@@ -1123,6 +1143,56 @@ fn execute(execution: CliExecutionCapability) {
             ),
             (
                 "crates/rsid-store/src/vault/check.rs",
+                "let response = match request.send().await",
+                "let _extra = request.send().await; let response = match request.send().await",
+            ),
+            (
+                "crates/rsid-store/src/bedrock_setup.rs",
+                "\"max_tokens\": 1,",
+                "\"max_tokens\": 2,",
+            ),
+            (
+                "crates/rsid-store/src/bedrock_setup.rs",
+                "\"content\": \"ping\"",
+                "\"content\": \"perform a task\"",
+            ),
+            (
+                "crates/rsid-store/src/bedrock_setup.rs",
+                "\"anthropic_version\": \"bedrock-2023-05-31\"",
+                "\"anthropic_version\": \"uncontrolled-version\"",
+            ),
+            (
+                "crates/rsid-store/src/bedrock_setup.rs",
+                "{base}/model/{}/invoke",
+                "{base}/v1/chat/completions/{}",
+            ),
+            (
+                "crates/rsid-store/src/bedrock_setup.rs",
+                "runtime_invoke_url(region, model, false)",
+                "runtime_invoke_url(region, model, true)",
+            ),
+            (
+                "crates/rsid-store/src/bedrock_setup.rs",
+                "let url = match",
+                "let mut url = match",
+            ),
+            (
+                "crates/rsid-store/src/bedrock_setup.rs",
+                "let request = http",
+                "let mut request = http",
+            ),
+            (
+                "crates/rsid-store/src/bedrock_setup.rs",
+                ".post(url)",
+                ".post(other_url)",
+            ),
+            (
+                "crates/rsid-store/src/bedrock_setup.rs",
+                "request.send().await",
+                "other_request.send().await",
+            ),
+            (
+                "crates/rsid-store/src/bedrock_setup.rs",
                 "let response = match request.send().await",
                 "let _extra = request.send().await; let response = match request.send().await",
             ),

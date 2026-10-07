@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "latest_schema_version": 152,
+  "latest_schema_version": 160,
   "migration_dir": "crates/rsid-store/src/store/migrations",
   "blocks": {
     "0": "sha256:3e79edf6e3b6718c67bf3de92309ddd9cf97c1768cab75922a24d61405589ca5",
@@ -154,9 +154,165 @@
     "149": "sha256:05251bad4b4e1cbffbdeb652b9467d5056f62879121dd45595833860f5d7d30d",
     "150": "sha256:5b05b8b9e214c0c9dd0c5477e1d74b394f7984b931565ee7a4b3eabd6730d90a",
     "151": "sha256:8533597a94e8ca2019abc426c456b8fd8beb100f7e9939ccdc0ba33b3a853b94",
-    "152": "sha256:9de90ca5abca057656111472df96aa4eab7829f3273942c74006696accee3564"
+    "152": "sha256:9de90ca5abca057656111472df96aa4eab7829f3273942c74006696accee3564",
+    "153": "sha256:c18c7667685fe88405b9244bfc5635224ea1d29731d798eb01d022d1be4967ac",
+    "154": "sha256:66b8a410922e6e2f42c4067a6f2dc9635ee364229bfa00131c57a483ca8f9e11",
+    "155": "sha256:645ce3d087ff1a7209367903f6cbee8971730d8fb0564b5e72d4e6943ae1a106",
+    "156": "sha256:637bc55e3f7aef85ccb81ac4dca8bcf8d4370058a82ea4afc384b97a5be4bb7e",
+    "157": "sha256:c655c1a048165f0eaa418e45474c42ecf861c36a6686aadaca1daa287ca6fba7",
+    "158": "sha256:8eec8e486c4bcf784f116969fd4def0dc46050586d19657944f15485c5598b69",
+    "159": "sha256:5316c41780934868371cf06ae058f7d31dc1108dae410cd2161ab65b77b0dd24",
+    "160": "sha256:04743daeea0e55fd52fdc4e4335f0c5a212546a4cb098e8c0698390ee922170c"
   },
   "protected_sections": {
+    "tier-routing-migration": {
+      "path": "crates/rsid-store/src/store/manager_tier_routing.rs",
+      "sha256": "sha256:2579e8de6e721d3f097164d4d908fbd17e3f2740c81ffd2ac9ed5087e72fa02f"
+    },
+    "satellite-inbound-attempts-migration": {
+      "path": "crates/rsid-store/src/store/satellite_inbound_attempts.rs",
+      "sha256": "sha256:6b4194770a4e24141f9d4b0bc9373a9ac609d2e0715b4c8dd37b5ce5d8dd21f6"
+    },
+    "v121-manager-review-catalog": {
+      "path": "crates/rsid-store/src/store/manager_review_v121.rs",
+      "sha256": "sha256:d7bb69aaec7b83ecf0f6b1db7b2efcc475804a8ba47043ef18259c59c4f81770"
+    },
+    "v121-manager-review-migration": {
+      "path": "crates/rsid-store/src/store/manager_review_v121.rs",
+      "sha256": "sha256:794dadedb1a04f96abfc7b976befac969f325dc0a12ead7cabae63195d2d3f14"
+    },
+    "v118-manager-notice-retirement-driver": {
+      "path": "crates/rsid-store/src/store/migrations/v118.rs",
+      "sha256": "sha256:4a8c2083e7162690b1e00bd4599f1fa6337726ecf08fa4d12f06e3f755f9d2eb"
+    },
+    "v157-friction-andon": {
+      "path": "crates/rsid-store/src/store/migrations/v157.rs",
+      "sha256": "sha256:7b6fb7ce78ad7454bd75ace3fe92550e62fb9cadb62ce2ea63cb9a3f29ad92e2"
+    },
+    "issue-events-manager-actor-catalog": {
+      "path": "crates/rsid-store/src/store/issue_events_manager_actor.rs",
+      "sha256": "sha256:47b5f356b5bf6e9e02ac9fb6a582d6cc5a38b1a492052d2c8bec72c674f2460d"
+    },
+    "issue-events-manager-actor-migration": {
+      "path": "crates/rsid-store/src/store/issue_events_manager_actor.rs",
+      "sha256": "sha256:e60968d8e2a4d1ba4b1eb15a1b6480954cdc6c166c73d8504b75c135a80c48fc"
+    },
+    "v131-sandbox-reclaim-journal-driver": {
+      "path": "crates/rsid-store/src/store/migrations/v131.rs",
+      "sha256": "sha256:182b0d35b362d2a88cffb7320ff44f9a001c4256c5df527785f2d9f00337c272"
+    },
+    "v120-source-worktree-session-relevance-function": {
+      "path": "crates/rsid-store/src/store/mod.rs",
+      "sha256": "sha256:29d676f4b5c57d5278b1c0f785d6c8192ee4db6295e63e47a794ddebb7311756"
+    },
+    "v128-watchdog-restart-catalog": {
+      "path": "crates/rsid-store/src/daemon_restart_persistence.rs",
+      "sha256": "sha256:50030bd93f4efd338aa2da2265744599088222da3d416308fe94343b8afb0e05"
+    },
+    "v128-watchdog-restart-migration": {
+      "path": "crates/rsid-store/src/daemon_restart_persistence.rs",
+      "sha256": "sha256:456566954b3d061d8018af0b061a602c03e01004c5efae346f07785938611937"
+    },
+    "manager-nodes-migration": {
+      "path": "crates/rsid-store/src/store/manager_nodes.rs",
+      "sha256": "sha256:6a1c0cf8feddb637e534db500071a6207dc7f24cc48b4a7939bc336054a46ca5"
+    },
+    "manager-nodes-backfill": {
+      "path": "crates/rsid-store/src/store/manager_nodes.rs",
+      "sha256": "sha256:efde34037b40cac12d84ab0a88380c735ef5e8404e6c8d42a7f505f31545a6c5"
+    },
+    "v135-satellite-identity-migration": {
+      "path": "crates/rsid-store/src/store/satellite_identity.rs",
+      "sha256": "sha256:77746df6292eb71e954c2db1e1382085993d8cb1781775988a08c9ca1104ffac"
+    },
+    "v130-agent-child-relaunch-intents": {
+      "path": "crates/rsid-store/src/store/agent_child_relaunch_intents.rs",
+      "sha256": "sha256:6f83c9ba3ad2a79a602637a7204a828fa08756e43ede1dccdcd31c35ef9d7142"
+    },
+    "v158-deploy-interrupt-workers": {
+      "path": "crates/rsid-store/src/store/migrations/v158.rs",
+      "sha256": "sha256:6b056ac74354746830cc7ecf470cdc18cff4c8d6f08e924f5dac75e47d7d4bd6"
+    },
+    "v126-bedrock-provider-driver": {
+      "path": "crates/rsid-store/src/store/migrations/v126.rs",
+      "sha256": "sha256:00afb0ee83b4efae185d01c3b6aef4079eedbc788b960951db02beae98cf2761"
+    },
+    "v94-migration-driver": {
+      "path": "crates/rsid-store/src/store/migrations/v094.rs",
+      "sha256": "sha256:5cb3c1f19ce5fac59a0314f517323521966956fed5a4b81ac031d28453d845a7"
+    },
+    "v101-configured-context-window": {
+      "path": "crates/rsid-store/src/store/migrations/v101.rs",
+      "sha256": "sha256:18511c213d3b3063ff4b33980784999ae6a572cf17f1fe41bc3f1903ec0f0cf8"
+    },
+    "v129-topology-executor-catalog": {
+      "path": "crates/rsid-store/src/store/topology_v129.rs",
+      "sha256": "sha256:c61ae680710250c72ce6ef96285f145561f42ec5803612665000f1b7ed9ebcca"
+    },
+    "v129-topology-executor-migration": {
+      "path": "crates/rsid-store/src/store/topology_v129.rs",
+      "sha256": "sha256:02cd363266395fbf0765fe793b225e740198e2803fcaf1ea874df41483308770"
+    },
+    "v121-manager-review-driver": {
+      "path": "crates/rsid-store/src/store/migrations/v121.rs",
+      "sha256": "sha256:007b9aada7d547d5413e431f1ab00e4da5cf768a58367d97e07016e31701dd54"
+    },
+    "session-tool-policy-migration": {
+      "path": "crates/rsid-store/src/store/session_tool_policy.rs",
+      "sha256": "sha256:a2cc2ba02881443ac932740ab1daef9f075946b0a59d0f9462028e0a64f5e2aa"
+    },
+    "migration-allocation-catalog": {
+      "path": "crates/rsid-store/src/store/migration_allocation.rs",
+      "sha256": "sha256:faf05c4581510bbe6233f4f22e495170f6324000f4e937130e3b7e099719dbe9"
+    },
+    "migration-allocation-migration": {
+      "path": "crates/rsid-store/src/store/migration_allocation.rs",
+      "sha256": "sha256:b4222cff7ee29d52133102f3aba95aaa1d11d38c94205e7e20b3cd6534b5b539"
+    },
+    "v114-lineage-detachment-driver": {
+      "path": "crates/rsid-store/src/store/migrations/v114.rs",
+      "sha256": "sha256:1f06d3020da1b4323db845dfdc230d596ee3475ea72d11224747e0ce3d4d5dfb"
+    },
+    "agent-deploys-operator-migration": {
+      "path": "crates/rsid-store/src/store/agent_deploys_operator.rs",
+      "sha256": "sha256:f2d6eb8185a7998c3468666df9a6be2f902e3a9a0907cfad9154b7bc03ae9e8c"
+    },
+    "v131-sandbox-reclaim-journal-schema": {
+      "path": "crates/rsid-store/src/store/sandbox_reclaim.rs",
+      "sha256": "sha256:d20c37310d52d2363bd71129720495c5f7fde2ee74e9cec74901cec9dc753413"
+    },
+    "satellite-dispatch-migration": {
+      "path": "crates/rsid-store/src/store/satellite_dispatch.rs",
+      "sha256": "sha256:2473c8f884e2d5ab225ebaca6f4593c5f72316957b6cce54900fcc3ae380a189"
+    },
+    "portfolio-node-migration": {
+      "path": "crates/rsid-store/src/store/portfolio_nodes.rs",
+      "sha256": "sha256:62b3b57a1d184e4db27b3a431e9926710682908706bf19f304658fb036cc49bc"
+    },
+    "rolling-queue-migration": {
+      "path": "crates/rsid-store/src/store/rolling_queue.rs",
+      "sha256": "sha256:de169cd6d98293e8fcd6b955062ab438f5a0440f0acb030d54520b11366a3e88"
+    },
+    "v127-session-diagnostics-schema": {
+      "path": "crates/rsid-store/src/store/session_diagnostics.rs",
+      "sha256": "sha256:85835d0375d5ae82b6145f1173bc7a2abd5a873e9381a9634a6787362e653cff"
+    },
+    "v127-session-diagnostics-migration": {
+      "path": "crates/rsid-store/src/store/session_diagnostics.rs",
+      "sha256": "sha256:42adcdc9c389f75c268405b499d98efaca8466c5564dfeae4fe5756a2342bb66"
+    },
+    "v127-session-diagnostics-catalog": {
+      "path": "crates/rsid-store/src/store/session_diagnostics.rs",
+      "sha256": "sha256:2d0d288d6830169d8c061fac425ba4ffbdfa1419707809139abfb2ad89961706"
+    },
+    "v95-migration-driver": {
+      "path": "crates/rsid-store/src/store/migrations/v095.rs",
+      "sha256": "sha256:57ae11c1eb77eab5d3dc5610422cd194da4ff942dc580e8bb40f37676972280c"
+    },
+    "agent-jobs-migration": {
+      "path": "crates/rsid-store/src/store/agent_jobs.rs",
+      "sha256": "sha256:358d46cb7461d01d65ff5a7cba269aea49bcc16aedb3583f1f3fed9feb6941bd"
+    },
     "v112-operator-views-convergence-driver": {
       "path": "crates/rsid-store/src/store/migrations/v112.rs",
       "sha256": "sha256:20898355b85c69fc635573aed110db9345c13517a73fa7166bfc2d9c00eb9cde"
@@ -173,58 +329,6 @@
       "path": "crates/rsid-store/src/store/session_model_updates.rs",
       "sha256": "sha256:33c096f6bc2c9c796f8f5ec2d14e24a4738d26599bc9bfff78321c8cfd3d0f6b"
     },
-    "migration-allocation-catalog": {
-      "path": "crates/rsid-store/src/store/migration_allocation.rs",
-      "sha256": "sha256:faf05c4581510bbe6233f4f22e495170f6324000f4e937130e3b7e099719dbe9"
-    },
-    "migration-allocation-migration": {
-      "path": "crates/rsid-store/src/store/migration_allocation.rs",
-      "sha256": "sha256:b4222cff7ee29d52133102f3aba95aaa1d11d38c94205e7e20b3cd6534b5b539"
-    },
-    "v120-source-worktree-batch-driver": {
-      "path": "crates/rsid-store/src/store/migrations/v120.rs",
-      "sha256": "sha256:4f9e158a151bfa88cd8662d33fd68a9007c22886843583917dbe4760be60778f"
-    },
-    "issue-events-manager-actor-catalog": {
-      "path": "crates/rsid-store/src/store/issue_events_manager_actor.rs",
-      "sha256": "sha256:47b5f356b5bf6e9e02ac9fb6a582d6cc5a38b1a492052d2c8bec72c674f2460d"
-    },
-    "issue-events-manager-actor-migration": {
-      "path": "crates/rsid-store/src/store/issue_events_manager_actor.rs",
-      "sha256": "sha256:e60968d8e2a4d1ba4b1eb15a1b6480954cdc6c166c73d8504b75c135a80c48fc"
-    },
-    "session-tool-policy-migration": {
-      "path": "crates/rsid-store/src/store/session_tool_policy.rs",
-      "sha256": "sha256:a2cc2ba02881443ac932740ab1daef9f075946b0a59d0f9462028e0a64f5e2aa"
-    },
-    "v113-archive-projection-driver": {
-      "path": "crates/rsid-store/src/store/migrations/v113.rs",
-      "sha256": "sha256:e0d5aa2d8487fb5215fe11e0f00fc3cbca7bfa75065f52a1d2b2395063cc857b"
-    },
-    "v101-configured-context-window": {
-      "path": "crates/rsid-store/src/store/migrations/v101.rs",
-      "sha256": "sha256:18511c213d3b3063ff4b33980784999ae6a572cf17f1fe41bc3f1903ec0f0cf8"
-    },
-    "v120-source-worktree-batch-migration": {
-      "path": "crates/rsid-store/src/store/source_worktree_v120.rs",
-      "sha256": "sha256:2f644559ca929ffbbd8179a737d3c4dd315a79a89b9a52df2698b8a9c76fecea"
-    },
-    "v120-source-worktree-batch-catalog": {
-      "path": "crates/rsid-store/src/store/source_worktree_v120.rs",
-      "sha256": "sha256:480b0f8dddef0799feb05d0dd9045c02d21c8dc0beea95184cffb7c9623aad7e"
-    },
-    "v120-source-worktree-session-relevance-helper": {
-      "path": "crates/rsid-store/src/store/source_worktree_v120.rs",
-      "sha256": "sha256:9eea2312fdd650fb23c10c130cbb69c00070c47e3776bb7ab69b834999c32807"
-    },
-    "satellite-dispatch-migration": {
-      "path": "crates/rsid-store/src/store/satellite_dispatch.rs",
-      "sha256": "sha256:2473c8f884e2d5ab225ebaca6f4593c5f72316957b6cce54900fcc3ae380a189"
-    },
-    "v119-target-reclaim-sweep-driver": {
-      "path": "crates/rsid-store/src/store/migrations/v119.rs",
-      "sha256": "sha256:1db74c8bb7d47d76f9f4f10c7fb1795478d271868fb1dde571199ac33c1d8ec6"
-    },
     "v119-target-reclaim-sweep-fingerprints": {
       "path": "crates/rsid-store/src/store/target_reclaim_sweep.rs",
       "sha256": "sha256:dd66f99a4ad29d45cdcde2954e063642e5e0d909d3c161bd117b47604da58fd0"
@@ -237,229 +341,17 @@
       "path": "crates/rsid-store/src/store/target_reclaim_sweep.rs",
       "sha256": "sha256:895318f7f4b7d4e7f430e8bfa60c16d065a4e5f149a69050257d632d68e1623d"
     },
-    "v128-watchdog-restart-catalog": {
-      "path": "crates/rsid-store/src/daemon_restart_persistence.rs",
-      "sha256": "sha256:50030bd93f4efd338aa2da2265744599088222da3d416308fe94343b8afb0e05"
-    },
-    "v128-watchdog-restart-migration": {
-      "path": "crates/rsid-store/src/daemon_restart_persistence.rs",
-      "sha256": "sha256:456566954b3d061d8018af0b061a602c03e01004c5efae346f07785938611937"
-    },
-    "rolling-queue-migration": {
-      "path": "crates/rsid-store/src/store/rolling_queue.rs",
-      "sha256": "sha256:de169cd6d98293e8fcd6b955062ab438f5a0440f0acb030d54520b11366a3e88"
-    },
-    "v118-manager-notice-retirement-driver": {
-      "path": "crates/rsid-store/src/store/migrations/v118.rs",
-      "sha256": "sha256:4a8c2083e7162690b1e00bd4599f1fa6337726ecf08fa4d12f06e3f755f9d2eb"
-    },
-    "satellite-registry-catalog": {
-      "path": "crates/rsid-store/src/store/satellite_registry.rs",
-      "sha256": "sha256:b2ad121fdfa857f16f274ff30233747f2076d7141c798156d7b8221be2acc29c"
-    },
-    "satellite-registry-migration": {
-      "path": "crates/rsid-store/src/store/satellite_registry.rs",
-      "sha256": "sha256:8b26f2a77072daebaaf62084c77dc159e5e2d6dbc5dab5ef9b10aa49e8945e84"
-    },
-    "satellite-registry-validator": {
-      "path": "crates/rsid-store/src/store/satellite_registry.rs",
-      "sha256": "sha256:b7bce47a6e61c001486bf1480e92cbe387b993b9869a6ba85abcc5aac6f98ea7"
-    },
-    "v130-agent-child-relaunch-intents": {
-      "path": "crates/rsid-store/src/store/agent_child_relaunch_intents.rs",
-      "sha256": "sha256:6f83c9ba3ad2a79a602637a7204a828fa08756e43ede1dccdcd31c35ef9d7142"
-    },
-    "v127-session-diagnostics-rewind": {
-      "path": "crates/rsid-store/src/store/tests.rs",
-      "sha256": "sha256:eca45abbd759475bc3533aa624bd2512f4d8f5443f354635df2413d8eedc3708"
-    },
-    "v132-session-model-updates-rewind": {
-      "path": "crates/rsid-store/src/store/tests.rs",
-      "sha256": "sha256:0453c56d9c06caf4db92ee6d2a40998014936954f92eb949db7be85353eb308d"
-    },
-    "v127-session-diagnostics-fixture-assertion": {
-      "path": "crates/rsid-store/src/store/tests.rs",
-      "sha256": "sha256:2003bca96a8093c54f5d5fd82d4a0c34ebfef0325f76ec54cddde0a0d3476453"
-    },
-    "v132-session-model-updates-fixture-assertion": {
-      "path": "crates/rsid-store/src/store/tests.rs",
-      "sha256": "sha256:81a18e225a512de83fa8e8089d997280555ee2773707c411d22b6cd2c2bde557"
-    },
-    "v127-session-diagnostics-replay-assertion": {
-      "path": "crates/rsid-store/src/store/tests.rs",
-      "sha256": "sha256:7b6a8e5004620d1ac1c2ebea16e0d958e12f67a1b1131e3f2440087c03d16250"
-    },
-    "v132-session-model-updates-replay-assertion": {
-      "path": "crates/rsid-store/src/store/tests.rs",
-      "sha256": "sha256:9228fa1ce4c2cfbd3bae32011c304d54f70ca1f41ad23e40315218589672df88"
-    },
-    "v123-watch-repair-catalog": {
-      "path": "crates/rsid-store/src/store/watch_repair_v123.rs",
-      "sha256": "sha256:2135d40684d7d3351ef6a9b0b9ec32cdf54bdadc778fb7d91e480f9b400be919"
-    },
-    "v123-watch-repair-migration": {
-      "path": "crates/rsid-store/src/store/watch_repair_v123.rs",
-      "sha256": "sha256:f26b36c0765f494d0b796a01d6ad699fb160d9b10d85b7bdf7687ae549b4e665"
-    },
-    "v117-manager-notices-driver": {
-      "path": "crates/rsid-store/src/store/migrations/v117.rs",
-      "sha256": "sha256:132848fe4917a26296ce4c20d1d4a3783123a7c25ce0e66469d15382e4c0ff58"
-    },
-    "v115-prepared-actions-catalog": {
-      "path": "crates/rsid-store/src/store/manager_prepared_actions.rs",
-      "sha256": "sha256:1ccdd4aa838ca6f3f12270a4684a90b0f28028a910828448d654ce207b109792"
-    },
-    "v115-prepared-actions-driver": {
-      "path": "crates/rsid-store/src/store/manager_prepared_actions.rs",
-      "sha256": "sha256:36c1567053a2f55e2a53d691b4be7986302e48babd61a744c77c4258be90f8f5"
-    },
-    "v116-prepared-actions-caller-catalog": {
-      "path": "crates/rsid-store/src/store/manager_prepared_actions.rs",
-      "sha256": "sha256:65a7dfd67c62943f21c7abfa894e6f9f63dce5f3c9f54a72a5e8647de4b28417"
-    },
-    "v116-prepared-actions-caller-driver": {
-      "path": "crates/rsid-store/src/store/manager_prepared_actions.rs",
-      "sha256": "sha256:75ae66d7410d76e0e8b7061710c86cbd0a2ac70024c9a2cfd0a77afa12e39448"
-    },
-    "v118-full-catalog-fingerprint": {
-      "path": "crates/rsid-store/src/store/manager_prepared_actions.rs",
-      "sha256": "sha256:b5a1c16bbdaa9471da6611e423f4b837322863d89d1707d06fa9a356979194bf"
-    },
-    "v131-sandbox-reclaim-journal-schema": {
-      "path": "crates/rsid-store/src/store/sandbox_reclaim.rs",
-      "sha256": "sha256:d20c37310d52d2363bd71129720495c5f7fde2ee74e9cec74901cec9dc753413"
-    },
-    "v135-satellite-identity-migration": {
-      "path": "crates/rsid-store/src/store/satellite_identity.rs",
-      "sha256": "sha256:77746df6292eb71e954c2db1e1382085993d8cb1781775988a08c9ca1104ffac"
-    },
-    "v114-lineage-detachment-driver": {
-      "path": "crates/rsid-store/src/store/migrations/v114.rs",
-      "sha256": "sha256:1f06d3020da1b4323db845dfdc230d596ee3475ea72d11224747e0ce3d4d5dfb"
-    },
-    "satellite-inbound-attempts-migration": {
-      "path": "crates/rsid-store/src/store/satellite_inbound_attempts.rs",
-      "sha256": "sha256:6b4194770a4e24141f9d4b0bc9373a9ac609d2e0715b4c8dd37b5ce5d8dd21f6"
-    },
-    "v95-migration-driver": {
-      "path": "crates/rsid-store/src/store/migrations/v095.rs",
-      "sha256": "sha256:57ae11c1eb77eab5d3dc5610422cd194da4ff942dc580e8bb40f37676972280c"
-    },
-    "v133-topology-agent-requests-catalog": {
-      "path": "crates/rsid-store/src/store/topology_agent_audit.rs",
-      "sha256": "sha256:11c5e7f55f7373e3e8ea847f610c75880cd01be2dc605f14da589d1cc4b13e2c"
-    },
-    "v133-topology-agent-requests-migration": {
-      "path": "crates/rsid-store/src/store/topology_agent_audit.rs",
-      "sha256": "sha256:a141cf2ebe7c3383ae226b01df8ae8c08787e2a8074fc90d04b3ac1e85841ee1"
-    },
-    "v134-restart-intent-catalog": {
-      "path": "crates/rsid-store/src/store/restart_intents.rs",
-      "sha256": "sha256:d9c4bc873f80be37de45f3a1bea172c2a9d6004cd56dda804298bde553a416bf"
-    },
-    "v134-restart-intent-migration": {
-      "path": "crates/rsid-store/src/store/restart_intents.rs",
-      "sha256": "sha256:7dd1ec1298060e186f9873ae4f4c419ae46e43cc1fbbb7a9adff2ff6a230a51f"
-    },
-    "v134-restart-intent-validator": {
-      "path": "crates/rsid-store/src/store/restart_intents.rs",
-      "sha256": "sha256:538a56899871af801dded7b47746c1a7f44b2bcce2d23dd1ae8e2b10c335e6db"
-    },
-    "v94-migration-driver": {
-      "path": "crates/rsid-store/src/store/migrations/v094.rs",
-      "sha256": "sha256:5cb3c1f19ce5fac59a0314f517323521966956fed5a4b81ac031d28453d845a7"
-    },
-    "agent-deploys-migration": {
-      "path": "crates/rsid-store/src/store/agent_deploys.rs",
-      "sha256": "sha256:d88ad63a4711484a46d7ae346ffdf55c3489d3497e58a4c90b1e0cbc7751f6e7"
-    },
-    "manager-nodes-migration": {
-      "path": "crates/rsid-store/src/store/manager_nodes.rs",
-      "sha256": "sha256:6a1c0cf8feddb637e534db500071a6207dc7f24cc48b4a7939bc336054a46ca5"
-    },
-    "manager-nodes-backfill": {
-      "path": "crates/rsid-store/src/store/manager_nodes.rs",
-      "sha256": "sha256:efde34037b40cac12d84ab0a88380c735ef5e8404e6c8d42a7f505f31545a6c5"
-    },
-    "session-completion-gates-migration": {
-      "path": "crates/rsid-store/src/store/session_completion_gates.rs",
-      "sha256": "sha256:e8705d316686f2f3076be292d7b9f70b9ea36d78b93b9568e69d2aafd9a51d9b"
-    },
-    "v94-v95-settlement-fingerprints": {
-      "path": "crates/rsid-store/src/store/cohort_settlement.rs",
-      "sha256": "sha256:58551463539a4e7b46cd547e173ff3f620c2e753fa42cfcc885cb5161aa8c39e"
-    },
-    "v94-settlement-projections-and-bridge": {
-      "path": "crates/rsid-store/src/store/cohort_settlement.rs",
-      "sha256": "sha256:f4ee9c4a239a99e870fb8fa63779c08debd6114a6cef122dc56b11d8d6e8ef3e"
-    },
-    "v95-settlement-migration": {
-      "path": "crates/rsid-store/src/store/cohort_settlement.rs",
-      "sha256": "sha256:c07d04e26ac082ad8456d57e3975180e7925ea1810508f3a8197352f4a2e86e8"
-    },
-    "agent-jobs-migration": {
-      "path": "crates/rsid-store/src/store/agent_jobs.rs",
-      "sha256": "sha256:358d46cb7461d01d65ff5a7cba269aea49bcc16aedb3583f1f3fed9feb6941bd"
-    },
-    "v127-session-diagnostics-schema": {
-      "path": "crates/rsid-store/src/store/session_diagnostics.rs",
-      "sha256": "sha256:85835d0375d5ae82b6145f1173bc7a2abd5a873e9381a9634a6787362e653cff"
-    },
-    "v127-session-diagnostics-migration": {
-      "path": "crates/rsid-store/src/store/session_diagnostics.rs",
-      "sha256": "sha256:42adcdc9c389f75c268405b499d98efaca8466c5564dfeae4fe5756a2342bb66"
-    },
-    "v127-session-diagnostics-catalog": {
-      "path": "crates/rsid-store/src/store/session_diagnostics.rs",
-      "sha256": "sha256:2d0d288d6830169d8c061fac425ba4ffbdfa1419707809139abfb2ad89961706"
-    },
-    "v131-sandbox-reclaim-journal-driver": {
-      "path": "crates/rsid-store/src/store/migrations/v131.rs",
-      "sha256": "sha256:182b0d35b362d2a88cffb7320ff44f9a001c4256c5df527785f2d9f00337c272"
-    },
-    "v121-manager-review-catalog": {
-      "path": "crates/rsid-store/src/store/manager_review_v121.rs",
-      "sha256": "sha256:d7bb69aaec7b83ecf0f6b1db7b2efcc475804a8ba47043ef18259c59c4f81770"
-    },
-    "v121-manager-review-migration": {
-      "path": "crates/rsid-store/src/store/manager_review_v121.rs",
-      "sha256": "sha256:794dadedb1a04f96abfc7b976befac969f325dc0a12ead7cabae63195d2d3f14"
-    },
-    "v120-source-worktree-session-relevance-function": {
-      "path": "crates/rsid-store/src/store/mod.rs",
-      "sha256": "sha256:29d676f4b5c57d5278b1c0f785d6c8192ee4db6295e63e47a794ddebb7311756"
-    },
-    "manager-v2-live-bookkeeping-index-migration": {
-      "path": "crates/rsid-store/src/store/harness_manager_v2.rs",
-      "sha256": "sha256:e8ccf3c69ed8c7d1d7b27e42f6d4fa9f23d45ab15f496805e1f5c3c3d1392615"
-    },
-    "v129-topology-executor-catalog": {
-      "path": "crates/rsid-store/src/store/topology_v129.rs",
-      "sha256": "sha256:c61ae680710250c72ce6ef96285f145561f42ec5803612665000f1b7ed9ebcca"
-    },
-    "v129-topology-executor-migration": {
-      "path": "crates/rsid-store/src/store/topology_v129.rs",
-      "sha256": "sha256:02cd363266395fbf0765fe793b225e740198e2803fcaf1ea874df41483308770"
-    },
     "v100-context-window-provenance": {
       "path": "crates/rsid-store/src/store/migrations/v100.rs",
       "sha256": "sha256:659d473126e9cf516d6272f89b77c413511cd17ffdb5f829dcc1d596d248f474"
     },
-    "v126-bedrock-provider-driver": {
-      "path": "crates/rsid-store/src/store/migrations/v126.rs",
-      "sha256": "sha256:00afb0ee83b4efae185d01c3b6aef4079eedbc788b960951db02beae98cf2761"
-    },
-    "agent-deploys-operator-migration": {
-      "path": "crates/rsid-store/src/store/agent_deploys_operator.rs",
-      "sha256": "sha256:f2d6eb8185a7998c3468666df9a6be2f902e3a9a0907cfad9154b7bc03ae9e8c"
-    },
-    "global-manager-migration": {
-      "path": "crates/rsid-store/src/store/global_manager.rs",
-      "sha256": "sha256:53bd33e554f5e5329f2363fad448d05b4f40801d80e50b79b5f80318043495fb"
-    },
     "v122-manager-work-facts-migration": {
       "path": "crates/rsid-store/src/store/manager_ledger/facts.rs",
       "sha256": "sha256:881e6cb27cf22505fca60d9d8e932de74589d9cc98d076d18c72674f7e372528"
+    },
+    "v113-archive-projection-driver": {
+      "path": "crates/rsid-store/src/store/migrations/v113.rs",
+      "sha256": "sha256:e0d5aa2d8487fb5215fe11e0f00fc3cbca7bfa75065f52a1d2b2395063cc857b"
     },
     "v112-archive-cleanup-catalog": {
       "path": "crates/rsid-store/src/store/migrations/support.rs",
@@ -485,9 +377,149 @@
       "path": "crates/rsid-store/src/store/migrations/support.rs",
       "sha256": "sha256:907bc83d2c9efe15378afc1a77332b38f619fb7a45e0116813d53c9aee023d16"
     },
-    "v121-manager-review-driver": {
-      "path": "crates/rsid-store/src/store/migrations/v121.rs",
-      "sha256": "sha256:007b9aada7d547d5413e431f1ab00e4da5cf768a58367d97e07016e31701dd54"
+    "v115-prepared-actions-catalog": {
+      "path": "crates/rsid-store/src/store/manager_prepared_actions.rs",
+      "sha256": "sha256:1ccdd4aa838ca6f3f12270a4684a90b0f28028a910828448d654ce207b109792"
+    },
+    "v115-prepared-actions-driver": {
+      "path": "crates/rsid-store/src/store/manager_prepared_actions.rs",
+      "sha256": "sha256:36c1567053a2f55e2a53d691b4be7986302e48babd61a744c77c4258be90f8f5"
+    },
+    "v116-prepared-actions-caller-catalog": {
+      "path": "crates/rsid-store/src/store/manager_prepared_actions.rs",
+      "sha256": "sha256:65a7dfd67c62943f21c7abfa894e6f9f63dce5f3c9f54a72a5e8647de4b28417"
+    },
+    "v116-prepared-actions-caller-driver": {
+      "path": "crates/rsid-store/src/store/manager_prepared_actions.rs",
+      "sha256": "sha256:75ae66d7410d76e0e8b7061710c86cbd0a2ac70024c9a2cfd0a77afa12e39448"
+    },
+    "v118-full-catalog-fingerprint": {
+      "path": "crates/rsid-store/src/store/manager_prepared_actions.rs",
+      "sha256": "sha256:b5a1c16bbdaa9471da6611e423f4b837322863d89d1707d06fa9a356979194bf"
+    },
+    "v119-target-reclaim-sweep-driver": {
+      "path": "crates/rsid-store/src/store/migrations/v119.rs",
+      "sha256": "sha256:1db74c8bb7d47d76f9f4f10c7fb1795478d271868fb1dde571199ac33c1d8ec6"
+    },
+    "v156-portfolio-appointments": {
+      "path": "crates/rsid-store/src/store/migrations/v156.rs",
+      "sha256": "sha256:b3bd465795728e151822a18750208612c96528981f67e37c52710dd116ede472"
+    },
+    "v159-agent-jobs-queued": {
+      "path": "crates/rsid-store/src/store/migrations/v159.rs",
+      "sha256": "sha256:4c7d5c013255ccf5af29e29cba537e5564ffa6258078732ece750513d0722f2f"
+    },
+    "session-completion-gates-migration": {
+      "path": "crates/rsid-store/src/store/session_completion_gates.rs",
+      "sha256": "sha256:e8705d316686f2f3076be292d7b9f70b9ea36d78b93b9568e69d2aafd9a51d9b"
+    },
+    "agent-deploys-migration": {
+      "path": "crates/rsid-store/src/store/agent_deploys.rs",
+      "sha256": "sha256:d88ad63a4711484a46d7ae346ffdf55c3489d3497e58a4c90b1e0cbc7751f6e7"
+    },
+    "v134-restart-intent-catalog": {
+      "path": "crates/rsid-store/src/store/restart_intents.rs",
+      "sha256": "sha256:d9c4bc873f80be37de45f3a1bea172c2a9d6004cd56dda804298bde553a416bf"
+    },
+    "v134-restart-intent-migration": {
+      "path": "crates/rsid-store/src/store/restart_intents.rs",
+      "sha256": "sha256:7dd1ec1298060e186f9873ae4f4c419ae46e43cc1fbbb7a9adff2ff6a230a51f"
+    },
+    "v134-restart-intent-validator": {
+      "path": "crates/rsid-store/src/store/restart_intents.rs",
+      "sha256": "sha256:538a56899871af801dded7b47746c1a7f44b2bcce2d23dd1ae8e2b10c335e6db"
+    },
+    "v133-topology-agent-requests-catalog": {
+      "path": "crates/rsid-store/src/store/topology_agent_audit.rs",
+      "sha256": "sha256:11c5e7f55f7373e3e8ea847f610c75880cd01be2dc605f14da589d1cc4b13e2c"
+    },
+    "v133-topology-agent-requests-migration": {
+      "path": "crates/rsid-store/src/store/topology_agent_audit.rs",
+      "sha256": "sha256:a141cf2ebe7c3383ae226b01df8ae8c08787e2a8074fc90d04b3ac1e85841ee1"
+    },
+    "v120-source-worktree-batch-driver": {
+      "path": "crates/rsid-store/src/store/migrations/v120.rs",
+      "sha256": "sha256:4f9e158a151bfa88cd8662d33fd68a9007c22886843583917dbe4760be60778f"
+    },
+    "v123-watch-repair-catalog": {
+      "path": "crates/rsid-store/src/store/watch_repair_v123.rs",
+      "sha256": "sha256:2135d40684d7d3351ef6a9b0b9ec32cdf54bdadc778fb7d91e480f9b400be919"
+    },
+    "v123-watch-repair-migration": {
+      "path": "crates/rsid-store/src/store/watch_repair_v123.rs",
+      "sha256": "sha256:f26b36c0765f494d0b796a01d6ad699fb160d9b10d85b7bdf7687ae549b4e665"
+    },
+    "manager-v2-live-bookkeeping-index-migration": {
+      "path": "crates/rsid-store/src/store/harness_manager_v2.rs",
+      "sha256": "sha256:e8ccf3c69ed8c7d1d7b27e42f6d4fa9f23d45ab15f496805e1f5c3c3d1392615"
+    },
+    "satellite-registry-catalog": {
+      "path": "crates/rsid-store/src/store/satellite_registry.rs",
+      "sha256": "sha256:b2ad121fdfa857f16f274ff30233747f2076d7141c798156d7b8221be2acc29c"
+    },
+    "satellite-registry-migration": {
+      "path": "crates/rsid-store/src/store/satellite_registry.rs",
+      "sha256": "sha256:8b26f2a77072daebaaf62084c77dc159e5e2d6dbc5dab5ef9b10aa49e8945e84"
+    },
+    "satellite-registry-validator": {
+      "path": "crates/rsid-store/src/store/satellite_registry.rs",
+      "sha256": "sha256:b7bce47a6e61c001486bf1480e92cbe387b993b9869a6ba85abcc5aac6f98ea7"
+    },
+    "v127-session-diagnostics-rewind": {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "sha256": "sha256:eca45abbd759475bc3533aa624bd2512f4d8f5443f354635df2413d8eedc3708"
+    },
+    "v132-session-model-updates-rewind": {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "sha256": "sha256:0453c56d9c06caf4db92ee6d2a40998014936954f92eb949db7be85353eb308d"
+    },
+    "v127-session-diagnostics-fixture-assertion": {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "sha256": "sha256:2003bca96a8093c54f5d5fd82d4a0c34ebfef0325f76ec54cddde0a0d3476453"
+    },
+    "v132-session-model-updates-fixture-assertion": {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "sha256": "sha256:81a18e225a512de83fa8e8089d997280555ee2773707c411d22b6cd2c2bde557"
+    },
+    "v127-session-diagnostics-replay-assertion": {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "sha256": "sha256:7b6a8e5004620d1ac1c2ebea16e0d958e12f67a1b1131e3f2440087c03d16250"
+    },
+    "v132-session-model-updates-replay-assertion": {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "sha256": "sha256:9228fa1ce4c2cfbd3bae32011c304d54f70ca1f41ad23e40315218589672df88"
+    },
+    "v94-v95-settlement-fingerprints": {
+      "path": "crates/rsid-store/src/store/cohort_settlement.rs",
+      "sha256": "sha256:58551463539a4e7b46cd547e173ff3f620c2e753fa42cfcc885cb5161aa8c39e"
+    },
+    "v94-settlement-projections-and-bridge": {
+      "path": "crates/rsid-store/src/store/cohort_settlement.rs",
+      "sha256": "sha256:f4ee9c4a239a99e870fb8fa63779c08debd6114a6cef122dc56b11d8d6e8ef3e"
+    },
+    "v95-settlement-migration": {
+      "path": "crates/rsid-store/src/store/cohort_settlement.rs",
+      "sha256": "sha256:c07d04e26ac082ad8456d57e3975180e7925ea1810508f3a8197352f4a2e86e8"
+    },
+    "v120-source-worktree-batch-migration": {
+      "path": "crates/rsid-store/src/store/source_worktree_v120.rs",
+      "sha256": "sha256:2f644559ca929ffbbd8179a737d3c4dd315a79a89b9a52df2698b8a9c76fecea"
+    },
+    "v120-source-worktree-batch-catalog": {
+      "path": "crates/rsid-store/src/store/source_worktree_v120.rs",
+      "sha256": "sha256:480b0f8dddef0799feb05d0dd9045c02d21c8dc0beea95184cffb7c9623aad7e"
+    },
+    "v120-source-worktree-session-relevance-helper": {
+      "path": "crates/rsid-store/src/store/source_worktree_v120.rs",
+      "sha256": "sha256:9eea2312fdd650fb23c10c130cbb69c00070c47e3776bb7ab69b834999c32807"
+    },
+    "v117-manager-notices-driver": {
+      "path": "crates/rsid-store/src/store/migrations/v117.rs",
+      "sha256": "sha256:132848fe4917a26296ce4c20d1d4a3783123a7c25ce0e66469d15382e4c0ff58"
+    },
+    "global-manager-migration": {
+      "path": "crates/rsid-store/src/store/global_manager.rs",
+      "sha256": "sha256:53bd33e554f5e5329f2363fad448d05b4f40801d80e50b79b5f80318043495fb"
     }
   }
 }

@@ -87,6 +87,11 @@ impl PruneReport {
 
 /// The shared cargo target: `RSI_SHARED_TARGET_DIR`, then `CARGO_TARGET_DIR`,
 /// then `~/.cargo/shared-target`. `None` when none can be resolved.
+///
+/// Test builds never resolve the host's real cache: a test that exercises the
+/// pressure passes installs a temp directory with
+/// [`set_shared_target_dir_for_test`]; otherwise there is no shared target.
+#[cfg(not(any(test, feature = "test-seam")))]
 pub fn shared_target_dir() -> Option<PathBuf> {
     for key in ["RSI_SHARED_TARGET_DIR", "CARGO_TARGET_DIR"] {
         if let Some(dir) = std::env::var_os(key).filter(|value| !value.is_empty()) {
@@ -98,8 +103,26 @@ pub fn shared_target_dir() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".cargo/shared-target"))
 }
 
+#[cfg(any(test, feature = "test-seam"))]
+static TEST_SHARED_TARGET_DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(any(test, feature = "test-seam"))]
+pub fn set_shared_target_dir_for_test(dir: Option<PathBuf>) {
+    *TEST_SHARED_TARGET_DIR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = dir;
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+pub fn shared_target_dir() -> Option<PathBuf> {
+    TEST_SHARED_TARGET_DIR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 /// Non-blocking exclusive flock; the lock is released when the file drops.
-fn try_lock_exclusive(file: &File) -> io::Result<bool> {
+pub(crate) fn try_lock_exclusive(file: &File) -> io::Result<bool> {
     // SAFETY: flock on a descriptor owned by `file` for the whole call.
     let rc = unsafe { nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB) };
     if rc == 0 {

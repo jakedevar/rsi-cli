@@ -114,11 +114,11 @@ impl PromptSlot {
 /// Matches the purposes the Ctrl+E / Ctrl+B / Ctrl+M controls apply to.
 #[must_use]
 pub const fn has_settings_side(purpose: &PromptPurpose) -> bool {
-    matches!(purpose, PromptPurpose::Blank | PromptPurpose::TaskRabbit)
+    matches!(purpose, PromptPurpose::Blank)
 }
 
-/// Whether a prompt may appoint its session as manager. `TaskRabbit`
-/// sessions are one-shot tasks and never become a project's manager.
+/// Whether a prompt may appoint its session as manager. Only Blank
+/// prompts offer it.
 #[must_use]
 pub const fn offers_manager(purpose: &PromptPurpose) -> bool {
     matches!(purpose, PromptPurpose::Blank)

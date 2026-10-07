@@ -9,6 +9,7 @@
 //! - `overlay`    — overlay open/close, model/theme/project pickers
 //! - `window`     — tabs, splits, input bar, settings, quit
 
+pub(crate) mod aws_setup;
 mod cohort_settlement;
 pub(crate) mod daemon_config;
 pub(crate) mod mcp_servers;
@@ -98,9 +99,7 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
     }
     match action {
         // Session lifecycle: launch, interact, manage, docregblock exec, yank
-        LcAction::TaskRabbitPrompt
-        | LcAction::LaunchTaskRabbit(_)
-        | LcAction::BlankPrompt
+        LcAction::BlankPrompt
         | LcAction::LaunchBlank(_)
         | LcAction::InterruptSession
         | LcAction::HardInterruptSession
@@ -118,6 +117,7 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         | LcAction::CancelRetry
         | LcAction::ReassignSessionProject
         | LcAction::RotateSession
+        | LcAction::AbandonRotation(_)
         | LcAction::CommitAndPush
         | LcAction::ExecuteDocRegBlocks
         | LcAction::YankEventContent
@@ -221,7 +221,6 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         | LcAction::OpenSortPicker
         | LcAction::GoToArchiveZone
         | LcAction::GoToSessionsZone
-        | LcAction::GoToTaskRabbitZone
         | LcAction::GoToJobsZone
         | LcAction::OpenDiagnostics
         | LcAction::OpenRecursiveDagBrowser
@@ -245,6 +244,7 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         | LcAction::OpenTelescope
         | LcAction::OpenCommandPalette
         | LcAction::ToggleGitPanel
+        | LcAction::OpenBtop
         | LcAction::OpenGraphReview
         | LcAction::ResolveTopologyAttempt(_)
         | LcAction::GoToTrash
@@ -256,10 +256,10 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         | LcAction::OpenDialectic
         | LcAction::AskQuery(_)
         | LcAction::OpenScheduleBrowser
-        | LcAction::OpenColorCustomizer
         | LcAction::ToggleTerminal
         | LcAction::OpenRatingOverlay
         | LcAction::OpenSessionInfoPanel
+        | LcAction::OpenModelSwitchPicker
         | LcAction::RateSession(_)
         // Phase 4 hierarchy reassignment chords
         | LcAction::MoveToParent
@@ -288,12 +288,29 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         }
         LcAction::ManagerNodeCommand(command) => {
             crate::overlay::harness_manager::dispatch_node_command(app, &command).await;
+            crate::overlay::global_manager_workspace::refresh_if_open(app).await;
         }
         LcAction::ManagerGlobalCommand(command) => {
             crate::overlay::global_manager_command::dispatch_global_command(app, &command).await;
+            crate::overlay::global_manager_workspace::refresh_if_open(app).await;
+        }
+        LcAction::ManagerFrictionCommand(command) => {
+            crate::overlay::friction_command::dispatch_friction_command(app, &command).await;
+        }
+        LcAction::ManagerEscalationsCommand(command) => {
+            crate::overlay::escalations_command::dispatch_escalations_command(app, &command).await;
+        }
+        LcAction::ManagerPortfolioCommand(command) => {
+            crate::overlay::portfolio_command::dispatch_portfolio_command(app, &command).await;
+            crate::overlay::global_manager_workspace::refresh_if_open(app).await;
         }
         LcAction::OperatorRestartCommand(command) => {
             crate::overlay::operator_restart_command::dispatch(app, &command).await;
+            crate::overlay::global_manager_workspace::refresh_if_open(app).await;
+        }
+        LcAction::OpenFleet => crate::overlay::fleet::open(app).await,
+        LcAction::OpenGlobalManagerWorkspace => {
+            crate::overlay::global_manager_workspace::open(app).await;
         }
 
         // Window/layout: tabs, splits, input bar, settings, quit
@@ -446,18 +463,12 @@ pub(crate) async fn dispatch_registered_action(
                 crate::overlay::open_theme_picker(app);
             }
         }
-        ActionId::OpenLegacyColors if context.surface == ActionSurface::SessionList => {
-            if matches!(
-                &app.overlay,
-                crate::types::OverlayState::ColorCustomizer { .. }
-            ) {
-                app.overlay = crate::types::OverlayState::None;
-            } else {
-                crate::overlay::open_color_customizer(app);
-            }
-        }
         ActionId::OpenIssuesWorkspace if context.surface == ActionSurface::SessionList => {
             app.open_or_focus_issues();
+        }
+        ActionId::Fleet => crate::overlay::fleet::open(app).await,
+        ActionId::GlobalManagerWorkspace => {
+            crate::overlay::global_manager_workspace::open(app).await;
         }
         ActionId::ManagerPolicy
         | ActionId::ManagerBoard
@@ -838,9 +849,21 @@ pub async fn dispatch_catalog_command(app: &mut App, command: &str) {
             return;
         }
     }
+    if let Some(args) = command.trim().strip_prefix("worker-context-cap") {
+        if args.is_empty() || args.starts_with(char::is_whitespace) {
+            daemon_config::set_worker_context_cap(app, args).await;
+            return;
+        }
+    }
     if let Some(args) = command.trim().strip_prefix("context-cap") {
         if args.is_empty() || args.starts_with(char::is_whitespace) {
             daemon_config::set_coordinator_context_cap(app, args).await;
+            return;
+        }
+    }
+    if let Some(args) = command.trim().strip_prefix("aws-setup") {
+        if args.is_empty() || args.starts_with(char::is_whitespace) {
+            aws_setup::aws_setup(app, args).await;
             return;
         }
     }
@@ -917,6 +940,28 @@ mod tests {
         assert!(app.quit);
     }
 
+    /// `<Space>bb` needs no focused session: it requests a btop spawn when
+    /// btop is on PATH and otherwise says it is not installed.
+    #[tokio::test]
+    async fn open_btop_requests_spawn_only_when_installed() {
+        let mut app = test_app();
+        dispatch_action(&mut app, Action::Application(LcAction::OpenBtop)).await;
+        if which::which("btop").is_ok() {
+            assert_eq!(
+                app.pending_external,
+                Some(crate::app::ExternalRequest::Btop)
+            );
+        } else {
+            assert_eq!(app.pending_external, None);
+            assert!(
+                app.notifications
+                    .iter()
+                    .any(|n| n.message == "btop is not installed"),
+                "missing not-installed notice"
+            );
+        }
+    }
+
     /// A live-discovered Claude model (absent from the static fallback) stays
     /// selectable: picking a Claude model while already on Claude keeps the
     /// discovered list, and switching in from another provider shows the
@@ -956,6 +1001,47 @@ mod tests {
             crate::app::models_for_provider(SessionProvider::Claude)
         );
         assert!(app.needs_model_refresh);
+    }
+
+    /// `:model <name>` moves the launch default: it is saved at once and a
+    /// toast names the new default. Re-selecting the current default is quiet.
+    #[tokio::test]
+    async fn select_model_command_saves_and_announces_a_new_default() {
+        use rsi_common::types::SessionProvider;
+        let mut app = test_app();
+        app.selected_provider = SessionProvider::Claude;
+        app.custom_provider_index = None;
+        app.selected_model = Some("claude-opus-5-5".to_string());
+
+        dispatch_lc_action(
+            &mut app,
+            LcAction::SelectModel(Some("claude-sonnet-5".to_string())),
+        )
+        .await;
+        assert!(
+            app.notifications
+                .iter()
+                .any(|notification| notification.message.starts_with("Default model ✻ sonnet-5")),
+            "{:?}",
+            app.notifications
+                .iter()
+                .map(|notification| notification.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            crate::state::PersistedState::load()
+                .selected_model
+                .as_deref(),
+            Some("claude-sonnet-5")
+        );
+
+        let toasts = app.notifications.len();
+        dispatch_lc_action(
+            &mut app,
+            LcAction::SelectModel(Some("claude-sonnet-5".to_string())),
+        )
+        .await;
+        assert_eq!(app.notifications.len(), toasts);
     }
 
     #[tokio::test]
@@ -1708,9 +1794,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dispatch_command_task() {
+    async fn test_dispatch_command_blank_opens_prompt() {
         let mut app = test_app();
-        dispatch_command(&mut app, "task").await;
+        dispatch_command(&mut app, "blank").await;
         assert!(matches!(
             app.focused_input_overlay(),
             Some(crate::types::OverlayState::Prompt { .. })
@@ -1871,7 +1957,6 @@ mod tests {
                 selected_session: Some(id),
                 scroll_offset: 0,
                 active_zone: Default::default(),
-                taskrabbit_selected_index: 0,
                 archive_selected_index: 0,
                 jobs_selected_index: 0,
             };
@@ -1900,7 +1985,6 @@ mod tests {
                 selected_session: Some(id),
                 scroll_offset: 0,
                 active_zone: Default::default(),
-                taskrabbit_selected_index: 0,
                 archive_selected_index: 0,
                 jobs_selected_index: 0,
             };

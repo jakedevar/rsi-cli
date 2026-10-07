@@ -108,6 +108,7 @@ fn replace(p: &Pilot, expected: ManagerLeadFenceV2) -> ManagerActionV2 {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 fn prepared_replace(p: &Pilot) -> AgentManagerPrepareControlRequestV2 {
     AgentManagerPrepareControlRequestV2 {
+        project_id: None,
         operation: PreparedManagerActionV2::ReplaceLead {
             epic_id: p.epic,
             query: "take the Epic on the new provider".into(),

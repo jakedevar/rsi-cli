@@ -8,13 +8,62 @@
 
 use super::agent_verbs::AgentControlHandle;
 use crate::error::{DaemonError, Result};
+use crate::store::Store;
 use crate::store::rolling_queue::NewQueueEntry;
 use rsi_common::rolling_queue::{
     AgentEnqueueLandingSourceReceiptV1, AgentEnqueueLandingSourceRequestV1, QUEUE_DISABLED,
     QUEUE_FILTER_MATCHES_NO_TESTS, QUEUE_NOT_AUTHORIZED, QUEUE_SOURCE_INVALID, RollingQueueBinding,
 };
+use rsi_common::types::Session;
 use std::path::PathBuf;
 use uuid::Uuid;
+
+/// The admission shared by the first resolution and the effect-time recheck:
+/// the session whose sandbox is queued, whether the caller is its Epic lead,
+/// and the authority fence.
+fn admit(
+    store: &Store,
+    caller: Uuid,
+    request: &AgentEnqueueLandingSourceRequestV1,
+) -> Result<(Session, bool, String)> {
+    let (session, is_lead) = match request.source_session_id {
+        // #1235: land from an in-reach session's sandbox.
+        Some(source) => (
+            super::agent_jobs_verb::manager_reached_sandbox(
+                store,
+                caller,
+                source,
+                request.project_id,
+                QUEUE_NOT_AUTHORIZED,
+            )?,
+            false,
+        ),
+        None => {
+            let projection = store
+                .agent_authority_projection(caller)
+                .map_err(|_| DaemonError::PolicyDenied(QUEUE_NOT_AUTHORIZED.into()))?;
+            if !(projection.is_lead || projection.is_manager) {
+                return Err(DaemonError::PolicyDenied(QUEUE_NOT_AUTHORIZED.into()));
+            }
+            let session = store
+                .get_session(caller)?
+                .ok_or_else(|| DaemonError::PolicyDenied(QUEUE_NOT_AUTHORIZED.into()))?;
+            if request
+                .project_id
+                .is_some_and(|project| session.project_id != Some(project))
+            {
+                return Err(DaemonError::InvalidParam(
+                    rsi_common::global_manager::MANAGER_PROJECT_NOT_IN_SCOPE.into(),
+                ));
+            }
+            (session, projection.is_lead)
+        }
+    };
+    let fence = store
+        .agent_authority_fence(caller, request.source_session_id)
+        .map_err(|_| DaemonError::PolicyDenied(QUEUE_NOT_AUTHORIZED.into()))?;
+    Ok((session, is_lead, fence))
+}
 
 impl AgentControlHandle {
     /// # Errors
@@ -28,18 +77,9 @@ impl AgentControlHandle {
         request
             .validate()
             .map_err(|code| DaemonError::InvalidParam(code.into()))?;
-        let (session, is_lead) = {
+        let (session, is_lead, fence) = {
             let store = self.store.lock().await;
-            let projection = store
-                .agent_authority_projection(caller)
-                .map_err(|_| DaemonError::PolicyDenied(QUEUE_NOT_AUTHORIZED.into()))?;
-            if !(projection.is_lead || projection.is_manager) {
-                return Err(DaemonError::PolicyDenied(QUEUE_NOT_AUTHORIZED.into()));
-            }
-            let session = store
-                .get_session(caller)?
-                .ok_or_else(|| DaemonError::PolicyDenied(QUEUE_NOT_AUTHORIZED.into()))?;
-            (session, projection.is_lead)
+            admit(&store, caller, &request)?
         };
         if !queue_enabled {
             return Err(DaemonError::InvalidParam(QUEUE_DISABLED.into()));
@@ -67,6 +107,21 @@ impl AgentControlHandle {
                 "{QUEUE_FILTER_MATCHES_NO_TESTS}: {filter}"
             )));
         }
+        #[cfg(test)]
+        super::effect_fence::seam::run(&self.store, caller, "enqueue").await;
+        // #1277: the lock was released for the Git probe. Re-resolve the same
+        // admission under the lock that stays held through the insert and
+        // refuse if caller, grant, project, reach or custody changed.
+        let store = self.store.lock().await;
+        let (current, _, current_fence) = admit(&store, caller, &request)?;
+        super::effect_fence::require_unchanged(&fence, &current_fence, QUEUE_NOT_AUTHORIZED)?;
+        let current_repo = current
+            .sandbox_root
+            .clone()
+            .unwrap_or_else(|| current.working_dir.clone());
+        if current_repo != repo {
+            return Err(DaemonError::PolicyDenied(QUEUE_NOT_AUTHORIZED.into()));
+        }
         let new = NewQueueEntry {
             project_id: session.project_id,
             repo_path: repo.display().to_string(),
@@ -80,11 +135,7 @@ impl AgentControlHandle {
             test_filters: request.test_filters,
             idempotency_key: request.idempotency_key,
         };
-        let (entry, replayed) = self
-            .store
-            .lock()
-            .await
-            .enqueue_rolling_queue_source(&new, chrono::Utc::now())?;
+        let (entry, replayed) = store.enqueue_rolling_queue_source(&new, chrono::Utc::now())?;
         Ok(AgentEnqueueLandingSourceReceiptV1 { entry, replayed })
     }
 }

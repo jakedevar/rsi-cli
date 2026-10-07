@@ -214,6 +214,23 @@ pub fn agent_issue_invalid_request(
     agent_issue_error_from_envelope(envelope)
 }
 
+/// #1545: the bound-worker refusal for a request that carries more than a body
+/// append. `field` names the first disallowed request field when there is one.
+pub fn agent_issue_bound_field_not_allowed(
+    field: Option<rsi_common::rpc::AgentIssueValidationFieldV1>,
+) -> DaemonError {
+    let mut envelope = agent_issue_error_envelope(
+        rsi_common::rpc::AgentIssueErrorCodeV1::BoundIssueFieldNotAllowed,
+        None,
+        None,
+    );
+    envelope.validation = Some(rsi_common::rpc::AgentIssueValidationV1 {
+        class: rsi_common::rpc::AgentIssueValidationClassV1::InvalidField,
+        field,
+    });
+    agent_issue_error_from_envelope(envelope)
+}
+
 fn agent_issue_error_from_envelope(envelope: rsi_common::rpc::AgentIssueErrorV1) -> DaemonError {
     DaemonError::StructuredRpc {
         rpc_code: -32602,
@@ -232,7 +249,7 @@ pub fn agent_issue_error_envelope(
     let next_action = match code {
         AgentIssueErrorCodeV1::InvalidRequest => "correct the request fields and retry",
         AgentIssueErrorCodeV1::AuthorityDenied => {
-            "use the current lead of the Issue project's owning Epic"
+            "use the current lead of the Issue project's owning Epic; a worker launched for an Issue may only append to that Issue's body while its binding is live"
         }
         AgentIssueErrorCodeV1::NotFoundInScope => {
             "verify the Issue id from the current owning Epic project"
@@ -248,6 +265,21 @@ pub fn agent_issue_error_envelope(
         AgentIssueErrorCodeV1::Archived => "restore the Issue before updating it",
         AgentIssueErrorCodeV1::NotArchived => "archive the terminal Issue before restoring it",
         AgentIssueErrorCodeV1::StorageFailure => "retry later; the Issue mutation did not commit",
+        AgentIssueErrorCodeV1::ManagerProjectNotInScope => {
+            "name a project in your global grant, or omit project_id for your own project"
+        }
+        AgentIssueErrorCodeV1::BoundIssueBindingNotLive => {
+            "your Issue binding ended or was superseded by a later launch of the Issue; report through your parent instead of updating the Issue"
+        }
+        AgentIssueErrorCodeV1::BoundIssueWrongIssue => {
+            "a bound worker may update only the Issue it was launched for; omit project_id or name that Issue"
+        }
+        AgentIssueErrorCodeV1::BoundIssueFieldNotAllowed => {
+            "send only body, expected_row_version and idempotency_key; omit title, labels, priority and assignee"
+        }
+        AgentIssueErrorCodeV1::BoundIssueNotAppendOnly => {
+            "re-read the Issue with AgentGetIssue and send its current body byte for byte followed by your appended text"
+        }
     };
     AgentIssueErrorV1 {
         code,
@@ -277,6 +309,11 @@ pub fn normalize_agent_issue_error(error: DaemonError) -> DaemonError {
         return agent_issue_error_from_envelope(normalized);
     }
     let code = match error {
+        DaemonError::InvalidParam(code)
+            if code == rsi_common::global_manager::MANAGER_PROJECT_NOT_IN_SCOPE =>
+        {
+            AgentIssueErrorCodeV1::ManagerProjectNotInScope
+        }
         DaemonError::InvalidParam(_) | DaemonError::Rpc(_) | DaemonError::Json(_) => {
             AgentIssueErrorCodeV1::InvalidRequest
         }

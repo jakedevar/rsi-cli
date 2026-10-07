@@ -44,7 +44,7 @@ pub(crate) mod app_server_control;
 /// The bounded control worker that commits the plane's in-memory seals to
 /// durable storage (C-P2-15). Crate-private for the same reason as the plane.
 pub(crate) mod app_server_seal_worker;
-pub use rsid_store::{bedrock, bus};
+pub use rsid_store::{bedrock, bedrock_setup, bus};
 pub mod claude;
 #[doc(hidden)]
 pub mod closure_kernel;
@@ -89,6 +89,7 @@ pub mod openai;
 pub mod openrouter;
 pub mod pioneer;
 pub mod shared_target_prune;
+pub mod shared_target_reclaim;
 // Foundation module is intentionally unwired until the real scope lifecycle
 // gate passes and the provider call sites have separate ownership.
 #[allow(dead_code)]
@@ -111,10 +112,13 @@ pub mod recursive_dag;
 pub mod remote_control;
 // Bounded source projections for operator-only Remote reads.
 pub mod agent_jobs;
+pub mod cpu_andon;
 pub mod daemon_info;
 pub mod deploy;
 pub mod deploy_drain;
 pub mod deploy_operator;
+pub mod friction;
+pub mod host_load;
 pub mod provider_status;
 #[allow(dead_code)]
 pub(crate) mod remote_read;

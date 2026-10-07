@@ -15,13 +15,20 @@ env:
 
 jobs:
   check:
-    # macOS joins this matrix once the daemon builds there again.
-    name: build and test (linux)
-    runs-on: ubuntu-latest
+    name: build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - name: System libraries for the TUI end-to-end test harness
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libfontconfig1-dev libfreetype-dev pkg-config
+      - name: System libraries for the TUI end-to-end test harness (macOS)
+        if: runner.os == 'macOS'
+        run: brew install fontconfig freetype pkg-config
       - name: Install pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2

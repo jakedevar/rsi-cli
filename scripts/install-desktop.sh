@@ -43,9 +43,20 @@ skip() {
 command -v node >/dev/null 2>&1 || skip "node is not installed"
 command -v npm >/dev/null 2>&1 || skip "npm is not installed"
 command -v cargo >/dev/null 2>&1 || skip "cargo is not installed"
-if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists webkit2gtk-4.1; then
-    skip "webkit2gtk-4.1 development files are not installed (pkg-config webkit2gtk-4.1)"
-fi
+PLATFORM="$(uname -s)"
+case "$PLATFORM" in
+    Linux)
+        if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists webkit2gtk-4.1; then
+            skip "webkit2gtk-4.1 development files are not installed (pkg-config webkit2gtk-4.1)"
+        fi
+        ;;
+    Darwin)
+        # Tauri uses macOS's system WebKit; WebKitGTK is Linux-only.
+        command -v xcrun >/dev/null 2>&1 && xcrun --find clang >/dev/null 2>&1 \
+            || skip "Xcode command line tools are not installed (xcode-select --install)"
+        ;;
+    *) skip "unsupported platform: $PLATFORM" ;;
+esac
 
 cd "$DESKTOP_DIR"
 # Reinstall when node_modules is missing or older than the lockfile.
@@ -73,6 +84,12 @@ cp -p "$BUILT_BIN" "$temp"
 chmod 755 "$temp"
 mv -f "$temp" "$INSTALL_DIR/rsi-desktop"
 ln -sfn "$INSTALL_DIR/rsi-desktop" "$BIN_DIR/rsi-desktop"
+
+if [[ "$PLATFORM" == Darwin ]]; then
+    echo "Desktop UI installed:"
+    echo "  $BIN_DIR/rsi-desktop -> $INSTALL_DIR/rsi-desktop"
+    exit 0
+fi
 
 # Freedesktop entry (absolute Exec: launchers do not share this shell's PATH).
 APPS_DIR="$DATA_HOME/applications"

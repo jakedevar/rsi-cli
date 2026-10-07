@@ -73,6 +73,7 @@ criterion = { workspace = true }
 insta = { workspace = true }
 termwright = "0.2"
 tempfile = "3"
+rusqlite = { workspace = true }
 
 [[bench]]
 name = "ui_content"

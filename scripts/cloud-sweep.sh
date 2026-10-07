@@ -78,6 +78,13 @@ sweep_file_proto=never
 sweep_local_roots=()
 origin_checked=
 
+# Local Git origins and allowed roots must be existing directories. Bash's
+# physical cd resolves symlinks on both macOS and Linux without GNU realpath
+# flags; a subshell keeps the caller's cwd intact and CDPATH cannot add output.
+canonical_directory() {
+  (CDPATH= cd -P -- "$1" 2>/dev/null && pwd -P)
+}
+
 # The origin URL is caller-written data. Only https://, ssh:// and scp-style
 # git@host:path are fetched; ext::, a leading '-', whitespace and any other
 # transport are refused. A local path or file:// URL is fetched only when it
@@ -101,9 +108,9 @@ validated_origin() {
   esac
   if [[ -n "${path:-}" ]]; then
     [[ "$path" == /* && ${#sweep_local_roots[@]} -gt 0 ]] || return 1
-    real="$(realpath -e -- "$path" 2>/dev/null)" || return 1
+    real="$(canonical_directory "$path")" || return 1
     for root in "${sweep_local_roots[@]}"; do
-      root="$(realpath -e -- "$root" 2>/dev/null)" || continue
+      root="$(canonical_directory "$root")" || continue
       [[ "$real" == "$root"/* ]] && { sweep_file_proto=always; origin_checked="$real"; return 0; }
     done
     return 1

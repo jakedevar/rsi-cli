@@ -154,7 +154,6 @@ fn probe_app(session_count: usize, theme_key: &str) -> App {
                 selected_session: None,
                 scroll_offset: 0,
                 active_zone: Default::default(),
-                taskrabbit_selected_index: 0,
                 archive_selected_index: 0,
                 jobs_selected_index: 0,
             },

@@ -19,6 +19,7 @@ chrono = { workspace = true }
 nix = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
+tracing = { workspace = true }
 
 [features]
 default = []

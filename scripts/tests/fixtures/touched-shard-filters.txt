@@ -1,0 +1,4 @@
+rsid=shard:other-03:test(rpc::agent_x)
+rsid=shard:other-03:test(/^session::tests::manager_actions::[A-Za-z0-9_]+$/)
+rsid=shard:other-03:test(/^session::big::(?:\w+::)*(?:t3|t9)$/)
+rsid=shard:other-03:test(/^rpc::tests::(?:\w+::)*export_thing_is_refused$/)

@@ -5,7 +5,7 @@ use super::manager_actions::{ManagerActionOperationV2, action_epic};
 use crate::error::{DaemonError, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rsi_common::{
-    harness_manager::{HarnessManagerConfigV1, HarnessManagerNoticeV1},
+    harness_manager::{AgentManagerInboxRequestV1, HarnessManagerConfigV1, HarnessManagerNoticeV1},
     harness_manager_v2::*,
     rpc::WorkerSliceMemoryPressure,
     types::{PendingQuestion, Session, SessionKind, SessionStatus},
@@ -22,11 +22,17 @@ const MAX_NOTICE_RECONCILIATION_BATCH: i64 = 256;
 const MAX_NOTICE_RETRIEVAL_SCAN: i64 = 256;
 const MAX_OBSOLETE_NOTICES_PER_JOB: i64 = 16;
 const MAX_SCOPE_RETIREMENTS_PER_PASS: i64 = 8;
+/// #1310: how long an unsettled notice for a seat with no live lineage waits
+/// before background reconciliation retires it.
+const ORPHANED_NOTICE_RETIREMENT_DAYS: i64 = 7;
+const MAX_ORPHANED_NOTICES_PER_PASS: i64 = 64;
 const MAX_NOTICE_QUESTION_BYTES: usize = 8192;
 const MAX_NOTICE_RECORDS_PER_EPIC_PASS: i64 = 16;
 const WORKER_PRESSURE_FULL_AVG60_THRESHOLD_PCT: f64 = 10.0;
 const WORKER_PRESSURE_NOTICE_INTERVAL_MINUTES: i64 = 15;
 const WORKER_PRESSURE_NOTICE_SUBJECT: &str = "worker_slice_pressure";
+/// Subject prefix of the project-wide provider auth-failure notice (#1610).
+const PROVIDER_AUTH_INVALID_SUBJECT_PREFIX: &str = "provider_auth_invalid:";
 
 // Keep the executed statement shared with its physical-work regression. The
 // route equalities precede sequence in V118, so LIMIT bounds the scanned page
@@ -1034,6 +1040,76 @@ impl Store {
         Ok(Some(job_id))
     }
 
+    /// One project-wide notice per provider auth-failure episode (#1610). The
+    /// subject version is the episode's first failure, so repeated failures of
+    /// the same episode never wake the manager again; a later success followed
+    /// by a new rejection starts a new episode and a new notice. The notice
+    /// names the credentials gate: the credential stays operator-owned.
+    pub fn record_provider_auth_invalid_notice(
+        &self,
+        project_id: Uuid,
+        provider: &str,
+        episode_started_at: DateTime<Utc>,
+        last_failure_at: DateTime<Utc>,
+    ) -> Result<Option<Uuid>> {
+        let Some(config) = self.get_harness_manager_notice_config(project_id)? else {
+            return Ok(None);
+        };
+        if config.current_session_id.is_none()
+            || config.is_revoked()
+            || self
+                .get_harness_manager_policy(project_id)?
+                .is_none_or(|policy| policy.revoked)
+        {
+            return Ok(None);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let (job_id, _, _) = self.manager_action_watch_identity(&config);
+        let subject = format!("{PROVIDER_AUTH_INVALID_SUBJECT_PREFIX}{provider}");
+        let version = episode_started_at.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM harness_manager_notices
+             WHERE job_id=?1 AND kind='ledger_change' AND subject_id=?2 AND subject_version=?3)",
+            params![job_id.to_string(), subject, version],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Ok(None);
+        }
+        self.ensure_manager_action_watch(&config, &version)?;
+        self.conn.execute(
+            "INSERT INTO harness_manager_notices
+             (id,job_id,project_id,manager_session_id,scope_version,epic_id,direction,
+              source_session_id,recipient_session_id,kind,subject_id,subject_version,
+              state_json,recorded_at,queued_at)
+             VALUES(?1,?2,?3,?4,?5,NULL,'to_manager',NULL,?4,'ledger_change',?6,?7,?8,?7,?7)",
+            params![
+                Uuid::new_v4().to_string(),
+                job_id.to_string(),
+                project_id.to_string(),
+                config.manager_session_id.to_string(),
+                config.row_version,
+                subject,
+                version,
+                serde_json::to_string(&json!({
+                    "record_kind": "provider_auth_invalid",
+                    "provider": provider,
+                    "last_auth_failure_at": last_failure_at,
+                    "gate": "credentials",
+                    "detail": format!(
+                        "New {provider} sessions are failing with an authentication rejection (401). \
+                         Launch admission for {provider} is refused until the operator refreshes the \
+                         credential and a later {provider} session gets past startup. Do not relaunch \
+                         workers on {provider}; the credential is operator-owned."
+                    ),
+                }))?,
+            ],
+        )?;
+        self.refresh_manager_notice_job(job_id)?;
+        tx.commit()?;
+        Ok(Some(job_id))
+    }
+
     fn record_manager_ledger_notice(
         &self,
         config: &HarnessManagerConfigV1,
@@ -1344,7 +1420,19 @@ impl Store {
             [job_id.to_string()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        Ok(pending.then_some(undelivered))
+        if pending {
+            return Ok(Some(undelivered));
+        }
+        // #1310: a transport whose every notice was retrieved or retired is
+        // quiet, not notice-free. `None` is reserved for a pre-V117 watch that
+        // never had a durable subject; reporting it for a settled backlog
+        // would send a late wake naming notices retrieval already settled.
+        let retained: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM harness_manager_notices WHERE job_id=?1)",
+            [job_id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(retained.then_some(false))
     }
 
     /// Undelivered subject count when this durable manager transport owes its
@@ -1849,6 +1937,147 @@ impl Store {
         Ok(())
     }
 
+    /// #1310: retire, never delete, unsettled notices that no live seat can
+    /// retrieve: their scope was replaced, or their manager lineage has no live
+    /// seat, and they are older than the bound. One bounded page per pass; a
+    /// retired notice keeps its row and records no retrieval.
+    pub(crate) fn retire_orphaned_manager_notices(&self) -> Result<usize> {
+        let cutoff = (Utc::now() - chrono::Duration::days(ORPHANED_NOTICE_RETIREMENT_DAYS))
+            .to_rfc3339_opts(SecondsFormat::Nanos, true);
+        // This lane is global, not owned by an appointment. Reserve the nil
+        // owner in the existing cursor table so progress survives restarts and
+        // shares the reconciler's retirement transaction. No new schema needed.
+        let global_owner = Uuid::nil().to_string();
+        let after: String = self
+            .conn
+            .query_row(
+                "SELECT after_key FROM harness_manager_notice_reconcile_cursors
+             WHERE project_id=?1 AND manager_session_id=?1 AND scope_version=1
+               AND lane='orphaned_notices' AND owner_id=''",
+                [&global_owner],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let after: (String, String, i64, i64) = if after.is_empty() {
+            Default::default()
+        } else {
+            serde_json::from_str(&after)?
+        };
+        // A live anchor with no children is provably its own lineage tip.
+        // Exclude it before LIMIT. Anchors with children still require the
+        // authoritative Rust lineage checks (committed edges, forks, scope).
+        let mut statement = self.conn.prepare(
+            "SELECT n.id,n.job_id,n.project_id,n.manager_session_id,n.scope_version,n.sequence
+             FROM harness_manager_notices n
+                  INDEXED BY harness_manager_notices_pending_scope_sequence
+             WHERE n.retired_at IS NULL AND n.settled_at IS NULL AND n.recorded_at<?1
+               AND (n.project_id,n.manager_session_id,n.scope_version,n.sequence)>(?3,?4,?5,?6)
+               AND NOT EXISTS (
+                   SELECT 1 FROM harness_manager_scopes scope
+                   JOIN sessions anchor ON anchor.id=scope.manager_session_id
+                   WHERE scope.project_id=n.project_id
+                     AND scope.manager_session_id=n.manager_session_id
+                     AND scope.row_version=n.scope_version
+                     AND anchor.project_id=n.project_id
+                     AND anchor.session_kind IN
+                         ('Standard','TaskRabbit','Bug','Story','Task','Feature','Refactor','Research')
+                     AND anchor.status NOT IN ('Archived','Deleted')
+                     AND NOT EXISTS (SELECT 1 FROM sessions child
+                                     WHERE child.continued_from=anchor.id)
+               )
+             ORDER BY n.project_id,n.manager_session_id,n.scope_version,n.sequence
+             LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    cutoff,
+                    MAX_ORPHANED_NOTICES_PER_PASS,
+                    after.0,
+                    after.1,
+                    after.2,
+                    after.3
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        // Advance past inspected live rows too. A short/empty page wraps on
+        // the next pass, revisiting owners that have since become orphaned.
+        let next_cursor = if let Some((_, _, project, manager, scope, sequence)) = rows
+            .last()
+            .filter(|_| rows.len() == MAX_ORPHANED_NOTICES_PER_PASS as usize)
+        {
+            serde_json::to_string(&(project, manager, scope, sequence))?
+        } else {
+            String::new()
+        };
+        let retired = now();
+        let mut jobs = std::collections::BTreeSet::new();
+        let mut owners = std::collections::HashMap::new();
+        let mut count = 0;
+        for (id, job, project, manager, scope, _) in rows {
+            let owner = (project.clone(), manager.clone(), scope);
+            let orphaned = if let Some(known) = owners.get(&owner) {
+                *known
+            } else {
+                let current_scope: bool = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM harness_manager_scopes
+                     WHERE project_id=?1 AND manager_session_id=?2 AND row_version=?3)",
+                    params![project, manager, scope],
+                    |row| row.get(0),
+                )?;
+                let orphaned = !current_scope
+                    || match (Uuid::parse_str(&project), Uuid::parse_str(&manager)) {
+                        (Ok(project), Ok(manager)) => {
+                            super::harness_manager::current_manager_session_on(
+                                &self.conn, project, manager,
+                            )
+                            .is_none()
+                        }
+                        _ => true,
+                    };
+                owners.insert(owner, orphaned);
+                orphaned
+            };
+            if !orphaned {
+                continue;
+            }
+            count += self.conn.execute(
+                "UPDATE harness_manager_notices SET retired_at=?2
+                 WHERE id=?1 AND retired_at IS NULL AND settled_at IS NULL",
+                params![id, retired],
+            )?;
+            jobs.insert(job);
+        }
+        for job in jobs {
+            self.refresh_manager_notice_job(
+                Uuid::parse_str(&job).map_err(|_| refused("manager_invalid_stored_identity"))?,
+            )?;
+        }
+        self.conn.execute(
+            "INSERT INTO harness_manager_notice_reconcile_cursors(
+                 project_id,manager_session_id,scope_version,lane,owner_id,after_key,cycle,updated_at)
+             VALUES(?1,?1,1,'orphaned_notices','',?2,CASE WHEN ?2='' THEN 1 ELSE 0 END,?3)
+             ON CONFLICT(project_id,manager_session_id,scope_version,lane,owner_id)
+             DO UPDATE SET after_key=excluded.after_key,
+                 cycle=cycle+CASE WHEN excluded.after_key='' THEN 1 ELSE 0 END,
+                 updated_at=excluded.updated_at",
+            params![global_owner, next_cursor, retired],
+        )?;
+        Ok(count)
+    }
+
     /// Retire a transport whose persisted source/target route is no longer
     /// reachable under the current scope. Retirement is distinct from inbox
     /// retrieval: background reconciliation must never claim a reader or
@@ -1878,7 +2107,7 @@ impl Store {
         config: &HarnessManagerConfigV1,
         direction: &str,
         epic: Option<Uuid>,
-        request_id: Option<Uuid>,
+        request: &AgentManagerInboxRequestV1,
     ) -> Result<Vec<StoredNotice>> {
         let mut arguments = vec![
             SqlValue::Text(config.project_id.to_string()),
@@ -1886,7 +2115,7 @@ impl Store {
             SqlValue::Integer(config.row_version),
             SqlValue::Text(direction.to_owned()),
         ];
-        let sql = if let Some(request_id) = request_id {
+        let sql = if let Some(request_id) = request.request_id {
             arguments.push(SqlValue::Text(request_id.to_string()));
             let epic_filter = if let Some(epic) = epic {
                 arguments.push(SqlValue::Text(epic.to_string()));
@@ -1894,6 +2123,17 @@ impl Store {
             } else {
                 ""
             };
+            let after = arguments.len() + 1;
+            arguments.push(SqlValue::Integer(request.after_notice_sequence));
+            let kind = arguments.len() + 1;
+            arguments.push(
+                request
+                    .notice_kind
+                    .clone()
+                    .map_or(SqlValue::Null, SqlValue::Text),
+            );
+            let page_filter =
+                format!(" AND sequence>?{after} AND (?{kind} IS NULL OR kind=?{kind})");
             let limit = arguments.len() + 1;
             arguments.push(SqlValue::Integer(MAX_NOTICE_RETRIEVAL_SCAN));
             format!(
@@ -1902,14 +2142,14 @@ impl Store {
                          INDEXED BY harness_manager_notices_pending_subject_sequence
                     WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3
                       AND direction=?4 AND kind='message' AND subject_id=?5
-                      AND retired_at IS NULL AND settled_at IS NULL{epic_filter}
+                      AND retired_at IS NULL AND settled_at IS NULL{epic_filter}{page_filter}
                     UNION ALL
                     SELECT {NOTICE_COLUMNS} FROM harness_manager_notices
                          INDEXED BY harness_manager_notices_pending_request_sequence
                     WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3
                       AND direction=?4 AND kind='message'
                       AND json_extract(state_json,'$.request_id')=?5 AND subject_id<>?5
-                      AND retired_at IS NULL AND settled_at IS NULL{epic_filter}
+                      AND retired_at IS NULL AND settled_at IS NULL{epic_filter}{page_filter}
                  ) ORDER BY sequence LIMIT ?{limit}"
             )
         } else {
@@ -1924,13 +2164,24 @@ impl Store {
             } else {
                 ""
             };
+            let after = arguments.len() + 1;
+            arguments.push(SqlValue::Integer(request.after_notice_sequence));
+            let kind = arguments.len() + 1;
+            arguments.push(
+                request
+                    .notice_kind
+                    .clone()
+                    .map_or(SqlValue::Null, SqlValue::Text),
+            );
+            let page_filter =
+                format!(" AND sequence>?{after} AND (?{kind} IS NULL OR kind=?{kind})");
             let limit = arguments.len() + 1;
             arguments.push(SqlValue::Integer(MAX_NOTICE_RETRIEVAL_SCAN));
             format!(
                 "SELECT {NOTICE_COLUMNS} FROM harness_manager_notices INDEXED BY {index}
                  WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3
                    AND direction=?4 AND retired_at IS NULL AND settled_at IS NULL
-                   {epic_filter}
+                   {epic_filter}{page_filter}
                  ORDER BY sequence LIMIT ?{limit}"
             )
         };
@@ -1945,7 +2196,7 @@ impl Store {
         config: &HarnessManagerConfigV1,
         direction: &str,
         epic: Option<Uuid>,
-        request_id: Option<Uuid>,
+        request: &AgentManagerInboxRequestV1,
         after: Option<i64>,
     ) -> Result<bool> {
         let Some(after) = after else {
@@ -1953,7 +2204,7 @@ impl Store {
         };
         // One request has one original message and at most 32 replies. The
         // exact subject/request indexes return the whole bounded exchange.
-        if request_id.is_some() {
+        if request.request_id.is_some() {
             return Ok(false);
         }
         if let Some(epic) = epic {
@@ -1963,7 +2214,7 @@ impl Store {
                          INDEXED BY harness_manager_notices_pending_epic_sequence
                     WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3
                       AND direction=?4 AND epic_id=?5 AND retired_at IS NULL
-                      AND settled_at IS NULL AND sequence>?6
+                      AND settled_at IS NULL AND sequence>?6 AND (?7 IS NULL OR kind=?7)
                  )",
                 params![
                     config.project_id.to_string(),
@@ -1971,7 +2222,8 @@ impl Store {
                     config.row_version,
                     direction,
                     epic.to_string(),
-                    after
+                    after,
+                    request.notice_kind
                 ],
                 |row| row.get(0),
             )?);
@@ -1982,19 +2234,21 @@ impl Store {
                      INDEXED BY harness_manager_notices_pending_direction_sequence
                 WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3
                   AND direction=?4 AND retired_at IS NULL
-                  AND settled_at IS NULL AND sequence>?5
+                  AND settled_at IS NULL AND sequence>?5 AND (?6 IS NULL OR kind=?6)
              )",
             params![
                 config.project_id.to_string(),
                 config.manager_session_id.to_string(),
                 config.row_version,
                 direction,
-                after
+                after,
+                request.notice_kind
             ],
             |row| row.get(0),
         )?)
     }
 
+    #[cfg(test)]
     pub(crate) fn retrieve_manager_notices(
         &self,
         config: &HarnessManagerConfigV1,
@@ -2003,6 +2257,110 @@ impl Store {
         limit: u16,
         request_id: Option<Uuid>,
     ) -> Result<(Vec<HarnessManagerNoticeV1>, bool)> {
+        let request = AgentManagerInboxRequestV1 {
+            limit,
+            request_id,
+            ..Default::default()
+        };
+        let (notices, more, _) =
+            self.retrieve_manager_notices_page(config, caller, is_manager, &request)?;
+        Ok((notices, more))
+    }
+
+    fn manager_notice_owned_by_caller(
+        &self,
+        config: &HarnessManagerConfigV1,
+        caller: Uuid,
+        is_manager: bool,
+        row: &StoredNotice,
+    ) -> Result<bool> {
+        let scoped = (is_manager
+            && (row.public.kind == "action_result"
+                || (row.public.kind == "ledger_change"
+                    && (row.public.subject_id == WORKER_PRESSURE_NOTICE_SUBJECT
+                        || row.public.subject_id
+                            == super::satellite_reports::SATELLITE_REPORT_NOTICE_SUBJECT
+                        || row
+                            .public
+                            .subject_id
+                            .starts_with(PROVIDER_AUTH_INVALID_SUBJECT_PREFIX)
+                        || row.public.subject_id.starts_with(
+                            super::worker_baton::WORKER_CONTEXT_CAP_SUBJECT_PREFIX,
+                        ))
+                    && row.public.epic_id.is_none())))
+            || row
+                .public
+                .epic_id
+                .is_some_and(|epic| config.epic_ids.contains(&epic));
+        Ok(scoped
+            && row.public.direction == if is_manager { "to_manager" } else { "to_lead" }
+            && self
+                .manager_lineage_tip(row.public.recipient_session_id)
+                .ok()
+                == Some(caller)
+            && self
+                .harness_manager_watch_route(row.job_id)?
+                .is_some_and(|(_, target)| target == caller))
+    }
+
+    /// Called inside the inbox transaction. Unknown and foreign IDs have the
+    /// same refusal, and any invalid ID rolls back the entire batch.
+    pub(crate) fn settle_manager_notice_ids(
+        &self,
+        config: &HarnessManagerConfigV1,
+        caller: Uuid,
+        is_manager: bool,
+        ids: &[Uuid],
+    ) -> Result<()> {
+        let settled = now();
+        let mut jobs = std::collections::HashSet::new();
+        for id in ids {
+            let query = format!(
+                // sql-dynamic-ok: fixed columns only; request values are bound.
+                "SELECT {NOTICE_COLUMNS} FROM harness_manager_notices
+                WHERE id=?1 AND project_id=?2 AND manager_session_id=?3 AND scope_version=?4
+                AND retired_at IS NULL"
+            );
+            let row = self
+                .conn
+                .query_row(
+                    &query,
+                    params![
+                        id.to_string(),
+                        config.project_id.to_string(),
+                        config.manager_session_id.to_string(),
+                        config.row_version
+                    ],
+                    read_notice,
+                )
+                .optional()?;
+            let Some(row) = row else {
+                return Err(refused("manager_notice_not_authorized"));
+            };
+            if !self.manager_notice_owned_by_caller(config, caller, is_manager, &row)? {
+                return Err(refused("manager_notice_not_authorized"));
+            }
+            self.conn.execute(
+                "UPDATE harness_manager_notices
+                SET retrieved_at=COALESCE(retrieved_at,?2),settled_at=COALESCE(settled_at,?2)
+                WHERE id=?1",
+                params![id.to_string(), settled],
+            )?;
+            jobs.insert(row.job_id);
+        }
+        for job in jobs {
+            self.refresh_manager_notice_job(job)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retrieve_manager_notices_page(
+        &self,
+        config: &HarnessManagerConfigV1,
+        caller: Uuid,
+        is_manager: bool,
+        request: &AgentManagerInboxRequestV1,
+    ) -> Result<(Vec<HarnessManagerNoticeV1>, bool, Option<i64>)> {
         let direction = if is_manager { "to_manager" } else { "to_lead" };
         let epic = if is_manager {
             None
@@ -2012,24 +2370,13 @@ impl Store {
         let retrieved = now();
         let mut live = Vec::new();
         let mut jobs = std::collections::HashSet::new();
-        let rows = self.pending_manager_notice_candidates(config, direction, epic, request_id)?;
+        let mut retired_stale = false;
+        let rows = self.pending_manager_notice_candidates(config, direction, epic, request)?;
         let last_candidate_sequence = rows.last().map(|row| row.public.sequence);
+        let mut last_sequence = request.after_notice_sequence;
         for row in rows {
-            let scoped = (is_manager
-                && (row.public.kind == "action_result"
-                    || (row.public.kind == "ledger_change"
-                        && (row.public.subject_id == WORKER_PRESSURE_NOTICE_SUBJECT
-                            || row.public.subject_id
-                                == super::satellite_reports::SATELLITE_REPORT_NOTICE_SUBJECT)
-                        && row.public.epic_id.is_none())))
-                || row
-                    .public
-                    .epic_id
-                    .is_some_and(|epic| config.epic_ids.contains(&epic));
-            let authorized = scoped
-                && self
-                    .harness_manager_watch_route(row.job_id)?
-                    .is_some_and(|(_, target)| target == caller);
+            let authorized =
+                self.manager_notice_owned_by_caller(config, caller, is_manager, &row)?;
             if !authorized {
                 // Each call retires a bounded stale prefix without fabricating
                 // retrieval evidence. Repeated retrieval therefore makes
@@ -2042,23 +2389,31 @@ impl Store {
                 if changed != 1 {
                     return Err(refused("manager_notice_changed"));
                 }
+                last_sequence = row.public.sequence;
+                retired_stale = true;
                 jobs.insert(row.job_id);
                 continue;
             }
+            let sequence = row.public.sequence;
             live.push(row);
-            if live.len() > usize::from(limit) {
+            if live.len() > usize::from(request.limit) {
                 break;
             }
+            last_sequence = sequence;
         }
         let unscanned = self.pending_manager_notice_candidates_remain(
             config,
             direction,
             epic,
-            request_id,
+            request,
             last_candidate_sequence,
         )?;
-        let more = live.len() > usize::from(limit) || unscanned;
-        live.truncate(usize::from(limit));
+        // #1310: `more` must let the caller continue. A page that settled or
+        // retired nothing cannot make the next call any different, so it never
+        // claims a continuation.
+        let progressed = !live.is_empty() || retired_stale;
+        let more = live.len() > usize::from(request.limit) || (unscanned && progressed);
+        live.truncate(usize::from(request.limit));
         for row in &mut live {
             let changed = self.conn.execute(
                 "UPDATE harness_manager_notices SET retrieved_at=?2,settled_at=?2
@@ -2071,13 +2426,27 @@ impl Store {
             row.public.retrieved_at =
                 super::parse_timestamp(&retrieved).map_err(DaemonError::Store)?;
             row.public.settled_at = row.public.retrieved_at;
+            // #1310: a notice addressed to a predecessor seat of this lineage
+            // is read, and reported, as addressed to the seat that retrieves it.
+            if row.public.recipient_session_id != caller
+                && self
+                    .manager_lineage_tip(row.public.recipient_session_id)
+                    .ok()
+                    == Some(caller)
+            {
+                row.public.recipient_session_id = caller;
+            }
             jobs.insert(row.job_id);
         }
         for job in jobs {
             self.refresh_manager_notice_job(job)?;
         }
         self.reconcile_deferred_manager_notice_transports(config)?;
-        Ok((live.into_iter().map(|row| row.public).collect(), more))
+        Ok((
+            live.into_iter().map(|row| row.public).collect(),
+            more,
+            more.then_some(last_sequence),
+        ))
     }
 
     pub(crate) fn manager_v2_project_decision_retrieval(
@@ -2109,7 +2478,13 @@ impl Store {
             return Ok(());
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let (config, is_manager) = self.manager_config_for_caller(caller)?;
+        let (config, is_manager) = match self.manager_config_for_caller(caller) {
+            Ok(current) => current,
+            // #1235: the global seat reads the decision board without
+            // recording a manager or lead retrieval in the project's ledger.
+            Err(_) if self.is_global_seat(caller)? => return Ok(()),
+            Err(denial) => return Err(denial),
+        };
         if result.scope_version != config.row_version {
             return Err(refused("manager_v2_scope_changed"));
         }
@@ -2376,6 +2751,7 @@ mod tests {
         store.manager_v2_commit_update(
             actor,
             &AgentManagerUpdateRequestV2 {
+                project_id: None,
                 fence: ManagerFenceV2 {
                     scope_version: 1,
                     policy_version: 1,
@@ -2404,6 +2780,8 @@ mod tests {
                 question: format!("Choose {key}"),
                 request_id: None,
                 work_key: work,
+                gate: None,
+                options: vec![],
             },
         )
         .unwrap();
@@ -2592,6 +2970,58 @@ mod tests {
             )
             .unwrap();
         assert_eq!(recorded, 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn provider_auth_invalid_notice_is_one_per_episode_and_names_the_credentials_gate() {
+        let store = Store::open_in_memory().unwrap();
+        let (config, _) = fixture(&store, policy());
+        let started = Utc::now() - chrono::Duration::minutes(10);
+        let job = store
+            .record_provider_auth_invalid_notice(
+                config.project_id,
+                "Codex",
+                started,
+                started + chrono::Duration::minutes(1),
+            )
+            .unwrap()
+            .expect("the first auth failure of an episode notifies the manager");
+        // Later failures of the same episode never notify again.
+        assert_eq!(
+            store
+                .record_provider_auth_invalid_notice(
+                    config.project_id,
+                    "Codex",
+                    started,
+                    started + chrono::Duration::minutes(5),
+                )
+                .unwrap(),
+            None
+        );
+        let manager = config.current_session_id.unwrap();
+        let (notices, _) = store
+            .retrieve_manager_notices(&config, manager, true, 32, None)
+            .unwrap();
+        let auth: Vec<_> = notices
+            .iter()
+            .filter(|notice| notice.subject_id == "provider_auth_invalid:Codex")
+            .collect();
+        assert_eq!(auth.len(), 1);
+        assert_eq!(auth[0].state["record_kind"], "provider_auth_invalid");
+        assert_eq!(auth[0].state["gate"], "credentials");
+        // A new episode (a success intervened) notifies once more.
+        assert_eq!(
+            store
+                .record_provider_auth_invalid_notice(
+                    config.project_id,
+                    "Codex",
+                    started + chrono::Duration::hours(1),
+                    started + chrono::Duration::hours(1),
+                )
+                .unwrap(),
+            Some(job)
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
@@ -2894,7 +3324,7 @@ mod tests {
             store
                 .record_satellite_report(peer, peer, &satellite_report("RESULT excess"), at)
                 .unwrap(),
-            ReportRecord::Refused("rate_limited")
+            ReportRecord::Retry(super::super::satellite_reports::RETRY_RATE_LIMITED)
         );
         assert_eq!(satellite_notice_count(&store), SATELLITE_REPORT_RATE_LIMIT);
         // Once the window has passed the peer may report again.
@@ -3020,7 +3450,7 @@ mod tests {
             store
                 .record_satellite_report(peer, peer, &satellite_report("RESULT over"), far)
                 .unwrap(),
-            ReportRecord::Retry
+            ReportRecord::Retry(super::super::satellite_reports::RETRY_RETENTION_CAP)
         );
         assert_eq!(
             store
@@ -3037,6 +3467,59 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
+    fn satellite_reports_route_to_the_dispatching_project_when_several_managers_exist() {
+        use super::super::satellite_reports::{RETRY_NO_MANAGER_PROJECT, ReportRecord};
+        let store = Store::open_in_memory().unwrap();
+        let (first, first_lead) = fixture(&store, policy());
+        let (second, second_lead) = fixture(&store, policy());
+        assert_ne!(first.project_id, second.project_id);
+        let peer = satellite_peer(&store, true, true);
+        // Two managers and no dispatch history: nobody is guessed, and the
+        // reason is named for the hub log.
+        assert_eq!(
+            store
+                .record_satellite_report(peer, peer, &satellite_report("RESULT a"), Utc::now())
+                .unwrap(),
+            ReportRecord::Retry(RETRY_NO_MANAGER_PROJECT)
+        );
+        // The second project's session dispatched to this peer.
+        let now = crate::store::harness_manager_v2::now();
+        store
+            .conn
+            .execute(
+                "INSERT INTO satellite_messages(id,owner_session_id,peer_id,remote_session_id,
+                   idempotency_digest,request_fingerprint,payload,created_at,expires_at,updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?5,'x',?6,?6,?6)",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    second_lead.id.to_string(),
+                    peer.to_string(),
+                    Uuid::new_v4().to_string(),
+                    "0".repeat(64),
+                    now,
+                ],
+            )
+            .unwrap();
+        let _ = first_lead;
+        assert_eq!(
+            store
+                .record_satellite_report(peer, peer, &satellite_report("RESULT b"), Utc::now())
+                .unwrap(),
+            ReportRecord::Recorded
+        );
+        let project: String = store
+            .conn
+            .query_row(
+                "SELECT project_id FROM harness_manager_notices WHERE subject_id='satellite_report'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(project, second.project_id.to_string());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
     fn satellite_report_waits_for_a_live_manager_instead_of_being_lost() {
         use super::super::satellite_reports::ReportRecord;
         let store = Store::open_in_memory().unwrap();
@@ -3046,7 +3529,7 @@ mod tests {
             store
                 .record_satellite_report(peer, peer, &satellite_report("RESULT x"), Utc::now())
                 .unwrap(),
-            ReportRecord::Retry
+            ReportRecord::Retry(super::super::satellite_reports::RETRY_NO_MANAGER_PROJECT)
         );
         assert_eq!(satellite_notice_count(&store), 0);
     }
@@ -3066,6 +3549,7 @@ mod tests {
                     caller: config.manager_session_id,
                 },
                 request: AgentManagerControlRequestV2 {
+                    project_id: None,
                     fence: ManagerFenceV2 {
                         scope_version: config.row_version,
                         policy_version: 1,
@@ -3256,6 +3740,8 @@ mod tests {
                 question: "Change the human question".into(),
                 request_id: None,
                 work_key: None,
+                gate: None,
+                options: vec![],
             },
         );
         assert!(
@@ -3486,6 +3972,7 @@ mod tests {
                     after_sequence: 0,
                     request_id: None,
                     limit: 1,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -3531,6 +4018,7 @@ mod tests {
             after_sequence: 0,
             request_id: None,
             limit: 1,
+            ..Default::default()
         };
         let first = store
             .manager_inbox(config.manager_session_id, &request)
@@ -4292,6 +4780,7 @@ mod tests {
             result: Some(ManagerActionResultV2::LeadPaused),
             deduplicated: false,
             operator_result: None,
+            sandbox_source: None,
         };
         let operation = action_operation(
             &config,
@@ -4341,6 +4830,7 @@ mod tests {
             result: Some(ManagerActionResultV2::ContainerCommitted { lead_state: None }),
             deduplicated: false,
             operator_result: None,
+            sandbox_source: None,
         };
         let operation = action_operation(
             &config,
@@ -4394,6 +4884,7 @@ mod tests {
             result: Some(ManagerActionResultV2::LeadUnassigned),
             deduplicated: false,
             operator_result: None,
+            sandbox_source: None,
         };
         let operation = action_operation(
             &config,
@@ -4510,6 +5001,7 @@ mod tests {
                     caller: config.manager_session_id,
                 },
                 AgentManagerControlRequestV2 {
+                    project_id: None,
                     fence: ManagerFenceV2 {
                         scope_version: config.row_version,
                         policy_version,
@@ -4751,6 +5243,7 @@ mod tests {
                     caller: config.manager_session_id,
                 },
                 AgentManagerControlRequestV2 {
+                    project_id: None,
                     fence: ManagerFenceV2 {
                         scope_version: config.row_version,
                         policy_version,
@@ -4868,6 +5361,7 @@ mod tests {
                         caller: config.manager_session_id,
                     },
                     AgentManagerControlRequestV2 {
+                        project_id: None,
                         fence: ManagerFenceV2 {
                             scope_version: config.row_version,
                             policy_version,
@@ -4981,6 +5475,7 @@ mod tests {
             result: Some(ManagerActionResultV2::LeadPaused),
             deduplicated: false,
             operator_result: None,
+            sandbox_source: None,
         };
         let operation = action_operation(
             &config,
@@ -5044,6 +5539,7 @@ mod tests {
                         caller: config.manager_session_id,
                     },
                     AgentManagerControlRequestV2 {
+                        project_id: None,
                         fence: ManagerFenceV2 {
                             scope_version: config.row_version,
                             policy_version,
@@ -5155,6 +5651,7 @@ mod tests {
                 .manager_progress_page(
                     config.manager_session_id,
                     &rsi_common::harness_manager::AgentManagerProgressRequestV1 {
+                        project_id: None,
                         after_epic_id: None,
                         limit: None,
                     },
@@ -5189,6 +5686,7 @@ mod tests {
                     after_sequence: 0,
                     request_id: Some(request.message_id),
                     limit: 32,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -5216,6 +5714,7 @@ mod tests {
                     after_sequence: 0,
                     request_id: Some(request.message_id),
                     limit: 32,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -5767,6 +6266,7 @@ mod tests {
                     caller: config.manager_session_id,
                 },
                 AgentManagerControlRequestV2 {
+                    project_id: None,
                     fence: ManagerFenceV2 {
                         scope_version: config.row_version,
                         policy_version,
@@ -5871,6 +6371,7 @@ mod tests {
                     caller: config.manager_session_id,
                 },
                 AgentManagerControlRequestV2 {
+                    project_id: None,
                     fence: ManagerFenceV2 {
                         scope_version: config.row_version,
                         policy_version,

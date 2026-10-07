@@ -284,10 +284,11 @@ pub fn render_markdown_line(
                 "\u{2502} ".to_string(),
                 Style::default().fg(super::theme::md_blockquote()),
             ));
-            let path_fg = super::theme::file_path_fg();
             for span in parse_inline_markdown(content_text) {
-                // Preserve file-path fg so click detection still finds the span
-                let merged = if span.style.fg == Some(path_fg) {
+                // Spans with their own colour (file paths, inline code, links)
+                // keep it so click detection and code styling survive; only
+                // plain prose takes the quote colour.
+                let merged = if span.style.fg.is_some() {
                     span.style.add_modifier(Modifier::ITALIC)
                 } else {
                     span.style
@@ -1880,10 +1881,14 @@ fn append_markdown_text_lines(
     max_width: u16,
 ) {
     let mut table_buf: Vec<(BlockElement, &str)> = Vec::new();
+    let mut prev_block_was_quote = false;
     for content_line in text.lines() {
         let leading_spaces = content_line.len() - content_line.trim_start().len();
         let nest_level = leading_spaces / 2;
         let (block, block_content) = detect_block_element(content_line);
+        let is_quote = matches!(block, BlockElement::Blockquote);
+        let continues_quote = is_quote && prev_block_was_quote;
+        prev_block_was_quote = is_quote;
         match block {
             BlockElement::TableRow | BlockElement::TableSeparator => {
                 table_buf.push((block, block_content));
@@ -1900,7 +1905,10 @@ fn append_markdown_text_lines(
                     );
                 }
 
+                // Separate a header or a new blockquote from the text above;
+                // consecutive `>` lines belong to one quote and stay together.
                 if matches!(block, BlockElement::Header(_) | BlockElement::Blockquote)
+                    && !continues_quote
                     && !lines.is_empty()
                     && lines.last().is_some_and(|l| !l.spans.is_empty())
                 {
@@ -1914,6 +1922,7 @@ fn append_markdown_text_lines(
                             | BlockElement::OrderedList(_)
                             | BlockElement::TaskUnchecked
                             | BlockElement::TaskChecked
+                            | BlockElement::Blockquote
                     ) {
                     format!("{}{}", indent, "  ".repeat(nest_level))
                 } else {
@@ -1976,7 +1985,9 @@ fn append_markdown_text_lines(
                             .into_iter()
                             .map(|target| crate::types::WebLinkTarget { line, target }),
                     );
-                    if i == 0 {
+                    if i == 0 || is_quote {
+                        // Every wrapped line of a blockquote keeps its bar and
+                        // quote styling, not only the first.
                         lines.push(render_markdown_line(&effective_indent, &block, chunk));
                     } else {
                         lines.push(render_markdown_line(
@@ -4025,5 +4036,53 @@ mod tests {
                 .collect::<String>();
             println!("Line {}: {:?}", idx, line_str);
         }
+    }
+
+    #[test]
+    fn wrapped_blockquote_keeps_bar_and_style_on_every_line() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
+        // A quote nested under an ordered list item, long enough to wrap,
+        // followed by a second `>` line of the same quote.
+        let md = "2. Give it this first prompt:\n   > You are the new global manager of this Mac. Read `~/.rsi/global-manager/handoff.md` first, then run `AgentManagerOverview` and give me a short digest.\n   > Second line.";
+        let mut lines = Vec::new();
+        let mut file_links = Vec::new();
+        let mut web_links = Vec::new();
+        append_markdown_text_lines(&mut lines, &mut file_links, &mut web_links, md, "", 50);
+        let plain: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        assert_eq!(plain[0], "2. Give it this first prompt:");
+        assert_eq!(
+            plain[1], "",
+            "one blank line separates the quote from the list"
+        );
+        let quote = &lines[2..];
+        assert!(quote.len() >= 3, "{plain:?}");
+        for (line, text) in quote.iter().zip(&plain[2..]) {
+            // Nested under the list item, every wrapped line carries the bar.
+            assert!(text.starts_with("  \u{2502} "), "{text:?} in {plain:?}");
+            // Prose spans keep the quote's italic styling past the first line.
+            for span in line.spans.iter().skip(2) {
+                assert!(
+                    span.style.add_modifier.contains(Modifier::ITALIC),
+                    "{span:?}"
+                );
+            }
+        }
+        // The code span stays one styled unit on whichever line it lands on.
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .any(|s| s.content == "AgentManagerOverview"
+                    && s.style.fg == Some(crate::ui::theme::md_inline_code_fg())),
+            "{plain:?}"
+        );
+        assert_eq!(
+            plain.last().map(String::as_str),
+            Some("  \u{2502} Second line.")
+        );
     }
 }

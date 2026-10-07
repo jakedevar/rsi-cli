@@ -138,33 +138,16 @@ impl Store {
             // Manager questions are delivered as attributed OPERATOR answers
             // in the scoped decision inbox. No v1 agent sender is fabricated.
             // Retrieval does not mark the associated work/request completed.
-            if let Some(work_key) = decision["work_key"].as_str() {
-                let work = self
-                    .manager_v2_record(&config, "work", work_key)?
-                    .ok_or_else(|| refused("manager_v2_decision_target_changed"))?;
-                if work.epic_id != Some(epic)
-                    || Some(work.row_version) != decision["target_row_version"].as_i64()
-                {
-                    return Err(refused("manager_v2_decision_target_changed"));
-                }
-            }
-            if let Some(request_id) = decision["request_id"].as_str() {
-                let id = Uuid::parse_str(request_id)
-                    .map_err(|_| refused("manager_v2_request_changed"))?;
-                if !self.manager_v2_operator_request_live(&config, epic, id)? {
-                    return Err(refused("manager_v2_request_changed"));
-                }
-                let version = self
-                    .manager_v2_record(&config, "request", request_id)?
-                    .map_or(0, |r| r.row_version);
-                if Some(version) != decision["request_row_version"].as_i64() {
-                    return Err(refused("manager_v2_request_changed"));
-                }
-            }
+            self.manager_v2_check_plain_decision_target(&config, epic, &decision)?;
             decision["status"] = json!("answered");
             decision["answer"] = json!(request.answer);
             decision["delivery"] = json!({"state":"available_in_scoped_inbox","actor":"operator","request_id":decision["request_id"],"work_key":decision["work_key"],"target_digest":request.target_digest});
         }
+        // #1415: the operator's answer is audited like a manager's ruling.
+        let actor = super::manager_decision_rulings::operator_actor();
+        let event = decision["status"].as_str().unwrap_or("answered").to_owned();
+        decision["answered_by"] = actor.clone();
+        super::manager_decision_rulings::push_history(&mut decision, &event, &actor, None);
         let updated = self.manager_v2_put_record(
             &config,
             "decision",

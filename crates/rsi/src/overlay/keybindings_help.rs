@@ -8,6 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub enum HelpView {
     Contextual,
     All,
+    Symbols,
 }
 
 /// Open the keybindings help overlay.
@@ -123,16 +124,27 @@ pub(super) fn handle_keybindings_help_key(app: &mut App, key: KeyEvent) {
     } else {
         // --- Scroll mode: vim navigation ---
         match key.code {
-            KeyCode::Tab => {
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('s')
+                if key.code != KeyCode::Char('s') || key.modifiers == KeyModifiers::NONE =>
+            {
                 if let OverlayState::KeybindingsHelp {
                     view,
                     scroll_offset,
                     ..
                 } = &mut app.overlay
                 {
-                    *view = match view {
-                        HelpView::Contextual => HelpView::All,
-                        HelpView::All => HelpView::Contextual,
+                    *view = match key.code {
+                        KeyCode::Char('s') => HelpView::Symbols,
+                        KeyCode::BackTab => match view {
+                            HelpView::Contextual => HelpView::Symbols,
+                            HelpView::All => HelpView::Contextual,
+                            HelpView::Symbols => HelpView::All,
+                        },
+                        _ => match view {
+                            HelpView::Contextual => HelpView::All,
+                            HelpView::All => HelpView::Symbols,
+                            HelpView::Symbols => HelpView::Contextual,
+                        },
                     };
                     *scroll_offset = 0;
                 }
@@ -237,26 +249,53 @@ mod tests {
     use crate::app::app_test_helpers::with_session_list;
 
     #[test]
-    fn tab_toggles_help_view() {
+    fn tab_cycles_help_views_and_backtab_reverses() {
         let mut app = with_session_list(0);
         open_contextual_help(&mut app);
-        handle_keybindings_help_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert!(matches!(
-            app.overlay,
+        for expected in [HelpView::All, HelpView::Symbols, HelpView::Contextual] {
+            handle_keybindings_help_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            assert!(matches!(app.overlay,
+                OverlayState::KeybindingsHelp { view, scroll_offset: 0, .. } if view == expected));
+        }
+        for expected in [HelpView::Symbols, HelpView::All, HelpView::Contextual] {
+            handle_keybindings_help_key(
+                &mut app,
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            );
+            assert!(matches!(app.overlay,
+                OverlayState::KeybindingsHelp { view, scroll_offset: 0, .. } if view == expected));
+        }
+    }
+
+    #[test]
+    fn symbols_help_restores_draft_and_keeps_shortcut_as_search_text() {
+        let mut app = with_session_list(0);
+        app.overlay = OverlayState::ThemeRoleEditor {
+            role: crate::ui::theme_roles::ThemeRole::Accent,
+            input: "#123456".to_string(),
+            opening_overrides: Vec::new(),
+            assessment: None,
+            committed: false,
+            pending_acknowledgement: None,
+        };
+        open_contextual_help(&mut app);
+        for c in ['s', '/', 's'] {
+            handle_keybindings_help_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
+        }
+        assert!(matches!(&app.overlay,
             OverlayState::KeybindingsHelp {
-                view: HelpView::All,
-                scroll_offset: 0,
-                ..
-            }
-        ));
-        handle_keybindings_help_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert!(matches!(
-            app.overlay,
-            OverlayState::KeybindingsHelp {
-                view: HelpView::Contextual,
-                ..
-            }
-        ));
+                view: HelpView::Symbols, filter, search_active: true, ..
+            } if filter == "s"));
+        handle_keybindings_help_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        handle_keybindings_help_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
+        assert!(matches!(&app.overlay,
+            OverlayState::ThemeRoleEditor { input, committed: false, .. } if input == "#123456"));
     }
 
     #[test]

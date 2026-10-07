@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "_comment": "Declared source-to-test coverage (#1585). scripts/check-touched-shards uses a rule only when every changed line of `path` (old and new side) sits inside a function named here (blank lines and // comments are free); any other change falls back to the derived module filters. The rule's `tests` is one spec or a list of specs (one per test module); together they must all resolve, in the head tree, to at most 24 sharded tests, or the rule is ignored. The shard compile check of the changed source is never skipped.",
+  "rules": [
+    {
+      "path": "crates/rsid-store/src/store/mod.rs",
+      "reason": "Store::open lifecycle hooks (newer-schema refusal, pre-migration work, schema init) are observed by the file-open tests, not by all of store::tests",
+      "functions": [
+        "open",
+        "init_schema",
+        "init_schema_internal",
+        "refuse_newer_schema"
+      ],
+      "function_prefixes": [
+        "pre_migration_",
+        "backup_"
+      ],
+      "tests": {
+        "module": "store::tests",
+        "names": [
+          "h1_v83_startup_terminal_history_is_idempotent_across_file_backed_reopen"
+        ],
+        "prefixes": [
+          "store_open_",
+          "init_schema_",
+          "pre_migration_"
+        ]
+      }
+    },
+    {
+      "path": "crates/rsid/src/session/mod.rs",
+      "reason": "The terminal-watch planner (watch_decision_for, plan_terminal_watch_fire) is observed by the terminal-watch ownership, stranded-worker watch and manager-notice coalescing/durable-notice tests, not by all of session",
+      "functions": [
+        "watch_decision_for",
+        "plan_terminal_watch_fire"
+      ],
+      "tests": [
+        {
+          "module": "session::tests::terminal_watch_owner",
+          "prefixes": [
+            "terminal_watch_",
+            "owner_settling_",
+            "explicit_name_rearm_",
+            "automatic_child_watch_rearm_"
+          ]
+        },
+        {
+          "module": "session::tests::worker_no_result",
+          "names": [
+            "terminal_watch_waits_for_the_automatic_continuation_then_fires",
+            "terminal_watch_fires_on_the_final_no_result_completed",
+            "watch_line_carries_the_stranded_worker_note"
+          ]
+        },
+        {
+          "module": "session::tests::harness_manager",
+          "prefixes": [
+            "manager_watch_"
+          ]
+        }
+      ]
+    }
+  ]
+}

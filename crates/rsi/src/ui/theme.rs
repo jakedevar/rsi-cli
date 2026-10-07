@@ -12,18 +12,6 @@ use super::theme_roles::ThemeRole;
 const DEFAULT_THEME_INDEX: usize = 0; // Goth
 static ACTIVE_THEME_INDEX: AtomicU8 = AtomicU8::new(DEFAULT_THEME_INDEX as u8);
 
-/// Per-slot border color overrides. u32::MAX = no override (use theme default).
-/// Slots: 0=assistant, 1=user, 2=tool_unselected, 3=tool_selected, 4=normal cursor bg, 5=insert cursor bg, 6=visual selection bg
-static BORDER_COLOR_OVERRIDES: [AtomicU32; 7] = [
-    AtomicU32::new(u32::MAX), // 0: assistant border
-    AtomicU32::new(u32::MAX), // 1: user border
-    AtomicU32::new(u32::MAX), // 2: tool border (unselected)
-    AtomicU32::new(u32::MAX), // 3: tool border (selected)
-    AtomicU32::new(u32::MAX), // 4: normal-mode cursor bg
-    AtomicU32::new(u32::MAX), // 5: insert-mode cursor bg
-    AtomicU32::new(u32::MAX), // 6: visual selection bg
-];
-
 const NO_THEME_ROLE_OVERRIDE: u32 = u32::MAX;
 static THEME_ROLE_OVERRIDES: [AtomicU32; 17] = [
     AtomicU32::new(NO_THEME_ROLE_OVERRIDE),
@@ -121,22 +109,22 @@ const GOTH_PALETTE: CustomPalette = CustomPalette {
     flamingo: rgb(225, 134, 134),
     pink: rgb(223, 106, 170),
     mauve: rgb(181, 138, 215),
-    red: rgb(217, 72, 95),
-    maroon: rgb(156, 65, 86),
+    red: rgb(229, 83, 105),
+    maroon: rgb(170, 76, 98),
     peach: rgb(223, 143, 118),
     yellow: rgb(210, 180, 90),
     green: rgb(111, 191, 141),
     teal: rgb(79, 166, 163),
     sky: rgb(123, 182, 217),
-    sapphire: rgb(47, 103, 127),
-    blue: rgb(74, 126, 216),
+    sapphire: rgb(92, 150, 192),
+    blue: rgb(92, 140, 234),
     lavender: rgb(203, 183, 255),
     text: rgb(244, 240, 255),
     subtext1: rgb(203, 196, 221),
     subtext0: rgb(158, 153, 183),
-    overlay2: rgb(111, 107, 132),
-    overlay1: rgb(86, 81, 106),
-    overlay0: rgb(63, 59, 78),
+    overlay2: rgb(138, 132, 162),
+    overlay1: rgb(118, 112, 144),
+    overlay0: rgb(96, 91, 118),
     surface2: rgb(43, 48, 68),
     surface1: rgb(32, 36, 52),
     surface0: rgb(26, 29, 39),
@@ -177,9 +165,9 @@ const TRANSPARENT_PALETTE: CustomPalette = CustomPalette {
     text: rgb(232, 230, 220),
     subtext1: rgb(196, 191, 184),
     subtext0: rgb(150, 146, 144),
-    overlay2: rgb(113, 109, 127),
-    overlay1: rgb(90, 86, 102),
-    overlay0: rgb(73, 70, 84),
+    overlay2: rgb(122, 118, 136),
+    overlay1: rgb(105, 101, 117),
+    overlay0: rgb(83, 80, 94),
     // Deliberate dark scrims. The terminal window may still be globally
     // transparent, so these need to survive wallpaper blending.
     surface2: rgb(31, 34, 49),
@@ -210,20 +198,20 @@ const JUNK_YARD_PALETTE: CustomPalette = CustomPalette {
     flamingo: rgb(237, 115, 133),
     pink: rgb(233, 116, 209),
     mauve: rgb(179, 136, 235),
-    red: rgb(230, 77, 85),
-    maroon: rgb(154, 61, 87),
+    red: rgb(240, 87, 93),
+    maroon: rgb(173, 78, 103),
     peach: rgb(255, 177, 122),
     yellow: rgb(243, 212, 95),
     green: rgb(102, 188, 126),
     teal: rgb(30, 185, 128),
     sky: rgb(126, 232, 250),
     sapphire: rgb(0, 154, 196),
-    blue: rgb(61, 90, 254),
+    blue: rgb(93, 133, 255),
     lavender: rgb(201, 197, 255),
     text: rgb(249, 247, 239),
     subtext1: rgb(225, 222, 210),
     subtext0: rgb(176, 171, 161),
-    overlay2: rgb(168, 176, 170),
+    overlay2: rgb(155, 163, 157),
     overlay1: rgb(139, 145, 140),
     overlay0: rgb(111, 114, 111),
     surface2: rgb(44, 53, 59),
@@ -231,7 +219,9 @@ const JUNK_YARD_PALETTE: CustomPalette = CustomPalette {
     surface0: rgb(30, 37, 41),
     base: rgb(19, 20, 23),
     mantle: rgb(25, 29, 32),
-    crust: rgb(245, 241, 231),
+    // Dark, like every other theme: crust is the foreground on bright accent
+    // badges (mode, active tab), where a light crust washed out.
+    crust: rgb(16, 18, 20),
     // Value-preserving tier migration (same pattern as Goth: tier_selected
     // == tier_raised, preserving the existing raised/selected overlap).
     tier_base: rgb(19, 20, 23),
@@ -240,10 +230,10 @@ const JUNK_YARD_PALETTE: CustomPalette = CustomPalette {
     tier_selected: rgb(36, 44, 49),
     dark_purple: rgb(105, 50, 175),
     group_powder_blue: rgb(138, 172, 192),
-    epic_purple: rgb(155, 108, 188),
+    epic_purple: rgb(168, 121, 202),
     story_yellow_orange: rgb(196, 145, 74),
-    task_gray: rgb(110, 110, 110),
-    raw_session_magenta: rgb(176, 94, 138),
+    task_gray: rgb(140, 140, 140),
+    raw_session_magenta: rgb(197, 113, 157),
 };
 
 // Anchored to the well-known gruvbox-dark hex palette (bg0_h/bg0/bg1/bg2 for
@@ -252,17 +242,17 @@ const JUNK_YARD_PALETTE: CustomPalette = CustomPalette {
 // discrepancy to replicate — that quirk is Transparent-only, pinned history).
 const GRUVBOX_WARM_PALETTE: CustomPalette = CustomPalette {
     rosewater: rgb(251, 241, 199),
-    flamingo: rgb(214, 93, 14),
+    flamingo: rgb(231, 108, 39),
     pink: rgb(211, 134, 155),
-    mauve: rgb(177, 98, 134),
-    red: rgb(251, 73, 52),
-    maroon: rgb(204, 36, 29),
+    mauve: rgb(200, 119, 155),
+    red: rgb(255, 83, 61),
+    maroon: rgb(213, 48, 38),
     peach: rgb(254, 128, 25),
     yellow: rgb(250, 189, 47),
     green: rgb(184, 187, 38),
     teal: rgb(104, 157, 106),
     sky: rgb(142, 192, 124),
-    sapphire: rgb(69, 133, 136),
+    sapphire: rgb(91, 155, 158),
     blue: rgb(131, 165, 152),
     lavender: rgb(184, 150, 214),
     text: rgb(235, 219, 178),
@@ -285,8 +275,8 @@ const GRUVBOX_WARM_PALETTE: CustomPalette = CustomPalette {
     group_powder_blue: rgb(168, 187, 180),
     epic_purple: rgb(191, 138, 182),
     story_yellow_orange: rgb(216, 158, 74),
-    task_gray: rgb(150, 140, 128),
-    raw_session_magenta: rgb(199, 120, 118),
+    task_gray: rgb(153, 143, 131),
+    raw_session_magenta: rgb(202, 122, 120),
 };
 
 // Maximized-separation dark theme: near-black tier ladder, saturated
@@ -338,22 +328,23 @@ const HIGH_CONTRAST_PALETTE: CustomPalette = CustomPalette {
 // active_tab_fg/mode-badge foregrounds drawn on bright accent backgrounds,
 // and dark-on-bright is needed there regardless of overall theme lightness.
 // surface0/surface1 = tier_panel/tier_raised (same requirement as the other
-// two new themes).
+// two new themes). Accents are deep inks: they colour text on the white
+// canvas, so each keeps at least 4.5:1 against tier_base and tier_panel.
 const LIGHT_PALETTE: CustomPalette = CustomPalette {
-    rosewater: rgb(196, 140, 130),
-    flamingo: rgb(200, 110, 95),
-    pink: rgb(190, 70, 140),
+    rosewater: rgb(147, 95, 86),
+    flamingo: rgb(170, 83, 69),
+    pink: rgb(182, 63, 133),
     mauve: rgb(120, 80, 170),
     red: rgb(200, 40, 40),
     maroon: rgb(150, 30, 40),
-    peach: rgb(200, 110, 40),
-    yellow: rgb(180, 130, 0),
-    green: rgb(40, 140, 60),
-    teal: rgb(20, 130, 120),
-    sky: rgb(50, 130, 190),
+    peach: rgb(171, 84, 0),
+    yellow: rgb(148, 99, 0),
+    green: rgb(17, 125, 45),
+    teal: rgb(0, 122, 112),
+    sky: rgb(29, 113, 172),
     sapphire: rgb(20, 100, 150),
     blue: rgb(28, 102, 181),
-    lavender: rgb(130, 110, 190),
+    lavender: rgb(116, 96, 174),
     text: rgb(30, 30, 30),
     subtext1: rgb(55, 53, 50),
     subtext0: rgb(80, 78, 74),
@@ -371,10 +362,10 @@ const LIGHT_PALETTE: CustomPalette = CustomPalette {
     tier_raised: rgb(230, 227, 219),
     tier_selected: rgb(214, 210, 198),
     dark_purple: rgb(90, 60, 140),
-    group_powder_blue: rgb(70, 120, 160),
+    group_powder_blue: rgb(64, 113, 153),
     epic_purple: rgb(110, 70, 160),
-    story_yellow_orange: rgb(190, 120, 30),
-    task_gray: rgb(120, 116, 110),
+    story_yellow_orange: rgb(160, 92, 0),
+    task_gray: rgb(112, 108, 103),
     raw_session_magenta: rgb(170, 60, 110),
 };
 
@@ -396,9 +387,9 @@ const RAINBOW_PALETTE: CustomPalette = CustomPalette {
     text: rgb(255, 248, 255),
     subtext1: rgb(232, 223, 244),
     subtext0: rgb(200, 189, 217),
-    overlay2: rgb(179, 166, 197),
-    overlay1: rgb(166, 149, 184),
-    overlay0: rgb(154, 137, 173),
+    overlay2: rgb(160, 148, 178),
+    overlay1: rgb(143, 126, 160),
+    overlay0: rgb(119, 103, 137),
     surface2: rgb(48, 34, 77),
     surface1: rgb(33, 24, 55),
     surface0: rgb(21, 16, 36),
@@ -477,9 +468,9 @@ const CUP_A_JOE_PALETTE: CustomPalette = CustomPalette {
     text: rgb(255, 243, 218),
     subtext1: rgb(230, 211, 180),
     subtext0: rgb(200, 177, 143),
-    overlay2: rgb(190, 162, 127),
-    overlay1: rgb(183, 154, 116),
-    overlay0: rgb(176, 146, 109),
+    overlay2: rgb(180, 152, 118),
+    overlay1: rgb(160, 132, 94),
+    overlay0: rgb(136, 108, 72),
     surface2: rgb(70, 48, 37),
     surface1: rgb(49, 33, 25),
     surface0: rgb(33, 22, 17),
@@ -516,9 +507,9 @@ const EMERALD_PALETTE: CustomPalette = CustomPalette {
     text: rgb(237, 255, 247),
     subtext1: rgb(208, 242, 226),
     subtext0: rgb(172, 211, 191),
-    overlay2: rgb(149, 189, 169),
-    overlay1: rgb(136, 178, 157),
-    overlay0: rgb(125, 168, 145),
+    overlay2: rgb(130, 170, 150),
+    overlay1: rgb(107, 149, 128),
+    overlay0: rgb(83, 125, 103),
     surface2: rgb(26, 73, 56),
     surface1: rgb(18, 51, 40),
     surface0: rgb(12, 33, 25),
@@ -555,9 +546,9 @@ const DIAMOND_PALETTE: CustomPalette = CustomPalette {
     text: rgb(247, 253, 255),
     subtext1: rgb(221, 239, 244),
     subtext0: rgb(187, 216, 224),
-    overlay2: rgb(166, 202, 211),
-    overlay1: rgb(149, 187, 197),
-    overlay0: rgb(133, 171, 182),
+    overlay2: rgb(132, 167, 176),
+    overlay1: rgb(110, 147, 156),
+    overlay0: rgb(86, 122, 133),
     surface2: rgb(37, 70, 81),
     surface1: rgb(25, 49, 59),
     surface0: rgb(15, 32, 40),
@@ -594,9 +585,9 @@ const RUBY_PALETTE: CustomPalette = CustomPalette {
     text: rgb(255, 245, 247),
     subtext1: rgb(242, 217, 223),
     subtext0: rgb(215, 181, 190),
-    overlay2: rgb(203, 163, 173),
-    overlay1: rgb(191, 145, 157),
-    overlay0: rgb(183, 129, 143),
+    overlay2: rgb(185, 145, 155),
+    overlay1: rgb(168, 123, 135),
+    overlay0: rgb(149, 97, 111),
     surface2: rgb(84, 33, 44),
     surface1: rgb(58, 23, 31),
     surface0: rgb(39, 16, 21),
@@ -633,9 +624,9 @@ const SAPHIRE_PALETTE: CustomPalette = CustomPalette {
     text: rgb(242, 247, 255),
     subtext1: rgb(215, 227, 248),
     subtext0: rgb(178, 198, 230),
-    overlay2: rgb(164, 189, 226),
-    overlay1: rgb(150, 176, 219),
-    overlay0: rgb(137, 168, 216),
+    overlay2: rgb(134, 158, 194),
+    overlay1: rgb(113, 137, 178),
+    overlay0: rgb(85, 114, 158),
     surface2: rgb(23, 54, 99),
     surface1: rgb(16, 38, 74),
     surface0: rgb(10, 24, 48),
@@ -937,6 +928,242 @@ pub enum BorderPolicy {
     AccentFocusOnly,
 }
 
+/// A palette accent a theme's text-accent mapping may name. Neutral text
+/// tiers (text, subtext, overlay) are deliberately absent: the mapping exists
+/// so secondary text carries the theme's colour instead of uniform grey. Red
+/// is absent too: it means error.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AccentSlot {
+    /// The theme's declared primary colour.
+    Primary,
+    Rosewater,
+    Flamingo,
+    Pink,
+    Mauve,
+    Peach,
+    Yellow,
+    Green,
+    Teal,
+    Sky,
+    Sapphire,
+    Blue,
+    Lavender,
+}
+
+impl AccentSlot {
+    fn resolve(self) -> Color {
+        let palette = active_palette();
+        match self {
+            Self::Primary => active_primary_color(),
+            Self::Rosewater => palette.rosewater,
+            Self::Flamingo => palette.flamingo,
+            Self::Pink => palette.pink,
+            Self::Mauve => palette.mauve,
+            Self::Peach => palette.peach,
+            Self::Yellow => palette.yellow,
+            Self::Green => palette.green,
+            Self::Teal => palette.teal,
+            Self::Sky => palette.sky,
+            Self::Sapphire => palette.sapphire,
+            Self::Blue => palette.blue,
+            Self::Lavender => palette.lavender,
+        }
+    }
+}
+
+/// Per-theme text-accent mapping: which palette accent colours each kind of
+/// session metadata and secondary label. Generalises the Truly Transparent
+/// treatment (coloured metadata instead of grey) to every theme, with the
+/// choices tuned to each theme's mood.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct TextAccents {
+    /// Model names.
+    model: AccentSlot,
+    /// Timestamps, durations and uptime.
+    time: AccentSlot,
+    /// Reasoning-effort levels.
+    effort: AccentSlot,
+    /// Turn, token and process counts.
+    count: AccentSlot,
+    /// Spend.
+    cost: AccentSlot,
+    /// Working directories and sandbox paths.
+    path: AccentSlot,
+    /// Section labels.
+    label: AccentSlot,
+}
+
+impl TextAccents {
+    /// Every slot, labelled, for exhaustive checks.
+    #[cfg(test)]
+    fn slots(self) -> [(&'static str, AccentSlot); 7] {
+        [
+            ("model", self.model),
+            ("time", self.time),
+            ("effort", self.effort),
+            ("count", self.count),
+            ("cost", self.cost),
+            ("path", self.path),
+            ("label", self.label),
+        ]
+    }
+}
+
+/// Fallback for a theme that declares no mapping: the Truly Transparent set.
+const DEFAULT_TEXT_ACCENTS: TextAccents = TextAccents {
+    model: AccentSlot::Lavender,
+    time: AccentSlot::Sky,
+    effort: AccentSlot::Peach,
+    count: AccentSlot::Blue,
+    cost: AccentSlot::Green,
+    path: AccentSlot::Teal,
+    label: AccentSlot::Primary,
+};
+
+// Goth: moonlit lavender and sky over rose effort and blood-rose paths.
+const GOTH_TEXT_ACCENTS: TextAccents = TextAccents {
+    model: AccentSlot::Lavender,
+    time: AccentSlot::Sky,
+    effort: AccentSlot::Pink,
+    count: AccentSlot::Blue,
+    cost: AccentSlot::Green,
+    path: AccentSlot::Rosewater,
+    label: AccentSlot::Primary,
+};
+
+// Junk Yard: hazard yellow time, rust effort, oil-slick cyan and teal.
+const JUNK_YARD_TEXT_ACCENTS: TextAccents = TextAccents {
+    model: AccentSlot::Sky,
+    time: AccentSlot::Yellow,
+    effort: AccentSlot::Peach,
+    count: AccentSlot::Lavender,
+    cost: AccentSlot::Green,
+    path: AccentSlot::Sapphire,
+    label: AccentSlot::Primary,
+};
+
+// Transparent and Truly Transparent share the original coloured-metadata set
+// (amber section labels included); it is the treatment the others generalise.
+const TRANSPARENT_TEXT_ACCENTS: TextAccents = TextAccents {
+    model: AccentSlot::Lavender,
+    time: AccentSlot::Sky,
+    effort: AccentSlot::Peach,
+    count: AccentSlot::Blue,
+    cost: AccentSlot::Green,
+    path: AccentSlot::Teal,
+    label: AccentSlot::Yellow,
+};
+
+// Gruvbox Warm: the canonical brights (purple, aqua, yellow, blue, green).
+const GRUVBOX_WARM_TEXT_ACCENTS: TextAccents = TextAccents {
+    model: AccentSlot::Pink,
+    time: AccentSlot::Sky,
+    effort: AccentSlot::Yellow,
+    count: AccentSlot::Blue,
+    cost: AccentSlot::Green,
+    path: AccentSlot::Teal,
+    label: AccentSlot::Primary,
+};
+
+// High Contrast: saturated, widely separated hues on black.
+const HIGH_CONTRAST_TEXT_ACCENTS: TextAccents = TextAccents {
+    model: AccentSlot::Lavender,
+    time: AccentSlot::Yellow,
+    effort: AccentSlot::Peach,
+    count: AccentSlot::Teal,
+    cost: AccentSlot::Green,
+    path: AccentSlot::Sapphire,
+    label: AccentSlot::Primary,
+};
+
+// Light: deep ink tones that read as text on white.
+const LIGHT_TEXT_ACCENTS: TextAccents = TextAccents {
+    model: AccentSlot::Mauve,
+    time: AccentSlot::Sapphire,
+    effort: AccentSlot::Peach,
+    count: AccentSlot::Pink,
+    cost: AccentSlot::Green,
+    path: AccentSlot::Teal,
+    label: AccentSlot::Primary,
+};
+
+// RAAAAINNNNNNBOOOZZZZZZZZ: one neon per role.
+const RAINBOW_TEXT_ACCENTS: TextAccents = TextAccents {
+    model: AccentSlot::Mauve,
+    time: AccentSlot::Sky,
+    effort: AccentSlot::Peach,
+    count: AccentSlot::Yellow,
+    cost: AccentSlot::Green,
+    path: AccentSlot::Pink,
+    label: AccentSlot::Primary,
+};
+
+// Cup`a Joe: caramel time and honey effort, dusty cool hues for the rest.
+const CUP_A_JOE_TEXT_ACCENTS: TextAccents = TextAccents {
+    model: AccentSlot::Mauve,
+    time: AccentSlot::Peach,
+    effort: AccentSlot::Yellow,
+    count: AccentSlot::Sky,
+    cost: AccentSlot::Green,
+    path: AccentSlot::Teal,
+    label: AccentSlot::Primary,
+};
+
+// Emerald: jade, gold and aqua around the emerald primary.
+const EMERALD_TEXT_ACCENTS: TextAccents = TextAccents {
+    model: AccentSlot::Lavender,
+    time: AccentSlot::Teal,
+    effort: AccentSlot::Yellow,
+    count: AccentSlot::Sky,
+    cost: AccentSlot::Green,
+    path: AccentSlot::Sapphire,
+    label: AccentSlot::Primary,
+};
+
+// Diamond: prismatic flashes (violet, rose, gold) against ice.
+const DIAMOND_TEXT_ACCENTS: TextAccents = TextAccents {
+    model: AccentSlot::Mauve,
+    time: AccentSlot::Sapphire,
+    effort: AccentSlot::Yellow,
+    count: AccentSlot::Pink,
+    cost: AccentSlot::Green,
+    path: AccentSlot::Teal,
+    label: AccentSlot::Primary,
+};
+
+// Ruby: a warm gem register (amber, gold, coral) with orchid models.
+const RUBY_TEXT_ACCENTS: TextAccents = TextAccents {
+    model: AccentSlot::Mauve,
+    time: AccentSlot::Peach,
+    effort: AccentSlot::Yellow,
+    count: AccentSlot::Lavender,
+    cost: AccentSlot::Green,
+    path: AccentSlot::Flamingo,
+    label: AccentSlot::Primary,
+};
+
+// Saphire: sky, aqua and azure around the sapphire primary.
+const SAPHIRE_TEXT_ACCENTS: TextAccents = TextAccents {
+    model: AccentSlot::Lavender,
+    time: AccentSlot::Sky,
+    effort: AccentSlot::Yellow,
+    count: AccentSlot::Teal,
+    cost: AccentSlot::Green,
+    path: AccentSlot::Sapphire,
+    label: AccentSlot::Primary,
+};
+
+// D. is for Daemon: hellfire gold and ember, brimstone pink, bone paths.
+const DAMON_TEXT_ACCENTS: TextAccents = TextAccents {
+    model: AccentSlot::Mauve,
+    time: AccentSlot::Yellow,
+    effort: AccentSlot::Peach,
+    count: AccentSlot::Flamingo,
+    cost: AccentSlot::Green,
+    path: AccentSlot::Rosewater,
+    label: AccentSlot::Primary,
+};
+
 #[derive(Clone, Copy)]
 struct ThemeDefinition {
     key: &'static str,
@@ -948,6 +1175,9 @@ struct ThemeDefinition {
     transparency_policy: TransparencyPolicy,
     /// Closed-loop gradient stops for the rainbow activity indicators.
     loader: &'static [Color],
+    /// Accent colours for metadata and secondary text; `None` falls back to
+    /// [`DEFAULT_TEXT_ACCENTS`].
+    text_accents: Option<&'static TextAccents>,
 }
 
 impl ThemeDefinition {
@@ -969,12 +1199,21 @@ impl ThemeDefinition {
             border_policy,
             transparency_policy,
             loader: &DEFAULT_LOADER,
+            text_accents: None,
         }
     }
 
     /// Declare the theme's loader spectrum (see the `*_LOADER` stops).
     const fn with_loader(self, loader: &'static [Color]) -> Self {
         Self { loader, ..self }
+    }
+
+    /// Declare the theme's text-accent mapping (see the `*_TEXT_ACCENTS`).
+    const fn with_text_accents(self, text_accents: &'static TextAccents) -> Self {
+        Self {
+            text_accents: Some(text_accents),
+            ..self
+        }
     }
 }
 
@@ -988,7 +1227,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
     )
-    .with_loader(&GOTH_LOADER),
+    .with_loader(&GOTH_LOADER)
+    .with_text_accents(&GOTH_TEXT_ACCENTS),
     ThemeDefinition::new(
         "junkyard",
         "Junk Yard",
@@ -998,7 +1238,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
     )
-    .with_loader(&JUNK_YARD_LOADER),
+    .with_loader(&JUNK_YARD_LOADER)
+    .with_text_accents(&JUNK_YARD_TEXT_ACCENTS),
     ThemeDefinition::new(
         "transparent",
         "Transparent",
@@ -1008,7 +1249,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         BorderPolicy::FullBorders,
         TransparencyPolicy::Scrimmed,
     )
-    .with_loader(&TRANSPARENT_LOADER),
+    .with_loader(&TRANSPARENT_LOADER)
+    .with_text_accents(&TRANSPARENT_TEXT_ACCENTS),
     ThemeDefinition::new(
         "gruvbox-warm",
         "Gruvbox Warm",
@@ -1018,7 +1260,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
     )
-    .with_loader(&GRUVBOX_WARM_LOADER),
+    .with_loader(&GRUVBOX_WARM_LOADER)
+    .with_text_accents(&GRUVBOX_WARM_TEXT_ACCENTS),
     ThemeDefinition::new(
         "high-contrast",
         "High Contrast",
@@ -1028,7 +1271,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
     )
-    .with_loader(&HIGH_CONTRAST_LOADER),
+    .with_loader(&HIGH_CONTRAST_LOADER)
+    .with_text_accents(&HIGH_CONTRAST_TEXT_ACCENTS),
     ThemeDefinition::new(
         "light",
         "Light",
@@ -1038,7 +1282,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
     )
-    .with_loader(&LIGHT_LOADER),
+    .with_loader(&LIGHT_LOADER)
+    .with_text_accents(&LIGHT_TEXT_ACCENTS),
     ThemeDefinition::new(
         "raaaainnnnnnbooozzzzzzzz",
         "RAAAAINNNNNNBOOOZZZZZZZZ",
@@ -1048,7 +1293,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
     )
-    .with_loader(&RAINBOW_LOADER),
+    .with_loader(&RAINBOW_LOADER)
+    .with_text_accents(&RAINBOW_TEXT_ACCENTS),
     ThemeDefinition::new(
         "truly-transparent",
         "Truly Transparent",
@@ -1058,7 +1304,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         BorderPolicy::FullBorders,
         TransparencyPolicy::TerminalDefault,
     )
-    .with_loader(&TRULY_TRANSPARENT_LOADER),
+    .with_loader(&TRULY_TRANSPARENT_LOADER)
+    .with_text_accents(&TRANSPARENT_TEXT_ACCENTS),
     ThemeDefinition::new(
         "cup-a-joe",
         "Cup`a Joe",
@@ -1068,7 +1315,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
     )
-    .with_loader(&CUP_A_JOE_LOADER),
+    .with_loader(&CUP_A_JOE_LOADER)
+    .with_text_accents(&CUP_A_JOE_TEXT_ACCENTS),
     ThemeDefinition::new(
         "emerald",
         "Emerald",
@@ -1078,7 +1326,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
     )
-    .with_loader(&EMERALD_LOADER),
+    .with_loader(&EMERALD_LOADER)
+    .with_text_accents(&EMERALD_TEXT_ACCENTS),
     ThemeDefinition::new(
         "diamond",
         "Diamond",
@@ -1088,7 +1337,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
     )
-    .with_loader(&DIAMOND_LOADER),
+    .with_loader(&DIAMOND_LOADER)
+    .with_text_accents(&DIAMOND_TEXT_ACCENTS),
     ThemeDefinition::new(
         "ruby",
         "Ruby",
@@ -1098,7 +1348,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
     )
-    .with_loader(&RUBY_LOADER),
+    .with_loader(&RUBY_LOADER)
+    .with_text_accents(&RUBY_TEXT_ACCENTS),
     ThemeDefinition::new(
         "saphire",
         "Saphire",
@@ -1108,7 +1359,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
     )
-    .with_loader(&SAPHIRE_LOADER),
+    .with_loader(&SAPHIRE_LOADER)
+    .with_text_accents(&SAPHIRE_TEXT_ACCENTS),
     ThemeDefinition::new(
         "d-is-for-devil",
         "D. is for Daemon",
@@ -1118,7 +1370,8 @@ const THEME_DEFINITIONS: [ThemeDefinition; 14] = [
         BorderPolicy::AccentFocusOnly,
         TransparencyPolicy::Opaque,
     )
-    .with_loader(&DAMON_LOADER),
+    .with_loader(&DAMON_LOADER)
+    .with_text_accents(&DAMON_TEXT_ACCENTS),
 ];
 
 pub const THEME_COUNT: usize = THEME_DEFINITIONS.len();
@@ -1228,58 +1481,6 @@ pub fn theme_swatch(index: usize) -> [Color; 8] {
     ]
 }
 
-/// Read a border-color override slot. Returns `None` if no override is set.
-fn border_override(slot: usize) -> Option<Color> {
-    let raw = BORDER_COLOR_OVERRIDES[slot].load(Ordering::Relaxed);
-    if raw == u32::MAX {
-        None
-    } else {
-        Some(Color::Rgb(
-            ((raw >> 16) & 0xFF) as u8,
-            ((raw >> 8) & 0xFF) as u8,
-            (raw & 0xFF) as u8,
-        ))
-    }
-}
-
-/// Set (or clear) a border-color override slot.
-/// `slot`: 0=assistant, 1=user, 2=tool_unselected, 3=tool_selected, 4=normal cursor bg, 5=insert cursor bg, 6=visual selection bg
-/// `rgb`: `None` = revert to theme default; `Some([r,g,b])` = fixed override.
-pub fn set_border_color_override(slot: usize, rgb: Option<[u8; 3]>) {
-    if slot >= 7 {
-        return;
-    }
-    let raw = match rgb {
-        None => u32::MAX,
-        Some([r, g, b]) => ((r as u32) << 16) | ((g as u32) << 8) | b as u32,
-    };
-    BORDER_COLOR_OVERRIDES[slot].store(raw, Ordering::Relaxed);
-}
-
-/// Get the current border-color override for a slot (for persistence).
-pub fn get_border_color_override(slot: usize) -> Option<[u8; 3]> {
-    if slot >= 7 {
-        return None;
-    }
-    let raw = BORDER_COLOR_OVERRIDES[slot].load(Ordering::Relaxed);
-    if raw == u32::MAX {
-        None
-    } else {
-        Some([
-            ((raw >> 16) & 0xFF) as u8,
-            ((raw >> 8) & 0xFF) as u8,
-            (raw & 0xFF) as u8,
-        ])
-    }
-}
-
-/// Apply all seven border-color overrides at once (call on app startup from persisted state).
-pub fn apply_border_color_overrides(overrides: &[Option<[u8; 3]>; 7]) {
-    for (slot, rgb) in overrides.iter().enumerate() {
-        set_border_color_override(slot, *rgb);
-    }
-}
-
 fn encode_rgb(rgb: [u8; 3]) -> u32 {
     ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32
 }
@@ -1339,7 +1540,6 @@ pub fn apply_theme_role_overrides(overrides: &[(ThemeRole, [u8; 3])]) {
 pub fn apply_startup_theme_state(
     theme_name: Option<&str>,
     role_overrides: &[(ThemeRole, [u8; 3])],
-    border_overrides: &[Option<[u8; 3]>; 7],
 ) {
     #[cfg(test)]
     let _guard = test_app_initialization_guard();
@@ -1348,7 +1548,6 @@ pub fn apply_startup_theme_state(
         let _ = set_theme_by_name(name);
     }
     apply_theme_role_overrides(role_overrides);
-    apply_border_color_overrides(border_overrides);
 }
 
 fn semantic_baseline(role: ThemeRole) -> Color {
@@ -1473,27 +1672,27 @@ pub fn user_role() -> Color {
 }
 /// Border color for assistant messages (when not selected and not tool).
 pub fn assistant_message_border() -> Color {
-    border_override(0).unwrap_or_else(assistant_role)
+    assistant_role()
 }
 /// Border color for user messages when not selected.
 pub fn user_message_border() -> Color {
-    border_override(1).unwrap_or_else(dark_purple)
+    dark_purple()
 }
 /// Border color for tool call messages (ToolUse / ToolResult) when not selected.
 pub fn tool_call_border() -> Color {
-    border_override(2).unwrap_or_else(overlay1)
+    overlay1()
 }
 /// Border color for tool call messages when selected (cursor is on them).
 pub fn tool_call_selected_border() -> Color {
-    border_override(3).unwrap_or_else(active_primary_color)
+    active_primary_color()
 }
 /// Background color for the normal-mode block cursor.
 pub fn cursor_normal_bg() -> Color {
-    border_override(4).unwrap_or_else(text)
+    text()
 }
 /// Background color for the insert-mode cursor highlight (rendered under the terminal beam).
 pub fn cursor_insert_bg() -> Color {
-    border_override(5).unwrap_or_else(green)
+    green()
 }
 pub fn tool_name() -> Color {
     peach()
@@ -1603,62 +1802,41 @@ pub fn dim_metadata() -> Color {
     }
 }
 
-// Terminal-default surfaces need color to distinguish metadata without a scrim.
-// Keep other themes' established text hierarchy.
+/// The active theme's text-accent mapping.
+fn active_text_accents() -> &'static TextAccents {
+    active_theme_definition()
+        .text_accents
+        .unwrap_or(&DEFAULT_TEXT_ACCENTS)
+}
+
+// Metadata and secondary text take theme-varied accent colours from the
+// active theme's text-accent mapping instead of uniform grey.
 pub fn model_text() -> Color {
-    if uses_terminal_default_backgrounds() {
-        lavender()
-    } else {
-        subtext1()
-    }
+    active_text_accents().model.resolve()
 }
 
 pub fn time_text() -> Color {
-    if uses_terminal_default_backgrounds() {
-        sky()
-    } else {
-        dim_metadata()
-    }
+    active_text_accents().time.resolve()
 }
 
 pub fn effort_text() -> Color {
-    if uses_terminal_default_backgrounds() {
-        peach()
-    } else {
-        dim_metadata()
-    }
+    active_text_accents().effort.resolve()
 }
 
 pub fn count_text() -> Color {
-    if uses_terminal_default_backgrounds() {
-        blue()
-    } else {
-        dim_metadata()
-    }
+    active_text_accents().count.resolve()
 }
 
 pub fn cost_text() -> Color {
-    if uses_terminal_default_backgrounds() {
-        green()
-    } else {
-        dim_metadata()
-    }
+    active_text_accents().cost.resolve()
 }
 
 pub fn path_text() -> Color {
-    if uses_terminal_default_backgrounds() {
-        teal()
-    } else {
-        subtext1()
-    }
+    active_text_accents().path.resolve()
 }
 
 pub fn section_label_text() -> Color {
-    if is_transparent_theme() {
-        yellow()
-    } else {
-        active_primary_color()
-    }
+    active_text_accents().label.resolve()
 }
 
 /// Neutral secondary text for labels inside the bounded session browser.
@@ -1986,7 +2164,6 @@ pub(crate) fn test_render_guard() -> Option<std::sync::MutexGuard<'static, ()>> 
 #[cfg(test)]
 struct ThemeSnapshot {
     theme: usize,
-    border_overrides: [Option<[u8; 3]>; 7],
     role_overrides: Vec<(ThemeRole, [u8; 3])>,
 }
 
@@ -2011,7 +2188,6 @@ impl Drop for PinnedThemeState {
     fn drop(&mut self) {
         if let Some(snapshot) = self.restore.take() {
             set_theme_by_index(snapshot.theme);
-            apply_border_color_overrides(&snapshot.border_overrides);
             apply_theme_role_overrides(&snapshot.role_overrides);
         }
         THEME_TEST_SCOPE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
@@ -2037,7 +2213,6 @@ pub(crate) fn pin_theme_state() -> PinnedThemeState {
         .unwrap_or_else(|error| error.into_inner());
     let restore = ThemeSnapshot {
         theme: active_theme_index(),
-        border_overrides: std::array::from_fn(get_border_color_override),
         role_overrides: snapshot_theme_role_overrides(),
     };
     THEME_TEST_SCOPE_DEPTH.with(|depth| depth.set(depth.get() + 1));
@@ -2099,8 +2274,10 @@ pub fn overlay_mode_insert_fg() -> Color {
 pub fn overlay_mode_insert_bg() -> Color {
     green()
 }
+/// Primary text, not `crust`: the badge sits on `surface2`, which is dark in
+/// every dark theme, so a crust foreground would vanish there.
 pub fn overlay_mode_normal_fg() -> Color {
-    crust()
+    text()
 }
 pub fn overlay_mode_normal_bg() -> Color {
     surface2()
@@ -2147,7 +2324,7 @@ pub fn suggestion_border() -> Color {
     overlay_border()
 }
 pub fn visual_selection_bg() -> Color {
-    border_override(6).unwrap_or_else(surface2)
+    surface2()
 }
 
 // File viewer search highlights — sourced from the active palette so they
@@ -2374,28 +2551,6 @@ pub fn overlay_block() -> ratatui::widgets::Block<'static> {
         .style(Style::default().bg(overlay_bg()))
 }
 
-/// Overlay block with plain (square-corner) borders for TaskRabbit popups.
-pub fn taskrabbit_overlay_block() -> ratatui::widgets::Block<'static> {
-    use ratatui::style::Style;
-    use ratatui::widgets::{Block, BorderType, Borders};
-
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(overlay_border()))
-        .style(Style::default().bg(overlay_bg()))
-}
-
-/// Teal accent color for TaskRabbit overlays.
-pub fn taskrabbit_border() -> Color {
-    teal()
-}
-
-/// Teal title color for TaskRabbit overlays.
-pub fn taskrabbit_title() -> Color {
-    teal()
-}
-
 /// Overlay block for unfocused input overlays in the stacked view.
 pub fn unfocused_overlay_block() -> ratatui::widgets::Block<'static> {
     use ratatui::style::Style;
@@ -2562,7 +2717,6 @@ mod tests {
             set_theme_by_index(index);
             for block in [
                 overlay_block(),
-                taskrabbit_overlay_block(),
                 blank_overlay_block(),
                 unfocused_overlay_block(),
             ] {
@@ -2617,6 +2771,165 @@ mod tests {
         let a = wcag_relative_luminance(a);
         let b = wcag_relative_luminance(b);
         (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn every_theme_declares_a_coloured_text_accent_mapping() {
+        let _guard = theme_test_guard();
+        clear_theme_role_overrides();
+        for (index, definition) in THEME_DEFINITIONS.iter().enumerate() {
+            let key = definition.key;
+            let accents = definition
+                .text_accents
+                .unwrap_or_else(|| panic!("{key}: declares no text-accent mapping"));
+            set_theme_by_index(index);
+            assert_eq!(active_text_accents(), accents, "{key}: active mapping");
+
+            let resolved = [
+                ("model", model_text(), accents.model),
+                ("time", time_text(), accents.time),
+                ("effort", effort_text(), accents.effort),
+                ("count", count_text(), accents.count),
+                ("cost", cost_text(), accents.cost),
+                ("path", path_text(), accents.path),
+                ("label", section_label_text(), accents.label),
+            ];
+            let grey = [
+                text(),
+                subtext1(),
+                subtext0(),
+                overlay2(),
+                overlay1(),
+                overlay0(),
+            ];
+            for (role, color, slot) in resolved {
+                assert_eq!(color, slot.resolve(), "{key}: {role} follows its slot");
+                assert!(
+                    !grey.contains(&color),
+                    "{key}: {role} resolves to a neutral text tier ({color:?})"
+                );
+            }
+
+            let mut distinct: Vec<Color> = Vec::new();
+            for (_, color, _) in resolved {
+                if !distinct.contains(&color) {
+                    distinct.push(color);
+                }
+            }
+            assert!(
+                distinct.len() >= 5,
+                "{key}: text accents must vary, got {} distinct colours",
+                distinct.len()
+            );
+        }
+    }
+
+    #[test]
+    fn truly_transparent_keeps_its_original_metadata_colours() {
+        let _guard = theme_test_guard();
+        assert!(set_theme_by_name("truly-transparent"));
+        assert_eq!(model_text(), lavender());
+        assert_eq!(time_text(), sky());
+        assert_eq!(effort_text(), peach());
+        assert_eq!(count_text(), blue());
+        assert_eq!(cost_text(), green());
+        assert_eq!(path_text(), teal());
+        assert_eq!(section_label_text(), yellow());
+    }
+
+    /// Every text role stays readable on the surfaces it is drawn over:
+    /// body text, secondary text, the text-accent mapping and the accents used
+    /// as text (roles, syntax, links) at 4.5:1; dim metadata (`overlay1`) at
+    /// 3:1; the faint comment/hint tier (`overlay0`) at 2.5:1. Truly
+    /// Transparent is exempt: its colours are terminal ANSI slots drawn over
+    /// the terminal's own background.
+    #[test]
+    fn text_roles_meet_contrast_targets_in_every_theme() {
+        let _guard = theme_test_guard();
+        clear_theme_role_overrides();
+        let mut failures = Vec::new();
+        for (index, definition) in THEME_DEFINITIONS.iter().enumerate() {
+            if definition.transparency_policy == TransparencyPolicy::TerminalDefault {
+                continue;
+            }
+            set_theme_by_index(index);
+            let key = definition.key;
+            let mut roles = vec![
+                ("text", text(), 4.5),
+                ("subtext1", subtext1(), 4.5),
+                ("subtext0", subtext0(), 4.5),
+                ("dim metadata", dim_metadata(), 3.0),
+                ("overlay1", overlay1(), 3.0),
+                ("overlay0", overlay0(), 2.5),
+                ("maroon", maroon(), 3.0),
+            ];
+            for (name, color) in [
+                ("rosewater", rosewater()),
+                ("flamingo", flamingo()),
+                ("pink", pink()),
+                ("mauve", mauve()),
+                ("red", red()),
+                ("peach", peach()),
+                ("yellow", yellow()),
+                ("green", green()),
+                ("teal", teal()),
+                ("sky", sky()),
+                ("sapphire", sapphire()),
+                ("blue", blue()),
+                ("lavender", lavender()),
+                ("group kind", group_powder_blue()),
+                ("epic kind", epic_purple()),
+                ("story kind", story_yellow_orange()),
+                ("task kind", task_gray()),
+                ("session kind", raw_session_magenta()),
+            ] {
+                roles.push((name, color, 4.5));
+            }
+            for (name, slot) in active_text_accents().slots() {
+                roles.push((name, slot.resolve(), 4.5));
+            }
+            for (surface, background) in [("tier_base", tier_base()), ("tier_panel", tier_panel())]
+            {
+                for &(role, foreground, minimum) in &roles {
+                    let ratio = wcag_contrast(foreground, background);
+                    if ratio < minimum {
+                        failures.push(format!(
+                            "{key}: {role} on {surface} is {ratio:.2}:1 (< {minimum})"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Accent badges (mode, active tab, docregblock, alarms) draw `crust` on
+    /// the accent; the overlay normal-mode badge draws on `surface2`.
+    #[test]
+    fn badge_foregrounds_stay_readable_on_their_backgrounds() {
+        let _guard = theme_test_guard();
+        clear_theme_role_overrides();
+        for (index, definition) in THEME_DEFINITIONS.iter().enumerate() {
+            if definition.transparency_policy == TransparencyPolicy::TerminalDefault {
+                continue;
+            }
+            set_theme_by_index(index);
+            let key = definition.key;
+            let ratio = wcag_contrast(overlay_mode_normal_fg(), overlay_mode_normal_bg());
+            assert!(ratio >= 4.5, "{key}: overlay normal badge {ratio:.2}:1");
+            // Light's deep-ink accents trade badge contrast for text
+            // contrast; its bold badges keep the 3:1 large-text bar.
+            let minimum = if key == "light" { 3.0 } else { 4.5 };
+            for (pair, background) in [
+                ("primary", active_primary_color()),
+                ("green", green()),
+                ("yellow", yellow()),
+                ("blue", blue()),
+            ] {
+                let ratio = wcag_contrast(crust(), background);
+                assert!(ratio >= minimum, "{key}: crust/{pair} {ratio:.2}:1");
+            }
+        }
     }
 
     #[test]

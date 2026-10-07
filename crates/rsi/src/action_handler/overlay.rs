@@ -37,6 +37,15 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
             }
         }
 
+        LcAction::OpenBtop => {
+            // btop is optional: only request the spawn when it is on PATH.
+            if which::which("btop").is_ok() {
+                app.pending_external = Some(crate::app::ExternalRequest::Btop);
+            } else {
+                app.notify("btop is not installed");
+            }
+        }
+
         LcAction::DismissAllNotifications => {
             let dismissed: Vec<_> = app.notifications.drain(..).collect();
             for n in dismissed {
@@ -100,31 +109,6 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
             {
                 *active_zone = crate::types::SessionListZone::Main;
                 *selected_session = app.filtered_session_order.get(*selected_index).copied();
-            }
-        }
-
-        LcAction::GoToTaskRabbitZone => {
-            // Switch to TaskRabbit zone from anywhere
-            let focused = app.interaction_pane_id();
-            if matches!(
-                app.tabs[app.active_tab].find_pane(focused),
-                Some(crate::types::Pane::SessionDetail { .. })
-            ) {
-                app.back_to_list();
-            }
-            let focused = app.interaction_pane_id();
-            if let Some(crate::types::Pane::SessionList {
-                active_zone,
-                selected_session,
-                taskrabbit_selected_index,
-                ..
-            }) = app.tabs[app.active_tab].find_pane_mut(focused)
-            {
-                *active_zone = crate::types::SessionListZone::TaskRabbit;
-                *selected_session = app
-                    .filtered_taskrabbit_order
-                    .get(*taskrabbit_selected_index)
-                    .copied();
             }
         }
 
@@ -198,6 +182,7 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
         }
 
         LcAction::SelectModel(model) => {
+            let before = app.default_model_identity();
             if let Some(ref model_id) = model {
                 // If already on Harness provider (direct API) or Antigravity,
                 // keep it — Harness and Antigravity models overlap with other CLI provider
@@ -245,11 +230,16 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
                         .map(|(id, name)| (id.to_string(), name.to_string()))
                         .collect();
                 }
+                // A custom endpoint belongs to the provider it was chosen on.
+                if app.selected_provider != before.0 {
+                    app.custom_provider_index = None;
+                }
             }
             app.selected_model = model;
             if let Some(model) = app.selected_model.as_deref() {
                 rsi_common::model_utils::reconcile_effort(model, &mut app.selected_effort);
             }
+            app.finish_default_model_change(&before);
         }
 
         LcAction::OpenThemePicker => {
@@ -257,14 +247,6 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
                 app.overlay = OverlayState::None;
             } else {
                 crate::overlay::open_theme_picker(app);
-            }
-        }
-
-        LcAction::OpenColorCustomizer => {
-            if matches!(&app.overlay, OverlayState::ColorCustomizer { .. }) {
-                app.overlay = OverlayState::None;
-            } else {
-                crate::overlay::open_color_customizer(app);
             }
         }
 
@@ -659,6 +641,10 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
 
         LcAction::OpenSessionInfoPanel => {
             crate::overlay::open_session_info_panel(app);
+        }
+
+        LcAction::OpenModelSwitchPicker => {
+            crate::overlay::open_model_switch_picker(app).await;
         }
 
         // === Phase 4: hierarchy reassignment ===

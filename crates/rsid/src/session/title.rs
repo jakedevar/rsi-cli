@@ -62,11 +62,34 @@ pub(crate) fn should_enqueue_title_refinement(
     role_titled_identity: bool,
     event_count: usize,
     title_is_none: bool,
+    succession_queued: bool,
 ) -> bool {
     !matches!(session_kind, SessionKind::TaskRabbit | SessionKind::Bug)
         && !role_titled_identity
         && event_count >= 3
         && title_is_none
+        && !succession_queued
+}
+
+/// #1390: true while an unresolved manager succession replaces `session_id`.
+/// Title refinement is skipped then: the succession pins the predecessor row,
+/// and a refinement write would refuse it. A store error also skips the
+/// refinement, which is cosmetic.
+pub(crate) async fn manager_succession_holds_title(
+    store: &Arc<Mutex<Store>>,
+    session_id: Uuid,
+) -> bool {
+    match store
+        .lock()
+        .await
+        .session_has_unresolved_manager_succession(session_id)
+    {
+        Ok(queued) => queued,
+        Err(error) => {
+            tracing::warn!(%error, %session_id, "manager succession lookup failed; skipping title refinement");
+            true
+        }
+    }
 }
 
 #[cfg(test)]
@@ -88,6 +111,15 @@ mod identity_policy_tests {
             true,
             3,
             true,
+            false,
+        ));
+        // #1390: a queued manager succession suppresses refinement.
+        assert!(!should_enqueue_title_refinement(
+            SessionKind::Standard,
+            false,
+            3,
+            true,
+            true,
         ));
 
         assert!(should_enqueue_initial_title_generation(
@@ -101,6 +133,7 @@ mod identity_policy_tests {
             false,
             3,
             true,
+            false,
         ));
         assert!(should_enqueue_initial_title_generation(
             SessionKind::Task,

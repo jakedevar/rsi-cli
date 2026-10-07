@@ -138,7 +138,13 @@ pub(crate) async fn report_round(store: &Arc<Mutex<Store>>, root: &Path, state: 
         else {
             continue;
         };
+        // A full page means more may be queued: pull again next round instead
+        // of waiting out the pacing interval (the queue holds up to 32).
+        let full_page = reports.len() >= SATELLITE_REPORT_MAX_PER_FETCH;
         let acks = record_reports(store, peer.id, installation, reports).await;
+        if full_page && !acks.is_empty() {
+            state.next_poll.insert(peer.id, Instant::now());
+        }
         state.pending_acks.insert(peer.id, (installation, acks));
     }
 }
@@ -157,6 +163,7 @@ pub(crate) async fn record_reports(
 ) -> Vec<Uuid> {
     let guard = store.lock().await;
     let mut acks = Vec::new();
+    let mut retries: Vec<&'static str> = Vec::new();
     for report in reports.into_iter().take(SATELLITE_REPORT_MAX_PER_FETCH) {
         match guard.record_satellite_report(peer_id, verified_installation, &report, Utc::now()) {
             Ok(ReportRecord::Recorded | ReportRecord::Duplicate) => acks.push(report.report_id),
@@ -167,11 +174,21 @@ pub(crate) async fn record_reports(
                 tracing::warn!(peer_id = %peer_id, class, "satellite report refused");
                 acks.push(report.report_id);
             }
-            Ok(ReportRecord::Retry) => {}
+            Ok(ReportRecord::Retry(reason)) => retries.push(reason),
             Err(error) => {
                 tracing::warn!(peer_id = %peer_id, "satellite report record failed: {error}");
             }
         }
+    }
+    // A stalled pull is never silent: the reports stay on the satellite and
+    // the hub names why (one line per round and peer).
+    if let Some(reason) = retries.first() {
+        tracing::warn!(
+            peer_id = %peer_id,
+            reason = *reason,
+            held = retries.len(),
+            "satellite reports held on the satellite: not recorded"
+        );
     }
     acks
 }
@@ -212,6 +229,10 @@ mod tests {
     }
 
     async fn rig(dispatch_enabled: bool, honor_acks: bool) -> Rig {
+        rig_with(dispatch_enabled, honor_acks, 1).await
+    }
+
+    async fn rig_with(dispatch_enabled: bool, honor_acks: bool, queued: usize) -> Rig {
         let temp = tempfile::Builder::new()
             .prefix("sat-rep-")
             .tempdir_in("/tmp")
@@ -225,11 +246,15 @@ mod tests {
         let installation = Uuid::new_v4();
         let fake = Fake {
             fetches: Arc::new(AtomicUsize::new(0)),
-            reports: Arc::new(StdMutex::new(vec![SatelliteReportV1 {
-                report_id: Uuid::new_v4(),
-                kind: SatelliteReportKindV1::Enqueue,
-                text: "ENQUEUE deadbeef issue=#1".into(),
-            }])),
+            reports: Arc::new(StdMutex::new(
+                (0..queued)
+                    .map(|index| SatelliteReportV1 {
+                        report_id: Uuid::new_v4(),
+                        kind: SatelliteReportKindV1::Enqueue,
+                        text: format!("ENQUEUE deadbeef issue=#{index}"),
+                    })
+                    .collect(),
+            )),
             acks_seen: Arc::new(StdMutex::new(Vec::new())),
         };
         let (fetches, reports, acks_seen) = (
@@ -271,7 +296,11 @@ mod tests {
                                     held.retain(|report| !params.acked.contains(&report.report_id));
                                 }
                                 serde_json::to_value(SatelliteFetchReportsReplyV1 {
-                                    reports: held.clone(),
+                                    reports: held
+                                        .iter()
+                                        .take(SATELLITE_REPORT_MAX_PER_FETCH)
+                                        .cloned()
+                                        .collect(),
                                 })
                                 .unwrap()
                             }
@@ -431,5 +460,62 @@ mod tests {
         .await;
         assert_eq!(acks.len(), reports.len());
         assert_eq!(notices(&rig).await, 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_queue_larger_than_one_page_drains_over_successive_pulls() {
+        // Within the per-peer rate limit, so only paging is in play.
+        let queued = SATELLITE_REPORT_MAX_PER_FETCH + SATELLITE_REPORT_MAX_PER_FETCH / 2;
+        let rig = rig_with(true, true, queued).await;
+        let mut state = ReportState::default();
+        // No pacing sleep: a full page is followed by an immediate pull.
+        for _ in 0..2 {
+            report_round(&rig.store, &rig.root, &mut state).await;
+        }
+        assert_eq!(notices(&rig).await, i64::try_from(queued).unwrap());
+        // The last short page's acknowledgement rides the next paced pull.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        report_round(&rig.store, &rig.root, &mut state).await;
+        assert_eq!(notices(&rig).await, i64::try_from(queued).unwrap());
+        assert!(rig.fake.reports.lock().unwrap().is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_hub_with_two_managers_still_records_for_the_dispatching_project() {
+        let rig = rig_with(true, true, 3).await;
+        let owner = {
+            let guard = rig.store.lock().await;
+            let (_second, lead) = fixture(
+                &guard,
+                ManagerPolicyV2 {
+                    capabilities: vec![ManagerCapabilityV2::WorkPlan],
+                    ..Default::default()
+                },
+            );
+            let stamp = crate::store::harness_manager_v2::now();
+            guard
+                .conn
+                .execute(
+                    "INSERT INTO satellite_messages(id,owner_session_id,peer_id,remote_session_id,
+                       idempotency_digest,request_fingerprint,payload,created_at,expires_at,updated_at)
+                     VALUES(?1,?2,?3,?4,?5,?5,'x',?6,?6,?6)",
+                    rusqlite::params![
+                        Uuid::new_v4().to_string(),
+                        lead.id.to_string(),
+                        rig.peer.to_string(),
+                        Uuid::new_v4().to_string(),
+                        "0".repeat(64),
+                        stamp,
+                    ],
+                )
+                .unwrap();
+            lead.id
+        };
+        let _ = owner;
+        let mut state = ReportState::default();
+        report_round(&rig.store, &rig.root, &mut state).await;
+        assert_eq!(notices(&rig).await, 3);
     }
 }

@@ -81,21 +81,7 @@ fn effort_label(
     provider_override: Option<SessionProvider>,
 ) -> Option<(String, bool)> {
     let (model, provider) = effective_model_and_provider(app, model_override, provider_override);
-    let model = model?;
-    let ladder = app.model_effort_ladder(provider, model);
-    if ladder.is_empty() {
-        return None;
-    }
-    if let Some(effort) = app
-        .selected_effort
-        .as_deref()
-        .filter(|effort| ladder.contains(effort))
-    {
-        return Some((effort.to_string(), true));
-    }
-    app.model_default_effort(provider, model)
-        .filter(|effort| ladder.contains(effort))
-        .map(|effort| (effort.to_string(), false))
+    app.resolved_launch_effort(provider, model?)
 }
 
 /// Build what a prompt renders about its launch from the app state.
@@ -419,7 +405,6 @@ pub(super) fn render_prompt_popup(
     let base_block = if focused {
         match purpose {
             PromptPurpose::ContinueSession(_) => theme::overlay_block(),
-            PromptPurpose::TaskRabbit => theme::taskrabbit_overlay_block(),
             PromptPurpose::Blank => theme::blank_overlay_block(),
             // Phase 4: typed-leaf prompts share Blank's chrome for now.
             PromptPurpose::CreateTyped { .. } => theme::blank_overlay_block(),
@@ -447,11 +432,11 @@ pub(super) fn render_prompt_popup(
         1,
     );
 
-    // Model indicator next to the working directory for Blank and TaskRabbit
+    // Model indicator next to the working directory for Blank
     // popups. Per-session override takes precedence over global selection.
     let effective_model = model_override.or(selected_model);
     let mut model_spans = Vec::new();
-    if matches!(purpose, PromptPurpose::Blank | PromptPurpose::TaskRabbit) {
+    if matches!(purpose, PromptPurpose::Blank) {
         let model_display = effective_model.unwrap_or("default");
         model_spans.push(Span::styled("  ", Style::default()));
         model_spans.push(Span::styled(

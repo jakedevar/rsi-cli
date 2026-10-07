@@ -120,6 +120,23 @@ mod tests {
                 ..Default::default()
             }
         ));
+        // #1284: a live Issue-bound worker may append to its Issue, and that
+        // right grants no lifecycle or archive control.
+        let bound_writer = VerbRights {
+            issue_bound: true,
+            issue_bound_writer: true,
+            ..Default::default()
+        };
+        assert!(permitted_verb(Verb::UpdateIssue, &bound_writer));
+        assert!(permitted_verb(Verb::GetIssue, &bound_writer));
+        for verb in [
+            Verb::UpdateIssueStatus,
+            Verb::ArchiveIssue,
+            Verb::RestoreIssue,
+            Verb::ListIssues,
+        ] {
+            assert!(!permitted_verb(verb, &bound_writer), "{verb:?}");
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]

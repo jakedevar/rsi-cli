@@ -803,6 +803,7 @@ pub enum AllowedExclusionOperation {
     LoopbackModelPost,
     NonModelHttpPost,
     CredentialHttpProbe,
+    BedrockSetupHttpProbe,
     QueueNoOp,
 }
 
@@ -828,6 +829,9 @@ impl AllowedExclusionOperation {
             }
             Self::CredentialHttpProbe => {
                 "One source-bound credential check: catalog GETs or a fixed default-model Bedrock POST with one output token and a ping message."
+            }
+            Self::BedrockSetupHttpProbe => {
+                "One source-bound Bedrock setup POST/send to the runtime InvokeModel endpoint with one output token and a ping message."
             }
             Self::QueueNoOp => "Explicit `Ok(())` no-op queue completion; no paid sink family.",
         }
@@ -1105,16 +1109,23 @@ pub const NON_INVOCATIONS: &[NonInvocationContract] = &[
     exclusion(
         "rolling_land_remote_fetch",
         "crates/rsid/src/bin/rsi-rolling-land.rs",
-        "remote_fetch",
+        "remote_fetch_once",
         AllowedExclusionOperation::UtilityCliSpawn,
         "remote_git_command",
     ),
     exclusion(
         "rolling_land_remote_tip",
         "crates/rsid/src/bin/rsi-rolling-land.rs",
-        "remote_tip",
+        "remote_tip_once",
         AllowedExclusionOperation::UtilityCliSpawn,
         "remote_git_command",
+    ),
+    exclusion(
+        "rolling_land_test_impact_tree",
+        "crates/rsid/src/bin/rsi-rolling-land/test_impact.rs",
+        "load_tree",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "git",
     ),
     exclusion(
         "rolling_land_canary_runner",
@@ -1136,6 +1147,13 @@ pub const NON_INVOCATIONS: &[NonInvocationContract] = &[
         "run_lander",
         AllowedExclusionOperation::UtilityCliSpawn,
         "--accepted",
+    ),
+    exclusion(
+        "wake_when_rolling_fetch",
+        "crates/rsid/src/scheduler/wake_when.rs",
+        "fetch_origin_rolling",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "git",
     ),
     exclusion(
         "worker_no_result_test_process_tree",
@@ -1290,6 +1308,13 @@ pub const NON_INVOCATIONS: &[NonInvocationContract] = &[
         "HttpCredentialProbe::probe",
         AllowedExclusionOperation::CredentialHttpProbe,
         "BEDROCK_DEFAULT_MODEL",
+    ),
+    exclusion(
+        "bedrock_setup_probe",
+        "crates/rsid-store/src/bedrock_setup.rs",
+        "HttpBedrockInvokeProbe::invoke",
+        AllowedExclusionOperation::BedrockSetupHttpProbe,
+        "runtime_invoke_url",
     ),
     exclusion(
         "queue_noop",

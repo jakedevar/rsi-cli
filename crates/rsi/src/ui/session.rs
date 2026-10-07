@@ -367,7 +367,6 @@ struct SessionBrowserLayout {
 fn resolve_session_browser_layout(
     content: Rect,
     surface: SessionListSurface,
-    active_zone: crate::types::SessionListZone,
 ) -> SessionBrowserLayout {
     let legacy = || SessionBrowserLayout {
         mode: SessionBrowserMode::LegacyTable,
@@ -378,10 +377,8 @@ fn resolve_session_browser_layout(
         embedded_inspector: None,
         activity: None,
     };
-    if active_zone != crate::types::SessionListZone::Main {
-        return legacy();
-    }
-
+    // Main, Archive and Jobs share one browser path (operational table,
+    // embedded inspector, relay layouts).
     if surface == SessionListSurface::Embedded {
         if content.width < EMBEDDED_INSPECTOR_MIN_WIDTH
             || content.height < EMBEDDED_INSPECTOR_MIN_HEIGHT
@@ -655,7 +652,6 @@ pub(crate) fn recursive_dag_detail_line(
 
 fn zone_empty_message(zone: crate::types::SessionListZone) -> &'static str {
     match zone {
-        crate::types::SessionListZone::TaskRabbit => "No TaskRabbit sessions",
         crate::types::SessionListZone::Main => "No sessions. Press 'n' to create one.",
         crate::types::SessionListZone::Archive => "No archived sessions",
         crate::types::SessionListZone::Jobs => "No scheduled job sessions",
@@ -828,6 +824,17 @@ fn column_header_height(_presentation: SessionListPresentation) -> u16 {
     1
 }
 
+/// `⇅ Longest idle · ` — the active session-list order, shown in the scope
+/// header so the operator can see which `<Space>s` order is in effect.
+fn sort_chip_spans(order: crate::app::SortOrder, bg: Color) -> Vec<Span<'static>> {
+    let dim = Style::default().fg(theme::dim_metadata()).bg(bg);
+    vec![
+        Span::styled("⇅ ", dim),
+        Span::styled(order.label(), Style::default().fg(theme::subtext1()).bg(bg)),
+        Span::styled(" · ", dim),
+    ]
+}
+
 fn render_scope_header(
     frame: &mut Frame,
     area: Rect,
@@ -837,6 +844,7 @@ fn render_scope_header(
     descent_path: &[uuid::Uuid],
     sessions: &HashMap<uuid::Uuid, SessionState>,
     search_query: &str,
+    sort_order: Option<crate::app::SortOrder>,
     bg: Color,
 ) {
     if area.height == 0 || area.width == 0 {
@@ -883,7 +891,7 @@ fn render_scope_header(
         ));
     }
 
-    let right = Line::from(vec![
+    let count_spans = vec![
         Span::styled(
             count.to_string(),
             Style::default()
@@ -899,7 +907,23 @@ fn render_scope_header(
             },
             Style::default().fg(theme::dim_metadata()).bg(bg),
         ),
-    ]);
+    ];
+    // The order chip joins the count only while the breadcrumb still fits
+    // beside both; on a narrow pane the breadcrumb wins.
+    let left_w = Line::from(left.clone()).width();
+    let right = match sort_order {
+        Some(order) => {
+            let mut spans = sort_chip_spans(order, bg);
+            spans.extend(count_spans.iter().cloned());
+            let with_sort = Line::from(spans);
+            if left_w + with_sort.width() < area.width as usize {
+                with_sort
+            } else {
+                Line::from(count_spans)
+            }
+        }
+        None => Line::from(count_spans),
+    };
     let right_w = right.width() as u16;
     let chunks = Layout::horizontal([
         Constraint::Fill(1),
@@ -933,7 +957,6 @@ fn scope_breadcrumb_title(
 fn title_case_zone(zone: crate::types::SessionListZone) -> &'static str {
     match zone {
         crate::types::SessionListZone::Main => "Sessions",
-        crate::types::SessionListZone::TaskRabbit => "TaskRabbit",
         crate::types::SessionListZone::Archive => "Archive",
         crate::types::SessionListZone::Jobs => "Jobs",
     }
@@ -942,7 +965,6 @@ fn title_case_zone(zone: crate::types::SessionListZone) -> &'static str {
 fn zone_accent(zone: crate::types::SessionListZone) -> Color {
     match zone {
         crate::types::SessionListZone::Main => theme::accent(),
-        crate::types::SessionListZone::TaskRabbit => theme::teal(),
         crate::types::SessionListZone::Archive => theme::peach(),
         crate::types::SessionListZone::Jobs => theme::blue(),
     }
@@ -1004,7 +1026,6 @@ fn render_navigator_header(
             // spans both.
             navigator_layout::NavigatorColumn::Provider => "",
             navigator_layout::NavigatorColumn::Model => "MODEL",
-            navigator_layout::NavigatorColumn::Effort => glyphs::EFFORT,
             navigator_layout::NavigatorColumn::Retry => "RETRY",
             navigator_layout::NavigatorColumn::Cost => "COST",
             navigator_layout::NavigatorColumn::Work => "WORK",
@@ -1087,6 +1108,7 @@ fn render_dense_rows(
     focus_index: &HashMap<uuid::Uuid, SessionFocusEntry>,
     manager_ids: &HashSet<uuid::Uuid>,
     operator_pauses: &HashMap<uuid::Uuid, crate::client::OperatorPauseLevel>,
+    operator_pause_info: &HashMap<uuid::Uuid, crate::client::OperatorPauseInfo>,
     _descent_head: Option<uuid::Uuid>,
     tree_depths: &[usize],
     bg: Color,
@@ -1172,6 +1194,17 @@ fn render_dense_rows(
             .get(id)
             .copied()
             .unwrap_or(crate::client::OperatorPauseLevel::None);
+        if row.is_manager {
+            // A manager seat always names its pause; the daemon detail adds
+            // the age and any held succession (#1541).
+            row.operator_pause_label = match operator_pause_info.get(id) {
+                Some(info) if info.pause_level == row.operator_pause => {
+                    info.seat_label(chrono::Utc::now())
+                }
+                _ => crate::client::OperatorPauseInfo::level_only(row.operator_pause)
+                    .seat_label(chrono::Utc::now()),
+            };
+        }
         let is_selected = idx == selected_index;
         let is_viewed = Some(*id) == viewed_session_id;
         let y = area.y + row_offset.saturating_sub(visible_start) as u16;
@@ -1390,9 +1423,16 @@ fn render_navigator_row_at_depth(
                 spans.push(fixed_span("", indent, Style::default().bg(row_bg)));
             }
             let title_width = cell.width - indent;
+            let seat_label = format!("{} ", row.operator_pause_label);
             let (marker, marker_color) = match row.operator_pause {
                 crate::client::OperatorPauseLevel::None => ("", theme::dim_metadata()),
-                crate::client::OperatorPauseLevel::Soft => ("SOFT ", theme::warning_status()),
+                crate::client::OperatorPauseLevel::Soft if row.is_manager => {
+                    (seat_label.as_str(), theme::warning_status())
+                }
+                crate::client::OperatorPauseLevel::Soft => ("", theme::dim_metadata()),
+                crate::client::OperatorPauseLevel::Hard if row.is_manager => {
+                    (seat_label.as_str(), theme::status_interrupted())
+                }
                 crate::client::OperatorPauseLevel::Hard => ("HARD ", theme::status_interrupted()),
             };
             let marker_width = marker.len().min(title_width);
@@ -1452,10 +1492,19 @@ fn render_navigator_row_at_depth(
                     })
                     .bg(row_bg),
             ),
-            navigator_layout::NavigatorColumn::Status => (
-                row.status_icon.clone(),
-                Style::default().fg(row.status_color).bg(row_bg),
-            ),
+            navigator_layout::NavigatorColumn::Status => {
+                // Pause is a lifecycle presentation, not a sticky title badge.
+                // A cached soft pause must not override a later running or
+                // terminal state. Hard pauses retain their explicit marker.
+                let (icon, color) = if row.status == SessionStatus::Interrupted
+                    && row.operator_pause == crate::client::OperatorPauseLevel::Soft
+                {
+                    (glyphs::SOFT_PAUSE, theme::warning_status())
+                } else {
+                    (row.status_icon.as_str(), row.status_color)
+                };
+                (icon.to_string(), Style::default().fg(color).bg(row_bg))
+            }
             navigator_layout::NavigatorColumn::Attention => (
                 row.attention_glyph.to_string(),
                 Style::default()
@@ -1500,21 +1549,6 @@ fn render_navigator_row_at_depth(
                     .unwrap_or_default(),
                 Style::default().fg(theme::model_text()).bg(row_bg),
             ),
-            navigator_layout::NavigatorColumn::Effort => {
-                let effort = session
-                    .filter(|session| rsi_common::is_leaf_kind(session.session_kind))
-                    .and_then(|session| {
-                        glyphs::effort_glyph(session.effort.as_deref(), session.model.as_deref())
-                    });
-                (
-                    effort
-                        .map(|(glyph, _)| glyph.to_string())
-                        .unwrap_or_default(),
-                    Style::default()
-                        .fg(effort.map_or_else(theme::subtext1, |(_, color)| color))
-                        .bg(row_bg),
-                )
-            }
             navigator_layout::NavigatorColumn::Retry => (
                 row.retry_info
                     .map(|(attempt, max)| format!("{attempt}/{max}"))
@@ -2630,14 +2664,7 @@ fn render_inspector_facts(
         if let Some(turns) = runtime.turns {
             chips.push(vec![
                 Span::styled(format!("{} ", glyphs::TURNS), glyph_style),
-                Span::styled(
-                    turns.to_string(),
-                    value_style.fg(if theme::uses_terminal_default_backgrounds() {
-                        theme::count_text()
-                    } else {
-                        theme::subtext1()
-                    }),
-                ),
+                Span::styled(turns.to_string(), value_style.fg(theme::count_text())),
             ]);
         }
         if let Some(cost) = runtime.cost_usd {
@@ -2647,11 +2674,7 @@ fn render_inspector_facts(
                 } else {
                     format!("${cost:.2}")
                 },
-                value_style.fg(if theme::uses_terminal_default_backgrounds() {
-                    theme::cost_text()
-                } else {
-                    theme::subtext1()
-                }),
+                value_style.fg(theme::cost_text()),
             )]);
         }
         let times = [
@@ -2668,14 +2691,7 @@ fn render_inspector_facts(
         if !times.is_empty() {
             chips.push(vec![
                 Span::styled(format!("{} ", glyphs::WORK_TIME), glyph_style),
-                Span::styled(
-                    times.join(" · "),
-                    value_style.fg(if theme::uses_terminal_default_backgrounds() {
-                        theme::time_text()
-                    } else {
-                        theme::subtext1()
-                    }),
-                ),
+                Span::styled(times.join(" · "), value_style.fg(theme::time_text())),
             ]);
         }
     }
@@ -2937,13 +2953,7 @@ fn render_inspector_context(
 /// active budget's source label muted.
 fn context_headline_spans(value: &str, bg: Color) -> Vec<Span<'static>> {
     let muted = Style::default().fg(theme::dim_metadata()).bg(bg);
-    let counts = Style::default()
-        .fg(if theme::uses_terminal_default_backgrounds() {
-            theme::count_text()
-        } else {
-            theme::subtext1()
-        })
-        .bg(bg);
+    let counts = Style::default().fg(theme::count_text()).bg(bg);
     let Some((usage, rest)) = value.split_once(" / ") else {
         return vec![Span::styled(value.to_string(), muted)];
     };
@@ -3526,6 +3536,15 @@ fn daemon_resource_lines(
         )));
     }
 
+    if sample.is_unsupervised() {
+        let warn = Style::default()
+            .fg(theme::peach())
+            .bg(bg)
+            .add_modifier(Modifier::BOLD);
+        lines.push(Line::from(Span::styled("no supervisor: deploys off", warn)));
+        lines.push(Line::from(Span::styled("fix: make release-install", warn)));
+    }
+
     let mut cpu = vec![Span::styled("cpu   ", dim)];
     if let Some(percent) = view.cpu_percent {
         let fill = theme::context_border_color(percent.min(100.0));
@@ -3622,7 +3641,7 @@ fn daemon_resource_lines(
     lines
 }
 
-/// Lowercase provider word shared by the symbol key and the RUNNING section.
+/// Lowercase provider word for the activity pane's RUNNING section.
 const fn provider_legend_word(provider: rsi_common::types::SessionProvider) -> &'static str {
     use rsi_common::types::SessionProvider;
     match provider {
@@ -3733,9 +3752,9 @@ fn flow_counts_line(flow: &crate::types::SessionFlowSummary, bg: Color) -> Line<
 }
 
 /// Dim symbol key for the navigator footer, under the list it explains:
-/// lifecycle, attention, provider, then role families.
+/// lifecycle, attention, then role families. Provider glyphs are not keyed
+/// here: the model picker (`Ctrl-M`) names each provider beside its glyph.
 fn legend_lines(width: usize, bg: Color) -> Vec<Line<'static>> {
-    use rsi_common::types::SessionProvider;
     let lifecycle = [
         (SessionStatus::Running, "run"),
         (SessionStatus::Completed, "done"),
@@ -3762,23 +3781,6 @@ fn legend_lines(width: usize, bg: Color) -> Vec<Line<'static>> {
         (glyphs::CONTEXT_UNKNOWN, theme::dim_metadata(), "ctx ?"),
     ]
     .map(|(glyph, color, word)| (glyph.to_string(), color, word));
-    let providers = [
-        SessionProvider::Claude,
-        SessionProvider::Codex,
-        SessionProvider::CodexAppServer,
-        SessionProvider::OpenRouter,
-        SessionProvider::Local,
-        SessionProvider::Antigravity,
-        SessionProvider::Pioneer,
-        SessionProvider::Harness,
-    ]
-    .map(|provider| {
-        (
-            glyphs::provider_glyph(provider).to_string(),
-            glyphs::provider_color(provider),
-            provider_legend_word(provider),
-        )
-    });
     let roles = [
         ("Manager", "lead"),
         ("Planner", "plan"),
@@ -3789,12 +3791,7 @@ fn legend_lines(width: usize, bg: Color) -> Vec<Line<'static>> {
     .map(|(role, word)| (glyphs::role_code(role), glyphs::role_color(role), word));
 
     let mut lines = Vec::new();
-    for group in [
-        lifecycle.as_slice(),
-        attention.as_slice(),
-        providers.as_slice(),
-        roles.as_slice(),
-    ] {
+    for group in [lifecycle.as_slice(), attention.as_slice(), roles.as_slice()] {
         let mut spans: Vec<Span<'static>> = Vec::new();
         let mut used = 0usize;
         for (glyph, color, word) in group {
@@ -3896,24 +3893,16 @@ pub fn render_session_list(
 ) {
     #[cfg(test)]
     let _theme_render_guard = theme::test_render_guard();
-    let (
-        selected_index,
-        active_zone,
-        tr_selected_index,
-        archive_selected_index,
-        jobs_selected_index,
-    ) = match pane {
+    let (selected_index, active_zone, archive_selected_index, jobs_selected_index) = match pane {
         Pane::SessionList {
             selected_index,
             active_zone,
-            taskrabbit_selected_index,
             archive_selected_index,
             jobs_selected_index,
             ..
         } => (
             *selected_index,
             *active_zone,
-            *taskrabbit_selected_index,
             *archive_selected_index,
             *jobs_selected_index,
         ),
@@ -3937,13 +3926,6 @@ pub fn render_session_list(
             theme::accent(),
             sort_order,
             app.labels.clone(),
-        ),
-        crate::types::SessionListZone::TaskRabbit => (
-            app.filtered_taskrabbit_order.clone(),
-            tr_selected_index,
-            theme::teal(),
-            crate::app::SortOrder::StalestFirst,
-            Vec::new(),
         ),
         crate::types::SessionListZone::Archive => (
             app.filtered_archived_order.clone(),
@@ -3973,6 +3955,9 @@ pub fn render_session_list(
         .unwrap_or_else(|| "All projects".to_string());
     let scope_h = 1u16.min(area.height);
     let scope_area = Rect::new(area.x, area.y, area.width, scope_h);
+    // Only the main zone follows the operator's `<Space>s` order; the other
+    // zones keep their own fixed ordering, so they show no order chip.
+    let sort_chip = (active_zone == crate::types::SessionListZone::Main).then_some(sort_order);
     render_scope_header(
         frame,
         scope_area,
@@ -3982,6 +3967,7 @@ pub fn render_session_list(
         &descent_path,
         &app.sessions,
         &app.search_query,
+        sort_chip,
         bg,
     );
 
@@ -3997,7 +3983,7 @@ pub fn render_session_list(
         return;
     }
 
-    let browser_layout = resolve_session_browser_layout(content_area, surface, active_zone);
+    let browser_layout = resolve_session_browser_layout(content_area, surface);
     let presentation = match browser_layout.mode {
         SessionBrowserMode::LegacyTable => SessionListPresentation::Table(
             SessionListDensity::for_width(browser_layout.navigator.width),
@@ -4040,7 +4026,6 @@ pub fn render_session_list(
     let render_state = &mut app.session_list_render;
     let crate::types::SessionListRenderState {
         main,
-        taskrabbit,
         archive,
         jobs,
         focus_index,
@@ -4050,7 +4035,6 @@ pub fn render_session_list(
     } = render_state;
     let zone_render = match active_zone {
         crate::types::SessionListZone::Main => main,
-        crate::types::SessionListZone::TaskRabbit => taskrabbit,
         crate::types::SessionListZone::Archive => archive,
         crate::types::SessionListZone::Jobs => jobs,
     };
@@ -4086,6 +4070,7 @@ pub fn render_session_list(
         focus_index,
         &manager_ids,
         &app.operator_pauses,
+        &app.operator_pause_info,
         descent_head,
         search_active,
         &empty_message,
@@ -4164,6 +4149,7 @@ fn render_zone_table(
     focus_index: &HashMap<uuid::Uuid, SessionFocusEntry>,
     manager_ids: &HashSet<uuid::Uuid>,
     operator_pauses: &HashMap<uuid::Uuid, crate::client::OperatorPauseLevel>,
+    operator_pause_info: &HashMap<uuid::Uuid, crate::client::OperatorPauseInfo>,
     descent_head: Option<uuid::Uuid>,
     search_active: bool,
     empty_message: &str,
@@ -4246,6 +4232,7 @@ fn render_zone_table(
             focus_index,
             manager_ids,
             operator_pauses,
+            operator_pause_info,
             descent_head,
             &tree_depths,
             bg,
@@ -4595,6 +4582,22 @@ pub fn render_session_detail(
     focused: bool,
     app: &App,
 ) {
+    render_session_detail_with_header(frame, area, area.width, session_id, focused, app);
+}
+
+/// Like [`render_session_detail`], but the three-row title header (title,
+/// metadata, divider) spans `header_width` columns from `area.x`. A width
+/// beyond `area` lets a left-pinned, capped column stretch its title bar to the
+/// far edge of the pane; the transcript below stays inside `area`.
+pub fn render_session_detail_with_header(
+    frame: &mut Frame,
+    area: Rect,
+    header_width: u16,
+    session_id: uuid::Uuid,
+    focused: bool,
+    app: &App,
+) {
+    let header_width = header_width.max(area.width);
     #[cfg(test)]
     let _theme_render_guard = theme::test_render_guard();
     let Some(state) = app.sessions.get(&session_id) else {
@@ -4621,25 +4624,25 @@ pub fn render_session_detail(
                     .add_modifier(Modifier::BOLD),
             )))
             .style(Style::default().bg(detail_bg)),
-            Rect::new(area.x, area.y, area.width, 1),
+            Rect::new(area.x, area.y, header_width, 1),
         );
     }
     if header_h > 1 {
         frame.render_widget(
             Paragraph::new(detail_header_metadata(app, state))
                 .style(Style::default().bg(detail_bg)),
-            Rect::new(area.x, area.y + 1, area.width, 1),
+            Rect::new(area.x, area.y + 1, header_width, 1),
         );
     }
     if header_h > 2 {
-        let divider = "─".repeat(area.width as usize);
+        let divider = "─".repeat(header_width as usize);
         frame.render_widget(
             Paragraph::new(divider).style(
                 Style::default()
                     .fg(theme::session_detail_border())
                     .bg(detail_bg),
             ),
-            Rect::new(area.x, area.y + 2, area.width, 1),
+            Rect::new(area.x, area.y + 2, header_width, 1),
         );
     }
 
@@ -5449,7 +5452,7 @@ pub(crate) fn status_icon(status: SessionStatus) -> &'static str {
     }
 }
 
-const BRAILLE_FRAMES: &[&str] = &[
+pub(crate) const BRAILLE_FRAMES: &[&str] = &[
     "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",
 ];
 
@@ -5544,8 +5547,8 @@ pub(crate) fn word_boundary_break(s: &str, max_width: usize) -> usize {
     }
 }
 
-// Both NORMAL and INSERT occupy six cells, plus a separating space.
-const INPUT_MODE_WIDTH: u16 = 7;
+// Reserve the longest mode label (LEADER: SPACE) and a separating space.
+const INPUT_MODE_WIDTH: u16 = 14;
 const INPUT_PROMPT_WIDTH: u16 = INPUT_MODE_WIDTH + 2;
 
 /// Compute the total height needed for the input bar, including borders.
@@ -5995,9 +5998,34 @@ pub fn render_input_bar(
         return;
     };
 
-    let is_insert = focused && state.input_bar.surface.mode == PopupMode::Insert;
-
-    let border_color = theme::input_bar_border(focused);
+    let surface = &state.input_bar.surface;
+    let is_insert = focused && surface.mode == PopupMode::Insert;
+    let leader = (focused && surface.mode == PopupMode::Normal && surface.vim_state.is_idle())
+        .then_some(app.vim_machine_prefix)
+        .flatten();
+    let mode = match (surface.mode, leader) {
+        (PopupMode::Insert, _) => "INSERT",
+        (PopupMode::Normal, Some(' ')) => "LEADER: SPACE",
+        (PopupMode::Normal, Some('g' | 'G')) => "LEADER: G",
+        _ => "NORMAL",
+    };
+    let mode_color = if !focused {
+        None
+    } else if is_insert {
+        Some(theme::green())
+    } else if surface.vim_state.pending_char_search_dir.is_some() {
+        // A delete followed by f/t is now waiting for a search target.
+        Some(theme::yellow())
+    } else if surface.vim_state.pending_operator == Some('d') {
+        Some(theme::red())
+    } else {
+        match leader {
+            Some(' ') => Some(theme::mauve()),
+            Some('g' | 'G') => Some(theme::sky()),
+            _ => None,
+        }
+    };
+    let border_color = mode_color.unwrap_or_else(|| theme::input_bar_border(focused));
     let border_style = if is_insert {
         Style::default()
             .fg(border_color)
@@ -6038,8 +6066,6 @@ pub fn render_input_bar(
         return;
     }
 
-    let surface = &state.input_bar.surface;
-
     // Keep the mode beside the prompt, inside the composer.
     let chunks = Layout::horizontal([
         Constraint::Length(INPUT_PROMPT_WIDTH),
@@ -6049,21 +6075,6 @@ pub fn render_input_bar(
     ])
     .split(inner);
 
-    // While a global leader sequence (e.g. Space or G prefix) is awaiting its
-    // continuation in a focused normal-mode input bar, surface that pending
-    // state as a distinct positive mode label instead of ordinary NORMAL.
-    // All three labels occupy the same six cells, so the fixed prompt-area
-    // layout is unaffected. The display clears on its own because
-    // `vim_machine_pending` is derived from the same KeyManager dispatch that
-    // completes or cancels the sequence.
-    let mode = if focused && app.vim_machine_pending && surface.mode == PopupMode::Normal {
-        "LEADER"
-    } else {
-        match surface.mode {
-            PopupMode::Normal => "NORMAL",
-            PopupMode::Insert => "INSERT",
-        }
-    };
     let prompt = surface
         .vim_state
         .pending_operator
@@ -6081,7 +6092,7 @@ pub fn render_input_bar(
         Paragraph::new(Line::from(Span::styled(
             format!("{mode} {prompt}"),
             Style::default()
-                .fg(theme::accent())
+                .fg(mode_color.unwrap_or_else(theme::accent))
                 .bg(input_bg)
                 .add_modifier(Modifier::BOLD),
         )))
@@ -6750,6 +6761,54 @@ mod tests {
     }
 
     #[test]
+    fn unsupervised_daemon_shows_the_release_install_fix_in_the_rsid_section() {
+        let view = |mode: &str| crate::daemon_resources::DaemonResourceView {
+            sample: crate::daemon_resources::DaemonResourceSample {
+                sampled_at: std::time::Instant::now(),
+                pid: None,
+                proc_counters: None,
+                open_fds: None,
+                uptime_secs: None,
+                rss_bytes: None,
+                heap_in_use_bytes: None,
+                persistence_queue_depth: 0,
+                persistence_queue_capacity: 0,
+                last_command_duration_ms: 0,
+                queue_pending: 0,
+                queue_claimed: 0,
+                queue_failed: 0,
+                supervisor_mode: Some(mode.to_string()),
+            },
+            cpu_percent: None,
+            restart_pending: None,
+        };
+        let text = |mode: &str| {
+            daemon_resource_lines(Some(&view(mode)), 40, Color::Reset)
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let unsupervised = text("none");
+        assert!(
+            unsupervised.contains("no supervisor: deploys off"),
+            "{unsupervised}"
+        );
+        assert!(
+            unsupervised.contains("make release-install"),
+            "{unsupervised}"
+        );
+        // A supervised daemon renders the same pane without the warning, so the
+        // two outputs differ by exactly the two warning rows.
+        let supervised = text("rsid-supervisor.sh");
+        assert_eq!(
+            unsupervised.lines().count(),
+            supervised.lines().count() + 2,
+            "{supervised}"
+        );
+    }
+
+    #[test]
     fn formulation_progress_is_none_when_disabled() {
         assert_eq!(formulation_progress(reveal_form(0), 10, false, 500), None);
     }
@@ -6971,12 +7030,10 @@ mod tests {
     }
 
     #[test]
-    fn session_row_shows_operator_pause_strength() {
+    fn session_row_shows_hard_operator_pause_strength() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
         let settings = crate::settings::UserSettings::default();
-        for (level, label) in [
-            (crate::client::OperatorPauseLevel::Soft, "SOFT"),
-            (crate::client::OperatorPauseLevel::Hard, "HARD"),
-        ] {
+        for (level, label) in [(crate::client::OperatorPauseLevel::Hard, "HARD")] {
             let mut row = crate::types::row::SessionRowViewModel::placeholder(uuid::Uuid::new_v4());
             row.display_title = "Pause target".into();
             row.operator_pause = level;
@@ -7001,6 +7058,141 @@ mod tests {
             let text = buffer_text(terminal.backend().buffer());
             assert!(text.contains(label), "{level:?}: {text}");
             assert!(text.contains("Pause target"), "{level:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn manager_seat_row_shows_pause_level_age_and_held_succession() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
+        let settings = crate::settings::UserSettings::default();
+        let cases = [
+            (crate::client::OperatorPauseLevel::Hard, "HARD 7d HELD"),
+            (crate::client::OperatorPauseLevel::Soft, "SOFT 2h"),
+        ];
+        for (level, label) in cases {
+            let mut row = crate::types::row::SessionRowViewModel::placeholder(uuid::Uuid::new_v4());
+            row.display_title = "Dictate PM".into();
+            row.is_manager = true;
+            row.operator_pause = level;
+            row.operator_pause_label = label.into();
+            let mut terminal = Terminal::new(TestBackend::new(100, 1)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_navigator_row(
+                        frame,
+                        frame.area(),
+                        &row,
+                        None,
+                        &settings,
+                        2,
+                        false,
+                        false,
+                        false,
+                        theme::blue(),
+                        theme::tier_panel(),
+                    );
+                })
+                .unwrap();
+            let text = buffer_text(terminal.backend().buffer());
+            assert!(text.contains(&format!("{label} Dictate PM")), "{text}");
+        }
+    }
+
+    #[test]
+    fn soft_pause_renders_in_status_column_and_follows_lifecycle() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
+        let settings = crate::settings::UserSettings::default();
+        for width in [40, 100] {
+            let layout = navigator_layout::resolve_ordered(
+                width,
+                2,
+                settings.navigator_preset,
+                settings.navigator_optional_columns.as_deref(),
+                &settings.navigator_column_order_for(settings.navigator_preset),
+            );
+            let status_x = layout
+                .columns
+                .iter()
+                .find(|cell| cell.column == navigator_layout::NavigatorColumn::Status)
+                .unwrap()
+                .start as u16;
+            let title_x = layout
+                .columns
+                .iter()
+                .find(|cell| cell.column == navigator_layout::NavigatorColumn::Function)
+                .unwrap()
+                .start as u16;
+            for selected in [false, true] {
+                // Leave the cached pause set while lifecycle advances, as can
+                // happen before GetOperatorPause's next bounded probe.
+                for status in [
+                    SessionStatus::Interrupted,
+                    SessionStatus::Starting,
+                    SessionStatus::Running,
+                    SessionStatus::WaitingApproval,
+                    SessionStatus::Completed,
+                    SessionStatus::Failed,
+                    SessionStatus::Archived,
+                    SessionStatus::Deleted,
+                ] {
+                    for pause in [
+                        crate::client::OperatorPauseLevel::Soft,
+                        crate::client::OperatorPauseLevel::None,
+                    ] {
+                        let mut row = crate::types::row::SessionRowViewModel::placeholder(
+                            uuid::Uuid::new_v4(),
+                        );
+                        row.display_title = "Pause target".into();
+                        row.status = status;
+                        row.status_icon =
+                            crate::types::row::navigator_lifecycle_icon(status).into();
+                        row.status_color = status_color(status);
+                        row.operator_pause = pause;
+                        let mut terminal =
+                            Terminal::new(TestBackend::new(width as u16, 1)).unwrap();
+                        terminal
+                            .draw(|frame| {
+                                render_navigator_row(
+                                    frame,
+                                    frame.area(),
+                                    &row,
+                                    None,
+                                    &settings,
+                                    2,
+                                    selected,
+                                    false,
+                                    false,
+                                    theme::blue(),
+                                    theme::tier_panel(),
+                                );
+                            })
+                            .unwrap();
+                        let buffer = terminal.backend().buffer();
+                        let paused = status == SessionStatus::Interrupted
+                            && pause == crate::client::OperatorPauseLevel::Soft;
+                        assert_eq!(
+                            buffer[(status_x, 0)].symbol(),
+                            if paused {
+                                "⏸"
+                            } else {
+                                row.status_icon.as_str()
+                            }
+                        );
+                        assert_eq!(
+                            buffer[(status_x, 0)].fg,
+                            if paused {
+                                theme::warning_status()
+                            } else {
+                                row.status_color
+                            }
+                        );
+                        assert_eq!(
+                            buffer_text_position(buffer, "Pause target"),
+                            Some((title_x, 0))
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -7269,31 +7461,22 @@ mod tests {
 
     #[test]
     fn session_browser_layout_matches_exact_acceptance_canvases() {
-        let at_120 = resolve_session_browser_layout(
-            Rect::new(0, 1, 120, 39),
-            SessionListSurface::Full,
-            crate::types::SessionListZone::Main,
-        );
+        let at_120 =
+            resolve_session_browser_layout(Rect::new(0, 1, 120, 39), SessionListSurface::Full);
         assert_eq!(at_120.mode, SessionBrowserMode::OperationalTable);
         assert_eq!(at_120.selected_signal, Some(Rect::new(2, 1, 116, 2)));
         assert_eq!(at_120.navigator, Rect::new(2, 4, 116, 36));
 
-        let at_200 = resolve_session_browser_layout(
-            Rect::new(0, 1, 200, 57),
-            SessionListSurface::Full,
-            crate::types::SessionListZone::Main,
-        );
+        let at_200 =
+            resolve_session_browser_layout(Rect::new(0, 1, 200, 57), SessionListSurface::Full);
         assert_eq!(at_200.mode, SessionBrowserMode::Relay);
         assert_eq!(at_200.navigator, Rect::new(13, 1, 100, 57));
         assert_eq!(at_200.tether, Some(Rect::new(113, 1, 2, 57)));
         assert_eq!(at_200.inspector, Some(Rect::new(115, 1, 72, 57)));
         assert_eq!(at_200.activity, None);
 
-        let at_240 = resolve_session_browser_layout(
-            Rect::new(0, 1, 240, 69),
-            SessionListSurface::Full,
-            crate::types::SessionListZone::Main,
-        );
+        let at_240 =
+            resolve_session_browser_layout(Rect::new(0, 1, 240, 69), SessionListSurface::Full);
         assert_eq!(at_240.mode, SessionBrowserMode::RelayWithActivity);
         assert_eq!(at_240.navigator, Rect::new(4, 1, 100, 69));
         assert_eq!(at_240.tether, Some(Rect::new(104, 1, 2, 69)));
@@ -7321,7 +7504,6 @@ mod tests {
             let layout = resolve_session_browser_layout(
                 Rect::new(0, 0, width, 40),
                 SessionListSurface::Full,
-                crate::types::SessionListZone::Main,
             );
             assert_eq!(layout.mode, expected_mode, "width {width}");
             let mut rects = vec![layout.navigator];
@@ -7339,11 +7521,8 @@ mod tests {
             );
         }
 
-        let ultra = resolve_session_browser_layout(
-            Rect::new(0, 0, 300, 40),
-            SessionListSurface::Full,
-            crate::types::SessionListZone::Main,
-        );
+        let ultra =
+            resolve_session_browser_layout(Rect::new(0, 0, 300, 40), SessionListSurface::Full);
         assert_eq!(ultra.navigator.width, NAVIGATOR_MAX_WIDTH);
         assert_eq!(ultra.inspector.unwrap().width, INSPECTOR_MAX_WIDTH);
         assert_eq!(ultra.activity.unwrap().width, ACTIVITY_MAX_WIDTH);
@@ -7351,33 +7530,20 @@ mod tests {
     }
 
     #[test]
-    fn session_browser_layout_preserves_low_height_detail_and_non_main_paths() {
-        let low = resolve_session_browser_layout(
-            Rect::new(0, 0, 240, 23),
-            SessionListSurface::Full,
-            crate::types::SessionListZone::Main,
-        );
+    fn session_browser_layout_preserves_low_height_and_embedded_detail() {
+        let low =
+            resolve_session_browser_layout(Rect::new(0, 0, 240, 23), SessionListSurface::Full);
         assert_eq!(low.mode, SessionBrowserMode::OperationalTable);
         assert_eq!(low.selected_signal, None);
         assert_eq!(low.navigator, Rect::new(42, 0, 156, 23));
 
-        for surface in [SessionListSurface::Full, SessionListSurface::Embedded] {
-            for zone in [
-                crate::types::SessionListZone::TaskRabbit,
-                crate::types::SessionListZone::Archive,
-                crate::types::SessionListZone::Jobs,
-            ] {
-                let layout =
-                    resolve_session_browser_layout(Rect::new(4, 7, 240, 40), surface, zone);
-                assert_eq!(layout.mode, SessionBrowserMode::LegacyTable);
-                assert_eq!(layout.navigator, Rect::new(4, 7, 240, 40));
-            }
-        }
-        let embedded = resolve_session_browser_layout(
-            Rect::new(4, 7, 240, 40),
-            SessionListSurface::Embedded,
-            crate::types::SessionListZone::Main,
+        assert_eq!(
+            resolve_session_browser_layout(Rect::new(4, 7, 240, 40), SessionListSurface::Full,)
+                .mode,
+            SessionBrowserMode::RelayWithActivity
         );
+        let embedded =
+            resolve_session_browser_layout(Rect::new(4, 7, 240, 40), SessionListSurface::Embedded);
         assert_eq!(embedded.mode, SessionBrowserMode::EmbeddedInspector);
         assert_eq!(embedded.navigator, Rect::new(4, 7, 240, 32));
         assert_eq!(embedded.embedded_inspector, Some(Rect::new(4, 40, 240, 7)));
@@ -7385,20 +7551,14 @@ mod tests {
 
     #[test]
     fn embedded_browser_bounds_the_list_and_assigns_remaining_height_to_selected_details() {
-        let layout = resolve_session_browser_layout(
-            Rect::new(0, 1, 64, 67),
-            SessionListSurface::Embedded,
-            crate::types::SessionListZone::Main,
-        );
+        let layout =
+            resolve_session_browser_layout(Rect::new(0, 1, 64, 67), SessionListSurface::Embedded);
         assert_eq!(layout.mode, SessionBrowserMode::EmbeddedInspector);
         assert_eq!(layout.navigator, Rect::new(0, 1, 64, 32));
         assert_eq!(layout.embedded_inspector, Some(Rect::new(0, 34, 64, 34)));
 
-        let short = resolve_session_browser_layout(
-            Rect::new(0, 1, 64, 24),
-            SessionListSurface::Embedded,
-            crate::types::SessionListZone::Main,
-        );
+        let short =
+            resolve_session_browser_layout(Rect::new(0, 1, 64, 24), SessionListSurface::Embedded);
         assert_eq!(short.mode, SessionBrowserMode::EmbeddedInspector);
         assert_eq!(short.navigator, Rect::new(0, 1, 64, 16));
         assert_eq!(short.embedded_inspector, Some(Rect::new(0, 18, 64, 7)));
@@ -7439,11 +7599,11 @@ mod tests {
             .iter()
             .find(|cell| cell.column == navigator_layout::NavigatorColumn::Context)
             .expect("context column");
-        let effort = layout
+        let model = layout
             .columns
             .iter()
-            .find(|cell| cell.column == navigator_layout::NavigatorColumn::Effort)
-            .expect("effort column");
+            .find(|cell| cell.column == navigator_layout::NavigatorColumn::Model)
+            .expect("model column");
         let mut source = baseline_session(uuid::Uuid::new_v4(), SessionKind::Task);
         source.provider = SessionProvider::Codex;
         source.model = Some("gpt-6-astra".to_string());
@@ -7491,14 +7651,7 @@ mod tests {
                 text.contains("6-astra"),
                 "model keeps its versioned canonical suffix: {text}"
             );
-            let (high_glyph, _) =
-                glyphs::effort_glyph(Some("high"), Some("gpt-6-astra")).expect("known effort");
-            assert_eq!(
-                buffer[(effort.start as u16, 0)].symbol(),
-                high_glyph,
-                "actual effort is a separate gauge cell: {text}"
-            );
-            assert_eq!(effort.start + effort.width, 120);
+            assert_eq!(model.start + model.width, 120);
             assert_eq!(
                 buffer_text_position(buffer, "42%").map(|(x, _)| x as usize),
                 Some(context.start + context.width - 3),
@@ -7851,6 +8004,7 @@ mod tests {
 
     #[test]
     fn t12_selected_inspector_places_model_in_header_and_location_facts_before_session_summary() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
         use crate::app::app_test_helpers::{baseline_session, with_session_list};
         use ratatui::{Terminal, backend::TestBackend};
         use rsi_common::types::{SandboxKind, SessionKind, SessionProvider};
@@ -7986,6 +8140,7 @@ mod tests {
 
     #[test]
     fn t15_source_derived_attention_survives_every_semantic_width_and_preset() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
         use crate::app::app_test_helpers::baseline_session;
         use ratatui::{Terminal, backend::TestBackend};
         use rsi_common::types::{PendingQuestion, QuestionItem, SessionKind};
@@ -8286,6 +8441,7 @@ mod tests {
 
     #[test]
     fn t14_source_lifecycle_projection_renders_each_normative_status_in_one_fixed_cell() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
         use crate::app::app_test_helpers::baseline_session;
         use ratatui::{Terminal, backend::TestBackend};
         use rsi_common::types::SessionKind;
@@ -8382,6 +8538,114 @@ mod tests {
     }
 
     #[test]
+    fn archive_and_jobs_render_the_same_columns_as_main() {
+        use crate::app::app_test_helpers::with_session_list;
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let header_columns = |zone: crate::types::SessionListZone,
+                              surface: SessionListSurface,
+                              width: u16,
+                              height: u16| {
+            let mut app = with_session_list(2);
+            let ids = app.filtered_session_order[..2].to_vec();
+            app.filtered_session_order = ids.clone();
+            app.filtered_archived_order = ids.clone();
+            app.filtered_jobs_order = ids.clone();
+            if let Pane::SessionList {
+                active_zone,
+                selected_index,
+                selected_session,
+                ..
+            } = app.session_list_pane_mut()
+            {
+                *active_zone = zone;
+                *selected_index = 0;
+                *selected_session = Some(ids[0]);
+            }
+            let pane = app.focused_pane().expect("list pane").clone();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+            terminal
+                .draw(|frame| {
+                    render_session_list(frame, frame.area(), &pane, true, &mut app, surface, None)
+                })
+                .expect("render list");
+            let buffer = terminal.backend().buffer();
+            ["FUNCTION", "STATUS", "PROJECT"].map(|name| buffer_text_position(buffer, name))
+        };
+
+        for surface in [SessionListSurface::Full, SessionListSurface::Embedded] {
+            for (width, height) in [(100, 30), (120, 40), (174, 30), (240, 40)] {
+                let main =
+                    header_columns(crate::types::SessionListZone::Main, surface, width, height);
+                assert!(
+                    main.iter().any(Option::is_some),
+                    "Main renders navigator columns {surface:?} {width}x{height}"
+                );
+                for zone in [
+                    crate::types::SessionListZone::Archive,
+                    crate::types::SessionListZone::Jobs,
+                ] {
+                    assert_eq!(
+                        header_columns(zone, surface, width, height),
+                        main,
+                        "{zone:?} {surface:?} {width}x{height} renders Main's columns"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stored_taskrabbit_row_deserialises_and_renders_in_archive() {
+        use crate::app::app_test_helpers::{baseline_session, with_session_list};
+        use ratatui::{Terminal, backend::TestBackend};
+        use rsi_common::types::{Session, SessionKind, SessionStatus};
+
+        // A row written by an older build: serde string unchanged.
+        let id = uuid::Uuid::new_v4();
+        let mut row = baseline_session(id, SessionKind::Standard);
+        row.status = SessionStatus::Archived;
+        row.title = Some("legacy-taskrabbit-row".to_string());
+        let mut json = serde_json::to_value(&row).expect("serialise session");
+        json["session_kind"] = serde_json::json!("TaskRabbit");
+        let stored: Session = serde_json::from_value(json).expect("legacy row still loads");
+        assert_eq!(stored.session_kind, SessionKind::TaskRabbit);
+
+        let mut app = with_session_list(1);
+        app.sessions
+            .insert(id, crate::types::SessionState::new(stored));
+        app.filtered_archived_order = vec![id];
+        if let Pane::SessionList {
+            active_zone,
+            selected_session,
+            ..
+        } = app.session_list_pane_mut()
+        {
+            *active_zone = crate::types::SessionListZone::Archive;
+            *selected_session = Some(id);
+        }
+        let pane = app.focused_pane().expect("list pane").clone();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_session_list(
+                    frame,
+                    frame.area(),
+                    &pane,
+                    true,
+                    &mut app,
+                    SessionListSurface::Full,
+                    None,
+                )
+            })
+            .expect("render list");
+        assert!(
+            buffer_text_position(terminal.backend().buffer(), "legacy-taskrabbit-row").is_some(),
+            "the archived legacy row renders in the Archive zone"
+        );
+    }
+
+    #[test]
     fn t18_table_ordinal_width_uses_real_dataset_width_on_every_applicable_surface() {
         use crate::app::app_test_helpers::{baseline_session, with_session_list};
         use crate::types::SplitNode;
@@ -8406,10 +8670,26 @@ mod tests {
                 SessionBrowserMode::EmbeddedInspector,
             ),
             (
+                "embedded-archive-inspector",
+                SessionListSurface::Embedded,
+                crate::types::SessionListZone::Archive,
+                240,
+                40,
+                SessionBrowserMode::EmbeddedInspector,
+            ),
+            (
+                "embedded-jobs-inspector",
+                SessionListSurface::Embedded,
+                crate::types::SessionListZone::Jobs,
+                240,
+                40,
+                SessionBrowserMode::EmbeddedInspector,
+            ),
+            (
                 "full-archive-legacy",
                 SessionListSurface::Full,
                 crate::types::SessionListZone::Archive,
-                240,
+                119,
                 40,
                 SessionBrowserMode::LegacyTable,
             ),
@@ -8426,7 +8706,6 @@ mod tests {
             app.sessions.insert(epic_id, SessionState::new(epic));
             let order = vec![child_id];
             app.filtered_session_order = order.clone();
-            app.filtered_taskrabbit_order = order.clone();
             app.filtered_archived_order = order.clone();
             app.filtered_jobs_order = order;
             if let Pane::SessionList {
@@ -8445,7 +8724,7 @@ mod tests {
                 _ => unreachable!("single list pane"),
             };
             let content = Rect::new(0, 1, width, height - 1);
-            let browser = resolve_session_browser_layout(content, surface, zone);
+            let browser = resolve_session_browser_layout(content, surface);
             assert_eq!(browser.mode, expected_mode, "{case}");
             let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
             terminal
@@ -8455,7 +8734,6 @@ mod tests {
                 .expect("table production render");
             let state = match zone {
                 crate::types::SessionListZone::Main => &app.session_list_render.main,
-                crate::types::SessionListZone::TaskRabbit => &app.session_list_render.taskrabbit,
                 crate::types::SessionListZone::Archive => &app.session_list_render.archive,
                 crate::types::SessionListZone::Jobs => &app.session_list_render.jobs,
             };
@@ -8503,6 +8781,7 @@ mod tests {
 
     #[test]
     fn t18_t37_rotated_function_title_and_optional_rotation_cell_stay_separate() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
         use crate::app::app_test_helpers::{baseline_session, with_session_list};
         use ratatui::{Terminal, backend::TestBackend};
         use rsi_common::types::SessionKind;
@@ -8588,7 +8867,7 @@ mod tests {
         all_enabled.navigator_optional_columns = Some(navigator_layout::OPTIONAL_ORDER.to_vec());
         let (sub_rotation, function) = render_cell(
             &all_enabled,
-            104,
+            102,
             navigator_layout::NavigatorColumn::Function,
         );
         assert_eq!(
@@ -8612,7 +8891,6 @@ mod tests {
                 navigator_layout::NavigatorColumn::Age,
                 navigator_layout::NavigatorColumn::Provider,
                 navigator_layout::NavigatorColumn::Model,
-                navigator_layout::NavigatorColumn::Effort,
                 navigator_layout::NavigatorColumn::Retry,
                 navigator_layout::NavigatorColumn::Cost,
                 navigator_layout::NavigatorColumn::Work,
@@ -8622,13 +8900,13 @@ mod tests {
 
         let (with_rotation, function) = render_cell(
             &all_enabled,
-            105,
+            103,
             navigator_layout::NavigatorColumn::Function,
         );
         assert_eq!(function, row.display_title, "ROT-enabled FUNCTION title");
         let (_, rotation_cell) = render_cell(
             &all_enabled,
-            105,
+            103,
             navigator_layout::NavigatorColumn::Rotation,
         );
         assert_eq!(
@@ -8652,7 +8930,6 @@ mod tests {
                 navigator_layout::NavigatorColumn::Age,
                 navigator_layout::NavigatorColumn::Provider,
                 navigator_layout::NavigatorColumn::Model,
-                navigator_layout::NavigatorColumn::Effort,
                 navigator_layout::NavigatorColumn::Retry,
                 navigator_layout::NavigatorColumn::Cost,
                 navigator_layout::NavigatorColumn::Work,
@@ -8694,7 +8971,6 @@ mod tests {
                 navigator_layout::NavigatorColumn::Age,
                 navigator_layout::NavigatorColumn::Provider,
                 navigator_layout::NavigatorColumn::Model,
-                navigator_layout::NavigatorColumn::Effort,
                 navigator_layout::NavigatorColumn::Retry,
                 navigator_layout::NavigatorColumn::Cost,
                 navigator_layout::NavigatorColumn::Work,
@@ -10281,6 +10557,85 @@ mod tests {
         assert_eq!(app.filtered_session_order, vec![id]);
     }
 
+    /// The navigator footer keys the list's own glyphs — lifecycle, attention
+    /// and role families — one group per line. Provider glyphs are named in
+    /// the model picker instead.
+    #[test]
+    fn navigator_symbol_key_covers_lifecycle_attention_and_roles() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
+        let lines: Vec<String> = legend_lines(96, theme::glass_panel_bg())
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "● run  ✓ done  × fail  ■ stop  ◐ start  ? wait  · arch",
+                "! you  • unread  ↺ retry  ⧗ stall  ◆ pin  ↻ rotated  ◌ ctx ?",
+                "Mg lead  Pl plan  Im build  Db debug  Rv check",
+            ]
+        );
+    }
+
+    fn render_scope_header_row(app: &mut App, width: u16) -> String {
+        use crate::types::SplitNode;
+        let pane = match &app.tabs[0].layout {
+            SplitNode::Leaf { pane, .. } => pane.clone(),
+            _ => unreachable!("fixture should use a single session-list pane"),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_session_list(
+                    frame,
+                    Rect::new(0, 0, width, 30),
+                    &pane,
+                    true,
+                    app,
+                    SessionListSurface::Full,
+                    None,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..width).map(|x| buffer[(x, 0)].symbol()).collect()
+    }
+
+    /// The scope header names the `<Space>s` order in effect beside the count,
+    /// and follows a change of order on the next frame.
+    #[test]
+    fn scope_header_names_the_active_sort_order() {
+        use crate::app::{SortOrder, app_test_helpers};
+
+        let mut app = app_test_helpers::with_session_list(3);
+        for order in SortOrder::ALL {
+            app.settings.sort_order = order;
+            let header = render_scope_header_row(&mut app, 120);
+            assert!(header.contains("All projects / Sessions"), "{header:?}");
+            assert!(
+                header
+                    .trim_end()
+                    .ends_with(&format!("⇅ {} · 3 sessions", order.label())),
+                "{order:?}: {header:?}"
+            );
+        }
+    }
+
+    /// On a pane too narrow for both, the breadcrumb and count win over the
+    /// order chip.
+    #[test]
+    fn narrow_scope_header_keeps_the_breadcrumb_and_count_whole() {
+        let mut app = crate::app::app_test_helpers::with_session_list(3);
+        let header = render_scope_header_row(&mut app, 40);
+        assert!(header.contains("All projects / Sessions"), "{header:?}");
+        assert!(header.trim_end().ends_with(" 3 sessions"), "{header:?}");
+    }
+
     #[test]
     fn render_fixture_session_list_without_daemon() {
         use crate::app::app_test_helpers;
@@ -10353,6 +10708,7 @@ mod tests {
 
     #[test]
     fn selected_inspector_places_model_above_title_and_renders_aligned_context_gauge() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
         use crate::app::app_test_helpers::{baseline_session, with_session_list};
         use ratatui::{Terminal, backend::TestBackend};
         use rsi_common::types::{SessionKind, SessionProvider};
@@ -10405,6 +10761,7 @@ mod tests {
 
     #[test]
     fn t09_selected_session_inspector_renders_positive_summary_and_description_destinations() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
         use crate::app::app_test_helpers::{baseline_session, with_session_list};
         use ratatui::{Terminal, backend::TestBackend};
         use rsi_common::types::SessionKind;
@@ -10646,11 +11003,8 @@ mod tests {
             );
         }
 
-        let layout = resolve_session_browser_layout(
-            Rect::new(0, 1, 240, 69),
-            SessionListSurface::Full,
-            crate::types::SessionListZone::Main,
-        );
+        let layout =
+            resolve_session_browser_layout(Rect::new(0, 1, 240, 69), SessionListSurface::Full);
         let inspector = layout.inspector.expect("240-wide inspector");
         let tether = layout.tether.expect("240-wide tether");
         let activity = layout.activity.expect("240-wide activity");
@@ -10799,7 +11153,6 @@ mod tests {
                 selected_session,
                 scroll_offset: 0,
                 active_zone: Default::default(),
-                taskrabbit_selected_index: 0,
                 archive_selected_index: 0,
                 jobs_selected_index: 0,
             },
@@ -10848,7 +11201,7 @@ mod tests {
                 && text.contains(glyphs::TURNS),
             "wide-tier header must expose the fixed navigator columns:\n{text}"
         );
-        for header in ["MODEL", glyphs::EFFORT] {
+        for header in ["MODEL"] {
             assert!(
                 text.contains(header),
                 "wide-tier navigator admits separate {header} after AGE:\n{text}"
@@ -11020,11 +11373,6 @@ mod tests {
         ];
         let legacy_surface_zone_cases = [
             (
-                "full-taskrabbit",
-                SessionListSurface::Full,
-                crate::types::SessionListZone::TaskRabbit,
-            ),
-            (
                 "full-archive",
                 SessionListSurface::Full,
                 crate::types::SessionListZone::Archive,
@@ -11038,11 +11386,6 @@ mod tests {
                 "embedded-main",
                 SessionListSurface::Embedded,
                 crate::types::SessionListZone::Main,
-            ),
-            (
-                "embedded-taskrabbit",
-                SessionListSurface::Embedded,
-                crate::types::SessionListZone::TaskRabbit,
             ),
             (
                 "embedded-archive",
@@ -11064,12 +11407,10 @@ mod tests {
                     legacy_surface_zone_cases
                         .iter()
                         .map(|(case, surface, zone)| {
-                            let expected_mode = if *surface == SessionListSurface::Embedded
-                                && *zone == crate::types::SessionListZone::Main
-                            {
+                            let expected_mode = if *surface == SessionListSurface::Embedded {
                                 SessionBrowserMode::EmbeddedInspector
                             } else {
-                                SessionBrowserMode::LegacyTable
+                                SessionBrowserMode::RelayWithActivity
                             };
                             (*case, *surface, *zone, 240, 40, expected_mode)
                         }),
@@ -11092,7 +11433,6 @@ mod tests {
                     state.list_card_expanded = expanded;
                 }
                 app.filtered_session_order = ids.clone();
-                app.filtered_taskrabbit_order = ids.clone();
                 app.filtered_archived_order = ids.clone();
                 app.filtered_jobs_order = ids;
                 let selected_id = app.filtered_session_order[0];
@@ -11110,7 +11450,7 @@ mod tests {
                 let pane = app.focused_pane().expect("list pane").clone();
                 let content = Rect::new(0, 1, width, height.saturating_sub(1));
                 assert_eq!(
-                    resolve_session_browser_layout(content, surface, zone).mode,
+                    resolve_session_browser_layout(content, surface).mode,
                     expected_mode,
                     "{case} resolves its intended browser mode"
                 );
@@ -11131,9 +11471,6 @@ mod tests {
                     .expect("render list");
                 let state = match zone {
                     crate::types::SessionListZone::Main => &app.session_list_render.main,
-                    crate::types::SessionListZone::TaskRabbit => {
-                        &app.session_list_render.taskrabbit
-                    }
                     crate::types::SessionListZone::Archive => &app.session_list_render.archive,
                     crate::types::SessionListZone::Jobs => &app.session_list_render.jobs,
                 };
@@ -11162,6 +11499,161 @@ mod tests {
                     "{case} {expanded:?}: second FUNCTION text begins one rendered row below"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn soft_pause_icon_shows_in_every_zone_and_browser_mode_then_clears() {
+        use crate::app::app_test_helpers::with_session_list;
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
+        let cases = [
+            (
+                SessionListSurface::Full,
+                crate::types::SessionListZone::Main,
+                119u16,
+                40u16,
+            ),
+            (
+                SessionListSurface::Full,
+                crate::types::SessionListZone::Main,
+                120,
+                40,
+            ),
+            (
+                SessionListSurface::Full,
+                crate::types::SessionListZone::Main,
+                174,
+                25,
+            ),
+            (
+                SessionListSurface::Full,
+                crate::types::SessionListZone::Main,
+                228,
+                25,
+            ),
+            (
+                SessionListSurface::Full,
+                crate::types::SessionListZone::Archive,
+                240,
+                40,
+            ),
+            (
+                SessionListSurface::Full,
+                crate::types::SessionListZone::Jobs,
+                240,
+                40,
+            ),
+            (
+                SessionListSurface::Embedded,
+                crate::types::SessionListZone::Main,
+                240,
+                40,
+            ),
+            (
+                SessionListSurface::Embedded,
+                crate::types::SessionListZone::Archive,
+                240,
+                40,
+            ),
+            (
+                SessionListSurface::Embedded,
+                crate::types::SessionListZone::Jobs,
+                240,
+                40,
+            ),
+        ];
+        for (surface, zone, width, height) in cases {
+            let mut app = with_session_list(2);
+            let ids = app.filtered_session_order[..2].to_vec();
+            for (id, title) in ids.iter().zip(["soft-pause-alpha", "soft-pause-beta"]) {
+                let state = app.sessions.get_mut(id).expect("known session");
+                state.session.status = SessionStatus::Interrupted;
+                state.session.title = Some(title.to_string());
+            }
+            app.filtered_session_order = ids.clone();
+            app.filtered_archived_order = ids.clone();
+            app.filtered_jobs_order = ids.clone();
+            let paused_id = ids[0];
+            app.operator_pauses
+                .insert(paused_id, crate::client::OperatorPauseLevel::Soft);
+            if let Pane::SessionList {
+                active_zone,
+                selected_index,
+                selected_session,
+                ..
+            } = app.session_list_pane_mut()
+            {
+                *active_zone = zone;
+                *selected_index = 1;
+                *selected_session = Some(ids[1]);
+            }
+
+            let render = |app: &mut crate::app::App| {
+                let pane = app.focused_pane().expect("list pane").clone();
+                let mut terminal =
+                    Terminal::new(TestBackend::new(width, height)).expect("terminal");
+                terminal
+                    .draw(|frame| {
+                        render_session_list(frame, frame.area(), &pane, true, app, surface, None)
+                    })
+                    .expect("render list");
+                terminal.backend().buffer().clone()
+            };
+
+            // Interrupted + soft pause: the paused row (not the other) shows
+            // the pause glyph in the colour SOFT used to have.
+            let buffer = render(&mut app);
+            let (_, row_y) = buffer_text_position(&buffer, "soft-pause-alpha")
+                .expect("paused row renders its title");
+            let pause_x = (0..width)
+                .find(|x| buffer[(*x, row_y)].symbol() == "⏸")
+                .unwrap_or_else(|| panic!("{surface:?} {zone:?} {width}: paused row shows ⏸"));
+            assert_eq!(buffer[(pause_x, row_y)].fg, theme::warning_status());
+            let (_, other_y) = buffer_text_position(&buffer, "soft-pause-beta")
+                .expect("other row renders its title");
+            assert_eq!(
+                buffer[(pause_x, other_y)].symbol(),
+                crate::types::row::navigator_lifecycle_icon(SessionStatus::Interrupted),
+                "an unpaused interrupted row keeps the stopped icon"
+            );
+
+            // The next state arrives: the session is running again. The
+            // cached soft pause is dropped and the normal icon shows.
+            let mut running = app.sessions[&paused_id].session.clone();
+            running.status = SessionStatus::Running;
+            app.upsert_session(running);
+            assert_eq!(
+                app.operator_pauses.get(&paused_id),
+                None,
+                "leaving Interrupted drops the cached soft pause"
+            );
+            // The poll-driven re-sort is not under test; keep the fixture order.
+            app.filtered_session_order = ids.clone();
+            app.filtered_archived_order = ids.clone();
+            app.filtered_jobs_order = ids.clone();
+            let buffer = render(&mut app);
+            let (_, row_y) =
+                buffer_text_position(&buffer, "soft-pause-alpha").unwrap_or_else(|| {
+                    panic!("row still renders its title:\n{}", buffer_text(&buffer))
+                });
+            let expected = {
+                let state = &app.sessions[&paused_id];
+                crate::types::row::compute_session_row_for_state_with_focus(
+                    state,
+                    &app.sessions,
+                    &app.projects,
+                    &app.settings,
+                    None,
+                )
+            };
+            assert_eq!(
+                buffer[(pause_x, row_y)].symbol(),
+                expected.status_icon,
+                "{surface:?} {zone:?} {width}: running icon replaces the pause glyph"
+            );
+            assert_eq!(buffer[(pause_x, row_y)].fg, expected.status_color);
         }
     }
 
@@ -11653,7 +12145,7 @@ mod tests {
         while let Some((action, _ctx)) = app.key_manager.pop() {
             actions.push(action);
         }
-        app.vim_machine_pending = actions.is_empty();
+        app.update_vim_machine_pending(key_event, actions.is_empty());
     }
 
     /// Render the focused input bar for `app` at the fixture geometry and
@@ -11671,6 +12163,68 @@ mod tests {
             })
             .expect("input bar render should succeed");
         buffer_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn render_input_bar_mode_colors_and_exact_leader_labels() {
+        let _pinned_theme = theme::pin_theme_state();
+        use ratatui::{Terminal, backend::TestBackend};
+        for (command, leader, label, color) in [
+            ("i", "", "INSERT", Some(theme::green())),
+            ("", "", "NORMAL", None),
+            ("", "g", "LEADER: G", Some(theme::sky())),
+            ("", " ", "LEADER: SPACE", Some(theme::mauve())),
+            ("", " g", "LEADER: SPACE", Some(theme::mauve())),
+            ("f", "", "NORMAL", Some(theme::yellow())),
+            ("F", "", "NORMAL", Some(theme::yellow())),
+            ("t", "", "NORMAL", Some(theme::yellow())),
+            ("T", "", "NORMAL", Some(theme::yellow())),
+            ("dt", "", "NORMAL", Some(theme::yellow())),
+            ("d", "", "NORMAL", Some(theme::red())),
+        ] {
+            let (mut app, id) = crate::app::app_test_helpers::with_session_detail();
+            let surface = &mut app.sessions.get_mut(&id).unwrap().input_bar.surface;
+            surface.textarea.insert_str("draft text");
+            for ch in command.chars() {
+                crate::vim_textarea::handle_vim_normal(
+                    &mut surface.textarea,
+                    &mut surface.vim_state,
+                    crossterm::event::KeyEvent::new(
+                        crossterm::event::KeyCode::Char(ch),
+                        crossterm::event::KeyModifiers::NONE,
+                    ),
+                    None,
+                );
+            }
+            if command == "i" {
+                surface.mode = crate::types::PopupMode::Insert;
+            }
+            for ch in leader.chars() {
+                feed_leader_key(&mut app, crossterm::event::KeyCode::Char(ch));
+            }
+            let mut terminal = Terminal::new(TestBackend::new(60, 5)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_input_bar(frame, Rect::new(0, 0, 60, 5), id, true, &app);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert!(
+                buffer_text(buffer).contains(label),
+                "{command:?} / {leader:?}"
+            );
+            assert_eq!(
+                buffer[(0, 0)].fg,
+                color.unwrap_or_else(|| theme::input_bar_border(true))
+            );
+            for x in 1..=label.len() as u16 {
+                assert_eq!(buffer[(x, 2)].fg, color.unwrap_or_else(theme::accent));
+            }
+            assert_eq!(
+                app.sessions[&id].input_bar.surface.wrap_width.get(),
+                (60 - INPUT_PROMPT_WIDTH - 4) as usize
+            );
+        }
     }
 
     #[test]
@@ -11702,7 +12256,7 @@ mod tests {
 
         let pending = render_input_bar_text(&app, session_id);
         assert!(
-            pending.contains("LEADER"),
+            pending.contains("LEADER: SPACE"),
             "pending leader state must render a distinct positive mode label after the prefix:\n{pending}"
         );
 
@@ -11732,7 +12286,7 @@ mod tests {
         assert!(app.vim_machine_pending, "Space prefix must be pending");
         let pending = render_input_bar_text(&app, session_id);
         assert!(
-            pending.contains("LEADER"),
+            pending.contains("LEADER: SPACE"),
             "pending leader state must render before cancellation:\n{pending}"
         );
 

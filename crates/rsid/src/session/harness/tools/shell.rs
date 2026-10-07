@@ -213,6 +213,13 @@ impl ShellTool {
             .or_else(|| command.strip_prefix("```sh\n"))
             .and_then(|c| c.strip_suffix("\n```"))
             .unwrap_or(command);
+        if let Some(refusal) = rsi_common::kill_guard::broad_kill_refusal(command) {
+            return ToolResult {
+                success: false,
+                output: String::new(),
+                error_msg: Some(refusal.to_string()),
+            };
+        }
 
         let identity = ShellLaunchIdentity {
             session_id: self.session_id,
@@ -355,6 +362,25 @@ mod tests {
             .await;
         assert!(result.success, "{:?}", result.error_msg);
         assert_eq!(result.output.trim(), "hello");
+    }
+
+    /// #1227: a pattern kill is refused before any process starts.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn shell_refuses_a_pattern_kill() {
+        let tool = ShellTool::default();
+        let result = tool
+            .execute(
+                serde_json::json!({"command": "echo start; killall rsi-1227-no-such-process"}),
+                Path::new("/tmp"),
+            )
+            .await;
+        assert!(!result.success);
+        assert_eq!(
+            result.error_msg.as_deref(),
+            Some(rsi_common::kill_guard::BROAD_KILL_REFUSAL)
+        );
+        assert_eq!(result.output, "");
     }
 
     fn launch_args(egress: EgressMode) -> Vec<String> {

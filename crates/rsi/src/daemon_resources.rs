@@ -67,9 +67,19 @@ pub struct DaemonResourceSample {
     pub queue_pending: i64,
     pub queue_claimed: i64,
     pub queue_failed: i64,
+    /// `rsid-supervisor.sh` or `none` (#1217); absent when the daemon cannot say.
+    pub supervisor_mode: Option<String>,
 }
 
 impl DaemonResourceSample {
+    /// The daemon positively reports it is not under `rsid-supervisor.sh`, so
+    /// managed deploys are refused until `make release-install` restarts it.
+    #[must_use]
+    pub fn is_unsupervised(&self) -> bool {
+        self.supervisor_mode.as_deref()
+            == Some(rsi_common::agent_daemon_info::DAEMON_SUPERVISOR_NONE)
+    }
+
     /// Combine a Health response with the `/proc` counters of `pid`.
     #[must_use]
     pub fn from_health(health: &HealthStatusResponse, pid: Option<u32>) -> Self {
@@ -102,6 +112,7 @@ impl DaemonResourceSample {
             queue_pending: health.queue_pending,
             queue_claimed: health.queue_claimed,
             queue_failed: health.queue_failed,
+            supervisor_mode: health.supervisor_mode.clone(),
         }
     }
 }
@@ -201,6 +212,30 @@ mod tests {
     }
 
     #[test]
+    fn daemon_resources_flag_only_a_daemon_that_reports_no_supervisor() {
+        let sample = |mode: Option<&str>| DaemonResourceSample {
+            sampled_at: Instant::now(),
+            pid: None,
+            proc_counters: None,
+            open_fds: None,
+            uptime_secs: None,
+            rss_bytes: None,
+            heap_in_use_bytes: None,
+            persistence_queue_depth: 0,
+            persistence_queue_capacity: 0,
+            last_command_duration_ms: 0,
+            queue_pending: 0,
+            queue_claimed: 0,
+            queue_failed: 0,
+            supervisor_mode: mode.map(str::to_string),
+        };
+        assert!(sample(Some("none")).is_unsupervised());
+        assert!(!sample(Some("rsid-supervisor.sh")).is_unsupervised());
+        // Unknown (older daemon, no /proc) is not a warning.
+        assert!(!sample(None).is_unsupervised());
+    }
+
+    #[test]
     fn daemon_resources_cpu_percent_needs_two_samples_of_one_process() {
         let start = Instant::now();
         let sample = |offset_ms: u64, ticks: u64, pid: u32| DaemonResourceSample {
@@ -221,6 +256,7 @@ mod tests {
             queue_pending: 0,
             queue_claimed: 0,
             queue_failed: 0,
+            supervisor_mode: None,
         };
         let first = DaemonResourceView::next(None, sample(0, 100, 7));
         assert!(first.awaiting_cpu());

@@ -298,24 +298,6 @@ fn default_true() -> bool {
     true
 }
 
-/// Per-role message border color overrides. `None` per slot = use theme default.
-/// Slots: [assistant, user, tool_unselected, tool_selected, normal cursor bg, insert cursor bg, visual selection bg]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BorderColorOverrides(pub [Option<[u8; 3]>; 7]);
-
-impl Default for BorderColorOverrides {
-    fn default() -> Self {
-        Self([None; 7])
-    }
-}
-
-impl BorderColorOverrides {
-    /// Convert to the fixed-size array expected by `theme::apply_border_color_overrides`.
-    pub fn as_array(&self) -> [Option<[u8; 3]>; 7] {
-        self.0
-    }
-}
-
 /// Committed semantic role overrides. Unknown or malformed entries are ignored
 /// individually so one future role cannot invalidate the rest of state.json.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -499,10 +481,6 @@ pub struct PersistedState {
     #[serde(default)]
     pub session_fold_states: HashMap<String, bool>,
 
-    /// Per-role message border color overrides (survives restarts).
-    #[serde(default)]
-    pub border_color_overrides: BorderColorOverrides,
-
     /// Per-theme semantic color overrides. Additive and safe for old files.
     #[serde(default)]
     pub theme_role_overrides: ThemeRoleOverrides,
@@ -545,18 +523,6 @@ impl PersistedState {
             settings: app.settings.clone(),
             settings_navigation: app.settings_state.navigation(),
             session_fold_states,
-            border_color_overrides: {
-                let arr = [
-                    crate::ui::theme::get_border_color_override(0),
-                    crate::ui::theme::get_border_color_override(1),
-                    crate::ui::theme::get_border_color_override(2),
-                    crate::ui::theme::get_border_color_override(3),
-                    crate::ui::theme::get_border_color_override(4),
-                    crate::ui::theme::get_border_color_override(5),
-                    crate::ui::theme::get_border_color_override(6),
-                ];
-                BorderColorOverrides(arr)
-            },
             theme_role_overrides: ThemeRoleOverrides::capture(),
             modal_geometries: app.modal_geometries.clone(),
             modal_defaults: app.modal_defaults.clone(),
@@ -1146,7 +1112,6 @@ mod tests {
             settings: UserSettings::default(),
             settings_navigation: SettingsNavigation::default(),
             session_fold_states: HashMap::new(),
-            border_color_overrides: BorderColorOverrides::default(),
             theme_role_overrides: ThemeRoleOverrides::default(),
             modal_geometries: HashMap::new(),
             modal_defaults: ModalDefaults::default(),
@@ -1249,7 +1214,6 @@ mod tests {
                         selected_session: None,
                         scroll_offset: 0,
                         active_zone: Default::default(),
-                        taskrabbit_selected_index: 0,
                         archive_selected_index: 0,
                         jobs_selected_index: 0,
                     },
@@ -1367,7 +1331,6 @@ mod tests {
                     selected_session: None,
                     scroll_offset: 0,
                     active_zone: Default::default(),
-                    taskrabbit_selected_index: 0,
                     archive_selected_index: 0,
                     jobs_selected_index: 0,
                 },
@@ -1402,6 +1365,26 @@ mod tests {
             state.tabs[0].descent_path.is_empty(),
             "descent_path should default to empty vec"
         );
+    }
+
+    #[test]
+    fn old_state_with_removed_taskrabbit_zone_restores_to_main() {
+        // Builds that still had the TaskRabbit zone wrote `active_zone:
+        // "TaskRabbit"` and a `taskrabbit_selected_index` into every list pane.
+        let json = r#"{"tabs":[{"name":"[1]","layout":{"Leaf":{"pane":{"SessionList":{"selected_index":2,"selected_session":null,"scroll_offset":0,"active_zone":"TaskRabbit","taskrabbit_selected_index":3,"archive_selected_index":1,"jobs_selected_index":0}},"id":0}},"focused_pane":0}]}"#;
+        let state: PersistedState = serde_json::from_str(json).unwrap();
+        let Some(crate::types::Pane::SessionList {
+            selected_index,
+            active_zone,
+            archive_selected_index,
+            ..
+        }) = state.tabs[0].layout.find_pane(state.tabs[0].focused_pane)
+        else {
+            panic!("restored pane is a session list");
+        };
+        assert_eq!(*active_zone, crate::types::SessionListZone::Main);
+        assert_eq!(*selected_index, 2);
+        assert_eq!(*archive_selected_index, 1);
     }
 
     mod modal_defaults {

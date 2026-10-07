@@ -645,3 +645,224 @@ fn the_mailbox_is_bounded_per_grant_across_recipients() {
         .unwrap_err();
     assert_eq!(code(full), GLOBAL_MANAGER_MAILBOX_FULL);
 }
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn latest_global_grant_keeps_a_revoked_seat_and_rows_flag_revoked_scopes() {
+    let store = Store::open_in_memory().unwrap();
+    assert!(store.latest_global_grant().unwrap().is_none());
+    let (a, b) = (project(&store, "A"), project(&store, "B"));
+    let seat = session(&store, None);
+    let grant = configure(&store, seat, &[a, b], 0, "g1").unwrap();
+    assert_eq!(
+        store.latest_global_grant().unwrap().map(|g| g.state),
+        Some("active".to_string())
+    );
+    appoint_pm(&store, a);
+    appoint_pm(&store, b);
+    // Revoke B's PM scope: no Epics, no groups, not project-wide.
+    let row_version = store.get_harness_manager(b).unwrap().unwrap().row_version;
+    store
+        .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+            project_id: b,
+            session_id: store
+                .get_harness_manager(b)
+                .unwrap()
+                .unwrap()
+                .current_session_id
+                .unwrap(),
+            epic_ids: Some(vec![]),
+            group_ids: vec![],
+            expected_row_version: row_version,
+        })
+        .unwrap();
+    let rows = store.global_project_rows(&grant).unwrap();
+    assert_eq!(rows[0].project_id, a);
+    assert!(rows[0].manager_session_id.is_some());
+    assert!(!rows[0].scope_revoked);
+    assert_eq!(rows[1].project_id, b);
+    assert!(rows[1].scope_revoked);
+    assert_eq!(rows[1].manager_session_id, None);
+
+    store
+        .revoke_global_manager(&RevokeGlobalManagerRequestV1 {
+            expected_grant_version: grant.grant_version,
+            idempotency_key: "r1".into(),
+        })
+        .unwrap();
+    let latest = store.latest_global_grant().unwrap().unwrap();
+    assert_eq!(latest.state, "revoked");
+    assert_eq!(latest.grant_id, grant.grant_id);
+    assert!(store.active_global_grant().unwrap().is_none());
+}
+
+/// The reported Koplik 20 → 4 surprise is refused atomically by both RPC
+/// store paths, including edits; confirmation retains normal CAS and replay.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn portfolio_caps_require_confirmation_and_overview_reports_chain_minimum() {
+    use crate::store::portfolio_nodes::PortfolioGrantor;
+    use rsi_common::harness_manager_v2::ConfigureHarnessManagerPolicyRequestV2;
+    use rsi_common::portfolio_nodes::{
+        ConfigurePortfolioNodeRequestV1, PORTFOLIO_CAP_REDUCTION_CONFIRMATION_REQUIRED,
+    };
+    let store = Store::open_in_memory().unwrap();
+    let a = project(&store, "Koplik");
+    let b = project(&store, "Other");
+    for (project_id, max_active_sessions) in [(a, 20), (b, 2)] {
+        appoint_pm(&store, project_id);
+        store
+            .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                project_id,
+                expected_scope_version: 1,
+                expected_policy_version: 0,
+                idempotency_key: format!("pm-{project_id}"),
+                policy: ManagerPolicyV2 {
+                    max_active_sessions,
+                    max_created_sessions: 50,
+                    ..ManagerPolicyV2::default()
+                },
+            })
+            .unwrap();
+    }
+    let seat = session(&store, Some(a));
+    let mut request = ConfigureGlobalManagerRequestV1 {
+        session_id: seat,
+        project_ids: vec![a, b],
+        allowed_launches: vec![launch()],
+        project_policy: ManagerPolicyV2 {
+            max_created_sessions: 100,
+            ..ManagerPolicyV2::default()
+        },
+        expected_grant_version: 0,
+        idempotency_key: "caps-global".into(),
+    };
+    let error = code(
+        store
+            .configure_global_manager(&request, "operator:test")
+            .unwrap_err(),
+    );
+    assert!(
+        error.contains(PORTFOLIO_CAP_REDUCTION_CONFIRMATION_REQUIRED),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("Koplik {a} ({a}): active sessions: 20 → 4")),
+        "{error}"
+    );
+    assert!(store.active_global_grant().unwrap().is_none());
+    assert!(store.list_portfolio_nodes(false).unwrap().is_empty());
+    assert_eq!(
+        store
+            .project_effective_resource_caps(a)
+            .unwrap()
+            .unwrap()
+            .max_active_sessions,
+        20
+    );
+    let saved = store
+        .configure_global_manager_confirmed(&request, "operator:test", true)
+        .unwrap();
+    // A replay needs no new approval and preserves the saved grant.
+    assert_eq!(
+        store
+            .configure_global_manager(&request, "operator:test")
+            .unwrap(),
+        saved
+    );
+    let rows = store.global_project_rows(&saved).unwrap();
+    assert_eq!(
+        rows[0]
+            .policy
+            .as_ref()
+            .unwrap()
+            .effective_caps
+            .as_ref()
+            .unwrap()
+            .max_active_sessions,
+        4
+    );
+    assert_eq!(
+        rows[1]
+            .policy
+            .as_ref()
+            .unwrap()
+            .effective_caps
+            .as_ref()
+            .unwrap()
+            .max_active_sessions,
+        2
+    );
+    let node = store.list_portfolio_nodes(false).unwrap().remove(0);
+    let mut edit = ConfigurePortfolioNodeRequestV1 {
+        node_id: Some(node.node_id),
+        parent_node_id: None,
+        adopt_node_ids: vec![],
+        expected_parent_grant_version: None,
+        tier_label: "global".into(),
+        seat_session_id: seat,
+        project_ids: vec![a, b],
+        allowed_launches: vec![launch()],
+        policy: request.project_policy.clone(),
+        child_policy: None,
+        max_direct_reports: node.max_direct_reports,
+        expected_node_grant_version: saved.grant_version,
+        expected_authority_epoch: node.authority_epoch,
+        idempotency_key: "caps-edit".into(),
+    };
+    edit.policy.max_active_sessions = 3;
+    let error = code(
+        store
+            .configure_portfolio_node(&edit, PortfolioGrantor::Operator, "operator:test")
+            .unwrap_err(),
+    );
+    assert!(error.contains("active sessions: 4 → 3"), "{error}");
+    assert_eq!(
+        store.get_portfolio_node(node.node_id).unwrap().unwrap(),
+        node
+    );
+    let saved_edit = store
+        .configure_portfolio_node_confirmed(
+            &edit,
+            PortfolioGrantor::Operator,
+            "operator:test",
+            true,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .project_effective_resource_caps(a)
+            .unwrap()
+            .unwrap()
+            .max_active_sessions,
+        3
+    );
+    // Raising a grant must replace its old ceiling, rather than intersect it.
+    edit.policy.max_active_sessions = 30;
+    edit.expected_node_grant_version = saved_edit.grant.grant_version;
+    edit.expected_authority_epoch = saved_edit.authority_epoch;
+    edit.idempotency_key = "caps-raise".into();
+    let raised = store
+        .configure_portfolio_node(&edit, PortfolioGrantor::Operator, "operator:test")
+        .unwrap();
+    assert_eq!(
+        store
+            .project_effective_resource_caps(a)
+            .unwrap()
+            .unwrap()
+            .max_active_sessions,
+        20
+    );
+    // Confirmation never bypasses stale-version protection.
+    request.expected_grant_version = saved.grant_version;
+    request.idempotency_key = "caps-stale".into();
+    assert!(
+        store
+            .configure_global_manager_confirmed(&request, "operator:test", true)
+            .is_err()
+    );
+    assert_eq!(
+        store.get_portfolio_node(node.node_id).unwrap().unwrap(),
+        raised
+    );
+}

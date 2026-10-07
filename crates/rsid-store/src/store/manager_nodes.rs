@@ -706,6 +706,13 @@ fn retire_subtree_on(
         tx.execute("UPDATE manager_nodes SET state='revoked',grant_version=?2,policy_version=policy_version+1,authority_epoch=authority_epoch+1,updated_at=?3 WHERE id=?1 AND state='active'",params![id.to_string(),next,now])?;
         tx.execute("INSERT INTO manager_node_grants(node_id,grant_version,state,grant_json,policy_json,operator_origin,created_at) VALUES(?1,?2,'revoked',NULL,NULL,?3,?4)",params![id.to_string(),next,origin,now])?;
         tx.execute("UPDATE manager_node_reservations SET state='released',updated_at=?2 WHERE child_node_id=?1 AND state='active'",params![id.to_string(),now])?;
+        // #1238: escalations it raised no longer wait above the root.
+        super::manager_tier_routing::retire_hops_from_source_on(
+            tx,
+            id,
+            child.seat_root_session_id,
+            now,
+        )?;
         revoked.push(id);
     }
     Ok(revoked)
@@ -1071,8 +1078,13 @@ impl Store {
             .policy
             .as_ref()
             .ok_or_else(|| node_refused("manager_node_parent_grant_absent"))?;
-        if !request.grant.strictly_narrower_than(parent_grant)
-            || request.policy.mode as u8 > parent_policy.mode as u8
+        // #1237: the unified rule (equal capabilities allowed; typed codes).
+        if request.grant.validate().is_err() || parent_grant.validate().is_err() {
+            return Err(node_refused("manager_node_grant_not_narrower"));
+        }
+        rsi_common::grant_narrowing::grant_narrows(&request.grant.bounds(), &parent_grant.bounds())
+            .map_err(node_refused)?;
+        if request.policy.mode as u8 > parent_policy.mode as u8
             || (parent_policy.paused && !request.policy.paused)
             || (request.policy.allow_create_groups && !parent_policy.allow_create_groups)
             || request.policy.max_recovery_attempts > parent_policy.max_recovery_attempts
@@ -1330,7 +1342,7 @@ impl Store {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::test_support::test_session;
     use rsi_common::harness_manager::{
@@ -1643,8 +1655,9 @@ mod tests {
         );
     }
 
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
-    fn area_fixture(granted: bool) -> (Store, Uuid, AreaNode, Uuid, Vec<Uuid>) {
+    // Shared by manager_node_workspace_tests in every shard (#1397).
+    #[allow(dead_code)]
+    pub(crate) fn area_fixture(granted: bool) -> (Store, Uuid, AreaNode, Uuid, Vec<Uuid>) {
         let store = Store::open_in_memory().unwrap();
         let project = add_legacy_root(&store, granted);
         if granted {
@@ -1702,8 +1715,9 @@ mod tests {
         (store, project, root, group, epics)
     }
 
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
-    fn area_request(
+    // Shared by manager_node_workspace_tests in every shard (#1397).
+    #[allow(dead_code)]
+    pub(crate) fn area_request(
         store: &Store,
         project: Uuid,
         parent: &AreaNode,

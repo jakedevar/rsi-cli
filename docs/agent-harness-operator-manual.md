@@ -184,7 +184,8 @@ root
         ├── Refactor                 spawnable leaf
         └── Research                 spawnable leaf
 
-TaskRabbit is a special one-shot leaf launched through the task workflow.
+The legacy `TaskRabbit` kind is retired: the TUI and daemon no longer launch
+it, and old rows still load and appear in Archive.
 ```
 
 `Group` and `Epic` organize work; they never launch a provider subprocess.
@@ -313,15 +314,13 @@ for Git branches: it is an RSI organizational and context boundary.
 
 ### 3. Launch the smallest suitable session
 
-Use a **Blank** session for general-purpose work or a **TaskRabbit** session
-for a bounded one-shot task.
+Use a **Blank** session for quick, general-purpose work. Bounded unattended
+work goes through an Issue-bound worker instead.
 
 | Action | Shortcut | Command mode equivalent |
 |---|---|---|
 | Open general Blank session prompt | `<Space>n` | `:blank` |
 | Launch Blank session with prompt | — | `:blank <objective>` |
-| Open TaskRabbit one-shot prompt | `<Space>o` | `:task` |
-| Launch TaskRabbit with prompt | — | `:task <objective>` |
 
 Write the initial objective as a concrete deliverable. Good first prompts name
 the target, constraints, expected evidence, and whether the agent may edit.
@@ -922,7 +921,6 @@ read [Keybindings Reference](keybindings.md) for exhaustive, current mappings.
 | Goal | Control |
 |---|---|
 | Launch general work | `<Space>n`, `:blank [objective]` |
-| Launch one-shot work | `<Space>o`, `:task [objective]` |
 | Choose project | `<Space>p`, `:projects`, `:project <name>` |
 | Inspect session facts | `F3` |
 | Open/enter selected session | `Enter`, `l`, or `L` |

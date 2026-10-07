@@ -149,7 +149,7 @@ fn submit_message_bridge_form(app: &mut App) {
         Ok(path) => {
             app.overlay = OverlayState::None;
             app.notify_success(format!(
-                "Saved {} config: {}",
+                "Saved {} config: {} · bridge restart required",
                 bridge.label(),
                 path.display()
             ));

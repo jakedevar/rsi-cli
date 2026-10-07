@@ -291,7 +291,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn valid_png_returns_bounded_image_block_and_metadata() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::disk_backed_tempdir("view-image-");
         let path = write_image(
             dir.path(),
             "small.png",
@@ -324,7 +324,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn corrupt_nonimage_and_oversized_files_return_bounded_errors() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::disk_backed_tempdir("view-image-");
         let corrupt = dir.path().join("corrupt.png");
         fs::write(&corrupt, b"\x89PNG\r\n\x1a\nnot an image").expect("write");
         let nonimage = dir.path().join("nonimage.txt");
@@ -348,7 +348,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn non_vision_route_and_escape_are_rejected_before_processing() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::disk_backed_tempdir("view-image-");
         let image = write_image(
             dir.path(),
             "small.png",
@@ -360,7 +360,7 @@ mod tests {
             Some("view_image unsupported: the selected model route does not accept image input")
         );
 
-        let outside = tempfile::tempdir().expect("outside tempdir");
+        let outside = crate::test_support::disk_backed_tempdir("view-image-outside-");
         let outside_image = write_image(
             outside.path(),
             "outside.png",
@@ -375,7 +375,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[tokio::test]
     async fn large_png_is_resized_and_limited_to_payload_cap() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::disk_backed_tempdir("view-image-");
         let mut image = RgbImage::new(1600, 1200);
         for (x, _, pixel) in image.enumerate_pixels_mut() {
             *pixel = Rgb([(x % 256) as u8, ((x / 3) % 256) as u8, 99]);

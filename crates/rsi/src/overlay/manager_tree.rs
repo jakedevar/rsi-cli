@@ -1,26 +1,68 @@
-//! `:manager tree` (#890 Slice C v0): a read-only, keyboard-navigable tree of
-//! the manager hierarchy (global grant, project seats, area nodes, led Epics)
-//! from one bounded operator snapshot (`GetManagerTree`). Appointment, scope,
-//! grant and revocation stay on `:manager appoint`, `:manager global` and
-//! `:manager node`; the view shows those hints and jumps to a node's session.
+//! `:manager tree`: a keyboard-navigable tree of the manager hierarchy (global
+//! grant, project seats, area nodes, led Epics) from one bounded operator
+//! snapshot (`GetManagerTree`, #890), with in-tree operator actions (#1214).
+//!
+//! Every action goes through an existing typed operator RPC (see
+//! [`actions`]); destructive ones open a confirm step that shows the
+//! descendant impact first. Every RPC carries the version the operator
+//! reviewed, and the tree reloads after each outcome so it never shows stale
+//! state as current.
 
+pub(crate) mod actions;
+#[cfg(test)]
+mod tests;
+
+use std::cell::Cell;
 use std::collections::HashSet;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use chrono::{DateTime, Utc};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use rsi_common::manager_tier_routing::ManagerNodeRefV1;
 use rsi_common::manager_tree::{
     GetManagerTreeRequestV1, GetManagerTreeResultV1, ManagerTreeKindV1, ManagerTreeRowV1,
 };
+use rsi_common::types::SessionProvider;
 use uuid::Uuid;
 
 use crate::app::App;
 use crate::types::OverlayState;
 
+pub(crate) use actions::offer_cap_confirmation;
+pub use actions::{
+    ActionAvailability, Candidate, GlobalEditor, NodeEditor, PendingAction, PreparedRequest,
+    TreeAction, TreeModal,
+};
+
 /// Rows requested per RPC page.
 pub const PAGE_LIMIT: u16 = 200;
 /// Pages fetched on open and refresh before the operator pages on demand.
 const AUTO_PAGES: usize = 5;
+/// Body rows a page key moves when the view has not been drawn yet.
+const DEFAULT_VIEWPORT: usize = 10;
 
-pub const HINTS: &str = "j/k move · h/l fold · Enter open session · n more · r refresh · Esc close   |   edit: :manager appoint · :manager global · :manager node";
+pub const HINTS: &str = "j/k move · h/l fold · Space toggle · H/L fold all · PgUp/PgDn page · n more · r refresh · Enter seat · o project · p preview · a appoint · e edit · x revoke · A manager above · m move under · Esc close";
+
+/// Selection and folds kept on [`App`] while the tree is closed, so jumping
+/// to a seat and reopening `:manager tree` lands on the same node.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TreeMemory {
+    pub selected_key: Option<String>,
+    pub collapsed: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Info,
+    Success,
+    Error,
+}
+
+/// The outcome of the last action or refresh, shown above the hints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub text: String,
+    pub tone: Tone,
+}
 
 #[derive(Debug, Default)]
 pub struct ManagerTreeState {
@@ -32,6 +74,17 @@ pub struct ManagerTreeState {
     pub selected: usize,
     pub collapsed: HashSet<String>,
     pub error: Option<String>,
+    pub notice: Option<Notice>,
+    pub modal: Option<TreeModal>,
+    /// The session focused behind the overlay: the seat an appoint uses.
+    pub candidate: Option<Candidate>,
+    /// #1237: the portfolio node a pending "move under" moves (id, label).
+    pub move_source: Option<(Uuid, String)>,
+    pub loaded_at: Option<DateTime<Utc>>,
+    /// Body rows drawn last frame (page size); written by the renderer.
+    pub viewport: Cell<usize>,
+    /// First drawn body row; the renderer keeps the selection inside it.
+    pub scroll: Cell<usize>,
 }
 
 impl ManagerTreeState {
@@ -64,10 +117,26 @@ impl ManagerTreeState {
             .any(|row| row.parent_key.as_deref() == Some(key.as_str()))
     }
 
+    pub fn selected_index(&self) -> Option<usize> {
+        self.visible().get(self.selected).copied()
+    }
+
     pub fn selected_row(&self) -> Option<&ManagerTreeRowV1> {
-        self.visible()
-            .get(self.selected)
-            .and_then(|index| self.rows.get(*index))
+        self.selected_index().and_then(|index| self.rows.get(index))
+    }
+
+    fn select_key(&mut self, key: &str) -> bool {
+        match self
+            .visible()
+            .iter()
+            .position(|index| self.rows[*index].key == key)
+        {
+            Some(position) => {
+                self.selected = position;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Replace the loaded rows, keeping the selection on the same row key.
@@ -78,15 +147,36 @@ impl ManagerTreeState {
         self.complete = page.complete;
         self.next_after = page.next_after.clone();
         self.global_grant_version = page.global_grant_version;
-        let visible = self.visible();
-        self.selected = keep
-            .and_then(|key| {
-                visible
-                    .iter()
-                    .position(|index| self.rows[*index].key == key)
-            })
-            .unwrap_or(0)
-            .min(visible.len().saturating_sub(1));
+        self.loaded_at = Some(Utc::now());
+        // A fold on a key that vanished is meaningless; drop it.
+        let keys: HashSet<&str> = self.rows.iter().map(|row| row.key.as_str()).collect();
+        self.collapsed.retain(|key| keys.contains(key.as_str()));
+        let visible_len = self.visible().len();
+        if !keep.is_some_and(|key| self.select_key(&key)) {
+            self.selected = self.selected.min(visible_len.saturating_sub(1));
+        }
+    }
+
+    pub fn memory(&self) -> TreeMemory {
+        TreeMemory {
+            selected_key: self.selected_row().map(|row| row.key.clone()),
+            collapsed: self.collapsed.clone(),
+        }
+    }
+
+    /// Restore folds and selection saved when the tree last closed.
+    pub fn restore(&mut self, memory: &TreeMemory) {
+        self.collapsed = memory.collapsed.clone();
+        let keys: HashSet<&str> = self.rows.iter().map(|row| row.key.as_str()).collect();
+        self.collapsed.retain(|key| keys.contains(key.as_str()));
+        if let Some(key) = &memory.selected_key {
+            self.select_key(key);
+        }
+    }
+
+    /// Rows not yet fetched (`total_rows` is exact for the snapshot).
+    pub fn unloaded_rows(&self) -> u64 {
+        self.total_rows.saturating_sub(self.rows.len() as u64)
     }
 
     pub fn count_line(&self) -> String {
@@ -104,76 +194,168 @@ impl ManagerTreeState {
         }
         line
     }
+
+    fn collapse_all(&mut self) {
+        let keep = self.selected_row().map(|row| row.key.clone());
+        let parents: Vec<String> = (0..self.rows.len())
+            .filter(|index| self.has_children(*index))
+            .map(|index| self.rows[index].key.clone())
+            .collect();
+        self.collapsed.extend(parents);
+        // Select the visible top-level ancestor of the previous selection.
+        let mut target = keep;
+        while let Some(key) = target.clone() {
+            if self.select_key(&key) {
+                return;
+            }
+            target = self
+                .rows
+                .iter()
+                .find(|row| row.key == key)
+                .and_then(|row| row.parent_key.clone());
+        }
+        self.selected = 0;
+    }
+
+    fn expand_all(&mut self) {
+        let keep = self.selected_row().map(|row| row.key.clone());
+        self.collapsed.clear();
+        if let Some(key) = keep {
+            self.select_key(&key);
+        }
+    }
+
+    fn page_size(&self) -> usize {
+        match self.viewport.get() {
+            0 => DEFAULT_VIEWPORT,
+            rows => rows,
+        }
+    }
 }
 
 fn count(value: Option<i64>) -> String {
     value.map_or_else(|| "?".into(), |n| n.to_string())
 }
 
-fn kind_tag(kind: ManagerTreeKindV1) -> &'static str {
+pub fn kind_tag(kind: ManagerTreeKindV1) -> &'static str {
     match kind {
         ManagerTreeKindV1::Global => "GLOBAL",
+        ManagerTreeKindV1::Portfolio => "PORTFOLIO",
         ManagerTreeKindV1::Project => "PROJECT",
         ManagerTreeKindV1::Area => "AREA",
         ManagerTreeKindV1::Epic => "EPIC",
     }
 }
 
-/// One row as plain text (no indentation or fold marker).
-pub fn row_text(row: &ManagerTreeRowV1) -> String {
-    let mut parts = vec![format!("{} {}", kind_tag(row.kind), row.label)];
+/// Seat health as text: status, model, context fill and last activity.
+pub fn seat_text(row: &ManagerTreeRowV1) -> String {
     match &row.seat {
         Some(seat) => {
-            let mut seat_text = format!("{:?}", seat.status);
+            let mut text = format!("{:?}", seat.status);
             if let Some(model) = &seat.model {
-                seat_text.push_str(&format!(" {model}"));
+                text.push_str(&format!(" {model}"));
             }
-            seat_text.push_str(&match seat.context_fill_pct {
+            text.push_str(&match seat.context_fill_pct {
                 Some(pct) => format!(" ctx {pct:.0}%"),
                 None => " ctx ?".into(),
             });
-            seat_text.push_str(&format!(" {}", seat.updated_at.format("%m-%d %H:%M")));
-            parts.push(seat_text);
+            text.push_str(&format!(" {}", seat.updated_at.format("%m-%d %H:%M")));
+            text
         }
-        None if row.focus_session_id.is_some() => parts.push("seat session missing".into()),
-        None => parts.push("no seat".into()),
+        None if row.focus_session_id.is_some() => "seat session missing".into(),
+        None => "no seat".into(),
     }
-    if let Some(scope) = &row.scope {
-        parts.push(scope.clone());
+}
+
+/// Capabilities and allowance of a node grant.
+pub fn grant_text(row: &ManagerTreeRowV1) -> Option<String> {
+    let grant = row.grant.as_ref()?;
+    let caps: Vec<String> = grant
+        .capabilities
+        .iter()
+        .map(|c| format!("{c:?}"))
+        .collect();
+    let mut text = format!(
+        "v{} caps {} · allow active {} sessions {} reports {}",
+        grant.grant_version,
+        if caps.is_empty() {
+            "none".into()
+        } else {
+            caps.join("+")
+        },
+        grant.max_active_sessions,
+        grant.max_created_sessions,
+        grant.max_direct_reports
+    );
+    for reserved in &grant.reserved {
+        text.push_str(&format!(
+            " reserved {}={}",
+            reserved.resource_kind, reserved.amount
+        ));
     }
-    if let Some(grant) = &row.grant {
-        let caps: Vec<String> = grant
-            .capabilities
-            .iter()
-            .map(|c| format!("{c:?}"))
-            .collect();
-        parts.push(format!("caps {}", caps.join("+")));
-        let mut allowance = format!(
-            "allow active {} sessions {} reports {}",
-            grant.max_active_sessions, grant.max_created_sessions, grant.max_direct_reports
-        );
-        for reserved in &grant.reserved {
-            allowance.push_str(&format!(
-                " reserved {}={}",
-                reserved.resource_kind, reserved.amount
-            ));
-        }
-        parts.push(allowance);
+    Some(text)
+}
+
+/// #1412: the launches a row's manager may make now, as `model/effort` pairs
+/// (provider shown only when it is not Claude). `None` when the row carries
+/// no restriction to show.
+pub fn launches_text(row: &ManagerTreeRowV1) -> Option<String> {
+    if row.launches.is_empty() {
+        return None;
     }
-    parts.push(format!(
+    let launches: Vec<String> = row
+        .launches
+        .iter()
+        .map(|launch| {
+            let model = launch
+                .model
+                .strip_prefix("claude-")
+                .unwrap_or(&launch.model);
+            let provider = match launch.provider {
+                SessionProvider::Claude => String::new(),
+                other => format!("{other:?}:"),
+            };
+            match &launch.effort {
+                Some(effort) => format!("{provider}{model}/{effort}"),
+                None => format!("{provider}{model}"),
+            }
+        })
+        .collect();
+    Some(format!("launches {}", launches.join(" ")))
+}
+
+/// Workload counts; `?` marks a count the daemon could not traverse.
+pub fn load_text(row: &ManagerTreeRowV1) -> String {
+    format!(
         "run {} reports {} esc {} dec {}",
         count(row.load.running_workers),
         count(row.load.direct_reports),
         count(row.load.pending_escalations),
         count(row.load.pending_decisions),
-    ));
+    )
+}
+
+/// One row as plain text (no indentation or fold marker).
+pub fn row_text(row: &ManagerTreeRowV1) -> String {
+    let mut parts = vec![format!("{} {}", kind_tag(row.kind), row.label)];
+    parts.push(seat_text(row));
+    if let Some(scope) = &row.scope {
+        parts.push(scope.clone());
+    }
+    if let Some(grant) = grant_text(row) {
+        parts.push(grant);
+    }
+    if let Some(launches) = launches_text(row) {
+        parts.push(launches);
+    }
+    parts.push(load_text(row));
     if !row.complete {
         parts.push("children incomplete".into());
     }
     parts.join(" · ")
 }
 
-fn state(app: &mut App) -> Option<&mut ManagerTreeState> {
+pub(super) fn state(app: &mut App) -> Option<&mut ManagerTreeState> {
     match &mut app.overlay {
         OverlayState::ManagerTree(state) => Some(state),
         _ => None,
@@ -210,32 +392,101 @@ async fn fetch(
     Ok((rows, page))
 }
 
+/// The leaf session focused behind the overlay, as an appoint candidate.
+pub(super) fn sync_candidate(app: &mut App) {
+    let candidate = app.selected_session_state().map(|state| {
+        let session = &state.session;
+        Candidate {
+            id: session.id,
+            name: session
+                .title
+                .as_deref()
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or(&session.query)
+                .chars()
+                .take(48)
+                .collect(),
+            project_id: session.project_id,
+            eligible: rsi_common::is_leaf_kind(session.session_kind)
+                && !matches!(
+                    session.status,
+                    rsi_common::types::SessionStatus::Archived
+                        | rsi_common::types::SessionStatus::Deleted
+                ),
+        }
+    });
+    if let Some(tree) = state(app) {
+        tree.candidate = candidate;
+    }
+}
+
+/// Which console Enter opens for a tree row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Console {
+    /// A pre-#1236 daemon's global row: the `gm` console.
+    Global,
+    Node(ManagerNodeRefV1),
+}
+
+/// #1240: the manager node a row stands for (`None` for an Epic row).
+#[must_use]
+pub fn console_target(row: &ManagerTreeRowV1) -> Option<Console> {
+    match row.kind {
+        ManagerTreeKindV1::Global => Some(Console::Global),
+        ManagerTreeKindV1::Portfolio => row
+            .node_id
+            .map(|node_id| Console::Node(ManagerNodeRefV1::Portfolio { node_id })),
+        ManagerTreeKindV1::Project => row
+            .project_id
+            .map(|project_id| Console::Node(ManagerNodeRefV1::Project { project_id })),
+        ManagerTreeKindV1::Area => row
+            .node_id
+            .map(|node_id| Console::Node(ManagerNodeRefV1::Area { node_id })),
+        ManagerTreeKindV1::Epic => None,
+    }
+}
+
 pub async fn open(app: &mut App) {
     match fetch(app, None, Vec::new(), AUTO_PAGES).await {
         Ok((rows, page)) => {
             let mut tree = ManagerTreeState::default();
             tree.install(rows, &page);
+            if let Some(memory) = &app.manager_tree_memory {
+                tree.restore(memory);
+            }
             app.overlay = OverlayState::ManagerTree(Box::new(tree));
+            sync_candidate(app);
         }
         Err(error) => app.notify_error(format!("Manager tree: {error}")),
     }
     app.mark_dirty();
 }
 
+/// Close the tree, remembering its selection and folds for the next open.
+pub(super) fn close(app: &mut App) {
+    if let Some(tree) = state(app) {
+        let memory = tree.memory();
+        app.manager_tree_memory = Some(memory);
+    }
+    app.overlay = OverlayState::None;
+}
+
 /// Reload from the start (a CAS-style refresh: the daemon snapshot is the
 /// truth after a succession or rescope), keeping the selected row.
-async fn refresh(app: &mut App) {
+pub(super) async fn refresh(app: &mut App) -> bool {
     match fetch(app, None, Vec::new(), AUTO_PAGES).await {
         Ok((rows, page)) => {
             if let Some(tree) = state(app) {
                 tree.install(rows, &page);
                 tree.error = None;
             }
+            true
         }
         Err(error) => {
             if let Some(tree) = state(app) {
                 tree.error = Some(format!("Refresh failed: {error}"));
             }
+            false
         }
     }
 }
@@ -254,7 +505,9 @@ async fn more(app: &mut App) {
             }
         }
         // A stale cursor means the tree changed under us: reload from the start.
-        Err(error) if error.contains("manager_tree_stale_cursor") => refresh(app).await,
+        Err(error) if error.contains("manager_tree_stale_cursor") => {
+            refresh(app).await;
+        }
         Err(error) => {
             if let Some(tree) = state(app) {
                 tree.error = Some(format!("Load more failed: {error}"));
@@ -274,24 +527,63 @@ async fn jump(app: &mut App, session_id: Uuid) {
                 }
             }
             Err(error) => {
-                app.notify_error(format!("Session unavailable: {error}"));
+                if let Some(tree) = state(app) {
+                    tree.notice = Some(Notice {
+                        text: format!("Session unavailable: {error}"),
+                        tone: Tone::Error,
+                    });
+                }
                 return;
             }
         }
     }
-    app.overlay = OverlayState::None;
+    close(app);
     app.open_session_in_current_pane(session_id);
 }
 
+fn set_notice(app: &mut App, text: impl Into<String>, tone: Tone) {
+    if let Some(tree) = state(app) {
+        tree.notice = Some(Notice {
+            text: text.into(),
+            tone,
+        });
+    }
+}
+
 pub async fn handle_key(app: &mut App, key: KeyEvent) {
+    sync_candidate(app);
     let Some(tree) = state(app) else { return };
+    if tree.modal.is_some() {
+        actions::handle_modal_key(app, key).await;
+        app.mark_dirty();
+        return;
+    }
     let visible = tree.visible();
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
-            app.overlay = OverlayState::None;
+        KeyCode::Esc if tree.move_source.is_some() => {
+            tree.move_source = None;
+            tree.notice = Some(Notice {
+                text: "Move cancelled.".into(),
+                tone: Tone::Info,
+            });
         }
-        KeyCode::Char('r') => refresh(app).await,
-        KeyCode::Char('n') => more(app).await,
+        KeyCode::Esc | KeyCode::Char('q') => close(app),
+        KeyCode::Char('r') => {
+            if refresh(app).await {
+                set_notice(app, "Refreshed from the daemon.", Tone::Info);
+            }
+        }
+        KeyCode::Char('n') => {
+            if tree.next_after.is_some() {
+                more(app).await;
+            } else {
+                tree.notice = Some(Notice {
+                    text: "Every node is loaded.".into(),
+                    tone: Tone::Info,
+                });
+            }
+        }
         KeyCode::Char('h') | KeyCode::Left => {
             if let Some(row) = tree.selected_row().cloned() {
                 let target = if tree.collapsed.contains(&row.key)
@@ -304,10 +596,7 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) {
                 };
                 if let Some(key) = target {
                     tree.collapsed.insert(key.clone());
-                    let visible = tree.visible();
-                    if let Some(pos) = visible.iter().position(|i| tree.rows[*i].key == key) {
-                        tree.selected = pos;
-                    }
+                    tree.select_key(&key);
                 }
             }
         }
@@ -317,13 +606,74 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) {
                 tree.collapsed.remove(&key);
             }
         }
-        KeyCode::Enter => {
-            let target = tree.selected_row().and_then(|row| row.focus_session_id);
-            match target {
-                Some(id) => jump(app, id).await,
-                None => app.notify_error("This node has no session to open."),
+        KeyCode::Char(' ') => {
+            if let Some(index) = tree.selected_index()
+                && tree.has_children(index)
+            {
+                let key = tree.rows[index].key.clone();
+                if !tree.collapsed.remove(&key) {
+                    tree.collapsed.insert(key);
+                }
             }
         }
+        KeyCode::Char('H') => tree.collapse_all(),
+        KeyCode::Char('L') => tree.expand_all(),
+        KeyCode::PageDown | KeyCode::Char('d') if key.code == KeyCode::PageDown || ctrl => {
+            let page = tree.page_size();
+            tree.selected = (tree.selected + page).min(visible.len().saturating_sub(1));
+            if tree.selected + 1 == visible.len() && tree.next_after.is_some() {
+                more(app).await;
+            }
+        }
+        KeyCode::PageUp | KeyCode::Char('u') if key.code == KeyCode::PageUp || ctrl => {
+            let page = tree.page_size();
+            tree.selected = tree.selected.saturating_sub(page);
+        }
+        KeyCode::Enter => {
+            // #1240: a manager node row opens that node's console; an Epic
+            // row jumps to its lead.
+            let console = tree.selected_row().and_then(console_target);
+            let target = tree.selected_row().and_then(|row| row.focus_session_id);
+            match (console, target) {
+                (Some(Console::Global), _) => {
+                    close(app);
+                    crate::overlay::global_manager_workspace::open(app).await;
+                }
+                (Some(Console::Node(node)), _) => {
+                    close(app);
+                    crate::overlay::global_manager_workspace::open_node(app, node).await;
+                }
+                (None, Some(id)) => jump(app, id).await,
+                (None, None) => {
+                    tree.notice = Some(Notice {
+                        text: "This node has no seat session to open (o opens its project).".into(),
+                        tone: Tone::Error,
+                    });
+                }
+            }
+        }
+        KeyCode::Char('o') => {
+            let project = tree.selected_row().and_then(|row| row.project_id);
+            match project {
+                Some(project_id) => {
+                    close(app);
+                    app.open_project_workspace(project_id);
+                }
+                None => {
+                    tree.notice = Some(Notice {
+                        text: "A manager row above project level has no single project to open."
+                            .into(),
+                        tone: Tone::Error,
+                    });
+                }
+            }
+        }
+        KeyCode::Char('p') => actions::begin(app, TreeAction::Preview).await,
+        KeyCode::Char('a') => actions::begin(app, TreeAction::Appoint).await,
+        KeyCode::Char('e') => actions::begin(app, TreeAction::Edit).await,
+        KeyCode::Char('x') => actions::begin(app, TreeAction::Revoke).await,
+        KeyCode::Char('A') => actions::begin(app, TreeAction::Above).await,
+        KeyCode::Char('m') => actions::begin(app, TreeAction::MoveUnder).await,
         _ => {
             let mut selected = tree.selected;
             if crate::overlay::list::handle_list_nav_key(&mut selected, visible.len(), &key) {
@@ -336,224 +686,4 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) {
         }
     }
     app.mark_dirty();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::Pane;
-    use crossterm::event::KeyModifiers;
-    use rsi_common::manager_tree::{ManagerTreeGrantV1, ManagerTreeLoadV1, ManagerTreeSeatV1};
-    use rsi_common::types::SessionStatus;
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
-    fn row(
-        key: &str,
-        parent: Option<&str>,
-        depth: u16,
-        kind: ManagerTreeKindV1,
-        focus: Option<Uuid>,
-    ) -> ManagerTreeRowV1 {
-        ManagerTreeRowV1 {
-            key: key.into(),
-            parent_key: parent.map(str::to_string),
-            depth,
-            kind,
-            label: key.into(),
-            project_id: None,
-            node_id: None,
-            epic_id: None,
-            scope: None,
-            seat: focus.map(|session_id| ManagerTreeSeatV1 {
-                session_id,
-                status: SessionStatus::Running,
-                model: Some("claude-opus-5-5".into()),
-                context_fill_pct: Some(41.6),
-                updated_at: chrono::Utc::now(),
-            }),
-            focus_session_id: focus,
-            grant: None,
-            load: ManagerTreeLoadV1 {
-                running_workers: Some(2),
-                direct_reports: None,
-                pending_escalations: Some(1),
-                pending_decisions: Some(0),
-            },
-            complete: true,
-        }
-    }
-
-    fn tree(focus: Uuid) -> ManagerTreeState {
-        let mut state = ManagerTreeState::default();
-        let rows = vec![
-            row("global", None, 0, ManagerTreeKindV1::Global, None),
-            row(
-                "project:a",
-                Some("global"),
-                1,
-                ManagerTreeKindV1::Project,
-                Some(focus),
-            ),
-            row(
-                "area:x",
-                Some("project:a"),
-                2,
-                ManagerTreeKindV1::Area,
-                None,
-            ),
-            row("epic:e", Some("area:x"), 3, ManagerTreeKindV1::Epic, None),
-            row(
-                "project:b",
-                Some("global"),
-                1,
-                ManagerTreeKindV1::Project,
-                None,
-            ),
-        ];
-        let page = GetManagerTreeResultV1 {
-            rows: vec![],
-            next_after: None,
-            total_rows: 5,
-            complete: true,
-            global_grant_version: Some(3),
-        };
-        state.install(rows, &page);
-        state
-    }
-
-    #[tokio::test]
-    async fn keys_navigate_fold_and_close() {
-        let mut app = crate::app::app_test_helpers::with_session_list(1);
-        app.overlay = OverlayState::ManagerTree(Box::new(tree(Uuid::new_v4())));
-        for code in [KeyCode::Char('j'), KeyCode::Char('j'), KeyCode::Char('j')] {
-            handle_key(&mut app, key(code)).await;
-        }
-        let OverlayState::ManagerTree(state) = &app.overlay else {
-            panic!("overlay closed")
-        };
-        assert_eq!(state.selected_row().unwrap().key, "epic:e");
-        // h on a leaf folds its parent and selects it; the subtree disappears.
-        handle_key(&mut app, key(KeyCode::Char('h'))).await;
-        let OverlayState::ManagerTree(state) = &app.overlay else {
-            panic!("overlay closed")
-        };
-        assert_eq!(state.selected_row().unwrap().key, "area:x");
-        let keys: Vec<_> = state
-            .visible()
-            .iter()
-            .map(|i| state.rows[*i].key.as_str())
-            .collect();
-        assert_eq!(keys, ["global", "project:a", "area:x", "project:b"]);
-        handle_key(&mut app, key(KeyCode::Char('l'))).await;
-        let OverlayState::ManagerTree(state) = &app.overlay else {
-            panic!("overlay closed")
-        };
-        assert_eq!(state.visible().len(), 5);
-        handle_key(&mut app, key(KeyCode::Char('G'))).await;
-        handle_key(&mut app, key(KeyCode::Char('g'))).await;
-        let OverlayState::ManagerTree(state) = &app.overlay else {
-            panic!("overlay closed")
-        };
-        assert_eq!(state.selected_row().unwrap().key, "global");
-        handle_key(&mut app, key(KeyCode::Esc)).await;
-        assert!(matches!(app.overlay, OverlayState::None));
-    }
-
-    #[tokio::test]
-    async fn enter_opens_the_focused_nodes_session() {
-        let mut app = crate::app::app_test_helpers::with_session_list(1);
-        let session = *app.sessions.keys().next().unwrap();
-        app.overlay = OverlayState::ManagerTree(Box::new(tree(session)));
-        handle_key(&mut app, key(KeyCode::Char('j'))).await;
-        handle_key(&mut app, key(KeyCode::Enter)).await;
-        assert!(matches!(app.overlay, OverlayState::None));
-        assert!(
-            matches!(app.focused_pane(), Some(Pane::SessionDetail { session_id }) if *session_id == session)
-        );
-    }
-
-    #[tokio::test]
-    async fn enter_on_a_node_without_a_session_keeps_the_view_open() {
-        let mut app = crate::app::app_test_helpers::with_session_list(1);
-        app.overlay = OverlayState::ManagerTree(Box::new(tree(Uuid::new_v4())));
-        handle_key(&mut app, key(KeyCode::Enter)).await;
-        assert!(matches!(app.overlay, OverlayState::ManagerTree(..)));
-    }
-
-    #[test]
-    fn counts_show_totals_and_mark_unknown_values() {
-        let mut state = tree(Uuid::new_v4());
-        assert_eq!(state.count_line(), "5 nodes · global grant v3");
-        state.total_rows = 12;
-        state.complete = false;
-        let line = state.count_line();
-        assert!(line.starts_with("5 of 12 nodes loaded"), "{line}");
-        assert!(line.contains("traversal incomplete"), "{line}");
-        let mut unknown = row("area:x", None, 0, ManagerTreeKindV1::Area, None);
-        unknown.load.running_workers = None;
-        unknown.complete = false;
-        let text = row_text(&unknown);
-        assert!(text.contains("run ? reports ? esc 1 dec 0"), "{text}");
-        assert!(text.contains("children incomplete"), "{text}");
-        assert!(text.contains("no seat"), "{text}");
-    }
-
-    #[test]
-    fn row_text_shows_seat_health_scope_grant_and_load() {
-        let mut node = row(
-            "area:x",
-            None,
-            2,
-            ManagerTreeKindV1::Area,
-            Some(Uuid::new_v4()),
-        );
-        node.scope = Some("0 groups, 1 epic".into());
-        node.grant = Some(ManagerTreeGrantV1 {
-            grant_version: 2,
-            capabilities: vec![rsi_common::harness_manager_v2::ManagerCapabilityV2::WorkPlan],
-            max_active_sessions: 3,
-            max_created_sessions: 5,
-            max_created_containers: 0,
-            max_direct_reports: 4,
-            max_spend_usd: None,
-            reserved: vec![rsi_common::manager_tree::ManagerTreeReservedV1 {
-                resource_kind: "active_sessions".into(),
-                amount: 2,
-            }],
-        });
-        let text = row_text(&node);
-        for needle in [
-            "AREA area:x",
-            "Running claude-opus-5-5 ctx 42%",
-            "0 groups, 1 epic",
-            "caps WorkPlan",
-            "allow active 3 sessions 5 reports 4 reserved active_sessions=2",
-            "run 2 reports ? esc 1 dec 0",
-        ] {
-            assert!(text.contains(needle), "{needle} missing from {text}");
-        }
-    }
-
-    #[test]
-    fn install_keeps_the_selection_on_the_same_row_after_a_refresh() {
-        let mut state = tree(Uuid::new_v4());
-        state.selected = 4;
-        assert_eq!(state.selected_row().unwrap().key, "project:b");
-        let mut rows = state.rows.clone();
-        rows.remove(3); // the Epic moved away between refreshes
-        let page = GetManagerTreeResultV1 {
-            rows: vec![],
-            next_after: None,
-            total_rows: 4,
-            complete: true,
-            global_grant_version: Some(4),
-        };
-        state.install(rows, &page);
-        assert_eq!(state.selected_row().unwrap().key, "project:b");
-        assert_eq!(state.total_rows, 4);
-        assert_eq!(state.global_grant_version, Some(4));
-    }
 }

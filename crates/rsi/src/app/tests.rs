@@ -22,7 +22,6 @@ fn test_app() -> App {
                 selected_session: None,
                 scroll_offset: 0,
                 active_zone: Default::default(),
-                taskrabbit_selected_index: 0,
                 archive_selected_index: 0,
                 jobs_selected_index: 0,
             },
@@ -170,6 +169,138 @@ async fn composing_to_busy_session_queues_without_changing_running_status() {
         rsi_common::types::SessionStatus::Running
     );
     assert_eq!(app.operator_messages[&session_id][0].id, message_id);
+}
+
+#[tokio::test]
+async fn clearing_a_manager_pause_asks_once_then_uses_set_operator_pause() {
+    use crate::client::OperatorPauseLevel;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let directory = tempfile::tempdir().expect("socket directory");
+    let socket_path = directory.path().join("daemon.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("listener");
+    let mut app = crate::app::app_test_helpers::with_session_list(1);
+    let session_id = app.selected_session_id().expect("selected session");
+    app.operator_pauses
+        .insert(session_id, OperatorPauseLevel::Hard);
+    app.client = DaemonClient::new(socket_path);
+    app.client.connect().await.expect("connect client");
+    app.poll.connected = true;
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("client");
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        let mut methods = Vec::new();
+        // read (ask), read (confirmed), set
+        for _ in 0..3 {
+            let line = lines.next_line().await.expect("request").expect("line");
+            let request: serde_json::Value = serde_json::from_str(&line).expect("json");
+            let method = request["method"].as_str().expect("method").to_string();
+            let result = if method == "GetOperatorPause" {
+                serde_json::json!({
+                    "session_id": request["params"]["session_id"],
+                    "pause_level": "hard",
+                    "since": "2026-09-30T00:00:00Z",
+                    "set_by": "operator",
+                    "held_succession": true,
+                })
+            } else {
+                serde_json::json!({
+                    "session_id": request["params"]["session_id"],
+                    "pause_level": request["params"]["pause_level"],
+                })
+            };
+            methods.push(method);
+            let response = serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+            writer
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .expect("reply");
+        }
+        methods
+    });
+
+    app.set_focused_operator_pause(OperatorPauseLevel::None)
+        .await;
+    // First press only describes what would be cleared.
+    assert_eq!(app.operator_pauses[&session_id], OperatorPauseLevel::Hard);
+    assert!(app.operator_pause_info[&session_id].held_succession);
+    app.set_focused_operator_pause(OperatorPauseLevel::None)
+        .await;
+    assert_eq!(app.operator_pauses[&session_id], OperatorPauseLevel::None);
+    assert_eq!(
+        app.operator_pause_info[&session_id].pause_level,
+        OperatorPauseLevel::None
+    );
+    assert_eq!(
+        server.await.expect("server"),
+        ["GetOperatorPause", "GetOperatorPause", "SetOperatorPause"]
+    );
+}
+
+#[tokio::test]
+async fn explicit_continuation_clears_cached_pause_only_on_acceptance() {
+    use crate::client::OperatorPauseLevel;
+    use rsi_common::types::SessionStatus;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    for pause in [OperatorPauseLevel::Soft, OperatorPauseLevel::Hard] {
+        for accepted in [false, true] {
+            let directory = tempfile::tempdir().expect("socket directory");
+            let socket_path = directory.path().join("daemon.sock");
+            let listener = tokio::net::UnixListener::bind(&socket_path).expect("listener");
+            let mut app = crate::app::app_test_helpers::with_session_list(1);
+            let session_id = app.selected_session_id().expect("selected session");
+            app.sessions
+                .get_mut(&session_id)
+                .expect("session")
+                .session
+                .status = SessionStatus::Interrupted;
+            app.operator_pauses.insert(session_id, pause);
+            app.client = DaemonClient::new(socket_path);
+            app.client.connect().await.expect("connect client");
+            app.poll.connected = true;
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("client");
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                let line = lines.next_line().await.expect("request").expect("line");
+                let request: serde_json::Value = serde_json::from_str(&line).expect("request JSON");
+                assert_eq!(request["method"], "ContinueSession");
+                assert_eq!(request["params"]["session_id"], session_id.to_string());
+                let response = if accepted {
+                    serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":null})
+                } else {
+                    serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "error":{"code":-32000, "message":"continuation rejected"}})
+                };
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .expect("reply");
+            });
+            assert_eq!(
+                app.continue_session(session_id, "Resume work").await,
+                accepted
+            );
+            server.await.expect("server");
+            assert_eq!(
+                app.operator_pauses[&session_id],
+                if accepted {
+                    OperatorPauseLevel::None
+                } else {
+                    pause
+                }
+            );
+            assert_eq!(
+                app.sessions[&session_id].session.status,
+                if accepted {
+                    SessionStatus::Starting
+                } else {
+                    SessionStatus::Interrupted
+                }
+            );
+        }
+    }
 }
 
 #[test]

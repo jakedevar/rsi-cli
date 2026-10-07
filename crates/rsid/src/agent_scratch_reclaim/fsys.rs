@@ -15,7 +15,9 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 use nix::dir::Dir;
-use nix::fcntl::{AtFlags, OFlag, RenameFlags, openat, renameat, renameat2};
+use nix::fcntl::{AtFlags, OFlag, openat, renameat};
+#[cfg(target_os = "linux")]
+use nix::fcntl::{RenameFlags, renameat2};
 use nix::sys::stat::{FileStat, Mode, SFlag, fstat, fstatat};
 use nix::unistd::{UnlinkatFlags, fsync, unlinkat};
 
@@ -130,6 +132,7 @@ pub(super) struct Statx {
     pub btime: Option<i128>,
 }
 
+#[cfg(target_os = "linux")]
 pub(super) fn statx_of(fd: RawFd) -> Statx {
     let mut out = std::mem::MaybeUninit::<nix::libc::statx>::zeroed();
     // SAFETY: `fd` is a valid open descriptor, the path is the empty string
@@ -154,6 +157,13 @@ pub(super) fn statx_of(fd: RawFd) -> Statx {
             i128::from(out.stx_btime.tv_sec) * 1_000_000_000 + i128::from(out.stx_btime.tv_nsec)
         }),
     }
+}
+
+// Non-Linux kernels cannot supply Linux mount IDs. Keep scratch unproven:
+// substituting a device number would miss same-device bind mounts.
+#[cfg(not(target_os = "linux"))]
+pub(super) fn statx_of(_fd: RawFd) -> Statx {
+    Statx::default()
 }
 
 /// An opened directory with the identity it had when opened.
@@ -753,11 +763,31 @@ pub(super) fn rmdir_proved(parent: &Pinned, name: &str, expected: Ident) -> io::
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Removal::Drift),
         Err(error) => return Err(error),
     }
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_ROOT_RMDIR.with(std::cell::Cell::get) {
+        hook(parent.raw(), name);
+    }
     match unlinkat(Some(parent.raw()), name, UnlinkatFlags::RemoveDir) {
         Ok(()) => Ok(Removal::Done),
         Err(nix::errno::Errno::ENOTEMPTY | nix::errno::Errno::EEXIST) => Ok(Removal::Drift),
         Err(error) => Err(nix_io(error)),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs between the identity stat and the `rmdir` of
+    /// [`rmdir_proved`] (parent descriptor, name).
+    pub(super) static BEFORE_ROOT_RMDIR: std::cell::Cell<Option<fn(RawFd, &str)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether the directory behind `fd` is no longer linked anywhere: its link
+/// count is 0 after its name was removed. A directory that is still linked (it
+/// was moved and another directory removed in its place), or a filesystem that
+/// does not report 0 for a removed directory, is `false`: callers retain.
+pub(super) fn is_unlinked(fd: RawFd) -> bool {
+    fstat_fd(fd).is_ok_and(|stat| stat.st_nlink == 0)
 }
 
 #[cfg(test)]
@@ -769,6 +799,7 @@ thread_local! {
 }
 
 /// Rename within one directory without replacing an existing entry.
+#[cfg(target_os = "linux")]
 pub(super) fn rename_noreplace(dir: &Pinned, from: &str, to: &str) -> io::Result<()> {
     renameat2(
         Some(dir.raw()),
@@ -778,6 +809,14 @@ pub(super) fn rename_noreplace(dir: &Pinned, from: &str, to: &str) -> io::Result
         RenameFlags::RENAME_NOREPLACE,
     )
     .map_err(nix_io)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn rename_noreplace(_dir: &Pinned, _from: &str, _to: &str) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "scratch reclaim requires Linux mount proofs",
+    ))
 }
 
 // ---- files ----------------------------------------------------------------
@@ -889,6 +928,29 @@ pub(super) fn replace_file(dir: &Pinned, name: &str, content: &[u8]) -> io::Resu
     fsync(dir.raw()).map_err(nix_io)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the call number (1-based, per thread, counted from the last
+    /// reset) of the [`sync_dir`] that fails; 0 never fails.
+    pub(super) static FAIL_SYNC_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static SYNC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Make a directory's own changes (names created, removed, renamed) durable.
+pub(super) fn sync_dir(dir: &Pinned) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        let call = SYNC_CALLS.with(|c| {
+            c.set(c.get() + 1);
+            c.get()
+        });
+        if FAIL_SYNC_AT.with(std::cell::Cell::get) == call {
+            return Err(io::Error::other("injected directory sync failure"));
+        }
+    }
+    fsync(dir.raw()).map_err(nix_io)
+}
+
 /// Remove a top-level file by name; missing is fine.
 pub(super) fn remove_file_quiet(dir: &Pinned, name: &str) {
     let _ = unlinkat(Some(dir.raw()), name, UnlinkatFlags::NoRemoveDir);
@@ -978,6 +1040,7 @@ thread_local! {
 
 /// Stat `name` (no symlink followed) once for identity, birth time and mount,
 /// confirming both calls saw the same inode.
+#[cfg(target_os = "linux")]
 fn named_stat(dir: RawFd, name: &str) -> Result<Named, InventoryError> {
     let stat = match stat_at(dir, name) {
         Ok(stat) => stat,
@@ -1035,6 +1098,11 @@ fn named_stat(dir: RawFd, name: &str) -> Result<Named, InventoryError> {
         mount: (out.stx_mask & nix::libc::STATX_MNT_ID != 0).then_some(out.stx_mnt_id),
         is_dir: u32::from(out.stx_mode) & nix::libc::S_IFMT == nix::libc::S_IFDIR,
     })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn named_stat(_dir: RawFd, _name: &str) -> Result<Named, InventoryError> {
+    Err(InventoryError::Unproven)
 }
 
 /// Every name in `dir` with what it names, sorted by name. A name that is not

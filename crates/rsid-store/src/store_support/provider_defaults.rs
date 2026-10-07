@@ -4,6 +4,21 @@
 
 pub const CODEX_TOOL_HISTORY_ERROR_CLASS: &str = "codex_resume_tool_history_invalid";
 pub const CODEX_USAGE_LIMIT_STOP_REASON: &str = "provider_error:codex_usage_limit";
+/// Closed stop reason for a provider startup that the provider rejected as
+/// unauthorized (an invalidated or missing credential, HTTP 401). The credential
+/// stays operator-owned; this only names the failure class (#1610).
+pub const PROVIDER_AUTH_INVALID_STOP_REASON: &str = "provider_error:provider_auth_invalid";
+
+/// Whether a provider's terminal diagnostic text reports an authentication
+/// rejection (HTTP 401 / invalidated token) rather than a task or quota error.
+pub fn is_provider_auth_failure_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    ["unauthorized (401)", "status 401", "401 unauthorized"]
+        .iter()
+        .any(|term| lower.contains(term))
+        || lower.contains("invalidated oauth token")
+        || lower.contains("provider_auth_invalid")
+}
 
 pub fn codex_reasoning_effort(effort: Option<&str>) -> Option<&'static str> {
     match effort {

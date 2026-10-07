@@ -320,6 +320,27 @@ impl App {
         self.start_bootstrap();
     }
 
+    /// Read one session's pause marker with its age/held-succession detail.
+    pub(crate) async fn probe_operator_pause(&mut self, session_id: Uuid) {
+        if let Ok(info) = self.client.get_operator_pause_info(session_id).await {
+            let level = info.pause_level;
+            if self.operator_pauses.insert(session_id, level) != Some(level) {
+                self.needs_redraw = true;
+            }
+            // The age only moves the label at minute granularity; the held
+            // flag and level are what change the row.
+            let changed = self
+                .operator_pause_info
+                .get(&session_id)
+                .map(|old| (old.pause_level, old.held_succession, old.since.as_ref()))
+                != Some((info.pause_level, info.held_succession, info.since.as_ref()));
+            if changed {
+                self.needs_redraw = true;
+            }
+            self.operator_pause_info.insert(session_id, info);
+        }
+    }
+
     /// Poll daemon for session updates and conversation events.
     pub async fn poll_sessions(&mut self) {
         if !self.poll.connected {
@@ -337,6 +358,18 @@ impl App {
             }
         }
 
+        // A manager seat's pause is never invisible (#1541): probe every
+        // rostered seat each poll, ahead of the round-robin below.
+        let seats: Vec<Uuid> = self
+            .session_order
+            .iter()
+            .copied()
+            .filter(|id| self.manager_roster.contains(*id))
+            .collect();
+        for session_id in seats {
+            self.probe_operator_pause(session_id).await;
+        }
+
         // GetOperatorPause is a per-session operator read. Walk the visible
         // list in bounded batches so every row eventually reflects external
         // pause edits without holding an entire poll behind a large roster.
@@ -344,11 +377,7 @@ impl App {
             let index = self.operator_pause_probe_cursor % self.session_order.len();
             self.operator_pause_probe_cursor = self.operator_pause_probe_cursor.wrapping_add(1);
             let session_id = self.session_order[index];
-            if let Ok(level) = self.client.get_operator_pause(session_id).await
-                && self.operator_pauses.insert(session_id, level) != Some(level)
-            {
-                self.needs_redraw = true;
-            }
+            self.probe_operator_pause(session_id).await;
             if let Ok(messages) = self.client.list_operator_messages(session_id).await
                 && self.operator_messages.get(&session_id) != Some(&messages)
             {

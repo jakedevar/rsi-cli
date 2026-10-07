@@ -79,6 +79,22 @@ pub const COORDINATOR_CONTEXT_CAP_TOKENS_MAX: u64 = 2_000_000;
 /// Prefix of a per-provider (`<Provider>`) or per-model
 /// (`<Provider>/<model>`) cap override field.
 pub const COORDINATOR_CONTEXT_CAP_OVERRIDE_PREFIX: &str = "coordinator_context_cap.";
+/// #1254: the live context at which a worker (any session that holds no
+/// coordinating seat and has a launching manager or Epic lead) is told to pass
+/// the baton: commit, append a handoff to its Issue and end its turn; its
+/// launcher gets a typed `worker_context_cap` notice. One field, three ranges:
+/// `0` turns it off, `1..=100` is a percentage of the session's known context
+/// window (no cap while the window is unknown), and
+/// `WORKER_CONTEXT_CAP_TOKENS_MIN..=WORKER_CONTEXT_CAP_TOKENS_MAX` is an
+/// absolute token count. A per-provider or per-model override is the dynamic
+/// field `worker_context_cap.<key>`.
+pub const WORKER_CONTEXT_CAP_TOKENS_DEFAULT: u64 = 60;
+/// The largest value read as a percentage of the context window.
+pub const WORKER_CONTEXT_CAP_MAX_PCT: u64 = 100;
+pub const WORKER_CONTEXT_CAP_TOKENS_MIN: u64 = 32_000;
+pub const WORKER_CONTEXT_CAP_TOKENS_MAX: u64 = 2_000_000;
+/// Prefix of a per-provider or per-model worker cap override field.
+pub const WORKER_CONTEXT_CAP_OVERRIDE_PREFIX: &str = "worker_context_cap.";
 /// #1050: agent-loop iterations one Harness turn may use before the #1039
 /// wrap-up. A normal Issue (read, edit, build, test, commit, report) takes
 /// 50-150 tool calls, so the default lets it finish in one turn; context and
@@ -174,8 +190,19 @@ pub const PERSISTED_RUNTIME_CONFIG_FIELDS: &[&str] = &[
     "rolling_queue_enabled",
     // Issue #1073: hold new work while a deploy waits for its quiet point.
     "deploy_drain_enabled",
+    // Issue #1320/#1311: how long an agent deploy may hold new worker starts.
+    "deploy_drain_hold_secs",
+    // Issue #1417: hold manager launches while the host's 1-minute load is
+    // above this threshold (0 disables).
+    "host_load_admission_threshold",
     "rolling_queue_batch_size",
     "rolling_queue_speculation_depth",
+    // Issue #1208: bounded wall time of one merge-queue batch's gating.
+    "rolling_queue_gate_timeout_mins",
+    // Issue #1337: runaway-test guard rails (job timeout, CPU-time andon).
+    "job_test_timeout_mins",
+    "cpu_andon_cpu_minutes",
+    "cpu_andon_host_load",
     // Issue #794 S3: child-aware continuation policy.
     "program_hold_while_children_run",
     "child_keepalive_enabled",
@@ -224,6 +251,9 @@ pub const PERSISTED_RUNTIME_CONFIG_FIELDS: &[&str] = &[
     "openrouter_context_budget_tokens",
     "harness_max_iterations_per_turn",
     "coordinator_context_cap_tokens",
+    "worker_context_cap_tokens",
+    "provider_profile",
+    "bedrock_region",
 ];
 
 pub fn is_persisted_runtime_config_field(field: &str) -> bool {
@@ -231,13 +261,24 @@ pub fn is_persisted_runtime_config_field(field: &str) -> bool {
         || openrouter_model_route_key(field).is_some()
         || bedrock_model_route_key(field).is_some()
         || coordinator_context_cap_override_key(field).is_some()
+        || worker_context_cap_override_key(field).is_some()
 }
 
 /// #1005: the override key of a `coordinator_context_cap.<key>` field. The
 /// key is `<Provider>` or `<Provider>/<model>`, the provider spelled as its
 /// serde name (`Claude`, `Codex`, ...).
 pub fn coordinator_context_cap_override_key(field: &str) -> Option<&str> {
-    let key = field.strip_prefix(COORDINATOR_CONTEXT_CAP_OVERRIDE_PREFIX)?;
+    cap_override_key(field, COORDINATOR_CONTEXT_CAP_OVERRIDE_PREFIX)
+}
+
+/// #1254: the override key of a `worker_context_cap.<key>` field, spelled as
+/// the coordinator cap's (`<Provider>` or `<Provider>/<model>`).
+pub fn worker_context_cap_override_key(field: &str) -> Option<&str> {
+    cap_override_key(field, WORKER_CONTEXT_CAP_OVERRIDE_PREFIX)
+}
+
+fn cap_override_key<'a>(field: &'a str, prefix: &str) -> Option<&'a str> {
+    let key = field.strip_prefix(prefix)?;
     let provider = key.split_once('/').map_or(key, |(provider, _)| provider);
     let model_ok = key
         .split_once('/')
@@ -254,6 +295,24 @@ fn provider_key(provider: SessionProvider) -> String {
         .ok()
         .and_then(|value| value.as_str().map(str::to_string))
         .unwrap_or_else(|| format!("{provider:?}"))
+}
+
+/// #1254: `0` (off), a percentage `1..=100` of the context window, or an
+/// absolute token count inside the hard range.
+pub fn valid_worker_context_cap(value: u64) -> bool {
+    value <= WORKER_CONTEXT_CAP_MAX_PCT
+        || (WORKER_CONTEXT_CAP_TOKENS_MIN..=WORKER_CONTEXT_CAP_TOKENS_MAX).contains(&value)
+}
+
+fn bounded_worker_cap(value: &serde_json::Value) -> Result<u64, String> {
+    value
+        .as_u64()
+        .filter(|value| valid_worker_context_cap(*value))
+        .ok_or_else(|| {
+            format!(
+                "expected 0 (off), a percentage of the context window in 1..={WORKER_CONTEXT_CAP_MAX_PCT}, or tokens in {WORKER_CONTEXT_CAP_TOKENS_MIN}..={WORKER_CONTEXT_CAP_TOKENS_MAX}"
+            )
+        })
 }
 
 fn bounded_cap_tokens(value: &serde_json::Value) -> Result<u64, String> {
@@ -673,6 +732,11 @@ pub struct RuntimeConfig {
     /// `rsi_common::launch_allowlist::normalize_launch_model_allowlist`.
     /// Operator-only: reachable only through `GetDaemonConfig`/`UpdateDaemonConfig`.
     pub launch_model_allowlist: RwLock<Vec<String>>,
+    /// Issue #1407: the operator provider profile. `all` (default) admits
+    /// every provider; `aws_only` admits only Claude Code on a Bedrock Claude
+    /// model. Checked in [`Self::launch_model_refusal`], so every launch path
+    /// that checks the allowlist checks the profile too; read live.
+    pub provider_profile: RwLock<rsi_common::provider_profile::ProviderProfile>,
     /// #694 K1: operator-only key-vault settings (`vault.env_compat`,
     /// `vault.check_ttl_secs`), shared with the daemon's `VaultHandle` so an
     /// `UpdateDaemonConfig` change applies to the next resolution/check.
@@ -689,6 +753,11 @@ pub struct RuntimeConfig {
     pub coordinator_context_cap_tokens: AtomicU64,
     /// #1005: per-provider/per-model cap overrides (0 = off for that key).
     pub coordinator_context_cap_overrides: RwLock<std::collections::HashMap<String, u64>>,
+    /// #1254: the worker baton cap (`0` off, `1..=100` percent of the
+    /// window, else tokens).
+    pub worker_context_cap_tokens: AtomicU64,
+    /// #1254: per-provider/per-model worker cap overrides.
+    pub worker_context_cap_overrides: RwLock<std::collections::HashMap<String, u64>>,
     /// #1050: operator cap on agent-loop iterations per Harness turn. Read
     /// when a turn starts, so a change applies to the next turn.
     pub harness_max_iterations_per_turn: AtomicU32,
@@ -710,6 +779,18 @@ pub struct RuntimeConfig {
     /// scheduled child wakes and new agent jobs so a busy hub can go quiet.
     /// Operator-only via `GetDaemonConfig`/`UpdateDaemonConfig`.
     pub deploy_drain_enabled: AtomicBool,
+    /// Issue #1320/#1311: an agent deploy holds new worker starts for at most
+    /// this many seconds after it was requested (0..=3600, default 600; 0
+    /// never holds). Past it the deploy keeps waiting for a quiet point without
+    /// holding, and holds again only from its first quiet poll to the restart.
+    /// Operator-only via `GetDaemonConfig`/`UpdateDaemonConfig`.
+    pub deploy_drain_hold_secs: AtomicU64,
+    /// Issue #1417: the daemon holds a manager's `create_session` (issue
+    /// workers and topology node launches included) while the host's
+    /// 1-minute load average is above this value (0..=1024, default 40; 0
+    /// disables the hold). Live: read at every admission decision.
+    /// Operator-only via `GetDaemonConfig`/`UpdateDaemonConfig`.
+    pub host_load_admission_threshold: AtomicU32,
     pub rolling_queue_batch_size: AtomicU32,
     /// Issue #1014: resource governor policy. `governor_max_load` 0 means 1.25 x cores.
     pub governor_build_slots: AtomicU32,
@@ -719,6 +800,21 @@ pub struct RuntimeConfig {
     pub governor_min_avail_mem_gb: AtomicU64,
     pub governor_max_workers_slice_gb: AtomicU64,
     pub rolling_queue_speculation_depth: AtomicU32,
+    /// Issue #1208: wall-clock budget (minutes, 30..=1440, default 360) of one
+    /// merge-queue batch's gating, bisect included. A batch past it refuses its
+    /// unsettled members with `queue_gate_timeout`. Operator-only via
+    /// `GetDaemonConfig`/`UpdateDaemonConfig`.
+    pub rolling_queue_gate_timeout_mins: AtomicU32,
+    /// Issue #1337: default wall-clock timeout (minutes, 5..=180, default 20)
+    /// of an `AgentSubmitJob` `test` job; a manager may raise one job. Read at
+    /// submit. Operator-only via `GetDaemonConfig`/`UpdateDaemonConfig`.
+    pub job_test_timeout_mins: AtomicU32,
+    /// Issue #1337: CPU-time andon threshold per agent process tree, in
+    /// CPU-minutes (0 = off, else 30..=10000; default 240). Read per sample.
+    pub cpu_andon_cpu_minutes: AtomicU32,
+    /// Issue #1337: 1-minute host load at or above which one dominant agent
+    /// process tree is a runaway (0 = off, else 4..=1024; default 40).
+    pub cpu_andon_host_load: AtomicU32,
     /// Issue #794 S3: hold a program-mode master's due Resume wake while its
     /// children run (default on) and, when `child_keepalive_enabled` (default
     /// off), give an idle parent one bounded keep-alive Resume per
@@ -916,6 +1012,7 @@ impl RuntimeConfig {
                 rsi_common::model_control::ORCHESTRATION_MAX_CHILD_EFFORT_UNSET.to_string(),
             ),
             launch_model_allowlist: RwLock::new(Vec::new()),
+            provider_profile: RwLock::new(rsi_common::provider_profile::ProviderProfile::All),
             vault_settings: Arc::new(crate::vault::VaultSettings::default()),
             openrouter_route: RwLock::new(OpenRouterRoute::CodexCli),
             openrouter_model_routes: RwLock::new(std::collections::HashMap::new()),
@@ -927,6 +1024,8 @@ impl RuntimeConfig {
             ),
             coordinator_context_cap_tokens: AtomicU64::new(COORDINATOR_CONTEXT_CAP_TOKENS_DEFAULT),
             coordinator_context_cap_overrides: RwLock::new(std::collections::HashMap::new()),
+            worker_context_cap_tokens: AtomicU64::new(WORKER_CONTEXT_CAP_TOKENS_DEFAULT),
+            worker_context_cap_overrides: RwLock::new(std::collections::HashMap::new()),
             harness_max_iterations_per_turn: AtomicU32::new(
                 HARNESS_MAX_ITERATIONS_PER_TURN_DEFAULT,
             ),
@@ -969,12 +1068,28 @@ impl RuntimeConfig {
             ),
             rolling_queue_enabled: AtomicBool::new(false),
             deploy_drain_enabled: AtomicBool::new(true),
+            deploy_drain_hold_secs: AtomicU64::new(
+                rsi_common::agent_deploy::DEPLOY_DRAIN_HOLD_DEFAULT_SECS,
+            ),
+            host_load_admission_threshold: AtomicU32::new(
+                rsi_common::agent_daemon_info::HOST_LOAD_THRESHOLD_DEFAULT,
+            ),
             rolling_queue_batch_size: AtomicU32::new(
                 rsi_common::rolling_queue::ROLLING_QUEUE_DEFAULT_BATCH_SIZE,
             ),
             rolling_queue_speculation_depth: AtomicU32::new(
                 rsi_common::rolling_queue::ROLLING_QUEUE_DEFAULT_SPECULATION_DEPTH,
             ),
+            rolling_queue_gate_timeout_mins: AtomicU32::new(
+                rsi_common::rolling_queue::ROLLING_QUEUE_DEFAULT_GATE_TIMEOUT_MINS,
+            ),
+            job_test_timeout_mins: AtomicU32::new(
+                rsi_common::agent_jobs::JOB_TEST_TIMEOUT_DEFAULT_MINS,
+            ),
+            cpu_andon_cpu_minutes: AtomicU32::new(
+                rsi_common::friction::CPU_ANDON_CPU_MINUTES_DEFAULT,
+            ),
+            cpu_andon_host_load: AtomicU32::new(rsi_common::friction::CPU_ANDON_HOST_LOAD_DEFAULT),
             governor_build_slots: AtomicU32::new(4),
             governor_lander_slots: AtomicU32::new(5),
             governor_max_load: AtomicU32::new(0),
@@ -1320,6 +1435,16 @@ impl RuntimeConfig {
                 self.deploy_drain_enabled.load(Ordering::Relaxed).into(),
             );
             map.insert(
+                "deploy_drain_hold_secs".to_string(),
+                self.deploy_drain_hold_secs.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
+                "host_load_admission_threshold".to_string(),
+                self.host_load_admission_threshold
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
                 "rolling_queue_batch_size".to_string(),
                 self.rolling_queue_batch_size.load(Ordering::Relaxed).into(),
             );
@@ -1330,12 +1455,36 @@ impl RuntimeConfig {
                     .into(),
             );
             map.insert(
+                "rolling_queue_gate_timeout_mins".to_string(),
+                self.rolling_queue_gate_timeout_mins
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            for (field, value) in [
+                ("job_test_timeout_mins", &self.job_test_timeout_mins),
+                ("cpu_andon_cpu_minutes", &self.cpu_andon_cpu_minutes),
+                ("cpu_andon_host_load", &self.cpu_andon_host_load),
+            ] {
+                map.insert(field.to_string(), value.load(Ordering::Relaxed).into());
+            }
+            map.insert(
                 rsi_common::provider_credentials::SETTING_VAULT_ENV_COMPAT.to_string(),
                 self.vault_settings.env_compat().into(),
             );
             map.insert(
                 rsi_common::provider_credentials::SETTING_VAULT_CHECK_TTL_SECS.to_string(),
                 self.vault_settings.check_ttl_secs().into(),
+            );
+            map.insert(
+                rsi_common::provider_profile::PROVIDER_PROFILE_FIELD.to_string(),
+                self.provider_profile().as_str().into(),
+            );
+            map.insert(
+                rsi_common::provider_profile::BEDROCK_REGION_FIELD.to_string(),
+                self.vault_settings
+                    .bedrock_region()
+                    .unwrap_or_default()
+                    .into(),
             );
             map.insert(
                 "api_route.openrouter".to_string(),
@@ -1380,6 +1529,18 @@ impl RuntimeConfig {
                 map.insert(
                     format!("{COORDINATOR_CONTEXT_CAP_OVERRIDE_PREFIX}{key}"),
                     (*tokens).into(),
+                );
+            }
+            map.insert(
+                "worker_context_cap_tokens".to_string(),
+                self.worker_context_cap_tokens
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            for (key, value) in self.worker_context_cap_overrides.read().iter() {
+                map.insert(
+                    format!("{WORKER_CONTEXT_CAP_OVERRIDE_PREFIX}{key}"),
+                    (*value).into(),
                 );
             }
             map.insert("recursive_dag_inspection".to_string(), true.into());
@@ -1571,11 +1732,19 @@ impl RuntimeConfig {
     /// everything). `model` must be the EFFECTIVE model (project and provider
     /// defaults applied); `None` means no model could be determined. Read live,
     /// so a change applies to the next launch.
+    ///
+    /// Issue #1407: the operator provider profile is checked first, so this is
+    /// the one predicate every launch path passes for both policies. A profile
+    /// refusal starts with `provider_profile_refused`
+    /// (`rsi_common::provider_profile::launch_refusal_code` names the code).
     pub fn launch_model_refusal(
         &self,
         provider: SessionProvider,
         model: Option<&str>,
     ) -> Option<String> {
+        if let Some(refusal) = self.provider_profile_refusal(provider, model) {
+            return Some(refusal);
+        }
         let allowlist = self.launch_model_allowlist.read();
         if rsi_common::launch_allowlist::launch_model_allowed(&allowlist, Some(provider), model) {
             return None;
@@ -1583,6 +1752,36 @@ impl RuntimeConfig {
         Some(rsi_common::launch_allowlist::launch_model_refusal(
             &allowlist, model,
         ))
+    }
+
+    /// Issue #1407: the live operator provider profile.
+    pub fn provider_profile(&self) -> rsi_common::provider_profile::ProviderProfile {
+        *self.provider_profile.read()
+    }
+
+    /// Issue #1407: the profile refusal for a launch of `model` on `provider`,
+    /// or `None` when the profile admits it. A `Bedrock` launch of a Claude
+    /// model is judged on the runtime it resolves to (`api_route.bedrock`):
+    /// Claude Code passes `aws_only`, the Harness does not.
+    pub fn provider_profile_refusal(
+        &self,
+        provider: SessionProvider,
+        model: Option<&str>,
+    ) -> Option<String> {
+        use rsi_common::provider_profile::{ProviderProfile, launch_allowed, launch_refusal};
+        let profile = self.provider_profile();
+        if profile == ProviderProfile::All {
+            return None;
+        }
+        let runtime = crate::bedrock::resolve_launch_provider(
+            provider,
+            model,
+            self.bedrock_route_for(model.unwrap_or(crate::bedrock::BEDROCK_DEFAULT_MODEL)),
+        );
+        if launch_allowed(profile, runtime, model) {
+            return None;
+        }
+        Some(launch_refusal(profile, provider, model))
     }
 
     /// #794: whether a Harness session runs its configured completion gates.
@@ -1616,6 +1815,33 @@ impl RuntimeConfig {
             .copied()
             .unwrap_or_else(|| self.coordinator_context_cap_tokens.load(Ordering::Relaxed));
         Some(cap).filter(|&tokens| tokens > 0)
+    }
+
+    /// #1254: the worker baton cap in tokens for a session on `provider` /
+    /// `model` whose known context window is `context_window` (0 = unknown),
+    /// or `None` when it is off or is a percentage of an unknown window. A
+    /// model override wins over a provider override, which wins over the
+    /// global setting.
+    pub fn worker_context_cap(
+        &self,
+        provider: SessionProvider,
+        model: Option<&str>,
+        context_window: u64,
+    ) -> Option<u64> {
+        let provider = provider_key(provider);
+        let overrides = self.worker_context_cap_overrides.read();
+        let value = model
+            .and_then(|model| overrides.get(&format!("{provider}/{model}")))
+            .or_else(|| overrides.get(&provider))
+            .copied()
+            .unwrap_or_else(|| self.worker_context_cap_tokens.load(Ordering::Relaxed));
+        match value {
+            0 => None,
+            pct if pct <= WORKER_CONTEXT_CAP_MAX_PCT => {
+                Some(context_window.saturating_mul(pct) / 100).filter(|&tokens| tokens > 0)
+            }
+            tokens => Some(tokens),
+        }
     }
 
     pub fn openrouter_route_for(&self, model: &str) -> OpenRouterRoute {
@@ -1717,6 +1943,17 @@ impl RuntimeConfig {
                 self.bedrock_model_routes
                     .write()
                     .insert(model.to_string(), route);
+            }
+            return Ok(true);
+        }
+        if let Some(key) = worker_context_cap_override_key(field) {
+            if value.is_null() {
+                self.worker_context_cap_overrides.write().remove(key);
+            } else {
+                let cap = bounded_worker_cap(value)?;
+                self.worker_context_cap_overrides
+                    .write()
+                    .insert(key.to_string(), cap);
             }
             return Ok(true);
         }
@@ -1900,6 +2137,27 @@ impl RuntimeConfig {
                     .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
                 Ok(true)
             }
+            "deploy_drain_hold_secs" => {
+                let value = bounded_u64(
+                    value,
+                    0,
+                    rsi_common::agent_deploy::DEPLOY_DRAIN_HOLD_MAX_SECS,
+                )?;
+                self.deploy_drain_hold_secs.store(value, Ordering::Relaxed);
+                Ok(true)
+            }
+            "host_load_admission_threshold" => {
+                let value = bounded_u64(
+                    value,
+                    0,
+                    u64::from(rsi_common::agent_daemon_info::HOST_LOAD_THRESHOLD_MAX),
+                )?;
+                self.host_load_admission_threshold.store(
+                    u32::try_from(value).map_err(|_| "expected value within u32 range")?,
+                    Ordering::Relaxed,
+                );
+                Ok(true)
+            }
             "rolling_queue_batch_size" => {
                 let value = bounded_u64(
                     value,
@@ -1919,6 +2177,58 @@ impl RuntimeConfig {
                     rsi_common::rolling_queue::ROLLING_QUEUE_MAX_SPECULATION_DEPTH,
                 )?;
                 self.rolling_queue_speculation_depth.store(
+                    u32::try_from(value).map_err(|_| "expected value within u32 range")?,
+                    Ordering::Relaxed,
+                );
+                Ok(true)
+            }
+            "rolling_queue_gate_timeout_mins" => {
+                let value = bounded_u64(
+                    value,
+                    rsi_common::rolling_queue::ROLLING_QUEUE_MIN_GATE_TIMEOUT_MINS,
+                    rsi_common::rolling_queue::ROLLING_QUEUE_MAX_GATE_TIMEOUT_MINS,
+                )?;
+                self.rolling_queue_gate_timeout_mins.store(
+                    u32::try_from(value).map_err(|_| "expected value within u32 range")?,
+                    Ordering::Relaxed,
+                );
+                Ok(true)
+            }
+            "job_test_timeout_mins" => {
+                let value = bounded_u64(
+                    value,
+                    rsi_common::agent_jobs::JOB_TEST_TIMEOUT_MIN_MINS.into(),
+                    rsi_common::agent_jobs::JOB_TEST_TIMEOUT_MAX_MINS.into(),
+                )?;
+                self.job_test_timeout_mins.store(
+                    u32::try_from(value).map_err(|_| "expected value within u32 range")?,
+                    Ordering::Relaxed,
+                );
+                Ok(true)
+            }
+            "cpu_andon_cpu_minutes" | "cpu_andon_host_load" => {
+                use rsi_common::friction as andon;
+                let (target, min, max) = if field == "cpu_andon_cpu_minutes" {
+                    (
+                        &self.cpu_andon_cpu_minutes,
+                        andon::CPU_ANDON_CPU_MINUTES_MIN,
+                        andon::CPU_ANDON_CPU_MINUTES_MAX,
+                    )
+                } else {
+                    (
+                        &self.cpu_andon_host_load,
+                        andon::CPU_ANDON_HOST_LOAD_MIN,
+                        andon::CPU_ANDON_HOST_LOAD_MAX,
+                    )
+                };
+                // 0 turns this trigger off; any other value is bounded.
+                let value = if value.as_u64() == Some(0) {
+                    0
+                } else {
+                    bounded_u64(value, min.into(), max.into())
+                        .map_err(|_| format!("expected 0 (off) or an integer in {min}..={max}"))?
+                };
+                target.store(
                     u32::try_from(value).map_err(|_| "expected value within u32 range")?,
                     Ordering::Relaxed,
                 );
@@ -1950,6 +2260,11 @@ impl RuntimeConfig {
             "coordinator_context_cap_tokens" => {
                 self.coordinator_context_cap_tokens
                     .store(bounded_cap_tokens(value)?, Ordering::Relaxed);
+                Ok(true)
+            }
+            "worker_context_cap_tokens" => {
+                self.worker_context_cap_tokens
+                    .store(bounded_worker_cap(value)?, Ordering::Relaxed);
                 Ok(true)
             }
             "openrouter_context_budget_tokens" => {
@@ -2236,6 +2551,16 @@ impl RuntimeConfig {
             "launch_model_allowlist" => {
                 *self.launch_model_allowlist.write() =
                     rsi_common::launch_allowlist::normalize_launch_model_allowlist(value)?;
+                Ok(true)
+            }
+            rsi_common::provider_profile::PROVIDER_PROFILE_FIELD => {
+                *self.provider_profile.write() =
+                    rsi_common::provider_profile::ProviderProfile::from_value(value)?;
+                Ok(true)
+            }
+            rsi_common::provider_profile::BEDROCK_REGION_FIELD => {
+                *self.vault_settings.bedrock_region.write() =
+                    rsi_common::provider_profile::normalize_bedrock_region(value)?;
                 Ok(true)
             }
             "sandbox_build_cache_reclaim_enabled" => {
@@ -3577,11 +3902,86 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
+    fn deploy_drain_hold_setting_defaults_to_ten_minutes_persists_and_validates() {
+        assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&"deploy_drain_hold_secs"));
+        let config = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(config.to_json()["deploy_drain_hold_secs"], 600);
+        for good in [0, 120, 3600] {
+            assert!(
+                config
+                    .update_field("deploy_drain_hold_secs", &serde_json::json!(good))
+                    .is_ok(),
+                "{good}"
+            );
+            assert_eq!(
+                config.persisted_field_value("deploy_drain_hold_secs"),
+                Some(serde_json::json!(good))
+            );
+        }
+        for bad in [
+            serde_json::json!(3601),
+            serde_json::json!(-1),
+            serde_json::json!(true),
+        ] {
+            assert!(
+                config.update_field("deploy_drain_hold_secs", &bad).is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(config.deploy_drain_hold_secs.load(Ordering::Relaxed), 3600);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn host_load_admission_threshold_defaults_to_forty_persists_and_validates() {
+        assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&"host_load_admission_threshold"));
+        let config = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(config.to_json()["host_load_admission_threshold"], 40);
+        for good in [0, 25, 40, 1024] {
+            assert!(
+                config
+                    .update_field("host_load_admission_threshold", &serde_json::json!(good))
+                    .is_ok(),
+                "{good}"
+            );
+            assert_eq!(
+                config.persisted_field_value("host_load_admission_threshold"),
+                Some(serde_json::json!(good))
+            );
+            assert_eq!(
+                config.host_load_admission_threshold.load(Ordering::Relaxed),
+                good
+            );
+        }
+        for bad in [
+            serde_json::json!(1025),
+            serde_json::json!(-1),
+            serde_json::json!(40.5),
+            serde_json::json!("40"),
+            serde_json::json!(true),
+        ] {
+            assert!(
+                config
+                    .update_field("host_load_admission_threshold", &bad)
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            config.host_load_admission_threshold.load(Ordering::Relaxed),
+            1024,
+            "a rejected value keeps the accepted one"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
     fn rolling_queue_settings_default_persist_and_validate() {
         for field in [
             "rolling_queue_enabled",
             "rolling_queue_batch_size",
             "rolling_queue_speculation_depth",
+            "rolling_queue_gate_timeout_mins",
         ] {
             assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&field), "{field}");
         }
@@ -3590,10 +3990,12 @@ mod tests {
         assert_eq!(json["rolling_queue_enabled"], false);
         assert_eq!(json["rolling_queue_batch_size"], 4);
         assert_eq!(json["rolling_queue_speculation_depth"], 1);
+        assert_eq!(json["rolling_queue_gate_timeout_mins"], 360);
         for (field, value) in [
             ("rolling_queue_enabled", serde_json::json!(true)),
             ("rolling_queue_batch_size", serde_json::json!(8)),
             ("rolling_queue_speculation_depth", serde_json::json!(0)),
+            ("rolling_queue_gate_timeout_mins", serde_json::json!(90)),
         ] {
             assert!(config.update_field(field, &value).is_ok(), "{field}");
             assert_eq!(config.persisted_field_value(field), Some(value));
@@ -3603,6 +4005,8 @@ mod tests {
             ("rolling_queue_batch_size", serde_json::json!(0)),
             ("rolling_queue_batch_size", serde_json::json!(9)),
             ("rolling_queue_speculation_depth", serde_json::json!(3)),
+            ("rolling_queue_gate_timeout_mins", serde_json::json!(29)),
+            ("rolling_queue_gate_timeout_mins", serde_json::json!(1441)),
         ] {
             assert!(
                 config.update_field(field, &value).is_err(),
@@ -3611,6 +4015,49 @@ mod tests {
         }
         // A rejected write leaves the accepted value in place.
         assert_eq!(config.to_json()["rolling_queue_batch_size"], 8);
+    }
+
+    /// #1337: the runaway-test guard rails are operator settings with
+    /// defaults (20 min, 240 CPU-minutes, load 40), persisted and bounded; the
+    /// andon triggers also accept 0 (off).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn runaway_guard_settings_default_persist_and_validate() {
+        let config = RuntimeConfig::from_config(&Config::default());
+        let json = config.to_json();
+        assert_eq!(json["job_test_timeout_mins"], 20);
+        assert_eq!(json["cpu_andon_cpu_minutes"], 240);
+        assert_eq!(json["cpu_andon_host_load"], 40);
+        for (field, value) in [
+            ("job_test_timeout_mins", serde_json::json!(45)),
+            ("cpu_andon_cpu_minutes", serde_json::json!(0)),
+            ("cpu_andon_cpu_minutes", serde_json::json!(600)),
+            ("cpu_andon_host_load", serde_json::json!(0)),
+            ("cpu_andon_host_load", serde_json::json!(64)),
+        ] {
+            assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&field), "{field}");
+            assert!(
+                config.update_field(field, &value).is_ok(),
+                "{field} {value}"
+            );
+            assert_eq!(config.persisted_field_value(field), Some(value));
+        }
+        for (field, value) in [
+            ("job_test_timeout_mins", serde_json::json!(0)),
+            ("job_test_timeout_mins", serde_json::json!(4)),
+            ("job_test_timeout_mins", serde_json::json!(181)),
+            ("cpu_andon_cpu_minutes", serde_json::json!(29)),
+            ("cpu_andon_cpu_minutes", serde_json::json!(10_001)),
+            ("cpu_andon_host_load", serde_json::json!(3)),
+            ("cpu_andon_host_load", serde_json::json!("40")),
+        ] {
+            assert!(
+                config.update_field(field, &value).is_err(),
+                "{field} {value}"
+            );
+        }
+        assert_eq!(config.to_json()["job_test_timeout_mins"], 45);
+        assert_eq!(config.to_json()["cpu_andon_host_load"], 64);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
@@ -3985,6 +4432,75 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(runtime.to_json()[field], serde_json::json!([]));
+    }
+
+    /// Issue #1407: `provider_profile` and `bedrock_region` validate on write,
+    /// round-trip through `GetDaemonConfig` and survive a restart; the profile
+    /// drives `launch_model_refusal` and the region drives Bedrock region
+    /// resolution ahead of the environment.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn provider_profile_and_bedrock_region_validate_round_trip_and_survive_restart() {
+        use rsi_common::provider_profile::{AWS_ONLY_DEFAULT_MODEL, PROVIDER_PROFILE_REFUSED};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rsi.db");
+        let store = crate::store::Store::open(&path).unwrap();
+        let runtime = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(runtime.to_json()["provider_profile"], "all");
+        assert_eq!(runtime.to_json()["bedrock_region"], "");
+        assert_eq!(
+            runtime.launch_model_refusal(SessionProvider::Codex, Some("gpt-6-sol")),
+            None,
+            "`all` admits every provider"
+        );
+        for bad in [serde_json::json!("aws"), serde_json::json!(1)] {
+            runtime
+                .update_field("provider_profile", &bad)
+                .expect_err("a malformed profile is refused");
+        }
+        for bad in [serde_json::json!("US East"), serde_json::json!(true)] {
+            runtime
+                .update_field("bedrock_region", &bad)
+                .expect_err("a malformed region is refused");
+        }
+        runtime
+            .update_field("provider_profile", &serde_json::json!("aws_only"))
+            .unwrap();
+        runtime
+            .update_field("bedrock_region", &serde_json::json!("eu-central-1"))
+            .unwrap();
+        let refusal = runtime
+            .launch_model_refusal(SessionProvider::Codex, Some("gpt-6-sol"))
+            .expect("aws_only refuses Codex");
+        assert!(refusal.starts_with(PROVIDER_PROFILE_REFUSED), "{refusal}");
+        assert_eq!(
+            runtime.launch_model_refusal(SessionProvider::Claude, Some(AWS_ONLY_DEFAULT_MODEL)),
+            None
+        );
+        let vault = crate::vault::VaultHandleBuilder::new(Arc::clone(&runtime.vault_settings))
+            .env(|_| None)
+            .open()
+            .unwrap();
+        assert_eq!(
+            crate::bedrock::region_from(&vault).as_deref(),
+            Ok("eu-central-1")
+        );
+        for field in ["provider_profile", "bedrock_region"] {
+            crate::store::daemon_settings::persist_runtime_config_field(&store, &runtime, field)
+                .unwrap();
+        }
+        drop(store);
+
+        let reopened = crate::store::Store::open(&path).unwrap();
+        let restarted = RuntimeConfig::from_config(&Config::default());
+        crate::store::daemon_settings::apply_persisted_runtime_config(&reopened, &restarted)
+            .unwrap();
+        assert_eq!(restarted.to_json()["provider_profile"], "aws_only");
+        assert_eq!(restarted.to_json()["bedrock_region"], "eu-central-1");
+        restarted
+            .update_field("bedrock_region", &serde_json::Value::Null)
+            .unwrap();
+        assert_eq!(restarted.vault_settings.bedrock_region(), None);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]

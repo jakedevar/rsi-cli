@@ -184,6 +184,25 @@ impl RpcServer {
         Ok(serde_json::to_value(claimed)?)
     }
 
+    /// #1183: the session's own hook confirms it wrote the mail it claimed.
+    /// Only ids this caller's hook claimed are confirmed; params carry the ids
+    /// and nothing else.
+    pub(super) async fn handle_confirm_boundary_mail(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let caller_session_id = self.resolve_caller_session_id(request).await?;
+        let params: rsi_common::boundary_mail_hook::ConfirmBoundaryMailParams =
+            serde_json::from_value(request.params.clone()).map_err(|_| {
+                DaemonError::InvalidParam("confirm_boundary_mail_invalid_request".into())
+            })?;
+        let confirmed = self
+            .session_manager
+            .confirm_boundary_mail(caller_session_id, &params)
+            .await?;
+        Ok(serde_json::to_value(confirmed)?)
+    }
+
     /// `AgentSubmitJob` (#1002): hand a typed long operation to the daemon.
     pub(super) async fn handle_agent_submit_job(
         &self,
@@ -199,7 +218,7 @@ impl RpcServer {
             .agent_submit_job(
                 caller,
                 params,
-                std::sync::Arc::new(crate::agent_jobs::SystemdJobRuntime::default()),
+                crate::agent_jobs::platform_job_runtime(),
                 crate::agent_jobs::JobTools::discover(),
             )
             .await?;
@@ -234,11 +253,7 @@ impl RpcServer {
         let cancelled = self
             .session_manager
             .agent_control()
-            .agent_cancel_job(
-                caller,
-                params,
-                std::sync::Arc::new(crate::agent_jobs::SystemdJobRuntime::default()),
-            )
+            .agent_cancel_job(caller, params, crate::agent_jobs::platform_job_runtime())
             .await?;
         Ok(serde_json::to_value(cancelled)?)
     }
@@ -664,15 +679,30 @@ impl RpcServer {
                         "next_fire_at": job.next_fire_at,
                         "wake_mode": job.wake_mode,
                         "wake_session_id": job.wake_session_id,
+                        "rearmed": false,
                     }))
                 }
-                // Idempotent re-arm: the EXISTING row, no insert, no nudge.
+                // #1391: the existing row delivered an epoch the child has
+                // left; it now owes the child's next terminal state.
+                ArmWatchOutcome::Rearmed(job) => {
+                    self.nudge_armed_watch(&job).await;
+                    Ok(serde_json::json!({
+                        "job_id": job.id,
+                        "next_fire_at": job.next_fire_at,
+                        "wake_mode": job.wake_mode,
+                        "wake_session_id": job.wake_session_id,
+                        "deduplicated": true,
+                        "rearmed": true,
+                    }))
+                }
+                // Idempotent re-arm: the EXISTING live row, no insert, no nudge.
                 ArmWatchOutcome::Deduplicated(existing) => Ok(serde_json::json!({
                     "job_id": existing.id,
                     "next_fire_at": existing.next_fire_at,
                     "wake_mode": existing.wake_mode,
                     "wake_session_id": existing.wake_session_id,
                     "deduplicated": true,
+                    "rearmed": false,
                 })),
             };
         }

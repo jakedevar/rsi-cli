@@ -37,6 +37,31 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
+/// The boot-time subscriber remains available while disabled. Each received
+/// event uses the current switch; per-session retry admission stays with the manager.
+pub async fn next_retryable_stall(
+    rx: &mut tokio::sync::broadcast::Receiver<Arc<DaemonEvent>>,
+    runtime: &crate::config::RuntimeConfig,
+) -> Option<Uuid> {
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                if let DaemonEvent::SessionStalled { session_id, .. } = event.as_ref()
+                    && runtime
+                        .retry_on_stall
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    return Some(*session_id);
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(lagged = n, "Stall-retry handler lagged");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+        }
+    }
+}
+
 /// Configuration for stall detection thresholds.
 #[derive(Debug, Clone)]
 pub struct StallConfig {
@@ -74,6 +99,23 @@ impl Default for StallConfig {
             classifier_cooldown_secs: 1800,
             classifier_max_per_session: 3,
         }
+    }
+}
+
+impl StallConfig {
+    /// Refresh only Settings-page fields; static remediation policy is unchanged.
+    fn refresh_from_runtime(&mut self, runtime: &crate::config::RuntimeConfig) {
+        use std::sync::atomic::Ordering;
+        self.classifier_idle_secs = runtime.stall_classifier_idle_secs.load(Ordering::Relaxed);
+        self.classifier_idle_secs_codex = runtime
+            .stall_classifier_idle_secs_codex
+            .load(Ordering::Relaxed);
+        self.classifier_cooldown_secs = runtime
+            .stall_classifier_cooldown_secs
+            .load(Ordering::Relaxed);
+        self.classifier_max_per_session = runtime
+            .stall_classifier_max_per_session
+            .load(Ordering::Relaxed);
     }
 }
 
@@ -147,6 +189,7 @@ pub fn spawn_stall_detector(
     runtime_config: Arc<crate::config::RuntimeConfig>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut config = config;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         // Set to missed-tick behavior that skips missed ticks (avoids burst after sleep)
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -155,6 +198,17 @@ pub fn spawn_stall_detector(
 
         loop {
             interval.tick().await;
+            if !runtime_config
+                .stall_detection_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                // Keep `reported` across a disable: re-enabling must not
+                // re-publish (and re-remediate) stalls already reported.
+                // Sessions that stall while disabled are reported on the
+                // first enabled tick; pruning resumes then too.
+                continue;
+            }
+            config.refresh_from_runtime(&runtime_config);
 
             let now = chrono::Utc::now();
 
@@ -185,7 +239,11 @@ pub fn spawn_stall_detector(
                     // enabled. Does NOT mark `reported` — static path
                     // remains the fallback safety net for telemetry-only
                     // verdicts.
-                    if stall_classifier_tx.is_some() {
+                    if stall_classifier_tx.is_some()
+                        && runtime_config
+                            .stall_classifier_enabled
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    {
                         let inputs = ClassifierTickInputs {
                             idle_duration,
                             provider: tracked.session.provider,
@@ -451,6 +509,157 @@ mod tests {
             SessionKind::Task,
             Some(1)
         ));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn classifier_thresholds_change_existing_detector_decisions() {
+        let mut initial = Config::default();
+        initial.stall_classifier_idle_secs = 600;
+        initial.stall_classifier_idle_secs_codex = 1800;
+        initial.stall_classifier_cooldown_secs = 1800;
+        initial.stall_classifier_max_per_session = 3;
+        let runtime = RuntimeConfig::from_config(&initial);
+        let mut detector = cfg();
+        let n = now();
+        for (field, value, provider, count, last) in [
+            (
+                "stall_classifier_idle_secs",
+                100,
+                SessionProvider::Claude,
+                0,
+                None,
+            ),
+            (
+                "stall_classifier_idle_secs_codex",
+                100,
+                SessionProvider::Codex,
+                0,
+                None,
+            ),
+            (
+                "stall_classifier_cooldown_secs",
+                30,
+                SessionProvider::Claude,
+                0,
+                Some(n - ChronoDuration::seconds(60)),
+            ),
+            (
+                "stall_classifier_max_per_session",
+                4,
+                SessionProvider::Claude,
+                3,
+                None,
+            ),
+        ] {
+            let idle = if field.contains("idle") { 200 } else { 2000 };
+            detector.refresh_from_runtime(&runtime);
+            let decision = |config: &StallConfig| {
+                should_signal_classifier(&ClassifierTickInputs {
+                    idle_duration: idle,
+                    provider,
+                    last_classified_at: last,
+                    classification_count: count,
+                    config,
+                    now: n,
+                })
+            };
+            assert!(!decision(&detector), "{field} before save");
+            runtime
+                .update_field(field, &serde_json::json!(value))
+                .unwrap();
+            detector.refresh_from_runtime(&runtime);
+            assert!(decision(&detector), "{field} after save");
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test(start_paused = true)]
+    async fn stall_retry_switch_updates_existing_subscription() {
+        let runtime = RuntimeConfig::from_config(&Config::default());
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let id = Uuid::new_v4();
+        for enabled in [false, true, false, true] {
+            runtime
+                .update_field("retry_on_stall", &serde_json::json!(enabled))
+                .unwrap();
+            bus.publish(DaemonEvent::SessionStalled {
+                session_id: id,
+                status: SessionStatus::Running,
+                idle_secs: 2000,
+            });
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                next_retryable_stall(&mut rx, &runtime),
+            )
+            .await;
+            if enabled {
+                assert_eq!(result.unwrap(), Some(id));
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test(start_paused = true)]
+    async fn detector_started_disabled_can_be_enabled_and_disabled_live() {
+        let runtime = RuntimeConfig::from_config(&Config::default());
+        runtime
+            .update_field("stall_detection_enabled", &serde_json::json!(false))
+            .unwrap();
+        runtime
+            .update_field("stall_classifier_enabled", &serde_json::json!(false))
+            .unwrap();
+        let now = chrono::Utc::now();
+        let stalled = |id: Uuid| {
+            let session = serde_json::from_value(serde_json::json!({
+                "id": id, "status": "Running", "created_at": now, "updated_at": now,
+                "query": "live settings", "working_dir": "/tmp", "claude_session_id": null,
+            }))
+            .unwrap();
+            let mut tracked = TrackedSession::new_for_test(session);
+            tracked.set_last_event_at_for_test(now - ChronoDuration::seconds(2000));
+            tracked
+        };
+        let id = Uuid::new_v4();
+        let active = Arc::new(RwLock::new(HashMap::from([(id, stalled(id))])));
+        let bus = Arc::new(EventBus::new(16));
+        let mut events = bus.subscribe();
+        let (tx, _rx) = mpsc::channel(8);
+        let handle =
+            spawn_stall_detector(Arc::clone(&active), bus, cfg(), tx, None, runtime.clone());
+        tokio::task::yield_now().await;
+        assert!(events.try_recv().is_err());
+        runtime
+            .update_field("stall_detection_enabled", &serde_json::json!(true))
+            .unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(events.try_recv().unwrap().as_ref(), DaemonEvent::SessionStalled { session_id, .. } if *session_id == id)
+        );
+        runtime
+            .update_field("stall_detection_enabled", &serde_json::json!(false))
+            .unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert!(events.try_recv().is_err());
+        // A session that stalls while disabled is reported after re-enable;
+        // the already-reported one is not re-published (no duplicate remediation).
+        let late = Uuid::new_v4();
+        active.write().await.insert(late, stalled(late));
+        runtime
+            .update_field("stall_detection_enabled", &serde_json::json!(true))
+            .unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(events.try_recv().unwrap().as_ref(), DaemonEvent::SessionStalled { session_id, .. } if *session_id == late)
+        );
+        assert!(events.try_recv().is_err());
+        handle.abort();
     }
 
     // --- Classifier-branch gating (RSI-0XX) ---

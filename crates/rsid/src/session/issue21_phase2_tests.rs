@@ -860,8 +860,58 @@ mod p2_07_gate_permit_spine {
         path: &std::path::Path,
         rejections: &[String],
     ) -> Result<bool, String> {
+        released_region_rejections_are_proven(
+            source_root,
+            path,
+            rejections,
+            RELEASED_QUEUE_REGION,
+            "crates/rsid-store/src/store/rolling_queue.rs",
+            &[RELEASED_QUEUE_REJECTION],
+        )
+    }
+
+    // #1519: the released tier-routing migration builds its catalog DDL with a
+    // local `ref_check!("col")` macro inside `concat!`, a shape the evaluator
+    // cannot expand, so `apply_migration` reports two opaque sinks (one per
+    // `execute_batch`). Released migration code is immutable, so it is accepted
+    // on the same terms as the rolling queue: the region digest equals the
+    // released inventory and the region text never names a protected table.
+    const RELEASED_TIER_ROUTING_REGION: &str = "tier-routing-migration";
+    const RELEASED_TIER_ROUTING_SOURCE: &str = "store/manager_tier_routing.rs";
+    const RELEASED_TIER_ROUTING_REJECTION: &str = "store::manager_tier_routing::apply_migration: opaque dynamic SQL at an execution sink cannot prove either protected write absent (unsupported or ambiguous macro ref_check!, unsupported or ambiguous macro ref_check!)";
+
+    fn released_tier_routing_rejections_are_proven(
+        source_root: &std::path::Path,
+        path: &std::path::Path,
+        rejections: &[String],
+    ) -> Result<bool, String> {
+        released_region_rejections_are_proven(
+            source_root,
+            path,
+            rejections,
+            RELEASED_TIER_ROUTING_REGION,
+            "crates/rsid-store/src/store/manager_tier_routing.rs",
+            &[RELEASED_TIER_ROUTING_REJECTION; 2],
+        )
+    }
+
+    /// A released migration region is accepted only while the rejections are
+    /// exactly the audited ones, the region's digest equals the released
+    /// inventory's pin, and the region text names no protected table.
+    fn released_region_rejections_are_proven(
+        source_root: &std::path::Path,
+        path: &std::path::Path,
+        rejections: &[String],
+        region_name: &str,
+        inventory_path_value: &str,
+        expected_rejections: &[&str],
+    ) -> Result<bool, String> {
         use sha2::Digest;
-        if rejections != [RELEASED_QUEUE_REJECTION.to_string()] {
+        if !rejections
+            .iter()
+            .map(String::as_str)
+            .eq(expected_rejections.iter().copied())
+        {
             return Ok(false);
         }
         let inventory_path = source_root.join("../../..").join(RELEASED_INVENTORY);
@@ -870,21 +920,51 @@ mod p2_07_gate_permit_spine {
         };
         let inventory: serde_json::Value = serde_json::from_slice(&inventory)
             .map_err(|error| format!("parse {} failed ({error})", inventory_path.display()))?;
-        let section = &inventory["protected_sections"][RELEASED_QUEUE_REGION];
+        let section = &inventory["protected_sections"][region_name];
         let source = std::fs::read_to_string(path)
             .map_err(|error| format!("read {} failed ({error})", path.display()))?;
-        let Some(region) = released_migration_region(&source, RELEASED_QUEUE_REGION) else {
+        let Some(region) = released_migration_region(&source, region_name) else {
             return Ok(false);
         };
         let digest = format!("sha256:{:x}", sha2::Sha256::digest(region.as_bytes()));
         let lowered = region.to_ascii_lowercase();
-        Ok(
-            section["path"] == "crates/rsid-store/src/store/rolling_queue.rs"
-                && section["sha256"] == digest.as_str()
-                && ["agent_message_provider", "effect_permits", "turn_gates"]
-                    .iter()
-                    .all(|protected| !lowered.contains(protected)),
-        )
+        Ok(section["path"] == inventory_path_value
+            && section["sha256"] == digest.as_str()
+            && ["agent_message_provider", "effect_permits", "turn_gates"]
+                .iter()
+                .all(|protected| !lowered.contains(protected)))
+    }
+
+    // #1519: the portable export/init walks its own carried-table lists, so its
+    // `dump_table` SELECT and `insert_row` INSERT take a runtime table (and
+    // runtime column list) the evaluator cannot enumerate. They are accepted
+    // only as exactly those two owners, and only while the whole source names
+    // no protected table: the carried lists are string literals in that file,
+    // and both sinks are reached only with a table taken from them, so the
+    // export can never write the gate or permit tables.
+    const PORTABLE_BUNDLE_SOURCE: &str = "store/portable_bundle.rs";
+    const PORTABLE_BUNDLE_REJECTIONS: [&str; 2] = [
+        "store::portable_bundle::Store::dump_table: opaque dynamic SQL at an execution sink cannot prove either protected write absent (unresolved field table.name, unresolved field table.filter, unresolved field table.order_by)",
+        "store::portable_bundle::insert_row: opaque dynamic SQL at an execution sink cannot prove either protected write absent (runtime parameter table, dynamic join input)",
+    ];
+
+    fn portable_bundle_rejections_are_proven(
+        path: &std::path::Path,
+        rejections: &[String],
+    ) -> Result<bool, String> {
+        if !rejections
+            .iter()
+            .map(String::as_str)
+            .eq(PORTABLE_BUNDLE_REJECTIONS)
+        {
+            return Ok(false);
+        }
+        let source = std::fs::read_to_string(path)
+            .map_err(|error| format!("read {} failed ({error})", path.display()))?;
+        let lowered = source.to_ascii_lowercase();
+        Ok(["agent_message_provider", "effect_permits", "turn_gates"]
+            .iter()
+            .all(|protected| !lowered.contains(protected)))
     }
 
     fn semantic_ident(ident: &syn::Ident) -> String {
@@ -7965,6 +8045,25 @@ mod p2_07_gate_permit_spine {
                 {
                     report.dynamic_rejections.truncate(prior_rejections);
                 }
+                if relative == RELEASED_TIER_ROUTING_SOURCE
+                    && report.writers.len() == prior_writers
+                    && released_tier_routing_rejections_are_proven(
+                        source_root,
+                        path,
+                        &report.dynamic_rejections[prior_rejections..],
+                    )?
+                {
+                    report.dynamic_rejections.truncate(prior_rejections);
+                }
+                if relative == PORTABLE_BUNDLE_SOURCE
+                    && report.writers.len() == prior_writers
+                    && portable_bundle_rejections_are_proven(
+                        path,
+                        &report.dynamic_rejections[prior_rejections..],
+                    )?
+                {
+                    report.dynamic_rejections.truncate(prior_rejections);
+                }
                 if relative == "store/catalog_convergence.rs" {
                     let expected = frozen_v114_catalog_rejections_match(
                         path,
@@ -10546,6 +10645,72 @@ mod p2_07_gate_permit_spine {
         )
         .unwrap();
         assert!(!released_queue_rejections_are_proven(&root, &edited, &expected).unwrap());
+    }
+
+    /// #1519: the released tier-routing migration and the portable bundle are
+    /// accepted only on their audited sink sets and source provenance.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn tier_routing_and_portable_bundle_provenance_fails_closed_on_drift() {
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let real_root = repo.join("crates/rsid-store/src");
+        let tier = real_root.join("store/manager_tier_routing.rs");
+        let expected = vec![RELEASED_TIER_ROUTING_REJECTION.to_string(); 2];
+        assert!(
+            released_tier_routing_rejections_are_proven(&real_root, &tier, &expected).unwrap(),
+            "the released tier-routing region must match its inventory digest"
+        );
+        assert!(!released_tier_routing_rejections_are_proven(&real_root, &tier, &[]).unwrap());
+        assert!(
+            !released_tier_routing_rejections_are_proven(&real_root, &tier, &expected[..1])
+                .unwrap()
+        );
+        let mut extra = expected.clone();
+        extra.push(
+            "store::manager_tier_routing::other: dynamic INSERT target could be agent_message_provider_effect_permits"
+                .to_string(),
+        );
+        assert!(!released_tier_routing_rejections_are_proven(&real_root, &tier, &extra).unwrap());
+
+        // A one-byte edit inside the released region no longer matches the
+        // inventory digest.
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().join("crates/rsid-store/src");
+        std::fs::create_dir_all(tree.path().join("tools")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::copy(
+            repo.join(RELEASED_INVENTORY),
+            tree.path().join(RELEASED_INVENTORY),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&tier).unwrap();
+        let edited = root.join("manager_tier_routing.rs");
+        std::fs::write(&edited, &text).unwrap();
+        assert!(released_tier_routing_rejections_are_proven(&root, &edited, &expected).unwrap());
+        std::fs::write(
+            &edited,
+            text.replacen(
+                "tx.execute_batch(CATALOG_MESSAGES)?;",
+                "tx.execute_batch(CATALOG_MESSAGES)?; // INSERT INTO agent_message_provider_effect_permits",
+                1,
+            ),
+        )
+        .unwrap();
+        assert!(!released_tier_routing_rejections_are_proven(&root, &edited, &expected).unwrap());
+
+        let bundle = real_root.join(PORTABLE_BUNDLE_SOURCE);
+        let bundle_expected = PORTABLE_BUNDLE_REJECTIONS.map(str::to_string);
+        assert!(portable_bundle_rejections_are_proven(&bundle, &bundle_expected).unwrap());
+        assert!(!portable_bundle_rejections_are_proven(&bundle, &[]).unwrap());
+        assert!(!portable_bundle_rejections_are_proven(&bundle, &bundle_expected[..1]).unwrap());
+        let drifted = tree.path().join("portable_bundle.rs");
+        let bundle_text = std::fs::read_to_string(&bundle).unwrap();
+        std::fs::write(
+            &drifted,
+            format!("{bundle_text}\n// agent_message_provider_turn_gates\n"),
+        )
+        .unwrap();
+        assert!(!portable_bundle_rejections_are_proven(&drifted, &bundle_expected).unwrap());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]

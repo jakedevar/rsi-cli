@@ -75,6 +75,40 @@ unknown/custom model identifiers remain compatible pass-throughs: RSI forwards
 their valid raw effort to the Codex CLI, which remains authoritative for their
 capabilities.
 
+### Codex CLI host setup: background server off
+
+RSI launches Codex only as `codex exec --json` (the Codex provider) and stdio
+`codex app-server` (CodexAppServer and the config probe). Both run Codex
+in-process, one process tree per RSI session. Neither attaches to Codex's
+shared background server (the app-server daemon). Since codex-cli 0.157 the
+interactive `codex` TUI starts that daemon by default, and the daemon breaks
+RSI's model in three ways:
+
+- it serves every client with the environment of the session that started
+  it, so per-session RSI identity and vault credentials would leak;
+- it updates itself and restarts, draining active turns;
+- a CLI/daemon version or feature mismatch stops startup at the prompt
+  "Background server has incompatible feature settings". A headless child
+  cannot answer that prompt.
+
+RSI is already the supervisor, so turn the shared server off on RSI hosts:
+
+```bash
+codex features disable daemon_auto_start   # persists [features] daemon_auto_start = false
+codex app-server daemon stop               # the TUI still reuses a daemon that is already running
+```
+
+Verify with `codex app-server daemon version` (`"status":"stopped"`) and
+`codex features list | grep daemon_auto_start` (`false`). The interactive
+`codex` TUI then runs its own embedded server and never shows the prompt.
+`codex exec` and `codex app-server` reject `--no-daemon` because they have no
+daemon path, so RSI needs no launch flag for this.
+
+If every Codex session fails with `workspace routing discovery unauthorized
+(401)`, and Codex stderr shows `token_revoked` or `refresh_token_invalidated`,
+the stored ChatGPT login has ended. The operator re-runs `codex login`. RSI
+never writes Codex credentials.
+
 Operator-facing model control is a separate control plane from `UpdateDaemonConfig`.
 Use the operator RPCs:
 

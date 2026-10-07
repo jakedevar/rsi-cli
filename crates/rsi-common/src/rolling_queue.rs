@@ -16,6 +16,12 @@ pub const ROLLING_QUEUE_DEFAULT_BATCH_SIZE: u32 = 4;
 pub const ROLLING_QUEUE_MAX_SPECULATION_DEPTH: u64 = 2;
 pub const ROLLING_QUEUE_DEFAULT_SPECULATION_DEPTH: u32 = 1;
 pub const ROLLING_QUEUE_LIST_MAX: usize = 200;
+/// Wall-clock budget, in minutes, of one batch's gating (every lander run of
+/// the batch, its bisect included). Operator setting
+/// `rolling_queue_gate_timeout_mins` (#1208).
+pub const ROLLING_QUEUE_MIN_GATE_TIMEOUT_MINS: u64 = 30;
+pub const ROLLING_QUEUE_MAX_GATE_TIMEOUT_MINS: u64 = 1440;
+pub const ROLLING_QUEUE_DEFAULT_GATE_TIMEOUT_MINS: u32 = 360;
 
 /// Stable refusal codes; each is the whole `InvalidParam`/`PolicyDenied` text.
 pub const QUEUE_DISABLED: &str = "queue_disabled";
@@ -39,6 +45,13 @@ pub const QUEUE_BATCH_ANCESTRY_UNVERIFIED: &str = "queue_batch_ancestry_unverifi
 /// A red-batch bisect step failed to shrink the suspect window (a guard: the
 /// remaining sources settle with this code rather than looping).
 pub const QUEUE_BISECT_NO_PROGRESS: &str = "queue_bisect_no_progress";
+/// The batch spent its whole gate wall-time budget
+/// (`rolling_queue_gate_timeout_mins`); its unsettled members are refused
+/// with this code instead of holding the queue (#1208).
+pub const QUEUE_GATE_TIMEOUT: &str = "queue_gate_timeout";
+/// The lander reported a source already integrated but the queue could not
+/// confirm it on `origin/rolling` (#1208). A confirmed one settles published.
+pub const QUEUE_SOURCE_ALREADY_INTEGRATED: &str = "queue_source_already_integrated";
 
 /// Lifecycle of one queue entry. Strings match the SQLite CHECK exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +160,15 @@ pub struct AgentEnqueueLandingSourceRequestV1 {
     #[serde(default)]
     pub test_filters: Vec<String>,
     pub idempotency_key: String,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
+    /// #1235: land from this in-reach session's sandbox instead of the
+    /// caller's own. The caller's manager scope must reach the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_session_id: Option<Uuid>,
 }
 
 impl AgentEnqueueLandingSourceRequestV1 {
@@ -213,6 +235,9 @@ pub struct RollingQueueResponse {
     pub enabled: bool,
     pub batch_size: u32,
     pub speculation_depth: u32,
+    /// The batch gate wall-time budget in minutes (#1208).
+    #[serde(default)]
+    pub gate_timeout_mins: u32,
     pub entries: Vec<RollingQueueEntryV1>,
 }
 
@@ -222,6 +247,8 @@ mod tests {
 
     fn request() -> AgentEnqueueLandingSourceRequestV1 {
         AgentEnqueueLandingSourceRequestV1 {
+            project_id: None,
+            source_session_id: None,
             source_commit: "a".repeat(40),
             test_filters: vec!["rsid=rolling_queue".into()],
             idempotency_key: "k1".into(),

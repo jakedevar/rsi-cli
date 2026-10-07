@@ -2,6 +2,7 @@
 use super::*;
 use crate::session::worker_result_guard::{
     NO_RESULT_STOP_REASON, install_test_provider_pid, live_descendant_count, no_result_wake_id,
+    settled_descendant_count,
 };
 use rsi_common::types::WakeMode;
 use std::sync::Arc;
@@ -42,6 +43,13 @@ async fn worker_pair(f: &Fixture) -> (Session, Session) {
 
 /// Run one full turn of a fake provider that says `text` then reports success.
 async fn run_turn(f: &Fixture, worker: &Session, text: &str) {
+    run_turn_messages(f, worker, &[text]).await;
+}
+
+/// One turn of a fake provider that sends each of `messages` as its own
+/// assistant message, then reports success.
+async fn run_turn_messages(f: &Fixture, worker: &Session, messages: &[&str]) {
+    let text = messages.last().copied().unwrap_or_default();
     {
         let store = f.manager.store.lock().await;
         store
@@ -60,14 +68,16 @@ async fn run_turn(f: &Fixture, worker: &Session, text: &str) {
     let (stop_tx, stop_rx) = mpsc::channel(1);
     tracked.stop_tx = stop_tx;
     f.manager.active.write().await.insert(worker.id, tracked);
-    let (provider_tx, provider_rx) = mpsc::channel(8);
-    provider_tx
-        .send(StreamEvent {
-            event_type: "assistant".into(),
-            data: serde_json::json!({"role":"assistant","content": text}),
-        })
-        .await
-        .unwrap();
+    let (provider_tx, provider_rx) = mpsc::channel(messages.len() + 8);
+    for message in messages {
+        provider_tx
+            .send(StreamEvent {
+                event_type: "assistant".into(),
+                data: serde_json::json!({"role":"assistant","content": message}),
+            })
+            .await
+            .unwrap();
+    }
     provider_tx
         .send(StreamEvent {
             event_type: "result".into(),
@@ -143,19 +153,42 @@ struct LiveRun {
 }
 
 impl LiveRun {
-    fn start() -> Self {
+    /// `sleeper` replaces `sleep` with another copy of it (a provider helper
+    /// stand-in for #1399); `None` runs plain `sleep`.
+    fn start(sleeper: Option<&std::path::Path>) -> Self {
+        let script = sleeper.map_or_else(
+            || "sleep 60 & wait".to_string(),
+            |path| "sleep 60 & wait".replacen("sleep", &format!("'{}'", path.display()), 1),
+        );
         let sh = std::process::Command::new("sh")
-            .args(["-c", "sleep 60 & wait"])
+            .args(["-c", &script])
             .spawn()
             .expect("spawn stand-in provider tree");
         let pid = sh.id();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while live_descendant_count(pid) == 0 {
+        while raw_child_count(pid) == 0 {
             assert!(std::time::Instant::now() < deadline, "child never started");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         Self { sh }
     }
+}
+
+/// Every child of `pid` (helpers included), by `/proc/*/stat`.
+fn raw_child_count(pid: u32) -> usize {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| std::fs::read_to_string(entry.path().join("stat")).ok())
+        .filter(|stat| {
+            stat.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+                .and_then(|ppid| ppid.parse::<u32>().ok())
+                == Some(pid)
+        })
+        .count()
 }
 
 impl Drop for LiveRun {
@@ -175,7 +208,7 @@ impl Drop for LiveRun {
 async fn no_result_with_live_child_gets_one_continuation_then_no_result() {
     let f = fixture();
     let (_parent, worker) = worker_pair(&f).await;
-    let run = LiveRun::start();
+    let run = LiveRun::start(None);
     install_test_provider_pid(worker.id, run.sh.id());
 
     run_turn(&f, &worker, "waiting for the run").await;
@@ -194,6 +227,7 @@ async fn no_result_with_live_child_gets_one_continuation_then_no_result() {
     assert_eq!(wake.wake_mode, WakeMode::Resume);
     assert_eq!(wake.wake_session_id, Some(worker.id));
     assert!(wake.message.contains("RESULT"));
+    assert!(wake.message.contains("PIPELINE HANDOFF — <STAGE>:"));
     assert_eq!(wake_count(&f, worker.id).await, 1);
 
     // The continuation also ends without RESULT: terminal `no_result`, and no
@@ -231,7 +265,7 @@ async fn running_agent_job_counts_as_owned_work() {
 async fn result_line_or_idle_worker_is_never_continued() {
     let f = fixture();
     let (_parent, with_result) = worker_pair(&f).await;
-    let run = LiveRun::start();
+    let run = LiveRun::start(None);
     install_test_provider_pid(with_result.id, run.sh.id());
     run_turn(&f, &with_result, "done\nRESULT ok commit=abc123").await;
     assert_eq!(wake_count(&f, with_result.id).await, 0);
@@ -253,7 +287,7 @@ async fn operator_and_epic_lead_sessions_are_never_continued() {
     let f = fixture();
     // Operator session: no parent.
     let operator = insert(&f, bare_session(Uuid::new_v4())).await;
-    let run = LiveRun::start();
+    let run = LiveRun::start(None);
     install_test_provider_pid(operator.id, run.sh.id());
     run_turn(&f, &operator, "waiting for the run").await;
     assert_eq!(wake_count(&f, operator.id).await, 0);
@@ -279,7 +313,21 @@ fn result_line_detection_accepts_report_forms_only() {
     assert!(has_result_line("RESULT ok"));
     assert!(has_result_line("notes\n  RESULT: done"));
     assert!(has_result_line("**RESULT** ok") || has_result_line("RESULT"));
+    // #1392: markup closing the keyword and the reviewer's handoff marker.
+    assert!(has_result_line("**RESULT**: green"));
+    assert!(has_result_line(
+        "PIPELINE HANDOFF — REVIEW:\nREVIEW: ACCEPTED"
+    ));
+    assert!(has_result_line("## PIPELINE HANDOFF — 07e501d9f"));
+    // #1616: a reviewer's closing verdict line is a report.
+    assert!(has_result_line("verdict\nREVIEW APPROVE commit=abc"));
+    assert!(has_result_line("REVIEW CHANGES: two blockers"));
+    assert!(has_result_line("**REVIEW APPROVE**"));
+    assert!(!has_result_line("REVIEW: ACCEPTED"));
+    assert!(!has_result_line("REVIEW APPROVED by nobody yet"));
+    assert!(!has_result_line("REVIEWS pending"));
     assert!(!has_result_line("the result is pending"));
+    assert!(!has_result_line("RESULTS are pending"));
     assert!(!has_result_line("waiting for the run"));
 }
 
@@ -290,7 +338,7 @@ async fn worker_with_armed_wake(
     f: &Fixture,
 ) -> (Session, LiveRun, rsi_common::types::ScheduledJob) {
     let (_parent, worker) = worker_pair(f).await;
-    let run = LiveRun::start();
+    let run = LiveRun::start(None);
     install_test_provider_pid(worker.id, run.sh.id());
     run_turn(f, &worker, "waiting for the run").await;
     let wake = f
@@ -476,7 +524,7 @@ async fn terminal_watch_waits_for_the_automatic_continuation_then_fires() {
     let f = fixture();
     let (worker, _run, wake) = worker_with_armed_wake(&f).await;
     // Transient Completed with the continuation armed: the watch is held.
-    let (held, _) = f.manager.watch_decision_for(worker.id).await.unwrap();
+    let (held, _) = f.manager.watch_decision_for(worker.id, true).await.unwrap();
     assert_eq!(held, WatchDecision::NotReady);
 
     // The continuation is retired (ineligible at delivery): the watch fires.
@@ -490,7 +538,7 @@ async fn terminal_watch_waits_for_the_automatic_continuation_then_fires() {
         )
         .unwrap();
     assert_retired_at_delivery(&f, &worker, &wake).await;
-    let (decision, _) = f.manager.watch_decision_for(worker.id).await.unwrap();
+    let (decision, _) = f.manager.watch_decision_for(worker.id, true).await.unwrap();
     assert!(
         matches!(decision, WatchDecision::Fire { .. }),
         "{decision:?}"
@@ -518,9 +566,272 @@ async fn terminal_watch_fires_on_the_final_no_result_completed() {
     run_turn(&f, &worker, "still waiting").await;
     let second = stored(&f, worker.id).await;
     assert_eq!(second.stop_reason.as_deref(), Some(NO_RESULT_STOP_REASON));
-    let (decision, _) = f.manager.watch_decision_for(worker.id).await.unwrap();
+    let (decision, _) = f.manager.watch_decision_for(worker.id, true).await.unwrap();
     assert!(
         matches!(decision, WatchDecision::Fire { .. }),
         "{decision:?}"
     );
+}
+
+// ---- #1392 / #1399: finished workers and reviewers get no nudge ----
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn finished_worker_and_reviewer_get_no_nudge() {
+    let f = fixture();
+    let run = LiveRun::start(None);
+
+    // #1392: the RESULT is its own message after prose with no trailing
+    // newline (Codex), so the turn accumulator holds it mid-line.
+    let (_parent, worker) = worker_pair(&f).await;
+    install_test_provider_pid(worker.id, run.sh.id());
+    run_turn_messages(
+        &f,
+        &worker,
+        &[
+            "All 44 tests passed; recording the handoff for review.",
+            "RESULT ba2f389e6b issue=#1351 status=green",
+        ],
+    )
+    .await;
+    assert_eq!(wake_count(&f, worker.id).await, 0);
+    let stored_worker = stored(&f, worker.id).await;
+    assert_eq!(stored_worker.status, SessionStatus::Completed);
+    assert_ne!(
+        stored_worker.stop_reason.as_deref(),
+        Some(NO_RESULT_STOP_REASON)
+    );
+
+    // A reviewer reports with a PIPELINE HANDOFF and REVIEW fields, no RESULT.
+    let (_parent, reviewer) = worker_pair(&f).await;
+    install_test_provider_pid(reviewer.id, run.sh.id());
+    run_turn(
+        &f,
+        &reviewer,
+        "PIPELINE HANDOFF — REVIEW:\nREVIEW: ACCEPTED commit=ba2f389e6b\nFriction: none",
+    )
+    .await;
+    assert_eq!(wake_count(&f, reviewer.id).await, 0);
+    assert_eq!(
+        stored(&f, reviewer.id).await.status,
+        SessionStatus::Completed
+    );
+}
+
+/// #1459: a foreground command that has just returned is still winding down
+/// (its `sleep` stands in for the shell, wrapper or pipe tail) when the
+/// provider emits its result. One sample sees it; the settled count does not.
+#[cfg(target_os = "linux")]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[test]
+fn just_finished_foreground_command_is_not_a_live_descendant() {
+    let mut sh = std::process::Command::new("sh")
+        .args(["-c", "sleep 0.3 & wait"])
+        .spawn()
+        .expect("spawn stand-in provider tree");
+    let pid = sh.id();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while raw_child_count(pid) == 0 {
+        assert!(std::time::Instant::now() < deadline, "child never started");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        live_descendant_count(pid),
+        1,
+        "one sample sees the winding-down command"
+    );
+    assert_eq!(
+        settled_descendant_count(pid, std::time::Duration::from_millis(800)),
+        0,
+        "the command exited within the settle window"
+    );
+    let _ = sh.wait();
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[test]
+fn still_running_command_survives_the_settle_window() {
+    let run = LiveRun::start(None);
+    assert_eq!(
+        settled_descendant_count(run.sh.id(), std::time::Duration::from_millis(100)),
+        1
+    );
+}
+
+/// A copy of `sleep` named like the provider's MCP gateway.
+#[cfg(target_os = "linux")]
+fn helper_named_sleeper(dir: &std::path::Path) -> std::path::PathBuf {
+    let sleep = ["/usr/bin/sleep", "/bin/sleep"]
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .find(|path| path.exists())
+        .expect("a sleep binary");
+    let helper = dir.join("rsi-agent-mcp");
+    std::fs::copy(sleep, &helper).expect("copy sleep");
+    helper
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn finished_run_with_only_provider_helpers_is_not_still_going() {
+    let f = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let helper = helper_named_sleeper(dir.path());
+    // #1399: every command returned; only the provider's helper remains.
+    let run = LiveRun::start(Some(&helper));
+    assert_eq!(raw_child_count(run.sh.id()), 1, "the helper is running");
+    assert_eq!(
+        live_descendant_count(run.sh.id()),
+        0,
+        "a provider helper is not a run"
+    );
+    let (_parent, worker) = worker_pair(&f).await;
+    install_test_provider_pid(worker.id, run.sh.id());
+    run_turn(&f, &worker, "all three cargo commands exited 0").await;
+    assert_eq!(wake_count(&f, worker.id).await, 0);
+    assert_eq!(stored(&f, worker.id).await.status, SessionStatus::Completed);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn armed_wake_is_retired_when_the_latest_turn_already_reported() {
+    let f = fixture();
+    let (worker, _run, wake) = worker_with_armed_wake(&f).await;
+    {
+        let store = f.manager.store.lock().await;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        store
+            .conn
+            .execute(
+                "INSERT INTO conversation_events(session_id,sequence,event_type,role,content,created_at)
+                 VALUES(?1,(SELECT COALESCE(MAX(sequence),0)+1000 FROM conversation_events WHERE session_id=?1),
+                        'Message','Assistant','RESULT abc1234 status=green',?2)",
+                rusqlite::params![worker.id.to_string(), now],
+            )
+            .unwrap();
+        assert!(store.latest_turn_reported(worker.id).unwrap());
+    }
+    assert_retired_at_delivery(&f, &worker, &wake).await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn result_sha_terminal_report_persists_mismatch_and_verified_replacement() {
+    let f = fixture();
+    let (_, mut worker) = worker_pair(&f).await;
+    let repo = crate::test_support::disk_backed_tempdir("result-sha-terminal");
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-q"]);
+    git(&["commit", "--allow-empty", "-qm", "fixture"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    worker.sandbox_root = Some(repo.path().to_path_buf());
+    let fabricated = format!(
+        "{}{}",
+        &head[..7],
+        if head[7..].chars().all(|c| c == '0') {
+            "1".repeat(33)
+        } else {
+            "0".repeat(33)
+        }
+    );
+    let report =
+        format!("PIPELINE HANDOFF — IMPLEMENTATION:\nRESULT {fabricated} issue=#1494 status=green");
+    run_turn(&f, &worker, &report).await;
+    let row = stored(&f, worker.id).await;
+    assert_eq!(row.status, SessionStatus::Completed);
+    assert_eq!(row.stop_reason.as_deref(), Some("result_sha_unknown"));
+    let store = f.manager.store.lock().await;
+    let raw = store
+        .last_assistant_message_event(worker.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(raw.content, report, "raw provider report remains auditable");
+    let normalized =
+        crate::session::worker_result_guard::result_sha::normalized_report(&store, &raw)
+            .unwrap()
+            .unwrap();
+    assert_eq!(normalized, report.replace(&fabricated, &head));
+    let notice = compose_watch_line(&row, None, false, None, None, "worker completed");
+    assert!(
+        notice.contains("result-sha: result_sha_unknown"),
+        "{notice}"
+    );
+    let diagnostics = store
+        .list_session_diagnostics(worker.id, None, 100)
+        .unwrap();
+    assert!(diagnostics.iter().any(|d| {
+        d.fields
+            .as_ref()
+            .is_some_and(|fields| fields["code"] == "result_sha_unknown")
+    }));
+    drop(store);
+
+    // A later valid abbreviated report has its own verification and cause.
+    run_turn(&f, &worker, &format!("RESULT {} status=green", &head[..7])).await;
+    let row = stored(&f, worker.id).await;
+    assert_eq!(row.stop_reason.as_deref(), Some("success"));
+    let store = f.manager.store.lock().await;
+    let raw = store
+        .last_assistant_message_event(worker.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        crate::session::worker_result_guard::result_sha::normalized_report(&store, &raw)
+            .unwrap()
+            .unwrap(),
+        format!("RESULT {head} status=green")
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn result_sha_without_sandbox_is_flagged_without_guessing_head() {
+    let f = fixture();
+    let (_, worker) = worker_pair(&f).await;
+    run_turn(&f, &worker, "PIPELINE HANDOFF — BATON 1234567").await;
+    let row = stored(&f, worker.id).await;
+    assert_eq!(row.status, SessionStatus::Completed);
+    assert_eq!(row.stop_reason.as_deref(), Some("result_sha_unknown"));
+    let store = f.manager.store.lock().await;
+    let raw = store
+        .last_assistant_message_event(worker.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        crate::session::worker_result_guard::result_sha::normalized_report(&store, &raw)
+            .unwrap()
+            .unwrap(),
+        raw.content
+    );
+}
+
+/// #1555: the manager's watch line carries the stranded-worker note.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn watch_line_carries_the_stranded_worker_note() {
+    let f = fixture();
+    let (_, worker) = worker_pair(&f).await;
+    let row = stored(&f, worker.id).await;
+    let note = "no-result: stranded; owns job 12345678 unit rsi-job-unit";
+    let line = compose_watch_line(&row, None, false, None, Some(note), "worker completed");
+    assert!(line.contains(&format!("({note})")), "{line}");
 }

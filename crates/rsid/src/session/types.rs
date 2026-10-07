@@ -1247,6 +1247,7 @@ pub enum StoreCommand {
     },
     InsertProject {
         project: rsi_common::types::Project,
+        respond_to: tokio::sync::oneshot::Sender<Result<()>>,
     },
     UpdateProjectRow {
         project: rsi_common::types::Project,

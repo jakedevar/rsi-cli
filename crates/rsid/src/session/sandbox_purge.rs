@@ -55,6 +55,12 @@ enum CandidateOutcome {
     Retained(&'static str),
 }
 
+/// Result of the locked removal section: removed, or retained with a reason.
+enum PurgeRemoval {
+    Removed,
+    Retained(&'static str),
+}
+
 enum PreservationResult {
     Success,
     Failed,
@@ -310,24 +316,41 @@ fn process_candidate(
         }
     }
     let root_bytes = purge_bytes(root_exists, &root)?;
-    let removed = git_worktree::with_repository_mutation(&origin, || {
+    let removal = git_worktree::with_repository_mutation(&origin, || {
         if let Some(tree) = &unlocked_proof {
-            // The unlocked proof is only as fresh as this check: a tree that
-            // changed since (a late writer, a new holder's output) is retained
-            // for the next pass instead of removed on a stale proof.
-            if !git_worktree::quarantine_tree_matches(tree)? {
-                return Ok::<bool, DaemonError>(false);
-            }
             // The holder proof above ran outside the lock and is stale by now:
             // a task that took a cwd or fd inside the tree since is missed by
-            // the digest check. Re-prove, with its own short wall-clock budget
-            // so the locked section stays bounded, immediately before the
-            // destructive step; a holder or a timeout retains the candidate.
+            // a digest check. Re-prove, with its own short wall-clock budget
+            // so the locked section stays bounded; a holder or a timeout
+            // retains the candidate.
             reaper::reprove_quarantine_has_no_untrusted_same_uid_holders_within(
                 &origin,
                 tree,
                 reaper::QUARANTINE_HOLDER_LOCKED_REPROOF_BUDGET,
             )?;
+            #[cfg(test)]
+            proof_test_hook::run(&root, proof_test_hook::Stage::AfterLockedHolderReproof);
+            // The tree, digest and nlink proof is taken last, after the holder
+            // re-proof and immediately before removal (#1250). That re-proof
+            // can take seconds, and link(2) leaves no fd or cwd in the tree,
+            // so an outside alias made meanwhile is visible only here: the
+            // full walk counts every name of each multiply-linked inode
+            // against its nlink. Any change since the unlocked proof retains
+            // the sandbox. This narrows, but does not close, the window: a
+            // link made between this walk and Git's unlinks is not fenced.
+            match git_worktree::quarantine_tree_matches(tree) {
+                Ok(true) => {}
+                Ok(false) => return Ok(PurgeRemoval::Retained("worktree_changed")),
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %candidate.session_id,
+                        error = %error,
+                        "Archived sandbox purge retained a tree that became unsafe \
+                         during the locked holder re-proof"
+                    );
+                    return Ok(PurgeRemoval::Retained("tree_unsafe_before_removal"));
+                }
+            }
             git_worktree::remove_live_worktree_non_force_locked(&origin, &root, &source_ref, &tip)?;
         }
         if git_worktree::observe_direct_ref_locked(&origin, &source_ref)?
@@ -335,10 +358,10 @@ fn process_candidate(
         {
             git_worktree::delete_ref_compare_locked(&origin, &source_ref, &tip)?;
         }
-        Ok(true)
+        Ok::<PurgeRemoval, DaemonError>(PurgeRemoval::Removed)
     })?;
-    if !removed {
-        return Ok(CandidateOutcome::Retained("worktree_changed"));
+    if let PurgeRemoval::Retained(code) = removal {
+        return Ok(CandidateOutcome::Retained(code));
     }
     {
         let mut store = store.blocking_lock_checked()?;
@@ -502,6 +525,9 @@ mod proof_test_hook {
     pub(super) enum Stage {
         BeforeHolderProof,
         AfterProofs,
+        /// Inside the repository lock, after the holder re-proof and before
+        /// the final tree proof.
+        AfterLockedHolderReproof,
     }
 
     type Hook = Arc<dyn Fn(Stage) + Send + Sync>;
@@ -1057,6 +1083,121 @@ mod tests {
         assert_eq!(report.purged.no_output, 1);
         assert!(!fixture.root.exists());
         assert_eq!(fixture.session_row().0, "Purged");
+    }
+
+    /// #1226: Cargo hard-links uplifted outputs to `target/<profile>/deps`.
+    /// Links that all live inside the sandbox are purged with it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test]
+    async fn cargo_hard_links_inside_the_sandbox_are_purged() {
+        let fixture = PurgeFixture::new();
+        let deps = fixture.root.join("target/release/deps");
+        std::fs::create_dir_all(&deps).expect("create cargo deps");
+        let hashed = deps.join("rsi-0123456789abcdef");
+        std::fs::write(&hashed, "binary\n").expect("write cargo output");
+        std::fs::hard_link(&hashed, fixture.root.join("target/release/rsi"))
+            .expect("cargo uplift hard link");
+        let report = fixture.run(false).await;
+        assert_eq!(report.purged.no_output, 1, "{report:?}");
+        assert!(!fixture.root.exists());
+        assert_eq!(fixture.session_row().0, "Purged");
+    }
+
+    /// #1226: a hard link that also lives outside the sandbox keeps the inode
+    /// reachable, so the sandbox and the outside file are both retained.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test]
+    async fn hard_link_reachable_outside_the_sandbox_retains_it() {
+        let fixture = PurgeFixture::new();
+        std::fs::create_dir_all(fixture.root.join("target")).expect("create target");
+        let inside = fixture.root.join("target/artifact");
+        std::fs::write(&inside, "shared\n").expect("write artifact");
+        let outside = fixture._temp.path().join("outside-artifact");
+        std::fs::hard_link(&inside, &outside).expect("outside hard link");
+        let report = fixture.run(false).await;
+        assert_eq!(report.retained["proof_failed"], 1, "{report:?}");
+        assert!(inside.exists());
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("outside file"),
+            "shared\n"
+        );
+        assert_eq!(fixture.session_row().0, "Live");
+    }
+
+    /// #1250: an outside hard link created DURING the locked holder re-proof
+    /// (after every earlier tree check) must still retain the sandbox. The
+    /// holder scan cannot see it (link(2) leaves no fd or cwd in the tree), so
+    /// only a tree/nlink re-proof taken after the holder proof catches it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test]
+    async fn outside_hard_link_created_during_holder_reproof_retains_sandbox() {
+        let fixture = PurgeFixture::new();
+        // Two in-tree aliases (a Cargo uplift): purgeable on their own.
+        let deps = fixture.root.join("target/release/deps");
+        std::fs::create_dir_all(&deps).expect("create cargo deps");
+        let inside = deps.join("artifact-0123456789abcdef");
+        std::fs::write(&inside, "shared\n").expect("write artifact");
+        std::fs::hard_link(&inside, fixture.root.join("target/release/artifact"))
+            .expect("in-tree hard link");
+        let outside = fixture._temp.path().join("outside-backup");
+        let linked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_inside = inside.clone();
+        let hook_outside = outside.clone();
+        let hook_linked = Arc::clone(&linked);
+        reaper::locked_reproof_test_hook::install(&fixture.root, move || {
+            // A benign snapshot helper links the artifact out and exits.
+            std::fs::hard_link(&hook_inside, &hook_outside).expect("late outside hard link");
+            hook_linked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let report = fixture.run(false).await;
+        assert_eq!(
+            linked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the late link was created during the locked holder re-proof"
+        );
+        assert_eq!(
+            report.retained["tree_unsafe_before_removal"], 1,
+            "{report:?}"
+        );
+        assert_eq!(report.purged, ArchivedSandboxPurgeCounts::default());
+        assert!(inside.exists());
+        assert!(fixture.root.join("target/release/artifact").exists());
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("outside file"),
+            "shared\n"
+        );
+        assert_eq!(fixture.session_row().0, "Live");
+        assert_ne!(
+            git(&fixture.repository, &["for-each-ref", &fixture.source_ref]),
+            ""
+        );
+    }
+
+    /// #1250: the tree digest is re-proved after the locked holder re-proof,
+    /// so a write that lands after it (inside the repository lock, before
+    /// removal) retains the sandbox instead of deleting on a stale digest.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test]
+    async fn tree_changed_after_locked_holder_reproof_is_retained() {
+        let fixture = PurgeFixture::new();
+        let root = fixture.root.clone();
+        proof_test_hook::install(&fixture.root, move |stage| {
+            if stage != proof_test_hook::Stage::AfterLockedHolderReproof {
+                return;
+            }
+            std::fs::create_dir_all(root.join("target")).expect("create ignored dir");
+            std::fs::write(root.join("target").join("late"), "late writer\n")
+                .expect("write late file");
+        });
+        let report = fixture.run(false).await;
+        assert_eq!(report.retained["worktree_changed"], 1, "{report:?}");
+        assert!(fixture.root.join("target").join("late").exists());
+        assert!(fixture.root.join("tracked").exists());
+        assert_eq!(fixture.session_row().0, "Live");
+        assert_ne!(
+            git(&fixture.repository, &["for-each-ref", &fixture.source_ref]),
+            ""
+        );
     }
 
     /// A purge-eligible archived sandbox must be retained while the owner

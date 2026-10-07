@@ -82,7 +82,44 @@ impl SessionManager {
                 + store.manager_v2_recover_decision_deliveries(self.program_run_boot_id)?
                 + store.recover_manager_actions_startup(self.program_run_boot_id)?
         };
+        let auth_episodes: Vec<(
+            String,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        )> = {
+            let store = self.store.lock().await;
+            match store.provider_launch_stats(pressure_observed_at) {
+                Ok(stats) => stats
+                    .into_iter()
+                    .filter_map(|(provider, stats)| {
+                        Some((
+                            provider,
+                            stats.auth_episode_started_at?,
+                            stats.last_auth_failure_at?,
+                        ))
+                    })
+                    .collect(),
+                Err(error) => {
+                    tracing::warn!(error=%error,"provider auth episode scan deferred");
+                    Vec::new()
+                }
+            }
+        };
         for project in &projects {
+            for (provider, started, last) in &auth_episodes {
+                match self
+                    .store
+                    .lock()
+                    .await
+                    .record_provider_auth_invalid_notice(*project, provider, *started, *last)
+                {
+                    Ok(Some(_)) => changed += 1,
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(project_id=%project,error=%error,"provider auth notice deferred");
+                    }
+                }
+            }
             if let Some(pressure) = worker_pressure.as_ref() {
                 match self.store.lock().await.record_worker_slice_pressure_notice(
                     *project,

@@ -22,6 +22,8 @@ pub use crate::store_support::restart_record::{
 pub const WATCHDOG_EXIT_CODE: i32 = 75;
 const PROBE_INTERVAL: Duration = Duration::from_secs(30);
 const PROBE_DEADLINE: Duration = Duration::from_secs(5);
+/// Wall-clock bound on each evidence step of the trip path.
+const TRIP_SNAPSHOT_DEADLINE: Duration = Duration::from_secs(2);
 const PROBE_KEY: &str = "internal_watchdog_probe_nonce";
 
 /// A completion marker shared by a daemon loop and the watchdog thread.
@@ -192,31 +194,34 @@ pub fn start_watchdog(
                 if let Some(trip) = decision.observe(&observation) {
                     let record = restart_record_from_trip(&trip);
                     let metrics = runtime.metrics();
-                    let thread_waits =
-                        bounded_thread_waits(Duration::from_secs(2), thread_wait_snapshot);
-                    tracing::error!(
-                        restart_id = %record.id,
-                        failed_probes = ?record.failed_probes,
-                        last_healthy_at = %record.last_healthy_at,
-                        scheduler_age_ms = ?observation.scheduler_age.map(|age| age.as_millis()),
-                        reconciliation_age_ms = ?observation.reconciliation_age.map(|age| age.as_millis()),
-                        store_lock_contended = store.try_lock().is_err(),
-                        store_probe_pending = store_probe_running.load(Ordering::Acquire),
-                        rpc_probe_pending = rpc_probe_running.load(Ordering::Acquire),
-                        tokio_workers = metrics.num_workers(),
-                        tokio_alive_tasks = metrics.num_alive_tasks(),
-                        tokio_global_queue_depth = metrics.global_queue_depth(),
-                        thread_waits = ?thread_waits,
-                        launch_phases = ?crate::launch_breadcrumbs::snapshot(),
-                        "daemon watchdog tripped"
+                    let store_lock_contended = store.try_lock().is_err();
+                    let store_probe_pending = store_probe_running.load(Ordering::Acquire);
+                    let rpc_probe_pending = rpc_probe_running.load(Ordering::Acquire);
+                    handle_trip(
+                        &data_dir,
+                        &record,
+                        TRIP_SNAPSHOT_DEADLINE,
+                        || crate::thread_stacks::thread_wait_report(TRIP_SNAPSHOT_DEADLINE),
+                        |thread_waits| {
+                            tracing::error!(
+                                restart_id = %record.id,
+                                failed_probes = ?record.failed_probes,
+                                last_healthy_at = %record.last_healthy_at,
+                                scheduler_age_ms = ?observation.scheduler_age.map(|age| age.as_millis()),
+                                reconciliation_age_ms = ?observation.reconciliation_age.map(|age| age.as_millis()),
+                                store_lock_contended,
+                                store_probe_pending,
+                                rpc_probe_pending,
+                                tokio_workers = metrics.num_workers(),
+                                tokio_alive_tasks = metrics.num_alive_tasks(),
+                                tokio_global_queue_depth = metrics.global_queue_depth(),
+                                thread_waits = ?thread_waits,
+                                launch_phases = ?crate::launch_breadcrumbs::snapshot(),
+                                "daemon watchdog tripped"
+                            );
+                        },
+                        |code| std::process::exit(code),
                     );
-                    if let Err(error) =
-                        write_restart_record(&sidecar_path(&data_dir, record.id), &record)
-                    {
-                        tracing::error!(%error, "watchdog restart evidence could not be persisted");
-                    }
-                    write_thread_stacks(&data_dir, record.id);
-                    std::process::exit(WATCHDOG_EXIT_CODE);
                 }
             }
         })?;
@@ -226,61 +231,54 @@ pub fn start_watchdog(
     })
 }
 
-/// Persist every thread's kernel wait state next to the restart record so a
-/// wedge tells a thread blocked on a lock from an idle park. The collection and
-/// the write run on a detached thread and the watchdog waits at most 2 s of wall
-/// clock: `/proc` reads of a wedged thread can block in the kernel, and this must
-/// never stop the restart that follows.
-fn write_thread_stacks(data_dir: &Path, restart_id: Uuid) {
-    let path = data_dir.join(format!("daemon-watchdog-stacks-{restart_id}.txt"));
-    let shown = path.display().to_string();
-    let deadline = Duration::from_secs(2);
-    let written = crate::thread_stacks::write_snapshot_bounded(path, deadline, move || {
-        format!(
-            "# launch phases (id phase age)\n{}\n{}",
-            crate::launch_breadcrumbs::snapshot().join("\n"),
-            crate::thread_stacks::thread_wait_report(deadline)
-        )
-    });
-    if written {
-        tracing::error!(restart_id = %restart_id, path = %shown, "watchdog thread wait snapshot written");
-    }
-}
-
-/// The legacy comm/wchan snapshot for the trip log, collected on a detached
-/// thread under a hard wall-clock deadline: a `/proc` read that blocks in the
-/// kernel must never delay the restart (#1173).
-fn bounded_thread_waits(
+/// The whole trip path after the decision: one bounded `/proc` collection, the
+/// trip log, the restart record, the bounded stacks file, then `exit`. Every step
+/// that can touch a wedged kernel object runs under a wall-clock deadline on a
+/// detached thread, so the restart is reached within a bounded time even when
+/// every `/proc` read hangs (#1173). `collect` and `exit` are seams: production
+/// passes the real snapshot and `process::exit`; tests inject a collector that
+/// never returns and a recorded exit.
+fn handle_trip(
+    data_dir: &Path,
+    record: &RestartRecord,
     deadline: Duration,
-    collect: impl FnOnce() -> Vec<String> + Send + 'static,
-) -> Vec<String> {
+    collect: impl FnOnce() -> String + Send + 'static,
+    log: impl FnOnce(&[String]),
+    exit: impl FnOnce(i32),
+) {
+    let report = bounded_report(deadline, collect);
+    log(&wait_lines(&report));
+    if let Err(error) = write_restart_record(&sidecar_path(data_dir, record.id), record) {
+        tracing::error!(%error, "watchdog restart evidence could not be persisted");
+    }
+    let path = data_dir.join(format!("daemon-watchdog-stacks-{}.txt", record.id));
+    let shown = path.display().to_string();
+    let content = format!(
+        "# launch phases (id phase age)\n{}\n{report}",
+        crate::launch_breadcrumbs::snapshot().join("\n"),
+    );
+    if crate::thread_stacks::write_snapshot_bounded(path, deadline, move || content) {
+        tracing::error!(restart_id = %record.id, path = %shown, "watchdog thread wait snapshot written");
+    }
+    exit(WATCHDOG_EXIT_CODE);
+}
+
+/// The kernel wait snapshot, collected on a detached thread under a hard
+/// wall-clock deadline: a `/proc` read that blocks in the kernel must never delay
+/// the restart. A timeout yields a one-line marker instead.
+fn bounded_report(deadline: Duration, collect: impl FnOnce() -> String + Send + 'static) -> String {
     crate::thread_stacks::bounded_call("watchdog-waits", deadline, collect)
-        .unwrap_or_else(|| vec!["<thread wait snapshot timed out>".to_owned()])
+        .unwrap_or_else(|| "# thread wait snapshot timed out\n".to_owned())
 }
 
-#[cfg(target_os = "linux")]
-fn thread_wait_snapshot() -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
-        return Vec::new();
-    };
-    let mut ids = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
-        .collect::<Vec<_>>();
-    ids.sort();
-    ids.into_iter()
+/// The per-thread lines of a report (comment lines dropped), for the trip log.
+fn wait_lines(report: &str) -> Vec<String> {
+    report
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
         .take(128)
-        .map(|id| {
-            let task = Path::new("/proc/self/task").join(&id);
-            let name = std::fs::read_to_string(task.join("comm")).unwrap_or_default();
-            let wait = std::fs::read_to_string(task.join("wchan")).unwrap_or_default();
-            format!("{}:{}:{}", id.to_string_lossy(), name.trim(), wait.trim())
-        })
+        .map(str::to_owned)
         .collect()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn thread_wait_snapshot() -> Vec<String> {
-    Vec::new()
 }
 
 fn rpc_probe(socket_path: &Path, deadline: Duration) -> bool {
@@ -450,23 +448,89 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
-    fn a_stalled_legacy_wait_snapshot_cannot_delay_the_trip_log() {
+    fn a_hung_snapshot_cannot_stop_the_trip_path_reaching_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let record = RestartRecord {
+            version: 1,
+            id: Uuid::new_v4(),
+            observed_at: now,
+            last_healthy_at: now,
+            failed_probes: vec![FailedProbe::Store.code().to_owned()],
+        };
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let logged = Arc::new(std::sync::Mutex::new(None));
         let started = Instant::now();
-        let waits = bounded_thread_waits(Duration::from_millis(300), || {
-            loop {
+        handle_trip(
+            directory.path(),
+            &record,
+            Duration::from_millis(300),
+            || loop {
                 std::thread::park();
-            }
-        });
+            },
+            {
+                let logged = Arc::clone(&logged);
+                move |waits| *logged.lock().unwrap() = Some(waits.to_vec())
+            },
+            move |code| exit_tx.send(code).unwrap(),
+        );
+        assert_eq!(exit_rx.try_recv(), Ok(WATCHDOG_EXIT_CODE));
         assert!(
             started.elapsed() < Duration::from_millis(1500),
-            "the trip path waited {:?} for a stalled collector",
+            "the trip path took {:?} with a hung snapshot",
             started.elapsed()
         );
-        assert_eq!(waits, vec!["<thread wait snapshot timed out>".to_owned()]);
+        assert_eq!(logged.lock().unwrap().as_deref(), Some(&[][..]));
         assert_eq!(
-            bounded_thread_waits(Duration::from_secs(2), || vec!["tid:comm:futex".into()]),
-            vec!["tid:comm:futex".to_owned()]
+            read_restart_record(&sidecar_path(directory.path(), record.id)).unwrap(),
+            Some(record.clone())
         );
+        let stacks = std::fs::read_to_string(
+            directory
+                .path()
+                .join(format!("daemon-watchdog-stacks-{}.txt", record.id)),
+        )
+        .unwrap();
+        assert!(
+            stacks.contains("thread wait snapshot timed out"),
+            "{stacks}"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn a_prompt_snapshot_feeds_both_the_log_and_the_stacks_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let record = RestartRecord {
+            version: 1,
+            id: Uuid::new_v4(),
+            observed_at: now,
+            last_healthy_at: now,
+            failed_probes: vec![FailedProbe::Rpc.code().to_owned()],
+        };
+        let mut exit_code = None;
+        let mut waits = Vec::new();
+        handle_trip(
+            directory.path(),
+            &record,
+            Duration::from_secs(2),
+            || "# header\ntid 1 comm \"x\" state S wchan futex_wait_queue\n".to_owned(),
+            |lines| waits = lines.to_vec(),
+            |code| exit_code = Some(code),
+        );
+        assert_eq!(exit_code, Some(WATCHDOG_EXIT_CODE));
+        assert_eq!(
+            waits,
+            vec!["tid 1 comm \"x\" state S wchan futex_wait_queue"]
+        );
+        let stacks = std::fs::read_to_string(
+            directory
+                .path()
+                .join(format!("daemon-watchdog-stacks-{}.txt", record.id)),
+        )
+        .unwrap();
+        assert!(stacks.contains("wchan futex_wait_queue"), "{stacks}");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]

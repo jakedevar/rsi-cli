@@ -169,7 +169,7 @@ pub fn compute_context_budget_view(state: &SessionState) -> ContextBudgetViewMod
     }
 }
 
-fn usage_indicator(confidence: ContextUsageConfidence) -> &'static str {
+pub(crate) fn usage_indicator(confidence: ContextUsageConfidence) -> &'static str {
     match confidence {
         ContextUsageConfidence::Counted | ContextUsageConfidence::Full => "",
         ContextUsageConfidence::Partial => "≈",
@@ -179,7 +179,7 @@ fn usage_indicator(confidence: ContextUsageConfidence) -> &'static str {
     }
 }
 
-fn capability_indicator(source: CapabilitySource) -> char {
+pub(crate) fn capability_indicator(source: CapabilitySource) -> char {
     match source {
         CapabilitySource::RuntimeTelemetry => 'T',
         CapabilitySource::Configured => 'K',
@@ -190,7 +190,7 @@ fn capability_indicator(source: CapabilitySource) -> char {
     }
 }
 
-fn capability_source_label(source: CapabilitySource) -> &'static str {
+pub(crate) fn capability_source_label(source: CapabilitySource) -> &'static str {
     match source {
         CapabilitySource::RuntimeTelemetry => "runtime telemetry",
         CapabilitySource::Configured => "configured",

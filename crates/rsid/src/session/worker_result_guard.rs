@@ -16,6 +16,9 @@ use uuid::Uuid;
 
 use crate::store::Store;
 
+#[path = "worker_result_sha.rs"]
+pub(super) mod result_sha;
+
 /// Closed `stop_reason` recorded when the worker misses its RESULT twice.
 pub(crate) const NO_RESULT_STOP_REASON: &str = "no_result";
 
@@ -40,27 +43,72 @@ pub(crate) enum NoResultVerdict {
     SecondMiss,
 }
 
-/// True when any line of `text` is a `RESULT` report line.
+/// True when any line of `text` is a final report: a `RESULT` line or a
+/// `PIPELINE HANDOFF` marker (#1392; see `store::worker_no_result`).
 pub(crate) fn has_result_line(text: &str) -> bool {
-    text.lines().any(|line| {
-        let line = line.trim_start_matches(|c: char| {
-            c.is_whitespace() || matches!(c, '*' | '#' | '>' | '`' | '-' | '_')
-        });
-        line == "RESULT"
-            || line
-                .strip_prefix("RESULT")
-                .is_some_and(|rest| rest.starts_with([' ', ':', '\t']))
-    })
+    crate::store::worker_no_result::is_final_report(text)
 }
 
-/// Live (non-zombie) descendants of `pid`, by the `/proc` parent chain.
-#[cfg(target_os = "linux")]
+/// #1392: true when any assistant message of the current turn (after the last
+/// user message) is a final report. The monitor's turn accumulator joins
+/// messages with no separator, so a `RESULT` message that follows prose
+/// without a trailing newline lands mid-line there; each message is checked
+/// on its own here.
+pub(crate) fn turn_messages_report(events: &[rsi_common::types::ConversationEvent]) -> bool {
+    use rsi_common::types::{EventType, Role};
+    events
+        .iter()
+        .rev()
+        .filter(|event| event.event_type == EventType::Message)
+        .take_while(|event| event.role != Some(Role::User))
+        .any(|event| event.role == Some(Role::Assistant) && has_result_line(&event.content))
+}
+
+/// #1399: long-lived helpers a provider starts for itself (the native-tool
+/// MCP gateway, Codex's code-mode runner, other stdio MCP servers). They live
+/// as long as the provider, so counting them reported "your run is still
+/// going" after every command had exited. `comm` is the kernel's 15-byte name.
+pub(crate) fn is_provider_helper_comm(comm: &str) -> bool {
+    matches!(comm, "rsi-agent-mcp" | "codex-code-mode")
+        || comm.ends_with("-mcp")
+        || comm.starts_with("mcp-")
+        || comm.contains("mcp-server")
+        || comm.contains("mcp_server")
+}
+
+/// How long a descendant must survive between two samples to count as a
+/// still-running run (#1459). A foreground command that just returned exits
+/// its shell, wrappers and pipe tails within milliseconds of the provider
+/// emitting its result; a single sample at that instant saw those exiting
+/// processes and reported "your run is still going" for a finished test.
+pub(crate) const DESCENDANT_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Live (non-zombie) descendants of `pid`, by the `/proc` parent chain,
+/// excluding provider helpers and everything below them (#1399).
 pub(crate) fn live_descendant_count(pid: u32) -> usize {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
+    live_descendant_pids(pid).len()
+}
+
+/// Descendants of `pid` that are still live after `settle`: the pids present
+/// in both a sample now and a second sample `settle` later (#1459).
+pub(crate) fn settled_descendant_count(pid: u32, settle: std::time::Duration) -> usize {
+    let first = live_descendant_pids(pid);
+    if first.is_empty() {
         return 0;
+    }
+    std::thread::sleep(settle);
+    live_descendant_pids(pid).intersection(&first).count()
+}
+
+#[cfg(target_os = "linux")]
+fn live_descendant_pids(pid: u32) -> std::collections::HashSet<u32> {
+    let mut live = std::collections::HashSet::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return live;
     };
     let mut parent_of = std::collections::HashMap::<u32, u32>::new();
     let mut zombies = std::collections::HashSet::<u32>::new();
+    let mut helpers = std::collections::HashSet::<u32>::new();
     for entry in entries.flatten() {
         let Some(child) = entry
             .file_name()
@@ -73,9 +121,10 @@ pub(crate) fn live_descendant_count(pid: u32) -> usize {
             continue;
         };
         // `pid (comm) state ppid ...`; comm may contain spaces and parens.
-        let Some(rest) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+        let Some((head, rest)) = stat.rsplit_once(')') else {
             continue;
         };
+        let comm = head.split_once('(').map_or("", |(_, comm)| comm);
         let mut fields = rest.split_whitespace();
         let state = fields.next();
         let Some(ppid) = fields.next().and_then(|p| p.parse::<u32>().ok()) else {
@@ -84,21 +133,23 @@ pub(crate) fn live_descendant_count(pid: u32) -> usize {
         if matches!(state, Some("Z" | "X" | "x")) {
             zombies.insert(child);
         }
+        if is_provider_helper_comm(comm) {
+            helpers.insert(child);
+        }
         parent_of.insert(child, ppid);
     }
-    let mut live = 0;
     for (&child, _) in &parent_of {
-        if zombies.contains(&child) {
+        if zombies.contains(&child) || helpers.contains(&child) {
             continue;
         }
         let mut cursor = child;
         let mut hops = 0;
         while let Some(&parent) = parent_of.get(&cursor) {
             if parent == pid {
-                live += 1;
+                live.insert(child);
                 break;
             }
-            if parent <= 1 || hops > 64 {
+            if parent <= 1 || hops > 64 || helpers.contains(&parent) {
                 break;
             }
             cursor = parent;
@@ -109,8 +160,8 @@ pub(crate) fn live_descendant_count(pid: u32) -> usize {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn live_descendant_count(_pid: u32) -> usize {
-    0
+fn live_descendant_pids(_pid: u32) -> std::collections::HashSet<u32> {
+    std::collections::HashSet::new()
 }
 
 #[cfg(test)]
@@ -162,7 +213,7 @@ pub(crate) async fn owned_children_alive(
     let Some(pid) = pid else {
         return false;
     };
-    tokio::task::spawn_blocking(move || live_descendant_count(pid) > 0)
+    tokio::task::spawn_blocking(move || settled_descendant_count(pid, DESCENDANT_SETTLE) > 0)
         .await
         .unwrap_or(false)
 }
@@ -172,9 +223,13 @@ pub(crate) async fn worker_no_result_verdict(
     store: &Arc<Mutex<Store>>,
     session: &Session,
     assistant_output: &str,
+    turn_reported: bool,
     children_at_result: bool,
 ) -> NoResultVerdict {
-    if session.status == SessionStatus::Archived || has_result_line(assistant_output) {
+    if session.status == SessionStatus::Archived
+        || has_result_line(assistant_output)
+        || turn_reported
+    {
         return NoResultVerdict::NotApplicable;
     }
     let guard = store.lock().await;
@@ -214,7 +269,7 @@ pub(crate) async fn schedule_no_result_continuation(
     let delivery = rsi_common::daemon_message::wrap(
         "worker-no-result",
         &format!(
-            "{NO_RESULT_MARKER} Your turn ended without a final RESULT line while your run is still going. Wait for it in the foreground (do not end the turn), then report the final `RESULT ...` line."
+            "{NO_RESULT_MARKER} Your turn ended without a final report while your run is still going. Wait for it in the foreground (do not end the turn), then report the result using `RESULT ...` or your required `PIPELINE HANDOFF — <STAGE>:` format."
         ),
     );
     let mut wake = super::harness::tools::schedule_wake::build_agent_scheduled_job(
@@ -260,14 +315,22 @@ pub(crate) async fn verdict_for_active(
     if status != SessionStatus::Completed {
         return NoResultVerdict::NotApplicable;
     }
-    let session = active
-        .read()
-        .await
-        .get(&session_id)
-        .map(|tracked| tracked.session.clone());
+    let session = active.read().await.get(&session_id).map(|tracked| {
+        (
+            tracked.session.clone(),
+            turn_messages_report(&tracked.events),
+        )
+    });
     match session {
-        Some(session) => {
-            worker_no_result_verdict(store, &session, assistant_output, children_at_result).await
+        Some((session, turn_reported)) => {
+            worker_no_result_verdict(
+                store,
+                &session,
+                assistant_output,
+                turn_reported,
+                children_at_result,
+            )
+            .await
         }
         None => NoResultVerdict::NotApplicable,
     }

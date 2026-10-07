@@ -8,7 +8,7 @@
 
 use crate::error::{DaemonError, Result};
 use crate::process_control::{
-    ProcessContainment, configure_tokio_process_group, signal_process_group,
+    ProcessContainment, configure_tokio_process_group, signal_process_group_because,
 };
 use rsi_common::rpc::WorkerSliceMemoryPressure;
 use std::ffi::OsStr;
@@ -21,7 +21,7 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
-const SCOPE_SLICE: &str = "rsi-workers.slice";
+pub(crate) const SCOPE_SLICE: &str = "rsi-workers.slice";
 const MIN_MEMORY_MIB: u64 = 256;
 const MAX_MEMORY_MIB: u64 = 1024 * 1024;
 const MAX_CPU_WEIGHT: u64 = 10_000;
@@ -168,6 +168,16 @@ impl WorkerScopeLimits {
 }
 
 fn worker_slice_cgroup_path(cgroup: &str, uid: u32) -> Result<std::path::PathBuf> {
+    // systemd.slice(5): each dash in a slice name encodes one parent level.
+    Ok(user_manager_cgroup_root(cgroup, uid)?
+        .join("rsi.slice")
+        .join(SCOPE_SLICE))
+}
+
+/// The cgroup directory of this user's systemd manager (`user@<uid>.service`)
+/// from the daemon's own `/proc/self/cgroup`. #1337: the CPU-time andon reads
+/// agent scopes and job units beneath it.
+pub(crate) fn user_manager_cgroup_root(cgroup: &str, uid: u32) -> Result<std::path::PathBuf> {
     let own = cgroup
         .lines()
         .find_map(|line| line.strip_prefix("0::"))
@@ -194,8 +204,7 @@ fn worker_slice_cgroup_path(cgroup: &str, uid: u32) -> Result<std::path::PathBuf
     for component in &components[..=index] {
         path.push(component);
     }
-    // systemd.slice(5): each dash in a slice name encodes one parent level.
-    Ok(path.join("rsi.slice").join(SCOPE_SLICE))
+    Ok(path)
 }
 
 #[cfg(target_os = "linux")]
@@ -316,7 +325,11 @@ pub(crate) async fn worker_slice_memory_pressure() -> Option<WorkerSliceMemoryPr
 pub(crate) async fn kill_worker_child(child: &mut tokio::process::Child) -> Result<()> {
     if let Some(pid) = child.id() {
         let pgid = nix::unistd::Pid::from_raw(pid as i32);
-        if let Err(error) = signal_process_group(pgid, nix::sys::signal::Signal::SIGKILL) {
+        if let Err(error) = signal_process_group_because(
+            pgid,
+            nix::sys::signal::Signal::SIGKILL,
+            "forced termination of a provider process group",
+        ) {
             child.kill().await?;
             return Err(DaemonError::Process(format!(
                 "worker process group kill failed: {error}"

@@ -510,6 +510,22 @@ pub fn spawn_reconciliation_loop_with_heartbeat(
     control: Option<crate::session::agent_verbs::AgentControlHandle>,
     heartbeat: Option<crate::watchdog::LoopHeartbeat>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_reconciliation_loop_with_runtime(
+        active, store, event_bus, config, control, heartbeat, None,
+    )
+}
+
+/// Runtime-enabled production loop. Disabled passes still prove executor
+/// liveness to the watchdog without reconciling or mutating session state.
+pub fn spawn_reconciliation_loop_with_runtime(
+    active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
+    store: Arc<tokio::sync::Mutex<Store>>,
+    event_bus: Arc<EventBus>,
+    config: ReconciliationConfig,
+    control: Option<crate::session::agent_verbs::AgentControlHandle>,
+    heartbeat: Option<crate::watchdog::LoopHeartbeat>,
+    runtime: Option<Arc<crate::config::RuntimeConfig>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut liveness_interval =
             tokio::time::interval(Duration::from_secs(config.liveness_interval_secs));
@@ -524,6 +540,16 @@ pub fn spawn_reconciliation_loop_with_heartbeat(
 
         loop {
             liveness_interval.tick().await;
+            if runtime.as_ref().is_some_and(|runtime| {
+                !runtime
+                    .reconciliation_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            }) {
+                if let Some(heartbeat) = &heartbeat {
+                    heartbeat.mark_completed();
+                }
+                continue;
+            }
             consistency_counter += 1;
 
             // --- Sub-step A: Process liveness check ---
@@ -662,6 +688,55 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[tokio::test(start_paused = true)]
+    async fn reconciliation_switch_updates_existing_loop() {
+        let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+        runtime
+            .update_field("reconciliation_enabled", &serde_json::json!(false))
+            .unwrap();
+        let now = Utc::now();
+        let id = Uuid::new_v4();
+        let session = serde_json::from_value(serde_json::json!({
+            "id": id, "status": "Running", "created_at": now, "updated_at": now,
+            "query": "live reconciliation", "working_dir": "/tmp", "claude_session_id": null,
+        }))
+        .unwrap();
+        let active = Arc::new(RwLock::new(HashMap::from([(
+            id,
+            TrackedSession::new_for_test(session),
+        )])));
+        let bus = Arc::new(EventBus::new(16));
+        let mut events = bus.subscribe();
+        let handle = spawn_reconciliation_loop_with_runtime(
+            active,
+            Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap())),
+            bus,
+            ReconciliationConfig::default(),
+            None,
+            Some(crate::watchdog::LoopHeartbeat::new()),
+            Some(runtime.clone()),
+        );
+        tokio::task::yield_now().await;
+        assert!(events.try_recv().is_err());
+        for enabled in [true, false, true] {
+            runtime
+                .update_field("reconciliation_enabled", &serde_json::json!(enabled))
+                .unwrap();
+            tokio::time::advance(Duration::from_secs(120)).await;
+            tokio::task::yield_now().await;
+            let event = events.try_recv();
+            if enabled {
+                assert!(
+                    matches!(event.unwrap().as_ref(), DaemonEvent::SessionReconciled { session_id, .. } if *session_id == id)
+                );
+            } else {
+                assert!(event.is_err());
+            }
+        }
+        handle.abort();
     }
 
     /// A5-P2 (F-013/F-014): boot-reconciliation orphan reap. Real OS

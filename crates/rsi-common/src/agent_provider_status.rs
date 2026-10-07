@@ -116,6 +116,12 @@ pub struct ProviderStatusEntryV1 {
     /// Last rate-limited (429-class) failure inside the lookback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_429_at: Option<DateTime<Utc>>,
+    /// Last auth-rejected (401-class) startup inside the lookback (#1610).
+    /// `launch_admission` is `refused` with detail `auth_invalid` from the
+    /// first such failure until a later launch of this provider gets past
+    /// startup; the credential itself stays operator-owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_auth_failure_at: Option<DateTime<Utc>>,
     pub launches_24h: u32,
     pub failed_launches_24h: u32,
     /// `failed_launches_24h / launches_24h`, `null` with no launches.
@@ -129,11 +135,82 @@ pub struct AgentGetProviderStatusResultV1 {
     pub cache_ttl_secs: u64,
     /// At most `PROVIDER_STATUS_NAMES.len()` entries.
     pub providers: Vec<ProviderStatusEntryV1>,
+    /// Issue #1407: the operator provider profile in force. Under `aws_only`
+    /// every provider but `claude` and `bedrock` (Claude on a Bedrock Claude
+    /// model) reports `launch_admission: refused` with
+    /// `refusal_detail: provider_profile_refused`.
+    #[serde(default)]
+    pub provider_profile: crate::provider_profile::ProviderProfile,
+}
+
+impl AgentGetProviderStatusResultV1 {
+    /// Record `profile` and mark every provider it refuses as refused up
+    /// front. `all` changes nothing.
+    pub fn apply_provider_profile(&mut self, profile: crate::provider_profile::ProviderProfile) {
+        self.provider_profile = profile;
+        if profile == crate::provider_profile::ProviderProfile::All {
+            return;
+        }
+        for entry in &mut self.providers {
+            if !matches!(entry.provider.as_str(), "claude" | "bedrock") {
+                entry.launch_admission = "refused".to_string();
+                entry.refusal_detail =
+                    Some(crate::provider_profile::PROVIDER_PROFILE_REFUSED.to_string());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aws_only_marks_every_provider_but_claude_and_bedrock_refused() {
+        let entry = |provider: &str| ProviderStatusEntryV1 {
+            provider: provider.to_string(),
+            configured: None,
+            credential_slot: None,
+            reachable: None,
+            launch_admission: "open".to_string(),
+            refusal_detail: None,
+            credit: None,
+            credential_check: None,
+            last_402_at: None,
+            last_429_at: None,
+            last_auth_failure_at: None,
+            launches_24h: 0,
+            failed_launches_24h: 0,
+            failure_rate_24h: None,
+        };
+        let mut report = AgentGetProviderStatusResultV1 {
+            generated_at: Utc::now(),
+            cache_ttl_secs: 60,
+            providers: PROVIDER_STATUS_NAMES
+                .iter()
+                .map(|name| entry(name))
+                .collect(),
+            provider_profile: crate::provider_profile::ProviderProfile::All,
+        };
+        let unchanged = report.clone();
+        report.apply_provider_profile(crate::provider_profile::ProviderProfile::All);
+        assert_eq!(report, unchanged, "`all` changes nothing");
+
+        report.apply_provider_profile(crate::provider_profile::ProviderProfile::AwsOnly);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["provider_profile"], "aws_only");
+        for status in &report.providers {
+            if matches!(status.provider.as_str(), "claude" | "bedrock") {
+                assert_eq!(status.launch_admission, "open", "{}", status.provider);
+            } else {
+                assert_eq!(status.launch_admission, "refused", "{}", status.provider);
+                assert_eq!(
+                    status.refusal_detail.as_deref(),
+                    Some(crate::provider_profile::PROVIDER_PROFILE_REFUSED)
+                );
+            }
+        }
+    }
 
     #[test]
     fn request_rejects_unknown_fields_and_names() {

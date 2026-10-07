@@ -93,6 +93,7 @@ fn manager_decision_history_preserves_all_pages_and_routes_new_answers_after_reo
         .manager_v2_commit_update(
             config.manager_session_id,
             &AgentManagerUpdateRequestV2 {
+                project_id: None,
                 fence: ManagerFenceV2 {
                     scope_version: config.row_version,
                     policy_version: 1,
@@ -105,6 +106,8 @@ fn manager_decision_history_preserves_all_pages_and_routes_new_answers_after_reo
                     question: "Choose the next feature".into(),
                     request_id: None,
                     work_key: None,
+                    gate: None,
+                    options: vec![],
                 },
             },
             &LedgerObservation::default(),

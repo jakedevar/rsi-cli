@@ -597,6 +597,37 @@ impl Store {
         Ok(authorized)
     }
 
+    /// #1284: the owning Epic of `session_id` in `project_id` by the same
+    /// durable topology walk as the lead authority, without any lead check.
+    /// A bound worker's Issue append records this Epic (the V97 audit row ties
+    /// every session content update to one) beside the worker's own id.
+    pub(crate) fn owning_epic_in_project_tx(
+        tx: &Transaction<'_>,
+        session_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<Option<Uuid>> {
+        let Some(session) = tx
+            .query_row(
+                // Only the constant column list is interpolated.
+                &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id=?1"), // sql-dynamic-ok
+                [session_id.to_string()],
+                map_session_row,
+            )
+            .optional()?
+            .map(super::row_mappers::SessionRow::into_session)
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        if !is_leaf_kind(session.session_kind) || session.project_id != Some(project_id) {
+            return Ok(None);
+        }
+        Ok(resolve_owning_epic_topology_tx(tx, &session)
+            .ok()
+            .filter(|epic| epic.project_id == Some(project_id))
+            .map(|epic| epic.id))
+    }
+
     /// Resolve the persisted owning-Epic authority used by V97 Issue control.
     /// This walks only durable rows and deliberately verifies every parent edge
     /// plus lead generation inside the caller's surrounding transaction.
@@ -1310,7 +1341,7 @@ impl Store {
         Ok(())
     }
 
-    /// Update session_kind (e.g., when escalating TaskRabbit -> Standard).
+    /// Update session_kind (the finalizer persists the final kind).
     pub fn update_session_kind(&self, id: Uuid, kind: SessionKind) -> Result<()> {
         self.conn.execute(
             "UPDATE sessions SET session_kind = ?1, updated_at = ?2 WHERE id = ?3",
@@ -1862,13 +1893,19 @@ impl Store {
     /// written at any point before this call wins regardless of how long
     /// generation took.
     ///
+    /// A session being replaced by an unresolved manager succession is left
+    /// untouched (#1390): its settlement snapshot pins the row.
+    ///
     /// Returns `true` when this call supplied the title and `false` when the
-    /// session already had one. A missing session is an error rather than a
+    /// session already had one or is being succeeded. A missing session is an error rather than a
     /// silent no-op so lost enrichment is visible.
     pub fn fill_session_title_if_absent(&self, session_id: Uuid, title: &str) -> Result<bool> {
         let updated = self.conn.execute(
             "UPDATE sessions SET title = ?1, updated_at = ?2
-             WHERE id = ?3 AND (title IS NULL OR trim(title) = '')",
+             WHERE id = ?3 AND (title IS NULL OR trim(title) = '')
+               AND NOT EXISTS(SELECT 1 FROM manager_root_successions
+                 WHERE predecessor_session_id = ?3
+                   AND state IN ('reserved','executing','established','cleanup_required'))",
             params![
                 title,
                 chrono::Utc::now().to_rfc3339(),
@@ -2190,6 +2227,28 @@ impl Store {
         rotation_id: &str,
         metadata: &str,
     ) -> Result<Vec<Uuid>> {
+        self.publish_rotation_successor_with_chain(guards, rotation_id, metadata)
+            .map(|publication| publication.epics)
+    }
+
+    /// [`Self::publish_rotation_successor`], reporting the sessions an abandon
+    /// publication (#1176) archived. When `(predecessor, rotation_id)` is the
+    /// holder rotation of an operator abandon, the same commit first settles
+    /// every unpublished hop of the blocked chain P → S (→ …) → holder: each
+    /// hop's `completed{successor_id}`, the global grant along the chain, every
+    /// Epic lead on the chain moved to the successor, each hop's `from`
+    /// archived with its manager rotation edge, including the final holder →
+    /// replacement edge. Ordinary rotation finalisation can replay that receipt.
+    ///
+    /// # Errors
+    /// As [`Self::publish_rotation_successor`]; `PolicyDenied` when the
+    /// abandon chain is settled, broken or ambiguous.
+    pub fn publish_rotation_successor_with_chain(
+        &self,
+        guards: &crate::store_support::spawn_single_flight::RotationPublicationGuards,
+        rotation_id: &str,
+        metadata: &str,
+    ) -> Result<super::rotation_abandon::RotationPublication> {
         let predecessor = guards.predecessor();
         let successor = guards.successor();
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
@@ -2228,12 +2287,41 @@ impl Store {
                 "rotation_successor_not_reserved:{denial}:{predecessor}:{successor}:{rotation_id}"
             )));
         }
-        let affected = find_epics_by_lead_on(&tx, predecessor)?;
-        for epic_id in &affected {
-            reject_nonterminal_agent_successor_epic_lead_mutation_on(&tx, *epic_id)?;
-        }
+        let chain =
+            super::rotation_abandon::rotation_abandon_chain_on(&tx, predecessor, rotation_id)?;
+        let is_abandon = chain.is_some();
+        let hops = chain.map(|chain| chain.hops).unwrap_or_default();
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-        for epic_id in &affected {
+        // #1176: the chain's hops settle before the holder's own hop. The
+        // grant moves one hop at a time while every `to` is still unarchived.
+        for hop in &hops {
+            tx.execute(
+                "INSERT INTO rotation_events (session_id, rotation_id, phase, event_type, metadata, created_at)
+                 VALUES (?1, ?2, 'completed', 'completed', ?3, ?4)",
+                params![
+                    hop.from.to_string(),
+                    hop.rotation_id,
+                    serde_json::json!({
+                        "successor_id": hop.to,
+                        "abandoned_to": successor,
+                        "abandon_rotation_id": rotation_id,
+                    })
+                    .to_string(),
+                    now,
+                ],
+            )?;
+            self.transfer_seat_node_in_tx(hop.from, hop.to)?;
+        }
+        let mut lead_holders: Vec<Uuid> = hops.iter().map(|hop| hop.from).collect();
+        lead_holders.push(predecessor);
+        let mut affected = Vec::new();
+        for holder in &lead_holders {
+            for epic_id in find_epics_by_lead_on(&tx, *holder)? {
+                reject_nonterminal_agent_successor_epic_lead_mutation_on(&tx, epic_id)?;
+                affected.push((epic_id, *holder));
+            }
+        }
+        for (epic_id, holder) in &affected {
             let changed = tx.execute(
                 "UPDATE sessions SET lead_session_id=?1,updated_at=?2
                  WHERE id=?3 AND lead_session_id=?4",
@@ -2241,25 +2329,60 @@ impl Store {
                     successor.to_string(),
                     now,
                     epic_id.to_string(),
-                    predecessor.to_string(),
+                    holder.to_string(),
                 ],
             )?;
             if changed != 1 {
                 return Err(DaemonError::Store(format!(
-                    "rotation Epic lead transfer lost durable witness:{epic_id}:{predecessor}"
+                    "rotation Epic lead transfer lost durable witness:{epic_id}:{holder}"
                 )));
             }
         }
+        let mut archived = Vec::with_capacity(hops.len());
+        for hop in &hops {
+            let changed = tx.execute(
+                "UPDATE sessions SET status='Archived', updated_at=?2
+                 WHERE id=?1 AND status IN ('Completed','Failed','Interrupted')
+                   AND pending_archive=0",
+                params![hop.from.to_string(), now],
+            )?;
+            if changed != 1 {
+                return Err(DaemonError::PolicyDenied(format!(
+                    "rotation_abandon_hop_not_archivable:{}",
+                    hop.from
+                )));
+            }
+            Self::record_harness_manager_rotation_on(&tx, hop.from, hop.to)?;
+            archived.push(hop.from);
+        }
+        let affected: Vec<Uuid> = affected.into_iter().map(|(epic_id, _)| epic_id).collect();
         // #1142 F3: the global manager grant follows the seat in the same
         // commit as the publication (a no-op unless the predecessor holds it).
-        self.transfer_global_seat_in_tx(predecessor, successor)?;
+        self.transfer_seat_node_in_tx(predecessor, successor)?;
         tx.execute(
             "INSERT INTO rotation_events (session_id, rotation_id, phase, event_type, metadata, created_at)
              VALUES (?1, ?2, 'completed', 'completed', ?3, ?4)",
             params![predecessor.to_string(), rotation_id, metadata, now],
         )?;
+        if is_abandon {
+            let changed = tx.execute(
+                "UPDATE sessions SET status='Archived', updated_at=?2
+                 WHERE id=?1 AND status='Failed' AND pending_archive=0",
+                params![predecessor.to_string(), now],
+            )?;
+            if changed != 1 {
+                return Err(DaemonError::PolicyDenied(format!(
+                    "rotation_abandon_holder_not_archivable:{predecessor}"
+                )));
+            }
+            Self::record_harness_manager_rotation_on(&tx, predecessor, successor)?;
+            archived.push(predecessor);
+        }
         tx.commit()?;
-        Ok(affected)
+        Ok(super::rotation_abandon::RotationPublication {
+            epics: affected,
+            archived,
+        })
     }
 
     /// RPC-1 C2: the published rotation tip of `predecessor`.
@@ -3365,6 +3488,10 @@ mod active_session_inventory_tests {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod rotation_publication_tests {
+    mod abandon_tests {
+        include!("rotation_abandon_tests.rs");
+    }
+
     use super::*;
     use crate::store::tests::make_test_session;
     use rsi_common::types::SessionKind;

@@ -226,12 +226,15 @@ impl SatelliteDeployRequestV1 {
             format!("hub-{:x}", hasher.finalize())
         };
         crate::agent_deploy::AgentRequestDeployRequestV1 {
+            project_id: None,
             sha: self.sha.clone(),
             binaries_dir: Some(self.binaries_dir.clone()),
             build: None,
             idempotency_key: namespaced,
             max_wait_secs: self.max_wait_secs,
             peer_id: None,
+            cancel: None,
+            interrupt_workers: None,
         }
     }
 }

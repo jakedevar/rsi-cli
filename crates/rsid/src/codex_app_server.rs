@@ -473,6 +473,18 @@ fn terminate_app_server_provider(child_pid: Option<u32>, reason: &str) -> bool {
         return false;
     };
     let pgid = nix::unistd::Pid::from_raw(pid as i32);
+    let target = crate::process_control::SignalTarget::describe(pgid.as_raw());
+    crate::process_control::log_signal(
+        &crate::process_control::SignalRecord {
+            pid: pgid.as_raw(),
+            pgid: Some(pgid.as_raw()),
+            signal: "SIGKILL",
+            reason,
+            target: &target,
+        },
+        std::panic::Location::caller(),
+        "sending",
+    );
     let signal_result = match nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL) {
         Ok(()) => Ok(()),
         Err(group_error) => {

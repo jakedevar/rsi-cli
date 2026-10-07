@@ -128,6 +128,10 @@ pub enum SpawnRejectReason {
     /// row or provider process exists; the launch chokepoint re-checks the
     /// effective model (project default included) for every other path.
     LaunchModelNotAllowed { model: String, allowed: Vec<String> },
+    /// The operator provider profile (issue #1407, `aws_only`) refuses the
+    /// child's provider and model. Refused synchronously like
+    /// `LaunchModelNotAllowed`; the launch chokepoint re-checks every path.
+    ProviderProfileRefused { message: String },
 }
 
 impl std::fmt::Display for SpawnRejectReason {
@@ -209,6 +213,7 @@ impl std::fmt::Display for SpawnRejectReason {
                 "{}",
                 rsi_common::launch_allowlist::launch_model_refusal(allowed, Some(model))
             ),
+            Self::ProviderProfileRefused { message } => write!(f, "{message}"),
             Self::ToolPolicyProviderUnsupported { provider } => write!(
                 f,
                 "{}: the emitter runs under a Harness tool policy that a {provider:?} child \
@@ -389,6 +394,11 @@ impl SpawnCoordinator {
 
     /// Install the daemon runtime config once (the source of the Harness tool
     /// policy defaults, #792). A second install is ignored.
+    /// The installed runtime config, if any (#1407 provider status).
+    pub(crate) fn runtime_config(&self) -> Option<&Arc<crate::config::RuntimeConfig>> {
+        self.runtime_config.get()
+    }
+
     pub(crate) fn install_runtime_config(&self, config: Arc<crate::config::RuntimeConfig>) {
         let _ = self.runtime_config.set(config);
     }
@@ -1025,6 +1035,19 @@ impl SpawnCoordinator {
         // inherit) is vetted at the launch chokepoint, where the project and
         // provider defaults are resolved.
         if let (Some(model), Some(config)) = (child_model.as_deref(), self.runtime_config.get()) {
+            // #1407: the operator provider profile, checked on the same known
+            // model before the allowlist.
+            if let Some(message) = config.provider_profile_refusal(child_provider, Some(model)) {
+                tracing::warn!(
+                    emitter_id = %emitter_id,
+                    epic_id = %epic_id,
+                    model,
+                    "spawn_child rejected by the operator provider profile"
+                );
+                return SpawnState::Rejected {
+                    reason: SpawnRejectReason::ProviderProfileRefused { message },
+                };
+            }
             let allowed = config.launch_model_allowlist.read().clone();
             if !rsi_common::launch_allowlist::launch_model_allowed(
                 &allowed,
@@ -2348,6 +2371,67 @@ mod tests {
             .await;
         assert!(matches!(state, SpawnState::Spawning { .. }), "{state:?}");
         assert!(rx.try_recv().is_ok(), "the allowed child is enqueued");
+    }
+
+    /// Issue #1407: under `provider_profile = aws_only`, `AgentSpawnChild`
+    /// refuses a child that is not Claude on a Bedrock Claude model, typed and
+    /// before any spawn request; a Bedrock Claude child spawns.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn agent_spawn_child_refuses_a_non_bedrock_child_under_the_aws_only_profile() {
+        let (store, _td) = open_store();
+        let (tx, mut rx) = mpsc::channel(8);
+        let coord = SpawnCoordinator::new(tx);
+        let config = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+        config
+            .update_field("provider_profile", &serde_json::json!("aws_only"))
+            .unwrap();
+        coord.install_runtime_config(config);
+        let (active, completed) = empty_runtime();
+        let epic_id = Uuid::new_v4();
+        let emitter_id = Uuid::new_v4();
+        insert(
+            &store,
+            &mk_session(epic_id, SessionKind::Epic, None, Some(emitter_id)),
+        )
+        .await;
+        insert(
+            &store,
+            &mk_session(emitter_id, SessionKind::Task, Some(epic_id), None),
+        )
+        .await;
+        seed_root_invocation(&store, emitter_id, "premium", "high").await;
+
+        let refused = AgentSpawnChildRequestV1 {
+            model: Some("claude-sonnet-5".to_string()),
+            ..agent_request("anthropic-api", "do the thing")
+        };
+        let state = coord
+            .handle_agent(emitter_id, refused, &active, &completed, &store)
+            .await;
+        match state {
+            SpawnState::Rejected {
+                reason: reason @ SpawnRejectReason::ProviderProfileRefused { .. },
+            } => {
+                let text = reason.to_string();
+                assert!(text.starts_with("provider_profile_refused"), "{text}");
+            }
+            other => panic!("expected ProviderProfileRefused, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no spawn request is enqueued");
+
+        let allowed = AgentSpawnChildRequestV1 {
+            model: Some(rsi_common::provider_profile::AWS_ONLY_DEFAULT_MODEL.to_string()),
+            ..agent_request("bedrock-claude", "do the thing")
+        };
+        let state = coord
+            .handle_agent(emitter_id, allowed, &active, &completed, &store)
+            .await;
+        assert!(matches!(state, SpawnState::Spawning { .. }), "{state:?}");
+        assert!(
+            rx.try_recv().is_ok(),
+            "the Bedrock Claude child is enqueued"
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]

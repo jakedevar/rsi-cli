@@ -301,7 +301,8 @@ impl<E: NodeEffects> Executor<E> {
         attempt: &AttemptRow,
     ) -> Result<bool> {
         if let Some(pgid) = attempt.process_group_id {
-            self.effects.kill_stale_group(pgid);
+            self.effects
+                .kill_stale_group(pgid, attempt.sandbox_root.as_deref());
         }
         let (status, settlement) = match Self::violation(execution, attempt) {
             Some(outcome) => outcome,

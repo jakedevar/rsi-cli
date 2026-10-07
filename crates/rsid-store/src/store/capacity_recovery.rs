@@ -2969,6 +2969,7 @@ mod tests {
             let history = fixture
                 .store
                 .list_issue_events_v1(&rsi_common::types::IssueEventPageRequestV1 {
+                    project_id: None,
                     issue_id,
                     after_sequence: 0,
                     limit: None,
@@ -3429,6 +3430,7 @@ mod tests {
                 let history = fixture
                     .store
                     .list_issue_events_v1(&rsi_common::types::IssueEventPageRequestV1 {
+                        project_id: None,
                         issue_id,
                         after_sequence: 0,
                         limit: None,

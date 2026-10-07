@@ -103,6 +103,81 @@ pub struct ManagerLaunchChoiceV2 {
     pub effort: Option<String>,
 }
 
+/// #1195: refusal for a malformed `sandbox_source` (a commit that is not 40
+/// lowercase hex, a relative or oversized path).
+pub const MANAGER_SANDBOX_SOURCE_INVALID: &str = "manager_sandbox_source_invalid";
+/// #1195: a `path` source that is not a registered worktree of the project
+/// repository (after canonicalization).
+pub const MANAGER_SANDBOX_SOURCE_NOT_WORKTREE: &str = "manager_sandbox_source_not_worktree";
+/// #1195: a `commit` source that is not a commit in the project repository.
+pub const MANAGER_SANDBOX_SOURCE_COMMIT_UNKNOWN: &str = "manager_sandbox_source_commit_unknown";
+
+/// #1195: where a manager-created worker's sandbox branches from.
+///
+/// Externally tagged: `{"rolling": {}}`, `{"commit": "<40-hex>"}` or
+/// `{"path": "<absolute worktree path>"}`. Omitted means `rolling`: the
+/// project's freshly fetched `origin/rolling` tip, observed at launch.
+/// `commit` and `path` are resolved once, when the action is admitted or
+/// prepared, and the pinned commit is what the sandbox is allocated from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ManagerSandboxSourceV1 {
+    Rolling {},
+    Commit(String),
+    Path(String),
+}
+
+impl ManagerSandboxSourceV1 {
+    /// Shape check only; the daemon resolves the commit or worktree.
+    ///
+    /// # Errors
+    /// [`MANAGER_SANDBOX_SOURCE_INVALID`].
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let valid = match self {
+            Self::Rolling {} => true,
+            Self::Commit(commit) => {
+                commit.len() == 40
+                    && commit
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }
+            Self::Path(path) => {
+                path.len() <= 4096
+                    && !path.contains('\0')
+                    && std::path::Path::new(path).is_absolute()
+            }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(MANAGER_SANDBOX_SOURCE_INVALID)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagerSandboxSourceKindV1 {
+    Rolling,
+    Commit,
+    Path,
+}
+
+/// #1195: the sandbox source a `create_session` receipt was admitted with.
+///
+/// `commit` is the pinned commit for `commit` and `path`; a `rolling` source
+/// is observed at launch and shows as the worker's `base_commit` in progress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagerSandboxSourceReceiptV1 {
+    pub kind: ManagerSandboxSourceKindV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// The named worktree had uncommitted changes; only its committed `HEAD`
+    /// is used.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub source_dirty: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagerProviderLimitV2 {
@@ -296,6 +371,12 @@ pub enum ManagerInspectSectionV2 {
     MigrationAllocations,
     /// One read-only health row per registered satellite peer (#1017).
     Satellites,
+    /// The project's friction rollup, one row per signature (#1333).
+    Friction,
+    /// Pending non-gate decision records the caller may settle with a
+    /// `decision_ruling` update: its own ledger's and every ledger below it
+    /// (a portfolio seat sees the project manager's), one page (#1415).
+    Rulings,
 }
 
 const fn page_limit() -> u16 {
@@ -313,11 +394,17 @@ pub struct AgentManagerInspectRequestV2 {
     pub cursor: Option<String>,
     #[serde(default = "page_limit")]
     pub limit: u16,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl Default for AgentManagerInspectRequestV2 {
     fn default() -> Self {
         Self {
+            project_id: None,
             section: ManagerInspectSectionV2::Overview,
             epic_id: None,
             cursor: None,
@@ -494,6 +581,9 @@ pub enum PreparedManagerActionV2 {
         kind: SessionKind,
         query: String,
         launch: ManagerLaunchChoiceV2,
+        /// #1195: omitted means a fresh `origin/rolling` base.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandbox_source: Option<ManagerSandboxSourceV1>,
     },
     AssignLead {
         epic_id: Uuid,
@@ -553,13 +643,17 @@ impl PreparedManagerActionV2 {
                 parent_id,
                 query,
                 launch,
+                sandbox_source,
                 ..
             } => {
                 if parent_id.is_nil() {
                     return Err("manager_v2_invalid_prepared_action");
                 }
                 text(query, 32_768)?;
-                launch.validate()
+                launch.validate()?;
+                sandbox_source
+                    .as_ref()
+                    .map_or(Ok(()), ManagerSandboxSourceV1::validate)
             }
             Self::AssignLead {
                 epic_id,
@@ -579,6 +673,11 @@ impl PreparedManagerActionV2 {
 #[serde(deny_unknown_fields)]
 pub struct AgentManagerPrepareControlRequestV2 {
     pub operation: PreparedManagerActionV2,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl AgentManagerPrepareControlRequestV2 {
@@ -673,6 +772,11 @@ pub struct AgentManagerCommitPreparedControlRequestV2 {
     pub prepared_id: Uuid,
     pub target_digest: String,
     pub idempotency_key: String,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl AgentManagerCommitPreparedControlRequestV2 {
@@ -707,6 +811,11 @@ pub enum ManagerPreparedActionCommitResultV2 {
 #[serde(deny_unknown_fields)]
 pub struct AgentManagerGetActionRequestV2 {
     pub operation_id: Uuid,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl AgentManagerGetActionRequestV2 {
@@ -778,6 +887,9 @@ pub enum ManagerActionV2 {
         kind: SessionKind,
         query: String,
         launch: ManagerLaunchChoiceV2,
+        /// #1195: omitted means a fresh `origin/rolling` base.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandbox_source: Option<ManagerSandboxSourceV1>,
     },
     AssignLead {
         epic_id: Uuid,
@@ -1142,13 +1254,17 @@ impl ManagerActionV2 {
                 parent_id,
                 query,
                 launch,
+                sandbox_source,
                 ..
             } => {
                 if parent_id.is_nil() {
                     return Err("manager_v2_invalid_action");
                 }
                 text(query, 262_144)?;
-                launch.validate()
+                launch.validate()?;
+                sandbox_source
+                    .as_ref()
+                    .map_or(Ok(()), ManagerSandboxSourceV1::validate)
             }
             Self::AssignLead {
                 epic_id,
@@ -1216,6 +1332,11 @@ pub struct AgentManagerControlRequestV2 {
     pub fence: ManagerFenceV2,
     pub idempotency_key: String,
     pub operation: ManagerActionV2,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl AgentManagerControlRequestV2 {
@@ -1355,6 +1476,51 @@ pub struct ManagerActionReceiptV2 {
     /// Boxed so every receipt held by value in async lifecycle paths stays
     /// as small as before K14 (inline it added 96 bytes per receipt).
     pub operator_result: Option<Box<OperatorCallResultV1>>,
+    /// #1195: the sandbox source of an admitted `create_session`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_source: Option<ManagerSandboxSourceReceiptV1>,
+}
+
+/// #1311: why a queued action has not started yet. Present only while the
+/// action is queued and something holds it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManagerActionHeldV1 {
+    /// `deploy_draining`: a deploy waits for its quiet point and holds new
+    /// worker starts. The action runs when the hold releases.
+    ///
+    /// `host_load` (#1417): the host's 1-minute load is above the operator's
+    /// `host_load_admission_threshold`, so the daemon holds this
+    /// `create_session` (queued, never refused). It starts on its own once
+    /// the load drops; held creates are released oldest-first. `load` and
+    /// `threshold` are set, `deploy_id` and `release_by` are not (a load hold
+    /// has no release time).
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_id: Option<Uuid>,
+    /// RFC3339 with nanoseconds: the hold releases no later than this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_by: Option<String>,
+    /// `host_load` only: the host's 1-minute load average when last read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load: Option<f64>,
+    /// `host_load` only: the operator threshold the load is compared with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<u32>,
+    /// `host_load` only: launches the daemon admitted in the last minute that
+    /// the 1-minute load has not absorbed yet; each counts one toward the
+    /// comparison with `threshold` (`load + recent_admissions > threshold`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_admissions: Option<u32>,
+}
+
+/// `AgentManagerGetAction` result: the stored receipt plus, while the action
+/// is queued behind a hold, why (#1311, #1417).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManagerActionViewV2 {
+    #[serde(flatten)]
+    pub receipt: ManagerActionReceiptV2,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<ManagerActionHeldV1>,
 }
 
 impl ManagerActionReceiptV2 {
@@ -1631,6 +1797,34 @@ pub enum ManagerUpdateV2 {
         question: String,
         request_id: Option<Uuid>,
         work_key: Option<String>,
+        /// #1415: the real gate this question belongs to, if any. A gated
+        /// record is answered by the operator alone. Omitted: a non-gate
+        /// question a delegated manager may settle (the daemon still refuses a
+        /// manager ruling on a reserved key or a question that names a gate).
+        #[serde(default)]
+        gate: Option<ManagerDecisionGateV2>,
+        /// #1415: the choices on offer, with the asker's recommendation.
+        #[serde(default)]
+        options: Vec<ManagerDecisionOptionV2>,
+    },
+    /// #1415: a delegated manager's audited ruling on a non-gate decision
+    /// record: the owning manager, or any ancestor portfolio seat covering the
+    /// project (`owner_manager_session_id` names the owning ledger as the
+    /// `rulings` inspection rows show it; omitted is the caller's own ledger).
+    /// A gate record refuses it (`manager_v2_decision_operator_gate`).
+    DecisionRuling {
+        key: String,
+        expected_row_version: i64,
+        target_digest: String,
+        answer: String,
+        #[serde(default)]
+        owner_manager_session_id: Option<Uuid>,
+    },
+    /// #1415: the owning manager withdraws its own pending decision record.
+    DecisionWithdraw {
+        key: String,
+        expected_row_version: i64,
+        reason: String,
     },
     Handoff {
         summary: String,
@@ -1651,6 +1845,11 @@ pub struct AgentManagerUpdateRequestV2 {
     pub fence: ManagerFenceV2,
     pub idempotency_key: String,
     pub change: ManagerUpdateV2,
+    /// #1235: the target project of a global manager seat acting inside its
+    /// operator grant. Omitted means the caller's own project. A target the
+    /// daemon checks against the grant, never caller identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
 }
 
 impl AgentManagerUpdateRequestV2 {
@@ -1836,6 +2035,7 @@ impl AgentManagerUpdateRequestV2 {
                 epic_id,
                 question,
                 work_key,
+                options,
                 ..
             } => {
                 if epic_id.is_nil() {
@@ -1846,6 +2046,44 @@ impl AgentManagerUpdateRequestV2 {
                 if let Some(key) = work_key {
                     text(key, 256)?;
                 }
+                if options.len() > MANAGER_DECISION_MAX_OPTIONS
+                    || options.iter().filter(|option| option.recommended).count() > 1
+                {
+                    return Err("manager_v2_invalid_update");
+                }
+                for option in options {
+                    text(&option.label, 256)?;
+                    if let Some(detail) = &option.detail {
+                        text(detail, 2048)?;
+                    }
+                }
+            }
+            ManagerUpdateV2::DecisionRuling {
+                key,
+                expected_row_version,
+                target_digest,
+                answer,
+                owner_manager_session_id,
+            } => {
+                if *expected_row_version <= 0
+                    || owner_manager_session_id.is_some_and(|id| id.is_nil())
+                {
+                    return Err("manager_v2_invalid_update");
+                }
+                text(key, 256)?;
+                text(target_digest, 128)?;
+                text(answer, 16384)?;
+            }
+            ManagerUpdateV2::DecisionWithdraw {
+                key,
+                expected_row_version,
+                reason,
+            } => {
+                if *expected_row_version <= 0 {
+                    return Err("manager_v2_invalid_update");
+                }
+                text(key, 256)?;
+                text(reason, 2048)?;
             }
         }
         Ok(())
@@ -1872,6 +2110,172 @@ pub struct AnswerHarnessManagerDecisionRequestV2 {
     pub target_digest: String,
     pub answer: String,
     pub idempotency_key: String,
+}
+
+/// #1415: the options one decision record may offer.
+pub const MANAGER_DECISION_MAX_OPTIONS: usize = 8;
+/// #1415: a pending decision record older than this many days is stale unless
+/// the operator's request names another bound.
+pub const MANAGER_DECISION_STALE_DAYS_DEFAULT: u32 = 7;
+/// #1415: the longest stale bound a request may name.
+pub const MANAGER_DECISION_STALE_DAYS_MAX: u32 = 3650;
+/// #1415: stale decision rows one list or archive request may carry.
+pub const MANAGER_DECISION_STALE_PAGE: usize = 128;
+
+/// #1415: a real gate. A decision record in one of these classes is answered by
+/// the operator alone: `main` or a release, real money or spend, credentials,
+/// deleting user data, or a human approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagerDecisionGateV2 {
+    MainOrRelease,
+    Spend,
+    Credentials,
+    DataDeletion,
+    HumanApproval,
+}
+
+impl ManagerDecisionGateV2 {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MainOrRelease => "main_or_release",
+            Self::Spend => "spend",
+            Self::Credentials => "credentials",
+            Self::DataDeletion => "data_deletion",
+            Self::HumanApproval => "human_approval",
+        }
+    }
+}
+
+/// #1415: one choice a decision offers, with the asker's recommendation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagerDecisionOptionV2 {
+    pub label: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub recommended: bool,
+}
+
+/// #1415 (operator-only): the project's pending decision records that are
+/// stale: older than `older_than_days`, or owned by a manager that is gone.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListStaleManagerDecisionsRequestV2 {
+    /// Omitted: every project.
+    #[serde(default)]
+    pub project_id: Option<Uuid>,
+    /// Omitted: [`MANAGER_DECISION_STALE_DAYS_DEFAULT`].
+    #[serde(default)]
+    pub older_than_days: Option<u32>,
+    /// Omitted: [`MANAGER_DECISION_STALE_PAGE`].
+    #[serde(default)]
+    pub limit: Option<u16>,
+}
+
+impl ListStaleManagerDecisionsRequestV2 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        validate_stale_days(self.older_than_days)?;
+        if self.project_id.is_some_and(|id| id.is_nil())
+            || self
+                .limit
+                .is_some_and(|n| n == 0 || usize::from(n) > MANAGER_DECISION_STALE_PAGE)
+        {
+            return Err("manager_v2_invalid_request");
+        }
+        Ok(())
+    }
+}
+
+fn validate_stale_days(days: Option<u32>) -> Result<(), &'static str> {
+    if days.is_some_and(|n| n == 0 || n > MANAGER_DECISION_STALE_DAYS_MAX) {
+        return Err("manager_v2_invalid_request");
+    }
+    Ok(())
+}
+
+/// #1415: the exact identity and version of one decision record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagerDecisionRefV2 {
+    pub project_id: Uuid,
+    /// The owning manager's ledger principal.
+    pub owner_manager_session_id: Uuid,
+    pub scope_version: i64,
+    pub key: String,
+    pub expected_row_version: i64,
+}
+
+/// #1415: one stale record a list returns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaleManagerDecisionV2 {
+    /// The exact identity to hand back to the archive request.
+    pub decision: ManagerDecisionRefV2,
+    pub epic_id: Option<Uuid>,
+    pub question: String,
+    pub status: String,
+    /// `operator` or `manager`.
+    pub answerable_by: String,
+    pub gate: Option<String>,
+    pub created_at: String,
+    pub age_seconds: i64,
+    /// `older_than_days` or `manager_gone`.
+    pub stale_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListStaleManagerDecisionsResponseV2 {
+    pub older_than_days: u32,
+    pub rows: Vec<StaleManagerDecisionV2>,
+    /// False when more stale records exist than `rows` carries.
+    pub complete: bool,
+}
+
+/// #1415 (operator-only): archive stale decision records (never delete). Each
+/// item is fenced by its row version and re-checked stale at archive time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveStaleManagerDecisionsRequestV2 {
+    pub items: Vec<ManagerDecisionRefV2>,
+    /// Omitted: [`MANAGER_DECISION_STALE_DAYS_DEFAULT`]; the bound the items
+    /// were listed with.
+    #[serde(default)]
+    pub older_than_days: Option<u32>,
+}
+
+impl ArchiveStaleManagerDecisionsRequestV2 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        validate_stale_days(self.older_than_days)?;
+        if self.items.is_empty() || self.items.len() > MANAGER_DECISION_STALE_PAGE {
+            return Err("manager_v2_invalid_request");
+        }
+        for item in &self.items {
+            if item.project_id.is_nil()
+                || item.owner_manager_session_id.is_nil()
+                || item.scope_version <= 0
+                || item.expected_row_version <= 0
+            {
+                return Err("manager_v2_invalid_request");
+            }
+            text(&item.key, 256)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedManagerDecisionV2 {
+    pub decision: ManagerDecisionRefV2,
+    /// `missing`, `changed`, `already_archived`, `not_stale` or `not_open`.
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveStaleManagerDecisionsResponseV2 {
+    pub archived: Vec<ManagerDecisionRefV2>,
+    pub skipped: Vec<SkippedManagerDecisionV2>,
 }
 
 pub fn text(value: &str, max: usize) -> Result<(), &'static str> {
@@ -2164,6 +2568,10 @@ mod tests {
                 "sandbox_root",
                 "token",
             ] {
+                // #1235: a top-level project_id is the global seat's target.
+                if pointer.is_empty() && key == "project_id" {
+                    continue;
+                }
                 let mut value = root_succession_request();
                 value
                     .pointer_mut(pointer)
@@ -2376,6 +2784,7 @@ mod tests {
     #[test]
     fn prepared_manager_commit_requires_exact_digest_and_key() {
         let valid = AgentManagerCommitPreparedControlRequestV2 {
+            project_id: None,
             prepared_id: Uuid::new_v4(),
             target_digest: format!("sha256:{}", "a".repeat(64)),
             idempotency_key: "commit-prepared-v1".into(),
@@ -2397,6 +2806,7 @@ mod tests {
         }
         assert!(
             AgentManagerGetActionRequestV2 {
+                project_id: None,
                 operation_id: Uuid::nil()
             }
             .validate()

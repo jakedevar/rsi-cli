@@ -719,8 +719,8 @@ impl crate::topology::executor::NodeEffects for SessionNodeEffects {
         self.manager.topology_drivers.commands.forget(attempt_id);
     }
 
-    fn kill_stale_group(&self, pgid: i32) {
-        crate::topology::catalog::kill_group(pgid);
+    fn kill_stale_group(&self, pgid: i32, sandbox: Option<&std::path::Path>) {
+        crate::topology::catalog::kill_group(pgid, sandbox);
     }
 
     fn build_node_cap(&self) -> u32 {
@@ -728,6 +728,22 @@ impl crate::topology::executor::NodeEffects for SessionNodeEffects {
             .runtime_config
             .topology_max_concurrent_build_nodes
             .load(Ordering::Relaxed)
+    }
+
+    fn launch_held(
+        &self,
+        agent_requested: bool,
+        since: chrono::DateTime<chrono::Utc>,
+        attempt: &crate::topology::store::AttemptRow,
+    ) -> bool {
+        // An operator-requested execution is never held (an operator launch
+        // starts when asked); a manager's or Epic lead's waits for the host.
+        agent_requested
+            && self
+                .manager
+                .host_load
+                .admit_waiter(attempt.id, since, Some(attempt.session_id))
+                .is_some()
     }
 }
 
@@ -1502,5 +1518,96 @@ mod tests {
 
         assert_eq!(registry.entries.len(), COMPLETED_EXECUTION_RETENTION_LIMIT);
         assert_eq!(registry.expired.len(), 1);
+    }
+
+    /// #1417: the production effects forward the host-load hold for a manager's
+    /// or Epic lead's execution only. An operator-requested execution is never
+    /// held, and a held node is released by the load dropping.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn host_load_holds_only_agent_requested_topology_launches() {
+        use crate::bus::EventBus;
+        use crate::config::{Config, RuntimeConfig};
+        use crate::host_load::LoadReading;
+        use crate::store::Store;
+        use crate::topology::executor::NodeEffects;
+        use crate::topology::store::{AttemptRow, AttemptStatus};
+
+        let state = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(
+            SessionManager::new(
+                Arc::new(EventBus::new(16)),
+                Store::open(&state.path().join("rsi.db")).unwrap(),
+                false,
+                state.path().join("daemon.sock"),
+                None,
+                Vec::new(),
+                RuntimeConfig::from_config(&Config::from_env()),
+                state.path().join("sandboxes"),
+            )
+            .unwrap(),
+        );
+        let load = Arc::new(std::sync::Mutex::new(75.0_f64));
+        let shared = Arc::clone(&load);
+        manager.host_load().set_source(Arc::new(move || {
+            LoadReading::Load1(*shared.lock().unwrap())
+        }));
+        let effects = SessionNodeEffects {
+            manager: Arc::clone(&manager),
+        };
+        let attempt = |node: &str| AttemptRow {
+            id: Uuid::new_v4(),
+            node_id: node.into(),
+            iteration: 0,
+            attempt_no: 1,
+            status: AttemptStatus::Reserved,
+            dedup_key: format!("topology.node:test:{node}:0:1"),
+            session_id: Uuid::new_v4(),
+            boot_id: None,
+            sandbox_root: None,
+            base_commit: "0".repeat(40),
+            result_commit: None,
+            input: serde_json::json!({}),
+            output: None,
+            failure_class: None,
+            error: None,
+            resolution: None,
+            preserved_ref: None,
+            preserved_commit: None,
+            started_at: None,
+            node_kind: "session".into(),
+            pre_head: None,
+            process_group_id: None,
+        };
+        let (older, younger) = (attempt("older"), attempt("younger"));
+        let now = Utc::now();
+        let (older_since, younger_since) = (now - Duration::minutes(5), now);
+
+        assert!(effects.launch_held(true, older_since, &older));
+        assert!(effects.launch_held(true, younger_since, &younger));
+        assert!(
+            !effects.launch_held(false, younger_since, &younger),
+            "an operator-requested execution is never held"
+        );
+        let status = manager.host_load().status(&[]);
+        assert!(status.holding);
+        assert_eq!(
+            status
+                .held
+                .iter()
+                .map(|item| item.session_id)
+                .collect::<Vec<_>>(),
+            vec![Some(older.session_id), Some(younger.session_id)],
+            "held nodes are listed oldest first"
+        );
+
+        *load.lock().unwrap() = 10.0;
+        assert!(
+            effects.launch_held(true, younger_since, &younger),
+            "the younger node does not overtake the older one"
+        );
+        assert!(!effects.launch_held(true, older_since, &older));
+        assert!(!effects.launch_held(true, younger_since, &younger));
+        assert!(manager.host_load().status(&[]).held.is_empty());
     }
 }

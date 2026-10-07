@@ -26,6 +26,7 @@ pub async fn handle_input_bar_key(app: &mut App, key: KeyEvent) -> bool {
     };
 
     let mode = state.input_bar.surface.mode;
+    let vim_idle = state.input_bar.surface.vim_state.is_idle();
 
     // Ctrl+Enter submits from any mode (insert or normal)
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Enter {
@@ -217,20 +218,35 @@ pub async fn handle_input_bar_key(app: &mut App, key: KeyEvent) -> bool {
     // When the vim machine is mid-sequence (e.g., Space was just pressed and it's waiting
     // for the next key), bypass the input bar entirely so leader sequences like Space+g
     // reach the vim machine even when the input bar has content in normal mode.
-    if app.vim_machine_pending && mode == PopupMode::Normal {
+    if app.vim_machine_pending && mode == PopupMode::Normal && vim_idle {
         return false;
     }
 
-    // Space is a leader key prefix in the global vim machine. In normal mode,
-    // pass it through so leader sequences (e.g., Space+G for ESP Square) work
-    // even when the input bar has content.
+    // An idle Space starts a global leader sequence even with a draft (an idle
+    // `g` does too, but only on an empty draft, which the surface passes
+    // through; with a draft it is the surface's own `gg`). A pending surface
+    // command owns its next key: f<Space>, fg, r<Space>, dgg, etc.
     if mode == PopupMode::Normal
+        && vim_idle
         && key.modifiers == KeyModifiers::NONE
         && key.code == KeyCode::Char(' ')
     {
         return false;
     }
 
+    handle_session_surface_key(app, session_id, key).await
+}
+
+/// Feed `key` to `session_id`'s input bar editor and act on the result:
+/// submit sends a continue, close clears the draft. Returns `false` when the
+/// caller should handle the key. Shared by the detail pane and the global
+/// manager workspace's conversation pane (#1231), which targets a session
+/// that is not the focused pane.
+pub(crate) async fn handle_session_surface_key(
+    app: &mut App,
+    session_id: uuid::Uuid,
+    key: KeyEvent,
+) -> bool {
     // Clone working_dir before mutable borrow to avoid borrow conflicts.
     let working_dir = app
         .sessions
@@ -269,13 +285,9 @@ pub async fn handle_input_bar_key(app: &mut App, key: KeyEvent) -> bool {
             app.mark_dirty();
             true
         }
-        InputAction::Passthrough(_) => {
-            // In normal mode with no content, or unhandled vim key — let caller handle
-            match mode {
-                PopupMode::Normal => false,
-                PopupMode::Insert => false,
-            }
-        }
+        // In normal mode with no content, or an unhandled vim key: the caller
+        // handles it.
+        InputAction::Passthrough(_) => false,
         InputAction::CompileDecision {
             accepted,
             context,
@@ -515,6 +527,101 @@ mod tests {
 
     fn shift_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    #[tokio::test]
+    async fn pending_vim_commands_capture_space_and_g_through_event_loop() {
+        for (keys, start, expected, cursor) in [
+            ("f ", 0, "abc def ghi", 3),
+            ("t ", 0, "abc def ghi", 2),
+            ("dt ", 0, " def ghi", 0),
+            ("fg", 0, "abc def ghi", 8),
+            ("r ", 0, " bc def ghi", 0),
+            ("F ", 10, "abc def ghi", 7),
+            ("T ", 10, "abc def ghi", 8),
+            ("2f ", 0, "abc def ghi", 7),
+            ("di ", 0, "abc def ghi", 0),
+            ("dag", 0, "abc def ghi", 0),
+        ] {
+            let (mut app, id) = crate::app::app_test_helpers::with_session_detail();
+            *app.focused_pane_mut().unwrap() = Pane::SessionDetail { session_id: id };
+            let surface = &mut app.sessions.get_mut(&id).unwrap().input_bar.surface;
+            surface.textarea.insert_str("abc def ghi");
+            surface
+                .textarea
+                .move_cursor(tui_textarea::CursorMove::Jump(0, start));
+            for ch in keys.chars() {
+                crate::event::step_once(&mut app, key(KeyCode::Char(ch))).await;
+            }
+            let surface = &app.sessions[&id].input_bar.surface;
+            assert_eq!(surface.content(), expected, "{keys:?}");
+            assert_eq!(surface.textarea.cursor(), (0, cursor), "{keys:?}");
+            assert!(surface.vim_state.is_idle(), "{keys:?}");
+            assert!(!app.vim_machine_pending, "{keys:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_g_with_a_draft_stays_the_surface_gg_prefix() {
+        let (mut app, id) = crate::app::app_test_helpers::with_session_detail();
+        *app.focused_pane_mut().unwrap() = Pane::SessionDetail { session_id: id };
+        let surface = &mut app.sessions.get_mut(&id).unwrap().input_bar.surface;
+        surface.textarea.insert_str("one\ntwo\nthree");
+        for ch in "gg".chars() {
+            crate::event::step_once(&mut app, key(KeyCode::Char(ch))).await;
+        }
+        let surface = &app.sessions[&id].input_bar.surface;
+        assert_eq!(surface.textarea.cursor(), (0, 0));
+        assert!(!app.vim_machine_pending);
+        assert_eq!(app.vim_machine_prefix, None);
+    }
+
+    #[tokio::test]
+    async fn pending_delete_captures_gg_in_input_bar() {
+        let (mut app, id) = crate::app::app_test_helpers::with_session_detail();
+        *app.focused_pane_mut().unwrap() = Pane::SessionDetail { session_id: id };
+        let surface = &mut app.sessions.get_mut(&id).unwrap().input_bar.surface;
+        surface.textarea.insert_str("one\ntwo\nthree");
+        surface
+            .textarea
+            .move_cursor(tui_textarea::CursorMove::Jump(1, 0));
+        for ch in "dgg".chars() {
+            assert!(handle_input_bar_key(&mut app, key(KeyCode::Char(ch))).await);
+        }
+        assert_eq!(app.sessions[&id].input_bar.surface.content(), "three");
+    }
+
+    #[tokio::test]
+    async fn idle_input_bar_still_dispatches_space_and_g_leaders() {
+        let (mut app, id) = crate::app::app_test_helpers::with_session_detail();
+        *app.focused_pane_mut().unwrap() = Pane::SessionDetail { session_id: id };
+        app.sessions
+            .get_mut(&id)
+            .unwrap()
+            .input_bar
+            .surface
+            .textarea
+            .insert_str("draft");
+        crate::event::step_once(&mut app, key(KeyCode::Char(' '))).await;
+        assert_eq!(app.vim_machine_prefix, Some(' '));
+        crate::event::step_once(&mut app, key(KeyCode::Char(';'))).await;
+        assert!(matches!(app.overlay, OverlayState::CommandPalette { .. }));
+        assert_eq!(app.vim_machine_prefix, None);
+        app.overlay = OverlayState::None;
+        // `g` only reaches the global machine on an empty draft; with a draft
+        // it is the surface's `gg` prefix.
+        app.sessions.get_mut(&id).unwrap().input_bar.surface.clear();
+        crate::event::step_once(&mut app, key(KeyCode::Char('g'))).await;
+        assert_eq!(app.vim_machine_prefix, Some('g'));
+        crate::event::step_once(&mut app, key(KeyCode::Char('j'))).await;
+        assert!(matches!(
+            app.focused_pane(),
+            Some(Pane::SessionList {
+                active_zone: crate::types::SessionListZone::Jobs,
+                ..
+            })
+        ));
+        assert_eq!(app.vim_machine_prefix, None);
     }
 
     /// Assert a Ctrl+Enter was handled as a *submit* whose continue was then

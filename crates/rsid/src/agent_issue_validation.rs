@@ -42,7 +42,10 @@ impl AgentIssueRequestKind {
 
     const fn allowed(self) -> &'static [&'static str] {
         match self {
+            // #1235: every guarded Issue verb takes the optional target
+            // project of a global manager seat.
             Self::List => &[
+                "project_id",
                 "status",
                 "archive",
                 "cursor",
@@ -51,8 +54,9 @@ impl AgentIssueRequestKind {
                 "order",
                 "title_contains",
             ],
-            Self::Get => &["issue_id", "display_number"],
+            Self::Get => &["project_id", "issue_id", "display_number"],
             Self::Update => &[
+                "project_id",
                 "issue_id",
                 "display_number",
                 "expected_row_version",
@@ -66,16 +70,20 @@ impl AgentIssueRequestKind {
                 "clear_assignee",
             ],
             Self::UpdateStatus => &[
+                "project_id",
                 "issue_id",
                 "display_number",
                 "status",
                 "expected_row_version",
                 "idempotency_key",
             ],
-            Self::Archive | Self::Restore => {
-                &["issue_id", "expected_row_version", "idempotency_key"]
-            }
-            Self::ListEvents => &["issue_id", "after_sequence", "limit"],
+            Self::Archive | Self::Restore => &[
+                "project_id",
+                "issue_id",
+                "expected_row_version",
+                "idempotency_key",
+            ],
+            Self::ListEvents => &["project_id", "issue_id", "after_sequence", "limit"],
         }
     }
 
@@ -113,6 +121,7 @@ fn field(name: &str) -> Option<AgentIssueValidationFieldV1> {
         "display_number" => Some(AgentIssueValidationFieldV1::DisplayNumber),
         "order" => Some(AgentIssueValidationFieldV1::Order),
         "title_contains" => Some(AgentIssueValidationFieldV1::TitleContains),
+        "project_id" => Some(AgentIssueValidationFieldV1::ProjectId),
         _ => None,
     }
 }

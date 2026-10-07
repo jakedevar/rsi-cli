@@ -1120,13 +1120,17 @@ mod tests {
                 )
                 .unwrap();
             let cache = allocation.root.join("target");
-            std::fs::create_dir_all(&cache).unwrap();
-            std::fs::write(cache.join(format!("{node}.bin")), "build-cache").unwrap();
+            std::fs::create_dir_all(cache.join("debug")).unwrap();
+            std::fs::write(
+                cache.join("debug").join(format!("{node}.bin")),
+                "build-cache",
+            )
+            .unwrap();
             sessions.push((id, cache));
         }
         assert!(reclaim_terminal_node_cache(&store, sandboxes.path(), sessions[0].0).unwrap());
         assert!(!sessions[0].1.exists());
-        assert!(sessions[1].1.join("B.bin").exists());
+        assert!(sessions[1].1.join("debug").join("B.bin").exists());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]

@@ -95,6 +95,29 @@ fn promisor() -> Promisor {
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
+async fn reclaimed_review_git_proof_never_fetches_missing_promised_objects() {
+    let f = promisor();
+    let common = sh(
+        &f.clone,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    );
+    let error = crate::sandbox::git_worktree::review_repository_source_holds_bounded(
+        &f.clone, &common, &f.commit, &f.blob,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("manager_v2_git_failed"),
+        "{error}"
+    );
+    assert_eq!(
+        invocations(&f.log),
+        0,
+        "the reclaimed-source proof stays local"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
 async fn a_missing_promised_object_is_a_typed_error_and_never_reaches_a_transport() {
     let f = promisor();
     let object = format!("{}:a.txt", f.commit);

@@ -58,8 +58,43 @@ mod gitproof;
 mod holders;
 mod record;
 mod registry;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests;
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod unsupported_tests {
+    use super::*;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn scratch_without_linux_proofs_retains_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let scratch = temp.path().join("rsi-old-scratch");
+        fs::create_dir(&scratch).unwrap();
+        let work = scratch.join("work.txt");
+        fs::write(&work, b"keep work").unwrap();
+        let mut config =
+            ScratchConfig::with_roots(vec![(temp.path().to_path_buf(), RootKind::VarTmp)]);
+        config.min_age = Duration::ZERO;
+        config.registry = temp.path().join("registry");
+        let report = run(&config, SystemTime::now(), false);
+        assert_eq!(report.reclaimed, 0);
+        assert_eq!(fs::read(&work).unwrap(), b"keep work");
+        let dir = record::pin_dir(&scratch).unwrap();
+        assert!(dir.mount.is_none(), "unsupported mount proof stays unknown");
+        assert_eq!(
+            fsys::named_inventory(
+                &dir,
+                &mut Budget::new(
+                    Instant::now() + config.max_duration,
+                    config.max_scan_entries
+                )
+            )
+            .err(),
+            Some(fsys::InventoryError::Unproven)
+        );
+    }
+}
 
 use std::fs;
 use std::io;
@@ -107,14 +142,7 @@ const MAX_REPORTED_BLOCKERS: usize = 64;
 const OWNER_FILE_LIMIT: usize = 4096;
 /// Landers' admin directories listed as roots, at most.
 const MAX_LANDER_ROOTS: usize = 4096;
-/// #1152: registry pruning (see `Registry::prune`) is OFF in production. The
-/// delta review found that absence cannot be proved against a same-user process
-/// racing renames inside the last window before the drop (the cost is a dropped
-/// registry entry, never data); turning it on is a tracked follow-up. The code
-/// and its tests stay; a test or a future caller opts in with
-/// `ScratchConfig::registry_prune`.
-const REGISTRY_PRUNE_ENABLED: bool = false;
-/// Registry names examined per pass when pruning.
+/// Tombstones examined per pass when pruning the registry (#1171).
 const PRUNE_PER_PASS: usize = 256;
 
 /// Which names a root lets the reclaim touch.
@@ -188,8 +216,8 @@ pub struct ScratchConfig {
     pub mountinfo: PathBuf,
     /// The allocation registry; `~/.rsi/scratch-registry` outside tests.
     pub registry: PathBuf,
-    /// Prune registry entries whose allocation is proved gone at the end of a
-    /// pass. Off (`REGISTRY_PRUNE_ENABLED`) in production.
+    /// Drop the registry files of allocations a reclaim finished (tombstoned,
+    /// #1171) at the end of a pass. On in production; a test may turn it off.
     pub registry_prune: bool,
     /// Test seam: runs after a candidate was renamed aside, before the
     /// re-proof, to simulate a late writer.
@@ -202,6 +230,10 @@ pub struct ScratchConfig {
     /// removal of the (now empty) aside directory.
     #[cfg(test)]
     pub before_final_rmdir: Option<fn(&Path)>,
+    /// Test seam: stop right after the tombstone is written, as an
+    /// interruption would, leaving the registry removal to a prune.
+    #[cfg(test)]
+    pub stop_after_tombstone: bool,
     /// Test seam: runs after an adoption wrote its record, before the
     /// directory's timestamps are restored.
     #[cfg(test)]
@@ -220,13 +252,15 @@ impl ScratchConfig {
             proc_root: PathBuf::from("/proc"),
             mountinfo: PathBuf::from("/proc/self/mountinfo"),
             registry: registry::default_registry_path(),
-            registry_prune: REGISTRY_PRUNE_ENABLED,
+            registry_prune: true,
             #[cfg(test)]
             after_rename: None,
             #[cfg(test)]
             after_proof: None,
             #[cfg(test)]
             before_final_rmdir: None,
+            #[cfg(test)]
+            stop_after_tombstone: false,
             #[cfg(test)]
             after_record_write: None,
         }
@@ -977,17 +1011,44 @@ impl<'a> Pass<'a> {
                 return Ok(Decision::Changed);
             }
         }
+        // The deletions above must be durable before anything concludes from
+        // them; a sync that fails stops here, with no tombstone (#1171).
+        if fsys::sync_dir(&prepared.pinned).is_err() {
+            return Ok(Decision::Failed);
+        }
         #[cfg(test)]
         if let Some(hook) = self.config.before_final_rmdir {
             hook(&root_path.join(&aside_name));
         }
-        // Only the directory that was proved: not whatever now has its name.
+        // Only the directory that was proved: not whatever now has its name. A
+        // directory that is not removed (late contents, a swapped name) is
+        // retained and never tombstoned.
         if fsys::rmdir_proved(root, &aside_name, prepared.pinned.ident)? == fsys::Removal::Drift {
             registry.manifest_remove(&prepared.entry.nonce);
             return Ok(Decision::Changed);
         }
-        registry.manifest_remove(&prepared.entry.nonce);
-        registry.remove_entry(&prepared.entry.nonce);
+        // The name was removed; was it the allocation? A concurrent rename can
+        // leave a different directory at the name for that rmdir to remove,
+        // while the allocation lives on elsewhere. Only an inode with no links
+        // left is proved removed; anything else (or a filesystem that does not
+        // say so) is retained with its entry and never tombstoned.
+        if !fsys::is_unlinked(prepared.pinned.raw()) {
+            registry.manifest_remove(&prepared.entry.nonce);
+            return Ok(Decision::Changed);
+        }
+        if fsys::sync_dir(root).is_err() {
+            return Ok(Decision::Failed);
+        }
+        // The directory is durably gone, so is anything that could name this
+        // allocation's nonce: record that before the last registry steps, so an
+        // interruption after this point is finished by a prune (#1171). A
+        // failed write leaves the plain cleanup below, which is also safe.
+        let _ = registry.tombstone_put(&prepared.entry);
+        #[cfg(test)]
+        if self.config.stop_after_tombstone {
+            return Ok(Decision::Reclaim);
+        }
+        registry.finish_reclaimed(&prepared.entry.nonce);
         Ok(Decision::Reclaim)
     }
 
@@ -1150,22 +1211,13 @@ pub fn run(config: &ScratchConfig, now: SystemTime, dry_run: bool) -> ScratchRep
             }
         }
     }
-    // Stale-allocation pruning (#1152): drops an entry only on proof of absence
-    // from its registered parent, under the custody lock reclaims also take.
+    // Finish the registry removal of allocations a reclaim completed (#1171):
+    // only tombstoned entries, under the custody lock reclaims also take.
     if config.registry_prune
         && !dry_run
         && let Some(registry) = &pass.registry
     {
-        let now_unix = u64::try_from(unix_ns(now) / 1_000_000_000).unwrap_or(0);
-        // Read now, not at pass start: a mount that could cover a name must be
-        // in the table the proof uses.
-        let mounts = fsys::read_mounts(&pass.config.mountinfo);
-        registry.prune(
-            now_unix,
-            PRUNE_PER_PASS,
-            &mut pass.budget,
-            mounts.as_deref(),
-        );
+        registry.prune(PRUNE_PER_PASS, &mut pass.budget);
     }
     report.budget_exhausted |= pass.budget.is_exhausted();
     report

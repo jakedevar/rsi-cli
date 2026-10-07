@@ -473,6 +473,7 @@ fn snap_get_health_status_response() {
             }],
             missing: Vec::new(),
         }),
+        supervisor_mode: None,
         // V99/P1-B: a populated snapshot, so the wire shape of the new field is
         // pinned rather than only its empty-vec default.
         rate_limits: vec![ProviderRateLimitSnapshot {

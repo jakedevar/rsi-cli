@@ -505,7 +505,54 @@ mod tests {
     use serde_json::json;
 
     fn temp_dir() -> tempfile::TempDir {
-        tempfile::TempDir::new().unwrap()
+        crate::test_support::disk_backed_tempdir("apply-patch-")
+    }
+
+    /// The system blocklist refuses `/dev` (so a tmpfs `TMPDIR=/dev/shm` working
+    /// directory is rejected on purpose); the refusal must carry `error_msg`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn blocked_working_dir_failure_sets_error_msg() {
+        if !cfg!(target_os = "linux") || !Path::new("/dev/shm").is_dir() {
+            return;
+        }
+        let working_dir = tempfile::tempdir_in("/dev/shm").unwrap();
+        let patch = "\
+*** Begin Patch
+*** Add File: added.txt
++value
+*** End Patch
+";
+        let result = ApplyPatchTool
+            .execute(json!({"patch": patch}), working_dir.path())
+            .await;
+        assert!(!result.success);
+        let message = result.error_msg.expect("failure carries error_msg");
+        assert!(message.contains("system path is blocked"), "{message}");
+        assert!(!working_dir.path().join("added.txt").exists());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn every_failure_path_sets_error_msg() {
+        let working_dir = temp_dir();
+        for args in [
+            json!({"patch": "not a patch"}),
+            json!({"patch": "*** Begin Patch\n*** Add File: ../escape.txt\n+x\n*** End Patch\n"}),
+            json!({"patch": "*** Begin Patch\n*** Update File: missing.txt\n@@\n-a\n+b\n*** End Patch\n"}),
+            json!({"patch": "*** Begin Patch\n*** Delete File: missing.txt\n*** End Patch\n"}),
+            json!({}),
+        ] {
+            let result = ApplyPatchTool
+                .execute(args.clone(), working_dir.path())
+                .await;
+            assert!(!result.success, "{args}");
+            assert!(
+                result.error_msg.as_deref().is_some_and(|m| !m.is_empty()),
+                "{args}: {:?}",
+                result.error_msg
+            );
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]

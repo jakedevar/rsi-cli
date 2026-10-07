@@ -10,9 +10,10 @@
 //! watches and the wakes of an open capacity incident keep their own owners.
 
 use super::super::Store;
-use super::super::harness_manager_v2::now;
+use super::super::harness_manager_v2::{now, refused};
 use super::{ManagerActionClaimV2, ManagerActionOriginV2, action_epic, parse_id};
 use crate::error::Result;
+use rsi_common::harness_manager::HarnessManagerConfigV1;
 use rsi_common::types::SessionStatus;
 use rusqlite::{Transaction, TransactionBehavior, params};
 use serde_json::json;
@@ -159,6 +160,108 @@ impl Store {
         Ok(retired)
     }
 
+    /// #1553: an appointment of another session displaces the seat's holder
+    /// and starts a new anchor, so nothing the displaced holder armed can reach
+    /// the new seat through the rotation lineage (a rotation successor shares
+    /// the anchor and inherits through it). The scope save calls this in its
+    /// own transaction, once the new anchor is published, to hand the displaced
+    /// lineage's pending deliverables to the project's seat:
+    ///
+    /// - enabled terminal watches (`on_terminal:`) on the displaced lineage move
+    ///   to `new_seat`; a watch the new seat already holds on the same session
+    ///   is disabled instead, so one terminal fires one wake;
+    /// - a live deploy (`staged`/`restarting`) changes owner, so its outcome
+    ///   wake is written for the new seat;
+    /// - a deploy outcome wake already written but not yet fired moves to
+    ///   `new_seat`;
+    /// - non-terminal daemon jobs and their pending batch waits move to
+    ///   `new_seat` (#1587);
+    /// - unsettled rolling-queue outcomes and their unfired wakes move to
+    ///   `new_seat` while enqueue/replay identity stays fixed (#1604).
+    ///
+    /// Manager notice watches and unrelated wakes keep their own owners. Rows
+    /// are retargeted or disabled, never deleted. Returns the retargeted
+    /// `(terminal watches, deploys, deploy wakes)`.
+    pub(crate) fn transfer_displaced_seat_wakes_on(
+        &self,
+        displaced: &HarnessManagerConfigV1,
+        new_seat: Uuid,
+    ) -> Result<(usize, usize, usize)> {
+        let origin = displaced.manager_session_id;
+        let mut lineage = super::super::harness_manager::manager_lineage_hops_on(
+            &self.conn,
+            origin,
+            displaced.project_id,
+        );
+        lineage.retain(|session| *session != new_seat);
+        let stamp = now();
+        let (mut watches, mut deploys, mut wakes) = (0, 0, 0);
+        for old in lineage {
+            super::super::agent_jobs::transfer_manager_jobs_on(&self.conn, old, new_seat)?;
+            let old = old.to_string();
+            let target = new_seat.to_string();
+            // Deploy replay/cancel identity is (owner, key). A historical
+            // deployment of the new owner can occupy that key. Refuse the
+            // entire appointment rather than publish a seat with an orphaned
+            // live deploy or make cancel address a different deployment.
+            let conflicting_deploy: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_deploys live
+                 JOIN agent_deploys prior ON prior.owner_session_id=?2
+                   AND prior.idempotency_digest=live.idempotency_digest AND prior.id<>live.id
+                 WHERE live.owner_session_id=?1 AND live.state IN ('staged','restarting'))",
+                params![old, target],
+                |row| row.get(0),
+            )?;
+            if conflicting_deploy {
+                return Err(refused("manager_deploy_transfer_key_conflict"));
+            }
+            let owned: Vec<(String, String)> = {
+                let mut statement = self.conn.prepare(
+                    "SELECT j.id, j.wake_mode FROM scheduled_jobs j
+                     WHERE j.enabled=1 AND j.wake_session_id=?1 AND j.wake_mode LIKE 'on_terminal:%'
+                       AND NOT EXISTS(SELECT 1 FROM harness_manager_watches w WHERE w.job_id=j.id)
+                     ORDER BY j.id",
+                )?;
+                statement
+                    .query_map([&old], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<std::result::Result<_, _>>()?
+            };
+            for (job, mode) in owned {
+                let held: bool = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM scheduled_jobs
+                     WHERE enabled=1 AND wake_session_id=?1 AND wake_mode=?2)",
+                    params![target, mode],
+                    |r| r.get(0),
+                )?;
+                let changed = if held {
+                    self.conn.execute(
+                        "UPDATE scheduled_jobs SET enabled=0,updated_at=?2 WHERE id=?1 AND enabled=1",
+                        params![job, stamp],
+                    )?
+                } else {
+                    self.conn.execute(
+                        "UPDATE scheduled_jobs SET wake_session_id=?2,updated_at=?3
+                         WHERE id=?1 AND enabled=1 AND wake_session_id=?4",
+                        params![job, target, stamp, old],
+                    )?
+                };
+                watches += usize::from(changed == 1 && !held);
+            }
+            deploys += self.conn.execute(
+                "UPDATE agent_deploys SET owner_session_id=?2
+                 WHERE owner_session_id=?1 AND state IN ('staged','restarting')",
+                params![old, target],
+            )?;
+            wakes += self.conn.execute(
+                "UPDATE scheduled_jobs SET wake_session_id=?2,updated_at=?3
+                 WHERE enabled=1 AND wake_mode='resume' AND wake_session_id=?1
+                   AND id IN (SELECT wake_job_id FROM agent_deploys WHERE wake_job_id IS NOT NULL)",
+                params![old, target, stamp],
+            )?;
+        }
+        Ok((watches, deploys, wakes))
+    }
+
     fn retirable_resume_wakes_for(&self, session: Uuid) -> Result<Vec<Uuid>> {
         let mut statement = self.conn.prepare(&format!(
             "SELECT j.id FROM scheduled_jobs j
@@ -302,5 +405,317 @@ mod tests {
         assert!(enabled(&store, on_root));
         assert!(!enabled(&store, on_middle));
         assert!(!enabled(&store, on_predecessor));
+    }
+
+    /// #1553: appointing another session displaces the seat's holder. What the
+    /// displaced holder left armed follows the seat: its terminal watches (one
+    /// per watched session, the new seat's own kept), its live deploy and the
+    /// outcome wake of a settled deploy. Its own continuation wakes stay.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn appointing_another_session_hands_the_displaced_seats_wakes_to_the_new_seat() {
+        use crate::store::agent_deploys::{NewDeploy, deploy_fingerprint_with};
+        use crate::store::manager_coordinator::tests::fixture;
+        use rsi_common::agent_deploy::DeployState;
+        use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
+        use rsi_common::harness_manager_v2::ManagerPolicyV2;
+        use rsi_common::types::SessionKind;
+
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        let store = Store::open_in_memory().unwrap();
+        let (config, lead) = fixture(&store, ManagerPolicyV2::default());
+        let old = config.manager_session_id;
+        let mut successor = crate::test_support::test_session(
+            Uuid::new_v4(),
+            std::path::PathBuf::from("/tmp/1553"),
+        );
+        successor.session_kind = SessionKind::Standard;
+        successor.project_id = Some(config.project_id);
+        successor.status = SessionStatus::Completed;
+        store.insert_session(&successor).unwrap();
+
+        let watch_on = |owner: Uuid, watched: Uuid| {
+            let job = build_agent_scheduled_job(ScheduleWakeRequest {
+                message: "Child ended".into(),
+                in_seconds: None,
+                at: None,
+                name: None,
+                every_seconds: None,
+                mode: Some("on_terminal".into()),
+                working_dir: std::path::PathBuf::from("/tmp/1553"),
+                provider: None,
+                model: None,
+                project_id: None,
+                origin_session_id: Some(owner),
+                watch_session_id: Some(watched),
+            })
+            .unwrap();
+            store.insert_scheduled_job(&job).unwrap();
+            job.id
+        };
+        let moved = watch_on(old, Uuid::new_v4());
+        let shared = Uuid::new_v4();
+        let displaced_duplicate = watch_on(old, shared);
+        let kept_duplicate = watch_on(successor.id, shared);
+        let own_continuation = wake(&store, old, "resume");
+
+        fn new_deploy(owner: Uuid, key: &str) -> NewDeploy<'_> {
+            NewDeploy {
+                id: Uuid::new_v4(),
+                owner_session_id: owner,
+                idempotency_key: key,
+                sha: SHA,
+                fingerprint: deploy_fingerprint_with(SHA, "x", 60, false),
+                manifest: &[],
+                max_wait_secs: 60,
+                interrupt_workers: false,
+            }
+        }
+        let settled = store
+            .insert_agent_deploy(&new_deploy(old, "settled"), chrono::Utc::now())
+            .unwrap();
+        let outcome_wake = store
+            .settle_agent_deploy(
+                settled.id,
+                DeployState::Failed,
+                Some("test"),
+                chrono::Utc::now(),
+            )
+            .unwrap()
+            .expect("the settled deploy's outcome wake");
+        let live = store
+            .insert_agent_deploy(&new_deploy(old, "live"), chrono::Utc::now())
+            .unwrap();
+
+        store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                project_id: config.project_id,
+                session_id: successor.id,
+                epic_ids: Some(vec![lead.parent_id.unwrap()]),
+                group_ids: Vec::new(),
+                expected_row_version: config.row_version,
+            })
+            .unwrap();
+
+        let owner_of = |job: Uuid| {
+            store
+                .get_scheduled_job(&job)
+                .unwrap()
+                .expect("retargeted, never deleted")
+                .wake_session_id
+        };
+        assert_eq!(owner_of(moved), Some(successor.id));
+        assert!(enabled(&store, moved));
+        assert!(!enabled(&store, displaced_duplicate));
+        assert!(enabled(&store, kept_duplicate));
+        assert_eq!(owner_of(kept_duplicate), Some(successor.id));
+        assert_eq!(owner_of(outcome_wake), Some(successor.id));
+        assert!(enabled(&store, outcome_wake));
+        assert_eq!(owner_of(own_continuation), Some(old));
+        assert!(enabled(&store, own_continuation));
+        assert_eq!(
+            store
+                .get_agent_deploy(live.id)
+                .unwrap()
+                .unwrap()
+                .owner_session_id,
+            Some(successor.id)
+        );
+        assert_eq!(
+            store
+                .get_agent_deploy(settled.id)
+                .unwrap()
+                .unwrap()
+                .owner_session_id,
+            Some(old)
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn seat_transfer_stops_at_a_rotation_that_changed_project_or_parent() {
+        use crate::store::agent_deploys::{NewDeploy, deploy_fingerprint_with};
+        use crate::store::manager_coordinator::tests::fixture;
+        use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
+        use rsi_common::harness_manager_v2::ManagerPolicyV2;
+
+        for change_project in [true, false] {
+            let store = Store::open_in_memory().unwrap();
+            let (config, lead) = fixture(&store, ManagerPolicyV2::default());
+            let old = config.manager_session_id;
+            let mut rotated = store.get_session(old).unwrap().unwrap();
+            rotated.id = Uuid::new_v4();
+            rotated.continued_from = Some(old);
+            rotated.rotation_depth += 1;
+            store.insert_session(&rotated).unwrap();
+            store
+                .update_session_status(old, SessionStatus::Archived)
+                .unwrap();
+            store
+                .record_harness_manager_rotation(old, rotated.id)
+                .unwrap();
+
+            let (other, _) = fixture(&store, ManagerPolicyV2::default());
+            // A committed edge does not freeze its sessions' project/parent.
+            // The old appointment's strict lineage now refuses this hop.
+            if change_project {
+                store
+                    .conn
+                    .execute(
+                        "UPDATE sessions SET project_id=?2 WHERE id=?1",
+                        params![rotated.id.to_string(), other.project_id.to_string()],
+                    )
+                    .unwrap();
+            } else {
+                store
+                    .conn
+                    .execute(
+                        "UPDATE sessions SET parent_id=?2 WHERE id=?1",
+                        params![rotated.id.to_string(), lead.parent_id.unwrap().to_string()],
+                    )
+                    .unwrap();
+            }
+            assert!(store.manager_lineage_tip(old).is_err());
+            let own_watch = wake(&store, old, "on_terminal");
+            let foreign_watch = wake(&store, rotated.id, "on_terminal");
+            let foreign_resume = wake(&store, rotated.id, "resume");
+            const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+            let deploy = store
+                .insert_agent_deploy(
+                    &NewDeploy {
+                        id: Uuid::new_v4(),
+                        owner_session_id: rotated.id,
+                        idempotency_key: "foreign-deploy",
+                        sha: SHA,
+                        fingerprint: deploy_fingerprint_with(SHA, "x", 60, false),
+                        manifest: &[],
+                        max_wait_secs: 60,
+                        interrupt_workers: false,
+                    },
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+            let mut successor = store.get_session(old).unwrap().unwrap();
+            successor.id = Uuid::new_v4();
+            successor.status = SessionStatus::Completed;
+            store.insert_session(&successor).unwrap();
+            store
+                .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                    project_id: config.project_id,
+                    session_id: successor.id,
+                    epic_ids: Some(vec![lead.parent_id.unwrap()]),
+                    group_ids: Vec::new(),
+                    expected_row_version: config.row_version,
+                })
+                .unwrap();
+            assert_eq!(
+                store
+                    .get_scheduled_job(&own_watch)
+                    .unwrap()
+                    .unwrap()
+                    .wake_session_id,
+                Some(successor.id)
+            );
+            for job in [foreign_watch, foreign_resume] {
+                let watch = store.get_scheduled_job(&job).unwrap().unwrap();
+                assert_eq!(watch.wake_session_id, Some(rotated.id));
+                assert!(watch.enabled);
+            }
+            assert_eq!(
+                store
+                    .get_agent_deploy(deploy.id)
+                    .unwrap()
+                    .unwrap()
+                    .owner_session_id,
+                Some(rotated.id)
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn deploy_key_collision_rolls_back_the_seat_and_all_wake_transfers() {
+        use crate::store::agent_deploys::{NewDeploy, deploy_fingerprint_with};
+        use crate::store::manager_coordinator::tests::fixture;
+        use rsi_common::agent_deploy::DeployState;
+        use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
+        use rsi_common::harness_manager_v2::ManagerPolicyV2;
+
+        let store = Store::open_in_memory().unwrap();
+        let (config, lead) = fixture(&store, ManagerPolicyV2::default());
+        let old = config.manager_session_id;
+        let mut successor = store.get_session(old).unwrap().unwrap();
+        successor.id = Uuid::new_v4();
+        store.insert_session(&successor).unwrap();
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        let stage = |owner| {
+            store
+                .insert_agent_deploy(
+                    &NewDeploy {
+                        id: Uuid::new_v4(),
+                        owner_session_id: owner,
+                        idempotency_key: "reused-key",
+                        sha: SHA,
+                        fingerprint: deploy_fingerprint_with(SHA, "x", 60, true),
+                        manifest: &[],
+                        max_wait_secs: 60,
+                        interrupt_workers: true,
+                    },
+                    chrono::Utc::now(),
+                )
+                .unwrap()
+        };
+        let prior = stage(successor.id);
+        store
+            .settle_agent_deploy(
+                prior.id,
+                DeployState::Failed,
+                Some("test"),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let live = stage(old);
+        let watch = wake(&store, old, "on_terminal");
+        let error = store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                project_id: config.project_id,
+                session_id: successor.id,
+                epic_ids: Some(vec![lead.parent_id.unwrap()]),
+                group_ids: Vec::new(),
+                expected_row_version: config.row_version,
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("manager_deploy_transfer_key_conflict"),
+            "{error}"
+        );
+        let held = store
+            .get_harness_manager(config.project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.manager_session_id, old);
+        assert_eq!(held.row_version, config.row_version);
+        let watch = store.get_scheduled_job(&watch).unwrap().unwrap();
+        assert_eq!(watch.wake_session_id, Some(old));
+        assert!(watch.enabled);
+        assert_eq!(
+            store
+                .get_agent_deploy(live.id)
+                .unwrap()
+                .unwrap()
+                .owner_session_id,
+            Some(old)
+        );
+        assert!(store.agent_deploy_interrupt(live.id).unwrap().requested);
+        // The retained seat can still cancel its own live deployment.
+        assert_eq!(
+            store
+                .cancel_agent_deploy(old, "reused-key", SHA, chrono::Utc::now())
+                .unwrap()
+                .id,
+            live.id
+        );
     }
 }

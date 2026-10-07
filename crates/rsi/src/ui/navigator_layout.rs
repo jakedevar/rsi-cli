@@ -17,7 +17,6 @@ pub enum NavigatorColumn {
     Age,
     Provider,
     Model,
-    Effort,
     Retry,
     Cost,
     Work,
@@ -123,15 +122,15 @@ fn optional_columns(
 
     match column {
         NavigatorOptionalColumn::Age => &[(Column::Age, 4, Right)],
-        // One persisted preference controls the complete execution identity.
-        // Provider and effort are one-cell glyphs; the model cell shows a
-        // verbatim suffix of the canonical ID (`glyphs::list_model_label`), so
-        // a family shorthand can never replace the actual model version.
-        NavigatorOptionalColumn::ModelEffort => &[
-            (Column::Provider, 1, Center),
-            (Column::Model, 20, Left),
-            (Column::Effort, 1, Center),
-        ],
+        // One persisted preference controls the execution identity. Provider
+        // is a one-cell glyph; the model cell shows a verbatim suffix of the
+        // canonical ID (`glyphs::list_model_label`), so a family shorthand can
+        // never replace the actual model version. The persisted variant keeps
+        // its `ModelEffort` name for state compatibility; the effort glyph
+        // column was removed.
+        NavigatorOptionalColumn::ModelEffort => {
+            &[(Column::Provider, 1, Center), (Column::Model, 20, Left)]
+        }
         NavigatorOptionalColumn::Retry => &[(Column::Retry, 5, Right)],
         NavigatorOptionalColumn::Cost => &[(Column::Cost, 7, Right)],
         NavigatorOptionalColumn::Work => &[(Column::Work, 6, Right)],
@@ -405,15 +404,14 @@ mod tests {
     fn t02_all_enabled_breakpoints_shift_with_ordinal_width() {
         let breakpoints = [
             (NavigatorColumn::Age, 43),
-            (NavigatorColumn::Provider, 80),
-            (NavigatorColumn::Model, 80),
-            (NavigatorColumn::Effort, 80),
-            (NavigatorColumn::Retry, 86),
-            (NavigatorColumn::Cost, 94),
-            (NavigatorColumn::Work, 101),
-            (NavigatorColumn::Rotation, 105),
-            (NavigatorColumn::Project, 118),
-            (NavigatorColumn::Created, 130),
+            (NavigatorColumn::Provider, 78),
+            (NavigatorColumn::Model, 78),
+            (NavigatorColumn::Retry, 84),
+            (NavigatorColumn::Cost, 92),
+            (NavigatorColumn::Work, 99),
+            (NavigatorColumn::Rotation, 103),
+            (NavigatorColumn::Project, 116),
+            (NavigatorColumn::Created, 128),
         ];
         for ordinal_width in 2..=4 {
             for (column, breakpoint) in breakpoints {
@@ -444,12 +442,8 @@ mod tests {
                     .filter(|candidate| !columns(&before).contains(candidate))
                     .collect();
                 let expected = if column == NavigatorColumn::Provider {
-                    vec![
-                        NavigatorColumn::Provider,
-                        NavigatorColumn::Model,
-                        NavigatorColumn::Effort,
-                    ]
-                } else if matches!(column, NavigatorColumn::Model | NavigatorColumn::Effort) {
+                    vec![NavigatorColumn::Provider, NavigatorColumn::Model]
+                } else if column == NavigatorColumn::Model {
                     continue;
                 } else {
                     vec![column]
@@ -462,14 +456,14 @@ mod tests {
     #[test]
     fn t03_preset_breakpoints_follow_enabled_subsequence() {
         let cases = [
-            (NavigatorPreset::Dense, vec![(43, 1), (80, 3)]),
+            (NavigatorPreset::Dense, vec![(43, 1), (78, 2)]),
             (
                 NavigatorPreset::Operations,
-                vec![(43, 1), (80, 3), (86, 1), (93, 1), (106, 1)],
+                vec![(43, 1), (78, 2), (84, 1), (91, 1), (104, 1)],
             ),
             (
                 NavigatorPreset::Cost,
-                vec![(43, 1), (80, 3), (88, 1), (95, 1), (107, 1)],
+                vec![(43, 1), (78, 2), (86, 1), (93, 1), (105, 1)],
             ),
         ];
         for ordinal_width in 2..=4 {
@@ -581,14 +575,14 @@ mod tests {
         let dense = resolve(200, 2, NavigatorPreset::Dense, None);
         assert_eq!(
             optional_sequence(&dense),
-            vec![C::Age, C::Provider, C::Model, C::Effort]
+            vec![C::Age, C::Provider, C::Model]
         );
         // Dense with a saved order that puts model/effort before age.
         let dense_order = normalize_order(&[O::ModelEffort, O::Age]);
         let dense = resolve_ordered(200, 2, NavigatorPreset::Dense, None, &dense_order);
         assert_eq!(
             optional_sequence(&dense),
-            vec![C::Provider, C::Model, C::Effort, C::Age]
+            vec![C::Provider, C::Model, C::Age]
         );
         // Operations has its own order, independent of Dense.
         let operations_order = normalize_order(&[O::Project, O::Work, O::Retry]);
@@ -596,15 +590,7 @@ mod tests {
             resolve_ordered(200, 2, NavigatorPreset::Operations, None, &operations_order);
         assert_eq!(
             optional_sequence(&operations),
-            vec![
-                C::Project,
-                C::Work,
-                C::Retry,
-                C::Age,
-                C::Provider,
-                C::Model,
-                C::Effort
-            ]
+            vec![C::Project, C::Work, C::Retry, C::Age, C::Provider, C::Model]
         );
         // Column starts stay strictly increasing (no overlap after reordering).
         for pair in operations.columns.windows(2) {

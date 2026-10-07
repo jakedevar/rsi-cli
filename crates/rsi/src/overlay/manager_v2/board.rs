@@ -1,11 +1,11 @@
-use super::{ManagerSection, ManagerSurface};
+use super::{ManagerSection, ManagerSurface, decisions};
 use crate::{app::App, types::OverlayState};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rsi_common::{harness_manager::HarnessManagerConfigV1, harness_manager_v2::*};
 use serde_json::Value;
 use uuid::Uuid;
 
-pub const SECTIONS: [ManagerInspectSectionV2; 13] = [
+pub const SECTIONS: [ManagerInspectSectionV2; 14] = [
     ManagerInspectSectionV2::Overview,
     ManagerInspectSectionV2::Workers,
     ManagerInspectSectionV2::Work,
@@ -19,6 +19,7 @@ pub const SECTIONS: [ManagerInspectSectionV2; 13] = [
     ManagerInspectSectionV2::Health,
     ManagerInspectSectionV2::MigrationAllocations,
     ManagerInspectSectionV2::Satellites,
+    ManagerInspectSectionV2::Friction,
 ];
 
 pub struct BoardState {
@@ -32,6 +33,11 @@ pub struct BoardState {
     pub error: Option<String>,
     pub notice: String,
     pub answer: Option<DecisionDraft>,
+    /// Highlighted option of the selected decision; `None` follows the
+    /// asker's recommendation (else the first option).
+    pub option_cursor: Option<usize>,
+    /// The open "archive stale decisions" confirmation (#1428).
+    pub archive: Option<ArchivePrompt>,
     /// First pages of Decisions, Requests and Health while the composite
     /// Board is shown; `inspection` then holds the Overview first page.
     pub composite: Option<BoardPages>,
@@ -166,18 +172,20 @@ pub fn band_row_label(band: Band, row: &Value) -> String {
             text(row, "fence_state").unwrap_or("unknown")
         ),
         Band::Health => health_label(row),
-        Band::Decisions | Band::Signals => row_title(row),
+        Band::Decisions => decision_label(row),
+        Band::Signals => row_title(row),
     }
 }
-/// Compact age, e.g. `42s`, `17m`, `3h`, `2d`; `?` when the daemon had none.
-fn compact_age(seconds: Option<i64>) -> String {
-    match seconds {
-        None => "?".into(),
-        Some(s) if s < 60 => format!("{s}s"),
-        Some(s) if s < 3600 => format!("{}m", s / 60),
-        Some(s) if s < 86_400 => format!("{}h", s / 3600),
-        Some(s) => format!("{}d", s / 86_400),
-    }
+use decisions::compact_age;
+/// One DECISIONS band line: the question's headline, then status and age.
+fn decision_label(row: &Value) -> String {
+    let now = chrono::Utc::now();
+    format!(
+        "{} · {} · {}",
+        decisions::headline(row),
+        decisions::status_text(row),
+        compact_age(decisions::age_secs(row, now))
+    )
 }
 /// One HEALTH band line: Epic, every stuck code (`ok` only for an empty list
 /// with a healthy current lead), lead status+age, live children and pending
@@ -248,20 +256,41 @@ fn kpi_value(row: &Value, key: &str) -> String {
         _ => "unknown".into(),
     }
 }
+/// Live records first (see [`decisions::sort_rows`]); other sections keep the
+/// daemon's order.
+fn sort_decisions(page: &mut ManagerInspectionV2) {
+    if page.section == ManagerInspectSectionV2::Decisions {
+        decisions::sort_rows(&mut page.rows, page.observed_at);
+    }
+}
+/// The operator's pending bulk archive: the stale records the daemon listed,
+/// held until the operator confirms the count.
+pub struct ArchivePrompt {
+    pub items: Vec<ManagerDecisionRefV2>,
+    /// One headline per listed record, for the confirmation preview.
+    pub headlines: Vec<String>,
+    pub older_than_days: u32,
+    /// The daemon listed every stale record; otherwise more remain.
+    pub complete: bool,
+}
 pub struct DecisionDraft {
     pub target: AnswerHarnessManagerDecisionRequestV2,
     pub question: String,
 }
 
+/// Field of a row or its `payload`; for rendering outside this module.
+pub fn row_text<'a>(row: &'a Value, key: &str) -> Option<&'a str> {
+    text(row, key)
+}
 pub fn row_payload(row: &Value) -> &Value {
     row.get("payload").unwrap_or(row)
 }
-fn text<'a>(row: &'a Value, key: &str) -> Option<&'a str> {
+pub(super) fn text<'a>(row: &'a Value, key: &str) -> Option<&'a str> {
     row.get(key)
         .and_then(Value::as_str)
         .or_else(|| row_payload(row).get(key).and_then(Value::as_str))
 }
-fn number(row: &Value, key: &str) -> Option<i64> {
+pub(super) fn number(row: &Value, key: &str) -> Option<i64> {
     row.get(key)
         .and_then(Value::as_i64)
         .or_else(|| row_payload(row).get(key).and_then(Value::as_i64))
@@ -594,8 +623,9 @@ impl BoardState {
         project_id: Uuid,
         identity: String,
         query: AgentManagerInspectRequestV2,
-        inspection: ManagerInspectionV2,
+        mut inspection: ManagerInspectionV2,
     ) -> Self {
+        sort_decisions(&mut inspection);
         Self {
             project_id,
             identity,
@@ -606,12 +636,16 @@ impl BoardState {
             detail_scroll: 0,
             error: None,
             answer: None,
+            option_cursor: None,
+            archive: None,
             composite: None,
             notice: "Reported work, accepted work and integrated delivery are separate. Null evidence is unknown.".into(),
         }
     }
     /// Show the composite Board from its three first pages.
-    pub fn install_board(&mut self, overview: ManagerInspectionV2, pages: BoardPages) {
+    pub fn install_board(&mut self, overview: ManagerInspectionV2, mut pages: BoardPages) {
+        sort_decisions(&mut pages.decisions);
+        self.option_cursor = None;
         self.query = AgentManagerInspectRequestV2::default();
         self.previous.clear();
         self.inspection = overview;
@@ -625,8 +659,10 @@ impl BoardState {
         &mut self,
         query: AgentManagerInspectRequestV2,
         previous: Vec<Option<String>>,
-        page: ManagerInspectionV2,
+        mut page: ManagerInspectionV2,
     ) {
+        sort_decisions(&mut page);
+        self.option_cursor = None;
         self.query = query;
         self.previous = previous;
         self.inspection = page;
@@ -862,6 +898,67 @@ impl BoardState {
         self.selected = index;
         Some(band.owner())
     }
+    /// The selected row when it is a decision record on the Decisions page.
+    fn selected_decision(&self) -> Option<&Value> {
+        let row = self.selected_row()?;
+        matches!(text(row, "type"), Some("decision") | None).then_some(row)
+    }
+    /// The selected decision's parsed question.
+    #[must_use]
+    pub fn selected_question(&self) -> Option<decisions::ParsedQuestion> {
+        self.selected_decision().map(decisions::parse_row)
+    }
+    /// Index of the option Enter would answer: the moved cursor, else the
+    /// asker's recommendation, else the first option.
+    #[must_use]
+    pub fn effective_option(&self) -> Option<usize> {
+        let parsed = self.selected_question()?;
+        if parsed.options.is_empty() {
+            return None;
+        }
+        Some(
+            self.option_cursor
+                .or(parsed.recommended)
+                .unwrap_or(0)
+                .min(parsed.options.len() - 1),
+        )
+    }
+    fn move_option(&mut self, forward: bool) {
+        let Some(count) = self.selected_question().map(|p| p.options.len()) else {
+            return;
+        };
+        let Some(current) = self.effective_option() else {
+            return;
+        };
+        self.option_cursor = Some(if forward {
+            (current + 1).min(count - 1)
+        } else {
+            current.saturating_sub(1)
+        });
+    }
+    /// A ready answer for the highlighted option; `None` when the decision has
+    /// no recognisable options (the caller opens the free-text prompt).
+    fn answer_selected_option(
+        &self,
+    ) -> Result<Option<AnswerHarnessManagerDecisionRequestV2>, String> {
+        let (Some(parsed), Some(index)) = (self.selected_question(), self.effective_option())
+        else {
+            return Ok(None);
+        };
+        let mut draft = self.decision_draft()?;
+        draft.target.answer = parsed.options[index].answer();
+        Ok(Some(draft.target))
+    }
+    fn accept_recommendation(&self) -> Result<AnswerHarnessManagerDecisionRequestV2, String> {
+        let parsed = self.selected_question().ok_or("Select a decision first.")?;
+        let option = parsed
+            .recommended
+            .and_then(|i| parsed.options.get(i))
+            .ok_or("This decision has no recommendation; pick an option or press a to write an answer.")?;
+        let mut draft = self.decision_draft()?;
+        draft.target.answer = option.answer();
+        Ok(draft.target)
+    }
     pub fn decision_draft(&self) -> Result<DecisionDraft, String> {
         let (section, index) = self.selected_origin().ok_or("Select a pending decision.")?;
         if section != ManagerInspectSectionV2::Decisions && self.composite.is_some() {
@@ -914,6 +1011,188 @@ impl BoardState {
     }
 }
 
+/// Plain wording for the daemon refusals an operator answer can meet.
+pub(super) fn answer_error(error: &str) -> String {
+    let friendly = [
+        (
+            "manager_v2_decision_changed",
+            "This decision changed since the board loaded (answered, withdrawn or re-asked). Press r to reload it.",
+        ),
+        (
+            "manager_v2_decision_scope_changed",
+            "The manager's scope or your policy changed since the board loaded. Press r to reload.",
+        ),
+        (
+            "manager_v2_explicit_grant_required",
+            "No operator policy is saved for this project. Open :manager policy and save one first.",
+        ),
+        (
+            "manager_v2_scope_denied",
+            "This decision's Epic is no longer in the manager's scope.",
+        ),
+    ];
+    friendly
+        .iter()
+        .find(|(code, _)| error.contains(code))
+        .map_or_else(|| error.to_string(), |(_, text)| (*text).to_string())
+}
+
+/// Send one exact-target answer, then reload so the board shows the new
+/// state instead of the stale `pending` row (#1428).
+async fn submit_answer(app: &mut App, target: AnswerHarnessManagerDecisionRequestV2) {
+    let result = app
+        .client
+        .answer_harness_manager_decision(target.clone())
+        .await;
+    match result {
+        Ok(receipt) => {
+            let state = text(&receipt, "state")
+                .or_else(|| text(&receipt, "status"))
+                .map(str::to_string);
+            let keep = super::board_mut(app).map_or(0, |s| s.selected);
+            if let Some(state) = super::board_mut(app) {
+                state.answer = None;
+            }
+            refresh(app).await;
+            if let Some(board) = super::board_mut(app) {
+                board.selected = keep.min(board.row_count().saturating_sub(1));
+                board.notice = format!(
+                    "Answered {} with “{}”{}. The asking manager reads it from its inbox.",
+                    target.decision_key,
+                    target.answer,
+                    state.map_or_else(String::new, |s| format!(" · receipt {s}"))
+                );
+            }
+        }
+        Err(e) => {
+            if let Some(state) = super::board_mut(app) {
+                state.error = Some(format!(
+                    "Answer not recorded: {}",
+                    answer_error(&e.to_string())
+                ));
+                if state.answer.is_some() {
+                    state.error = state
+                        .error
+                        .take()
+                        .map(|e| format!("{e} Your text is kept; Esc cancels."));
+                }
+            }
+        }
+    }
+}
+
+/// `X`: ask the daemon which pending records are stale and open the
+/// confirmation naming the count. Nothing changes until the operator confirms.
+async fn open_archive_prompt(app: &mut App) {
+    let Some(project_id) = super::board_mut(app).map(|s| s.project_id) else {
+        return;
+    };
+    let listed = app
+        .client
+        .list_stale_manager_decisions(ListStaleManagerDecisionsRequestV2 {
+            project_id: Some(project_id),
+            older_than_days: None,
+            limit: Some(u16::try_from(MANAGER_DECISION_STALE_PAGE).unwrap_or(128)),
+        })
+        .await;
+    let Some(state) = super::board_mut(app) else {
+        return;
+    };
+    match listed {
+        Ok(listed) if listed.rows.is_empty() => {
+            state.notice = format!(
+                "No stale decisions: nothing is pending past {} days or owned by a gone manager.",
+                listed.older_than_days
+            );
+        }
+        Ok(listed) => {
+            let headlines = listed
+                .rows
+                .iter()
+                .map(|row| decisions::parse_question(&row.question).headline)
+                .collect();
+            state.archive = Some(ArchivePrompt {
+                items: listed.rows.into_iter().map(|row| row.decision).collect(),
+                headlines,
+                older_than_days: listed.older_than_days,
+                complete: listed.complete,
+            });
+        }
+        Err(e) => state.error = Some(format!("Stale decisions not listed: {e}")),
+    }
+}
+
+/// Archive the confirmed stale records (never deletes), then reload so the
+/// board shows them as archived.
+async fn confirm_archive(app: &mut App) {
+    let Some(prompt) = super::board_mut(app).and_then(|s| s.archive.take()) else {
+        return;
+    };
+    let result = app
+        .client
+        .archive_stale_manager_decisions(ArchiveStaleManagerDecisionsRequestV2 {
+            items: prompt.items.clone(),
+            older_than_days: Some(prompt.older_than_days),
+        })
+        .await;
+    match result {
+        Ok(done) => {
+            let keep = super::board_mut(app).map_or(0, |s| s.selected);
+            refresh(app).await;
+            if let Some(board) = super::board_mut(app) {
+                board.selected = keep.min(board.row_count().saturating_sub(1));
+                let count = done.archived.len();
+                let mut notice = format!(
+                    "Archived {count} stale decision{}",
+                    if count == 1 { "" } else { "s" }
+                );
+                if !done.skipped.is_empty() {
+                    notice.push_str(&format!(
+                        ", skipped {} that changed since they were listed",
+                        done.skipped.len()
+                    ));
+                }
+                notice.push_str(if prompt.complete {
+                    ". They stay as archived history."
+                } else {
+                    ". More stale records remain: press X again."
+                });
+                board.notice = notice;
+            }
+        }
+        Err(e) => {
+            if let Some(state) = super::board_mut(app) {
+                state.error = Some(format!("Nothing archived: {e}"));
+            }
+        }
+    }
+}
+
+/// Reload the current page (or the composite Board) from its first page.
+async fn refresh(app: &mut App) {
+    let Some(state) = super::board_mut(app) else {
+        return;
+    };
+    if state.composite.is_some() {
+        let project_id = state.project_id;
+        let result = fetch_board(app, project_id).await;
+        if let Some(state) = super::board_mut(app) {
+            match result {
+                Ok((overview, pages)) => state.install_board(overview, pages),
+                Err(e) => {
+                    state.error = Some(format!(
+                        "Board not refreshed: {e}. Existing pages retained."
+                    ));
+                }
+            }
+        }
+    } else {
+        let mut query = state.query.clone();
+        query.cursor = None;
+        load(app, query, vec![]).await;
+    }
+}
+
 #[allow(clippy::future_not_send)]
 async fn fetch_page(
     app: &mut App,
@@ -932,6 +1211,38 @@ async fn fetch_page(
         })
         .await
         .map_err(|e| format!("{section:?}: {e}"))
+}
+
+/// Pages bounded for the Decisions list so live records that sort late by key
+/// still reach the top of the live-first view.
+pub const DECISION_PAGES: usize = 8;
+
+/// The Decisions section's records: up to [`DECISION_PAGES`] pages merged into
+/// one, so ordering can put live records first. A cursor remains when the
+/// bound is hit.
+#[allow(clippy::future_not_send)]
+pub(super) async fn fetch_decisions(
+    app: &mut App,
+    project_id: Uuid,
+) -> Result<ManagerInspectionV2, String> {
+    let mut merged = fetch_page(app, project_id, ManagerInspectSectionV2::Decisions, None).await?;
+    for _ in 1..DECISION_PAGES {
+        let Some(cursor) = merged.next_cursor.take() else {
+            break;
+        };
+        let page = fetch_page(
+            app,
+            project_id,
+            ManagerInspectSectionV2::Decisions,
+            Some(cursor),
+        )
+        .await?;
+        merged.rows.extend(page.rows);
+        merged.next_cursor = page.next_cursor;
+        merged.complete = page.complete;
+        merged.observed_at = page.observed_at;
+    }
+    Ok(merged)
 }
 
 fn kpi_rows(page: &ManagerInspectionV2) -> impl Iterator<Item = &Value> {
@@ -997,17 +1308,22 @@ pub(super) async fn open_section(
             .await
             .map_err(|e| format!("Manager board: {e}"))?;
         let mut ledger = BoardState::new(config.project_id, identity.clone(), query, overview);
-        ledger.composite = Some(pages);
+        ledger.install_board(ledger.inspection.clone(), pages);
         ledger
     } else {
-        let inspection = app
-            .client
-            .get_harness_manager_state(GetHarnessManagerStateRequestV2 {
-                project_id: config.project_id,
-                query: query.clone(),
-            })
-            .await
-            .map_err(|e| format!("Manager board: {e}"))?;
+        let inspection = if query.section == ManagerInspectSectionV2::Decisions {
+            fetch_decisions(app, config.project_id)
+                .await
+                .map_err(|e| format!("Manager board: {e}"))?
+        } else {
+            app.client
+                .get_harness_manager_state(GetHarnessManagerStateRequestV2 {
+                    project_id: config.project_id,
+                    query: query.clone(),
+                })
+                .await
+                .map_err(|e| format!("Manager board: {e}"))?
+        };
         BoardState::new(config.project_id, identity.clone(), query, inspection)
     };
     app.overlay_leader_pending = false;
@@ -1053,18 +1369,25 @@ async fn load(app: &mut App, query: AgentManagerInspectRequestV2, previous: Vec<
     let Some(state) = super::surface_mut(app).map(|s| &mut s.ledger) else {
         return;
     };
-    let request = GetHarnessManagerStateRequestV2 {
-        project_id: state.project_id,
-        query: query.clone(),
+    let project_id = state.project_id;
+    let result = if query.section == ManagerInspectSectionV2::Decisions && query.cursor.is_none() {
+        fetch_decisions(app, project_id).await
+    } else {
+        app.client
+            .get_harness_manager_state(GetHarnessManagerStateRequestV2 {
+                project_id,
+                query: query.clone(),
+            })
+            .await
+            .map_err(|e| e.to_string())
     };
-    let result = app.client.get_harness_manager_state(request).await;
     if let Some(state) = super::board_mut(app) {
         match result {
             Ok(page) => state.install_page(query, previous, page),
             Err(e) => {
                 state.error = Some(format!(
                     "Board not refreshed: {e}. Existing page retained; r restarts paging."
-                ))
+                ));
             }
         }
     }
@@ -1074,6 +1397,17 @@ pub(super) async fn handle_key(app: &mut App, key: KeyEvent) {
     let Some(state) = super::board_mut(app) else {
         return;
     };
+    if state.archive.is_some() {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => confirm_archive(app).await,
+            KeyCode::Esc | KeyCode::Char('n' | 'N' | 'q') => {
+                state.archive = None;
+                state.notice = "Nothing archived.".into();
+            }
+            _ => {}
+        }
+        return;
+    }
     if let Some(draft) = &mut state.answer {
         match key.code {
             KeyCode::Esc => state.answer = None,
@@ -1099,33 +1433,7 @@ pub(super) async fn handle_key(app: &mut App, key: KeyEvent) {
                     return;
                 }
                 let target = draft.target.clone();
-                match app
-                    .client
-                    .answer_harness_manager_decision(target.clone())
-                    .await
-                {
-                    Ok(receipt) => {
-                        if let Some(state) = super::board_mut(app) {
-                            state.answer = None;
-                            state.error = None;
-                            state.notice = format!(
-                                "Answer receipt for {} (version {}): {}. r refreshes delivery and gate state.",
-                                target.decision_key,
-                                target.expected_row_version,
-                                text(&receipt, "state")
-                                    .or_else(|| text(&receipt, "status"))
-                                    .unwrap_or("received; delivery outcome unknown")
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        if let Some(state) = super::board_mut(app) {
-                            state.error = Some(format!(
-                                "Answer not confirmed: {e}. Exact target and draft retained; Esc then r to refresh."
-                            ));
-                        }
-                    }
-                }
+                submit_answer(app, target).await;
             }
             _ => {}
         }
@@ -1134,10 +1442,27 @@ pub(super) async fn handle_key(app: &mut App, key: KeyEvent) {
     let rows = state.row_count();
     if super::super::list::handle_list_nav_key(&mut state.selected, rows, &key) {
         state.detail_scroll = 0;
+        state.option_cursor = None;
         return;
     }
     let board = state.composite.is_some();
+    let decisions_view = !board && state.query.section == ManagerInspectSectionV2::Decisions;
     match key.code {
+        KeyCode::Left | KeyCode::Char('h') if decisions_view => state.move_option(false),
+        KeyCode::Right | KeyCode::Char('l') if decisions_view => state.move_option(true),
+        KeyCode::Char('y') if decisions_view => match state.accept_recommendation() {
+            Ok(target) => submit_answer(app, target).await,
+            Err(e) => state.error = Some(e),
+        },
+        KeyCode::Enter if decisions_view => match state.answer_selected_option() {
+            Ok(Some(target)) => submit_answer(app, target).await,
+            Ok(None) => match state.decision_draft() {
+                Ok(draft) => state.answer = Some(draft),
+                Err(e) => state.error = Some(e),
+            },
+            Err(e) => state.error = Some(e),
+        },
+        KeyCode::Char('X') if decisions_view => open_archive_prompt(app).await,
         KeyCode::Esc | KeyCode::Char('q') => app.overlay = OverlayState::None,
         KeyCode::Char('o') => {
             let target = state.selected_row().and_then(row_session_id);

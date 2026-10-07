@@ -278,6 +278,17 @@ impl DaemonFeatureEntry {
                 },
             },
             Self {
+                field: "host_load_admission_threshold".to_string(),
+                label: "Host load limit for new launches".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "16", "24", "32", "40", "48", "64", "96"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 4,
+                },
+            },
+            Self {
                 field: "retry_max_default".to_string(),
                 label: "Max retries".to_string(),
                 value: DaemonFeatureValue::Display("?".to_string()),
@@ -328,6 +339,17 @@ impl DaemonFeatureEntry {
                         .map(str::to_string)
                         .collect(),
                     current: 0,
+                },
+            },
+            Self {
+                field: "worker_context_cap_tokens".to_string(),
+                label: "Worker context cap (0 off, 1-100 = % of window)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "40", "50", "60", "70", "80", "200000", "400000"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
                 },
             },
             Self {
@@ -507,6 +529,17 @@ impl DaemonFeatureEntry {
                 },
             },
             Self {
+                field: rsi_common::provider_profile::PROVIDER_PROFILE_FIELD.to_string(),
+                label: "Provider profile".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: rsi_common::provider_profile::ProviderProfile::ALL
+                        .iter()
+                        .map(|profile| profile.as_str().to_string())
+                        .collect(),
+                    current: 0,
+                },
+            },
+            Self {
                 field: "api_route.fallback".to_string(),
                 label: "API route fallback".to_string(),
                 value: DaemonFeatureValue::Bool(true),
@@ -576,6 +609,17 @@ impl DaemonFeatureEntry {
                 value: DaemonFeatureValue::Bool(true),
             },
             Self {
+                field: "deploy_drain_hold_secs".to_string(),
+                label: "Deploy hold limit (s)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "120", "300", "600", "900", "1800", "3600"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
                 field: "rolling_queue_batch_size".to_string(),
                 label: "Merge queue batch size".to_string(),
                 value: DaemonFeatureValue::Cycle {
@@ -592,6 +636,50 @@ impl DaemonFeatureEntry {
                 value: DaemonFeatureValue::Cycle {
                     options: ["0", "1", "2"].into_iter().map(str::to_string).collect(),
                     current: 1,
+                },
+            },
+            Self {
+                field: "rolling_queue_gate_timeout_mins".to_string(),
+                label: "Merge queue gate timeout (min)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["30", "60", "120", "180", "240", "360", "720", "1440"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 5,
+                },
+            },
+            Self {
+                field: "job_test_timeout_mins".to_string(),
+                label: "Agent test job timeout (min)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["5", "10", "15", "20", "30", "45", "60", "90", "120", "180"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
+                field: "cpu_andon_cpu_minutes".to_string(),
+                label: "CPU andon: CPU-minutes per tree".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "60", "120", "240", "480", "960"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
+                field: "cpu_andon_host_load".to_string(),
+                label: "CPU andon: host load".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "16", "24", "32", "40", "48", "64", "96"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 4,
                 },
             },
             Self {
@@ -1609,7 +1697,10 @@ pub struct UserSettings {
     pub prompt_processor: PromptProcessorConfig,
 
     /// Session list card fields with enabled flags.
-    #[serde(default = "default_card_fields")]
+    #[serde(
+        default = "default_card_fields",
+        deserialize_with = "deserialize_card_fields"
+    )]
     pub card_fields: Vec<CardFieldEntry>,
 
     /// Optional navigator-column policy. Missing values in older state files
@@ -2219,6 +2310,29 @@ pub fn cycle_model(current: &str, options: &[&str]) -> String {
     }
 }
 
+/// Card field list that skips entries naming a removed `CardField` (for
+/// example the retired `ContextBar`), so older state files keep every other
+/// setting instead of failing to load.
+fn deserialize_card_fields<'de, D>(deserializer: D) -> Result<Vec<CardFieldEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MaybeEntry {
+        Known(CardFieldEntry),
+        Unknown(serde::de::IgnoredAny),
+    }
+    let entries = Vec::<MaybeEntry>::deserialize(deserializer)?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            MaybeEntry::Known(entry) => Some(entry),
+            MaybeEntry::Unknown(_) => None,
+        })
+        .collect())
+}
+
 /// Default card field layout — all fields enabled.
 pub fn default_card_fields() -> Vec<CardFieldEntry> {
     CardField::ALL
@@ -2485,6 +2599,15 @@ mod tests {
     }
 
     #[test]
+    fn card_fields_skip_removed_context_bar_entry() {
+        let json = r#"{"card_fields":[{"field":"ContextBar","enabled":true},{"field":"Cost","enabled":false}]}"#;
+        let restored: UserSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(restored.card_fields.len(), 1);
+        assert_eq!(restored.card_fields[0].field, CardField::Cost);
+        assert!(!restored.card_fields[0].enabled);
+    }
+
+    #[test]
     fn card_fields_backward_compat_missing_field() {
         // Old state.json without card_fields should deserialize to defaults.
         let json = r#"{"show_audio_waveform":false}"#;
@@ -2500,7 +2623,7 @@ mod tests {
             card_fields: vec![],
             ..UserSettings::default()
         };
-        assert!(settings.is_card_field_enabled(CardField::ContextBar));
+        assert!(settings.is_card_field_enabled(CardField::Cost));
     }
 
     #[test]
@@ -2995,6 +3118,31 @@ mod tests {
             DaemonFeatureEntry::update_from_json(
                 &mut entries,
                 &serde_json::json!({ "coordinator_context_cap_tokens": value }),
+            );
+            assert_eq!(cap(&entries), value.to_string());
+        }
+    }
+
+    /// #1254: the worker baton cap is an operator row that follows the
+    /// daemon value (default 60 = 60% of the window; `0` off).
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn daemon_feature_defaults_expose_worker_context_cap() {
+        let cap = |entries: &[DaemonFeatureEntry]| match &entries
+            .iter()
+            .find(|entry| entry.field == "worker_context_cap_tokens")
+            .unwrap()
+            .value
+        {
+            DaemonFeatureValue::Cycle { options, current } => options[*current].clone(),
+            other => panic!("cap row must be a cycle, got {other:?}"),
+        };
+        let mut entries = DaemonFeatureEntry::defaults();
+        assert_eq!(cap(&entries), "60");
+        for value in [200_000_u64, 0, 50] {
+            DaemonFeatureEntry::update_from_json(
+                &mut entries,
+                &serde_json::json!({ "worker_context_cap_tokens": value }),
             );
             assert_eq!(cap(&entries), value.to_string());
         }

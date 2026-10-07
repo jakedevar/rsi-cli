@@ -32,8 +32,50 @@ You need Rust (rustup) and at least one signed-in agent CLI, such as
 [Claude Code](https://github.com/anthropics/claude-code) or
 [Codex](https://github.com/openai/codex). No subscription? Point the `Local`
 provider at [Ollama](https://ollama.com). Then press `<Space>p` to add a
-project, `<Space>n` to start a session, and `?` for help anywhere. Details are
-under [Install](#install) and [Run](#run).
+project, `<Space>N` to start a session, and `?` for help anywhere. Details are
+under [Install](#install) and [Run](#run). To have a manager working in
+minutes, see [Start here](#start-here).
+
+## Start here
+
+Paste one of these into a session to put a manager to work. Seating a manager is
+always an operator action: you run the command, the agent never appoints itself.
+Full detail: [docs/harness-manager.md](docs/harness-manager.md); the two ways to
+develop are in [docs/development-modes.md](docs/development-modes.md).
+
+**Seat a project manager on the current repo**
+
+1. `:projects` (or `<Space>p`), pick or add the project for this repo.
+2. `:blank Coordinate this project's work` starts a Standard root session
+   (`Ctrl-N` / `<Space>N` open the same prompt).
+3. With that session focused, run `:manager appoint`, keep the default scope
+   (whole current project) and press `Enter`.
+4. Optional: `:manager policy`, choose the **Execute** preset, press `s`.
+5. Send the session a starter prompt below.
+
+**Seat a global manager over several projects**
+
+1. Focus a Standard root session (as above).
+2. `:manager global appoint Rsi, Notes` names the projects (comma-separated;
+   no names means every project). Check it with `:manager global`; revoke with
+   `:manager global revoke`.
+3. Send it a prompt. To start a brand-new project from a prompt, use
+   `AgentCreateProject` *(after #1626 lands)*.
+
+**Starter prompts** (replace the angle-bracket parts)
+
+- > Create a slice map for <goal>: split it into small, independently landable
+  > Issues with acceptance criteria and dependencies, file them, then work
+  > through them in order, verifying each before the next.
+- > Triage the open Issues: rank them by priority and risk, close duplicates,
+  > then launch workers on the top five and report evidence for each.
+- > Review and harden <area>: read it, list correctness, error-handling and test
+  > gaps as Issues, then fix the highest-value ones with tests.
+- > Create a new project called <name> at <path> and seat a manager on it
+  > (uses `AgentCreateProject`, after #1626 lands).
+
+Inspect progress with `<Space>i` (Issues workspace), `<Space>gd` (manager
+decisions awaiting you) and `<Space>n` / `:alerts` (attention history).
 
 ## What it does
 
@@ -56,8 +98,8 @@ under [Install](#install) and [Run](#run).
 
 ## Dependencies
 
-rsi runs on Linux. macOS is a target too, but the daemon does not currently
-build there because it uses Linux-only filesystem calls; that is being fixed.
+rsi runs on Linux and macOS. Automatic scratch and target-directory reclamation
+requires Linux filesystem proofs; macOS conservatively retains those files.
 
 ### To build
 
@@ -127,7 +169,8 @@ licenses to permissive ones plus MPL-2.0.
 
 ## Install
 
-Prebuilt Linux binaries (x86_64, arm64), when available, are attached to
+Prebuilt Linux binaries (x86_64, arm64) and macOS binaries (Apple silicon), when
+available, are attached to
 [GitHub Releases](https://github.com/jakedevar/rsi-cli/releases): unpack the
 archive and put its four binaries on your `PATH`.
 
@@ -171,10 +214,9 @@ write daemon output to `~/.rsi/daemon.log`. Set
 First steps:
 
 1. `<Space>p` (or `:projects`): create or pick a project for your repository.
-2. `<Space>n` (or `:blank <objective>`): start a session. `<Space>o` or
-   `:task <objective>` starts a one-shot task.
+2. `<Space>N` or `Ctrl-N` (or `:blank <objective>`): start a session.
 3. `Enter` opens a session, `F3` shows exactly what it launched with, `x`
-   stops it, `<Space>a` archives it, and `<Space>N` (or `:alerts`) opens notifications.
+   stops it, `<Space>a` archives it, and `<Space>n` (or `:alerts`) opens notifications.
 4. `?` lists the keys available wherever you are.
 
 The [operator manual](docs/agent-harness-operator-manual.md) covers daily use,

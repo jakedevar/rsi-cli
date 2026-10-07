@@ -84,6 +84,9 @@ pub const NEVER_DELEGABLE_OPERATOR_METHODS_V1: &[&str] = &[
     "ListHarnessManagerScope",
     "GetHarnessManagerState",
     "AnswerHarnessManagerDecision",
+    // #1415: archiving a stale decision record is the operator's call.
+    "ListStaleManagerDecisions",
+    "ArchiveStaleManagerDecisions",
     "AnswerQuestion",
     // Scope self-escalation.
     "SetSessionParent",

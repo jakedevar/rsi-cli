@@ -325,7 +325,11 @@ impl Governor {
             ticket_id: ticket,
             class,
             position,
-            message: reason.describe(),
+            message: format!(
+                "{}{}",
+                reason.describe(),
+                holders_note(&state, class_of_slot_wait(&reason))
+            ),
             reason,
         })
     }
@@ -498,6 +502,48 @@ impl Governor {
             cap: class_cap(policy, class),
         }
     }
+}
+
+/// The class whose lease holders explain a slot or queue wait (#1591).
+fn class_of_slot_wait(reason: &BlockReason) -> Option<AdmissionClass> {
+    match reason {
+        BlockReason::Slots { class, .. } | BlockReason::QueueAhead { class, .. } => Some(*class),
+        _ => None,
+    }
+}
+
+/// `; held by pid N (label), ...`: who holds the class's slots, so a waiting
+/// job's log names the holder (#1591). Empty when the wait is not slot-bound.
+fn holders_note(state: &State, class: Option<AdmissionClass>) -> String {
+    let Some(class) = class else {
+        return String::new();
+    };
+    let mut held: Vec<&Lease> = state.leases.values().filter(|l| l.class == class).collect();
+    held.sort_by_key(|lease| lease.granted_at);
+    if held.is_empty() {
+        return String::new();
+    }
+    let shown: Vec<String> = held
+        .iter()
+        .take(3)
+        .map(|lease| {
+            let label: String = lease
+                .label
+                .as_deref()
+                .unwrap_or("")
+                .chars()
+                .take(60)
+                .collect();
+            format!("pid {} ({label})", lease.holder.pid)
+        })
+        .collect();
+    let more = held.len().saturating_sub(shown.len());
+    let tail = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    format!("; held by {}{tail}", shown.join(", "))
 }
 
 fn class_in_use(state: &State, class: AdmissionClass) -> u32 {
@@ -770,6 +816,28 @@ mod tests {
             (30, 16, 30)
         );
         assert_eq!(effective_max_load(&p, 32), 40);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_slot_wait_message_names_the_holders() {
+        let (_w, g) = World::new();
+        let p = GovernorPolicy {
+            build_slots: 1,
+            ..GovernorPolicy::default()
+        };
+        let mut holder = req(AdmissionClass::Build, 1);
+        holder.label = Some("make scoped-test".into());
+        granted(&g.acquire(&p, &holder).unwrap());
+        match g.acquire(&p, &req(AdmissionClass::Build, 2)).unwrap() {
+            AcquireOutcome::Queued { message, .. } => {
+                assert!(
+                    message.ends_with("; held by pid 1 (make scoped-test)"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected queued, got {other:?}"),
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]

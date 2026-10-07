@@ -13,7 +13,7 @@ use crate::daemon_info::{BUILD_SHA, DaemonInfoService, binary_sha256};
 use crate::deploy_drain::DeployDrain;
 use crate::error::{DaemonError, Result};
 use crate::store::Store;
-use crate::store::agent_deploys::{DeployRow, deploy_fingerprint};
+use crate::store::agent_deploys::{DeployRow, deploy_fingerprint_with};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rsi_common::agent_deploy::{
     DEPLOY_BINARIES, DEPLOY_BINARY_MISSING, DEPLOY_DIR_NOT_ALLOWED, DEPLOY_MAX_RESTARTS_PER_HOUR,
@@ -197,8 +197,8 @@ impl DeployService {
 
     /// Insert-side helper for the verb: build the row inputs.
     #[must_use]
-    pub(crate) fn fingerprint(sha: &str, dir: &str, wait: u32) -> String {
-        deploy_fingerprint(sha, dir, wait)
+    pub(crate) fn fingerprint(sha: &str, dir: &str, wait: u32, interrupt_workers: bool) -> String {
+        deploy_fingerprint_with(sha, dir, wait, interrupt_workers)
     }
 }
 
@@ -298,6 +298,15 @@ impl StagePlan {
             if binary_sha256(&staged).as_deref() != Some(source_hash.as_str()) {
                 return Err(invalid(DEPLOY_STAGE_FAILED));
             }
+            if name == "rsid-supervisor.sh"
+                && !std::process::Command::new("bash")
+                    .arg("-n")
+                    .arg(&staged)
+                    .status()
+                    .is_ok_and(|status| status.success())
+            {
+                return Err(invalid(DEPLOY_STAGE_FAILED));
+            }
             let identity = object_identity(&staged).ok_or_else(|| invalid(DEPLOY_STAGE_FAILED))?;
             if let Some(entry) = manifest.last_mut() {
                 entry.staged_identity = Some(identity);
@@ -342,10 +351,16 @@ fn marker_path(manifest: &[DeployBinaryV1]) -> Option<PathBuf> {
     Some(dest.with_file_name(format!("{name}.deploy-inflight")))
 }
 
-fn write_marker(manifest: &[DeployBinaryV1]) -> std::io::Result<()> {
+fn write_marker(manifest: &[DeployBinaryV1], database: Option<&str>) -> std::io::Result<()> {
     let path = marker_path(manifest)
         .ok_or_else(|| std::io::Error::other("deploy manifest has no rsid entry"))?;
-    std::fs::write(path, b"deploy in flight\n")
+    std::fs::write(
+        path,
+        database.map_or_else(
+            || "deploy in flight".into(),
+            |path| format!("database={path}"),
+        ),
+    )
 }
 
 fn remove_marker(manifest: &[DeployBinaryV1]) {
@@ -500,15 +515,48 @@ fn remove_if_installed(dest: &Path, identity: ObjectIdentityV1) {
         return;
     }
     // Not ours: put it back, never over something installed since.
+    #[cfg(target_os = "linux")]
     let restored = nix::fcntl::renameat2(
         None,
         &aside,
         None,
         dest,
         nix::fcntl::RenameFlags::RENAME_NOREPLACE,
-    );
+    )
+    .map_err(std::io::Error::from);
+    #[cfg(target_os = "macos")]
+    let restored = restore_without_replacing(&aside, dest);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let restored: std::io::Result<()> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace restore unavailable",
+    ));
     if let Err(error) = restored {
         tracing::warn!(%error, path = %aside.display(), "rollback kept a replaced file aside");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn restore_without_replacing(aside: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let aside = CString::new(aside.as_os_str().as_bytes())?;
+    let dest = CString::new(dest.as_os_str().as_bytes())?;
+    // SAFETY: both paths are NUL-terminated and live through the syscall.
+    // RENAME_EXCL atomically refuses an occupied destination, matching Linux.
+    let result = unsafe {
+        nix::libc::renameatx_np(
+            nix::libc::AT_FDCWD,
+            aside.as_ptr(),
+            nix::libc::AT_FDCWD,
+            dest.as_ptr(),
+            nix::libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -558,6 +606,76 @@ fn probe_binary(path: &Path) -> std::result::Result<(String, i64), String> {
     parse_build_info(&text).ok_or_else(|| "unparseable probe output".into())
 }
 
+/// Supervisor-only offline recovery, before starting the previous binary.
+/// The caller holds the database instance lease.
+pub fn restore_database_for_binary(database: &Path, binary: &Path) -> Result<()> {
+    let (_, supported) = probe_binary(binary).map_err(crate::error::DaemonError::Store)?;
+    let supported = i32::try_from(supported)
+        .map_err(|_| crate::error::DaemonError::Store("invalid binary schema version".into()))?;
+    if let Some(backup) = crate::store::migration_backup::restore(database, supported)? {
+        eprintln!(
+            "restored database from pre-migration backup {}",
+            backup.display()
+        );
+    }
+    Ok(())
+}
+
+/// Keep the recovery-capable new executable and ask the supervisor to restore
+/// offline, after every Store connection in this incarnation has closed.
+fn prepare_database_rollback(
+    store: &Store,
+    service: &DeployService,
+    row: &DeployRow,
+) -> Result<Option<PathBuf>> {
+    let Some(database) = store.database_path().map(Path::new) else {
+        return Ok(None);
+    };
+    let Some(rsid) = row.manifest.iter().find(|entry| entry.name == "rsid") else {
+        return Ok(None);
+    };
+    let dest = Path::new(&rsid.dest);
+    let previous = prev_path(dest);
+    if !previous.exists() {
+        return Ok(None);
+    }
+    let (_, supported) =
+        (service.plan.probe)(&previous).map_err(crate::error::DaemonError::Store)?;
+    let supported = i32::try_from(supported)
+        .map_err(|_| crate::error::DaemonError::Store("invalid binary schema version".into()))?;
+    let live = store.schema_version()?;
+    if live <= supported {
+        return Ok(None);
+    }
+    let marker = crate::store::migration_backup::read_marker(database)?.ok_or_else(|| {
+        crate::error::DaemonError::Store(
+            "binary rollback refused: pre-migration backup missing".into(),
+        )
+    })?;
+    if !crate::store::migration_backup::needs_restore(live, supported, &marker)
+        || !marker.path.exists()
+    {
+        return Err(crate::error::DaemonError::Store(
+            "binary rollback refused: compatible pre-migration backup missing".into(),
+        ));
+    }
+    // The existing rollback() restores all installed binaries. Save this one
+    // first, because the old binary does not have the recovery command.
+    let failed = dest.with_file_name(format!(
+        "{}.failed",
+        dest.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::copy(dest, &failed)?;
+    std::fs::write(
+        dest.with_file_name(format!(
+            "{}.db-rollback",
+            dest.file_name().unwrap().to_string_lossy()
+        )),
+        database.as_os_str().as_encoded_bytes(),
+    )?;
+    Ok(Some(marker.path))
+}
+
 /// `<40-hex sha> <schema>` as printed by `rsid --build-info`.
 #[must_use]
 pub fn parse_build_info(text: &str) -> Option<(String, i64)> {
@@ -602,6 +720,66 @@ fn settle(
     Ok(PollOutcome::Settled(row.id, state))
 }
 
+/// #1333 andon recording point: one `deploy_timeout:<blocker>` event per
+/// blocker still holding the quiet point at the deadline (`no_blocker` when
+/// the quiet polls simply ran out).
+fn note_deploy_timeout(store: &Store, row: &DeployRow, blockers: &[&'static str]) {
+    let blockers = if blockers.is_empty() {
+        &["no_blocker"][..]
+    } else {
+        blockers
+    };
+    for blocker in blockers {
+        let event = rsi_common::friction::NewFrictionEventV1::new(
+            rsi_common::friction::FrictionKind::DeployTimeout,
+            &[blocker],
+        )
+        .session(row.owner_session_id)
+        .evidence("deploy", row.id);
+        crate::friction::note_locked(store, &event);
+    }
+}
+
+/// #1461: record the workers a deploy restart interrupts: the row keeps their
+/// ids for the outcome wake and each gets one `deploy_interrupt` andon event.
+/// Telemetry and the record never fail the restart that already began.
+fn note_deploy_interrupts(store: &Store, row: &DeployRow, workers: &[Uuid]) {
+    if let Err(error) = store.record_agent_deploy_interrupted(row.id, workers) {
+        tracing::warn!(%error, deploy = %row.id, "interrupted workers not recorded on the deploy");
+    }
+    for worker in workers {
+        let event = rsi_common::friction::NewFrictionEventV1::new(
+            rsi_common::friction::FrictionKind::DeployInterrupt,
+            &["worker_mid_turn"],
+        )
+        .session(Some(*worker))
+        .evidence("deploy", row.id);
+        crate::friction::note_locked(store, &event);
+    }
+}
+
+/// #1461: whether the operator's drain hold on `row` is over, so a deploy that
+/// asked to `interrupt_workers` stops waiting for workers mid-turn. With the
+/// drain setting off nothing was ever held, so the hold is over from the start;
+/// an uncapped hold lasts to the deadline.
+fn drain_hold_over(
+    store: &Store,
+    row: &DeployRow,
+    drain: &DeployDrain,
+    drain_enabled: bool,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    if !drain_enabled {
+        return Ok(true);
+    }
+    let Some(cap) = drain.hold_cap() else {
+        return Ok(false);
+    };
+    Ok(store
+        .agent_deploy_created_at(row.id)?
+        .is_some_and(|created| now >= created + cap))
+}
+
 /// One pass of the deploy runner over the single live deploy.
 ///
 /// # Errors
@@ -617,13 +795,46 @@ pub async fn poll_once(
     let outcome = poll_step(store, service, now, gate, drain, drain_enabled).await;
     // Re-derive the hold from the durable row after every step: a settle or a
     // timeout releases it, a restart keeps it until the process exits.
-    let live = store.lock().await.live_agent_deploy();
-    match live {
-        Ok(live) => drain.sync(live.as_ref(), drain_enabled, now),
+    let synced = {
+        let store = store.lock().await;
+        store.live_agent_deploy().and_then(|live| {
+            let end = match &live {
+                Some(row) => hold_end(&store, row, drain, gate.quiet_polls > 0)?,
+                None => None,
+            };
+            drain.sync_until(live.as_ref(), end, drain_enabled, now);
+            Ok(())
+        })
+    };
+    match synced {
+        Ok(()) => {}
         Err(error) if outcome.is_ok() => return Err(error),
         Err(_) => {}
     }
     outcome
+}
+
+/// When the hold on new worker starts ends for `row`, if before its deadline
+/// (#1320/#1311). An agent deploy holds for at most the operator's
+/// `deploy_drain_hold_secs` after it was requested; past that it waits for a
+/// quiet point without holding. From its first quiet poll (`quiet_seen`) the
+/// hold runs to the deadline again, so nothing new starts before the swap. An
+/// operator restart (#1122) and a `restarting` deploy hold to the deadline.
+fn hold_end(
+    store: &Store,
+    row: &DeployRow,
+    drain: &DeployDrain,
+    quiet_seen: bool,
+) -> Result<Option<DateTime<Utc>>> {
+    if row.owner_session_id.is_none() || row.state != DeployState::Staged || quiet_seen {
+        return Ok(None);
+    }
+    let Some(cap) = drain.hold_cap() else {
+        return Ok(None);
+    };
+    Ok(store
+        .agent_deploy_created_at(row.id)?
+        .map(|created| created + cap))
 }
 
 async fn poll_step(
@@ -642,15 +853,24 @@ async fn poll_step(
         return Ok(PollOutcome::Idle);
     };
     // Hold new work before judging the quiet point, so nothing new arrives
-    // between the read of the blockers and the swap.
-    drain.sync(Some(&row), drain_enabled, now);
+    // between the read of the blockers and the swap (#1320: within the
+    // operator's hold window, or from the first quiet poll on).
+    let end = hold_end(&store, &row, drain, gate.quiet_polls > 0)?;
+    drain.sync_until(Some(&row), end, drain_enabled, now);
     if row.state != DeployState::Staged {
         // `restarting`: the drain is in flight; startup verification settles it.
         drain.set_blockers(&[]);
         return Ok(PollOutcome::Idle);
     }
+    // #1461: past the drain hold, an `interrupt_workers` deploy no longer waits
+    // for workers mid-turn; a landing and a local job still block.
+    let mut interrupting = false;
     let blockers = match row.owner_session_id {
-        Some(owner) => store.deploy_quiet_blockers(owner)?,
+        Some(owner) => {
+            interrupting = store.agent_deploy_interrupt(row.id)?.requested
+                && drain_hold_over(&store, &row, drain, drain_enabled, now)?;
+            store.deploy_quiet_blockers_with(owner, !interrupting)?
+        }
         // An operator restart also waits for managers mid-turn (#1122).
         None => store.operator_quiet_blockers()?.0,
     };
@@ -658,6 +878,8 @@ async fn poll_step(
     drain.set_blockers(&blockers);
     if blockers.is_empty() {
         gate.quiet_polls += 1;
+        // A lull: hold new worker starts through the confirming poll.
+        drain.sync_until(Some(&row), None, drain_enabled, now);
     } else {
         gate.quiet_polls = 0;
     }
@@ -675,13 +897,19 @@ async fn poll_step(
         if let Err(error) = service.check_budget(&store, now) {
             return settle(&store, &row, DeployState::Failed, &error.to_string(), now);
         }
+        // The workers this restart will cut off, read before the swap while the
+        // same store lock still holds the quiet judgement above.
+        let interrupted = match row.owner_session_id {
+            Some(owner) if interrupting => store.deploy_mid_turn_workers(owner)?,
+            _ => Vec::new(),
+        };
         if !store.mark_agent_deploy_restarting(row.id, now)? {
             return Ok(PollOutcome::Idle);
         }
         if let Err(error) = swap_in(&row.manifest, row.id) {
             return settle(&store, &row, DeployState::Failed, &error.to_string(), now);
         }
-        if let Err(error) = write_marker(&row.manifest) {
+        if let Err(error) = write_marker(&row.manifest, store.database_path()) {
             rollback(&row.manifest.iter().collect::<Vec<_>>());
             return settle(
                 &store,
@@ -702,9 +930,13 @@ async fn poll_step(
                 now,
             );
         }
+        if interrupting {
+            note_deploy_interrupts(&store, &row, &interrupted);
+        }
         return Ok(PollOutcome::Restarting(row.id));
     }
     if now >= row.deadline_at {
+        note_deploy_timeout(&store, &row, &blockers);
         let reason = format!("quiet point not reached: {}", blockers.join(","));
         return settle(&store, &row, DeployState::TimedOut, &reason, now);
     }
@@ -741,17 +973,24 @@ pub async fn verify_after_restart(
         remove_prev_files(&row.manifest);
         return Ok(Some(PollOutcome::Settled(row.id, DeployState::Succeeded)));
     }
+    let backup = prepare_database_rollback(&store, service, &row)?;
     // The new build did not come up as deployed: put the old binaries back and,
     // if a wrong-but-new build is what runs, restart once into them.
     remove_marker(&row.manifest);
     rollback(&row.manifest.iter().collect::<Vec<_>>());
     let new_bits_running = running_sha256.is_some() && expected == running_sha256;
-    let reason = format!(
+    let mut reason = format!(
         "verification failed: running build {build_sha}, expected {}; previous binaries restored",
         row.sha
     );
+    if let Some(path) = &backup {
+        reason.push_str(&format!(
+            "; offline database restore queued from {}",
+            path.display()
+        ));
+    }
     store.settle_agent_deploy(row.id, DeployState::Failed, Some(&reason), now)?;
-    if new_bits_running {
+    if new_bits_running || backup.is_some() {
         service.fire_restart();
     }
     Ok(Some(PollOutcome::Settled(row.id, DeployState::Failed)))
@@ -788,6 +1027,7 @@ pub async fn run_deploy_loop(
     loop {
         interval.tick().await;
         let drain_enabled = config.deploy_drain_enabled.load(Ordering::Relaxed);
+        drain.set_hold_cap_secs(config.deploy_drain_hold_secs.load(Ordering::Relaxed));
         match poll_once(
             &store,
             service,
@@ -808,6 +1048,7 @@ pub async fn run_deploy_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::agent_deploys::deploy_fingerprint;
     use crate::store::rolling_queue::NewQueueEntry;
     use rsi_common::rolling_queue::RollingQueueBinding;
     use std::sync::atomic::AtomicUsize;
@@ -879,6 +1120,11 @@ mod tests {
 
     /// Stage the fixture's build and record a `staged` deploy.
     async fn stage(f: &Fixture, key: &str, wait: u32) -> DeployRow {
+        stage_with(f, key, wait, false).await
+    }
+
+    /// [`stage`], optionally asking to interrupt workers past the hold (#1461).
+    async fn stage_with(f: &Fixture, key: &str, wait: u32, interrupt_workers: bool) -> DeployRow {
         let id = Uuid::new_v4();
         let manifest = f
             .service
@@ -894,9 +1140,10 @@ mod tests {
                     owner_session_id: f.owner,
                     idempotency_key: key,
                     sha: SHA,
-                    fingerprint: deploy_fingerprint(SHA, "x", wait),
+                    fingerprint: deploy_fingerprint_with(SHA, "x", wait, interrupt_workers),
                     manifest: &manifest,
                     max_wait_secs: wait,
+                    interrupt_workers,
                 },
                 Utc::now(),
             )
@@ -944,7 +1191,8 @@ mod tests {
                 "rsi-rpc",
                 "rsi-agent-mcp",
                 "rsi-build-rustc",
-                "rsi-contract-validate"
+                "rsi-contract-validate",
+                "rsid-supervisor.sh"
             ]
         );
         let id = Uuid::new_v4();
@@ -963,6 +1211,55 @@ mod tests {
             b"new-remote"
         );
         assert_eq!(installed(&f), NEW);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn supervisor_is_verified_swapped_and_rolled_back_with_the_manifest() {
+        let f = fixture(true);
+        let name = "rsid-supervisor.sh";
+        let old = b"#!/usr/bin/env bash\nexit 0\n";
+        let new = include_bytes!("../../../scripts/rsid-supervisor.sh");
+        std::fs::write(f.source.join(name), new).unwrap();
+        std::fs::write(f.install.join(name), old).unwrap();
+        let id = Uuid::new_v4();
+        let manifest = f
+            .service
+            .stage_plan()
+            .stage_binaries(id, f.source.to_str().unwrap(), SHA, 1)
+            .unwrap();
+        let entry = manifest.iter().find(|entry| entry.name == name).unwrap();
+        assert_eq!(entry.sha256, binary_sha256(&f.source.join(name)).unwrap());
+        assert!(entry.staged_identity.is_some());
+        assert_eq!(
+            std::fs::read(staged_path(Path::new(&entry.dest), id)).unwrap(),
+            new
+        );
+        swap_in(&manifest, id).unwrap();
+        assert_eq!(std::fs::read(f.install.join(name)).unwrap(), new);
+        assert_eq!(
+            std::fs::read(f.install.join(format!("{name}.prev"))).unwrap(),
+            old
+        );
+        rollback(&manifest.iter().collect::<Vec<_>>());
+        assert_eq!(std::fs::read(f.install.join(name)).unwrap(), old);
+        assert_eq!(installed(&f), OLD);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn syntax_invalid_supervisor_is_refused_and_staged_files_are_removed() {
+        let f = fixture(true);
+        std::fs::write(f.source.join("rsid-supervisor.sh"), b"if then\n").unwrap();
+        let id = Uuid::new_v4();
+        let error = f
+            .service
+            .stage_plan()
+            .stage_binaries(id, f.source.to_str().unwrap(), SHA, 1)
+            .unwrap_err();
+        assert!(error.to_string().contains(DEPLOY_STAGE_FAILED), "{error}");
+        assert_eq!(installed(&f), OLD);
+        assert_eq!(std::fs::read_dir(&f.install).unwrap().count(), 1);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
@@ -1037,6 +1334,94 @@ mod tests {
             .unwrap()
             .state;
         assert_eq!(state, DeployState::Restarting);
+    }
+
+    /// #1320/#1311: an agent deploy holds new worker starts only inside the
+    /// operator's hold window. Past it the deploy keeps waiting for a quiet
+    /// point while launches run; at the first quiet poll the hold engages again
+    /// through the confirming poll, and the deploy restarts before its deadline.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn the_hold_is_capped_and_the_deploy_restarts_at_a_later_lull() {
+        let f = fixture(true);
+        let worker = Uuid::new_v4();
+        session(&*f.store.lock().await, worker, "Running", Some(f.owner));
+        let row = stage(&f, "lull", 3600).await;
+        f.drain.set_hold_cap_secs(60);
+        let mut gate = GateState::default();
+        let start = Utc::now();
+        let other = Some(Uuid::new_v4());
+
+        let inside = poll_once(&f.store, &f.service, start, &mut gate, &f.drain, true)
+            .await
+            .unwrap();
+        assert_eq!(inside, PollOutcome::Waiting(vec!["worker_mid_turn"]));
+        assert!(f.drain.holds(other, true), "held inside the window");
+        let status = f.drain.status();
+        assert!(status.draining && status.waiting);
+        let release_by = DateTime::parse_from_rfc3339(status.release_by.as_deref().unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(
+            release_by <= start + ChronoDuration::seconds(61),
+            "released by the window, not the {}s deadline: {release_by}",
+            3600
+        );
+
+        // Past the window: still waiting on the worker, nothing held.
+        let past = start + ChronoDuration::seconds(120);
+        let unheld = poll_once(&f.store, &f.service, past, &mut gate, &f.drain, true)
+            .await
+            .unwrap();
+        assert_eq!(unheld, PollOutcome::Waiting(vec!["worker_mid_turn"]));
+        assert!(!f.drain.holds(other, true), "launches run past the window");
+        let status = f.drain.status();
+        assert!(!status.draining);
+        assert!(status.waiting, "the deploy still waits for a lull");
+        assert_eq!(status.deploy_id, Some(row.id));
+        assert_eq!(status.blockers, vec!["worker_mid_turn".to_string()]);
+        assert_eq!(installed(&f), OLD);
+
+        // The worker's turn ends: a lull. The hold engages for the confirming
+        // poll, then the deploy swaps and restarts.
+        f.store
+            .lock()
+            .await
+            .conn
+            .execute(
+                "UPDATE sessions SET status='Completed' WHERE id=?1",
+                [worker.to_string()],
+            )
+            .unwrap();
+        let lull = poll_once(&f.store, &f.service, past, &mut gate, &f.drain, true)
+            .await
+            .unwrap();
+        assert_eq!(lull, PollOutcome::Waiting(vec![]));
+        assert!(f.drain.holds(other, true), "held from the first quiet poll");
+        let restart = poll_once(&f.store, &f.service, past, &mut gate, &f.drain, true)
+            .await
+            .unwrap();
+        assert_eq!(restart, PollOutcome::Restarting(row.id));
+        assert_eq!(installed(&f), NEW);
+        assert!(f.drain.holds(other, true), "held through the restart");
+    }
+
+    /// A zero window never holds: the deploy only waits for a lull.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn a_zero_hold_window_waits_for_a_lull_without_holding() {
+        let f = fixture(true);
+        let worker = Uuid::new_v4();
+        session(&*f.store.lock().await, worker, "Running", Some(f.owner));
+        stage(&f, "no-hold", 900).await;
+        f.drain.set_hold_cap_secs(0);
+        let mut gate = GateState::default();
+        let waiting = poll_once(&f.store, &f.service, Utc::now(), &mut gate, &f.drain, true)
+            .await
+            .unwrap();
+        assert_eq!(waiting, PollOutcome::Waiting(vec!["worker_mid_turn"]));
+        assert!(!f.drain.is_draining());
+        assert!(f.drain.status().waiting);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
@@ -1175,6 +1560,23 @@ mod tests {
             wake[0].message.contains("worker_mid_turn"),
             "{}",
             wake[0].message
+        );
+        // #1333 andon: the timeout is friction data for the deploy's owner.
+        let friction = store
+            .friction_rollup(
+                &rsi_common::friction::ListFrictionRollupRequestV1::default(),
+                late,
+            )
+            .unwrap();
+        let row_signature = friction
+            .rows
+            .iter()
+            .find(|r| r.signature == "deploy_timeout:worker_mid_turn")
+            .expect("deploy timeout friction recorded");
+        assert_eq!(row_signature.occurrences, 1);
+        assert_eq!(
+            row_signature.evidence_refs,
+            vec![format!("deploy:{}", row.id)]
         );
         assert_eq!(installed(&f), OLD);
         // The staged copy is removed when the wait times out.
@@ -1355,6 +1757,264 @@ mod tests {
         assert!(!drain.is_draining());
     }
 
+    /// #1461 helper: a worker (a child of the deploy's owner) mid-turn.
+    async fn worker_mid_turn(f: &Fixture) -> Uuid {
+        let worker = Uuid::new_v4();
+        session(&*f.store.lock().await, worker, "Running", Some(f.owner));
+        worker
+    }
+
+    async fn poll_at(
+        f: &Fixture,
+        gate: &mut GateState,
+        at: DateTime<Utc>,
+        drain_enabled: bool,
+    ) -> PollOutcome {
+        poll_once(&f.store, &f.service, at, gate, &f.drain, drain_enabled)
+            .await
+            .unwrap()
+    }
+
+    /// #1461: `interrupt_workers` waits out the operator's hold like any
+    /// deploy, then stops treating a worker mid-turn as a blocker: after the
+    /// two quiet polls the deploy swaps and restarts, records which workers it
+    /// interrupted on its row, files one andon event per worker, and the outcome
+    /// (written after the restart) names them.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn interrupt_workers_restarts_over_workers_mid_turn_once_the_hold_is_over() {
+        let f = fixture(true);
+        let w1 = worker_mid_turn(&f).await;
+        let w2 = worker_mid_turn(&f).await;
+        let mut expected = vec![w1, w2];
+        expected.sort();
+        let row = stage_with(&f, "interrupt", 3600, true).await;
+        f.drain.set_hold_cap_secs(60);
+        let mut gate = GateState::default();
+        let start = Utc::now();
+        let other = Some(Uuid::new_v4());
+
+        // Inside the hold the workers still block, and new starts are held.
+        for at in [start, start + ChronoDuration::seconds(59)] {
+            assert_eq!(
+                poll_at(&f, &mut gate, at, true).await,
+                PollOutcome::Waiting(vec!["worker_mid_turn"])
+            );
+        }
+        assert!(f.drain.holds(other, true));
+        assert_eq!(installed(&f), OLD);
+
+        // Past it they do not: a quiet poll (the hold engages again), then the
+        // confirming poll swaps and restarts.
+        let past = start + ChronoDuration::seconds(120);
+        assert_eq!(
+            poll_at(&f, &mut gate, past, true).await,
+            PollOutcome::Waiting(vec![])
+        );
+        assert!(f.drain.holds(other, true), "held from the first quiet poll");
+        assert_eq!(f.restarts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            poll_at(&f, &mut gate, past, true).await,
+            PollOutcome::Restarting(row.id)
+        );
+        assert_eq!(f.restarts.load(Ordering::SeqCst), 1);
+        assert_eq!(installed(&f), NEW);
+        {
+            let store = f.store.lock().await;
+            assert_eq!(
+                store.agent_deploy_interrupt(row.id).unwrap(),
+                crate::store::agent_deploys::DeployInterrupt {
+                    requested: true,
+                    interrupted: expected.clone(),
+                }
+            );
+            let rollup = store
+                .friction_rollup(
+                    &rsi_common::friction::ListFrictionRollupRequestV1::default(),
+                    past,
+                )
+                .unwrap();
+            let event = rollup
+                .rows
+                .iter()
+                .find(|r| r.signature == "deploy_interrupt:worker_mid_turn")
+                .expect("an andon event per interrupted worker");
+            assert_eq!((event.occurrences, event.sessions), (2, 2));
+            assert_eq!(event.evidence_refs, vec![format!("deploy:{}", row.id)]);
+        }
+
+        // The next process settles the deploy and tells the manager who was cut off.
+        let new_sha = binary_sha256(&f.install.join("rsid")).unwrap();
+        assert_eq!(
+            verify_after_restart(&f.store, &f.service, SHA, Some(&new_sha), past)
+                .await
+                .unwrap(),
+            Some(PollOutcome::Settled(row.id, DeployState::Succeeded))
+        );
+        let store = f.store.lock().await;
+        let wake = wakes(&store, f.owner);
+        assert_eq!(wake.len(), 1);
+        for worker in &expected {
+            assert!(
+                wake[0].message.contains(&worker.to_string()),
+                "{}",
+                wake[0].message
+            );
+        }
+    }
+
+    /// #1461: without the option nothing changes: a worker mid-turn blocks past
+    /// the hold for as long as it runs, and nothing is interrupted or recorded.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn without_interrupt_workers_a_worker_mid_turn_blocks_past_the_hold() {
+        let f = fixture(true);
+        worker_mid_turn(&f).await;
+        let row = stage(&f, "plain", 3600).await;
+        f.drain.set_hold_cap_secs(60);
+        let mut gate = GateState::default();
+        let past = Utc::now() + ChronoDuration::seconds(120);
+        for _ in 0..3 {
+            assert_eq!(
+                poll_at(&f, &mut gate, past, true).await,
+                PollOutcome::Waiting(vec!["worker_mid_turn"])
+            );
+        }
+        assert_eq!(f.restarts.load(Ordering::SeqCst), 0);
+        assert_eq!(installed(&f), OLD);
+        assert_eq!(
+            f.store.lock().await.agent_deploy_interrupt(row.id).unwrap(),
+            crate::store::agent_deploys::DeployInterrupt::default()
+        );
+    }
+
+    /// #1461: only workers stop blocking. A landing in progress and a running
+    /// local job still hold the deploy back past the hold, so a landing or a
+    /// test/build run is never cut off.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn interrupt_workers_still_waits_for_a_landing_and_a_local_job() {
+        let f = fixture(true);
+        worker_mid_turn(&f).await;
+        let row = stage_with(&f, "keep-waiting", 3600, true).await;
+        f.drain.set_hold_cap_secs(60);
+        let mut gate = GateState::default();
+        let now = Utc::now() + ChronoDuration::seconds(120);
+        {
+            let store = f.store.lock().await;
+            store
+                .enqueue_rolling_queue_source(
+                    &NewQueueEntry {
+                        project_id: None,
+                        repo_path: "/tmp/repo".into(),
+                        source_commit: "b".repeat(40),
+                        source_session_id: f.owner,
+                        owner_epic_id: None,
+                        binding: RollingQueueBinding::Unbound,
+                        work_key: None,
+                        migration_version: None,
+                        hot_files: vec![],
+                        test_filters: vec![],
+                        idempotency_key: "land".into(),
+                    },
+                    now,
+                )
+                .unwrap();
+            store.claim_next_rolling_queue_entry(now).unwrap().unwrap();
+        }
+        assert_eq!(
+            poll_at(&f, &mut gate, now, true).await,
+            PollOutcome::Waiting(vec!["landing_in_progress"])
+        );
+        f.store
+            .lock()
+            .await
+            .conn
+            .execute(
+                "INSERT INTO agent_jobs(id, owner_session_id, kind, params_json, cwd, \
+                 unit_name, log_path, status_path, state, created_at, row_version) \
+                 VALUES (?1,?2,'test','{}','/tmp','u','/tmp/l','/tmp/s','running',?3,1)",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    f.owner.to_string(),
+                    now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            poll_at(&f, &mut gate, now, true).await,
+            PollOutcome::Waiting(vec!["landing_in_progress", "job_running"])
+        );
+        assert_eq!(gate.quiet_polls, 0);
+        assert_eq!(f.restarts.load(Ordering::SeqCst), 0);
+        assert_eq!(installed(&f), OLD);
+        assert!(
+            f.store
+                .lock()
+                .await
+                .agent_deploy_interrupt(row.id)
+                .unwrap()
+                .interrupted
+                .is_empty()
+        );
+    }
+
+    /// #1461: with the operator's drain setting off nothing is ever held, so
+    /// there is no hold to wait out.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn interrupt_workers_has_no_hold_to_wait_out_when_the_drain_setting_is_off() {
+        let f = fixture(true);
+        let worker = worker_mid_turn(&f).await;
+        let row = stage_with(&f, "no-drain", 3600, true).await;
+        f.drain.set_hold_cap_secs(600);
+        let mut gate = GateState::default();
+        let now = Utc::now();
+        assert_eq!(
+            poll_at(&f, &mut gate, now, false).await,
+            PollOutcome::Waiting(vec![])
+        );
+        assert_eq!(
+            poll_at(&f, &mut gate, now, false).await,
+            PollOutcome::Restarting(row.id)
+        );
+        assert_eq!(
+            f.store
+                .lock()
+                .await
+                .agent_deploy_interrupt(row.id)
+                .unwrap()
+                .interrupted,
+            vec![worker]
+        );
+    }
+
+    /// #1461: the deadline still bounds the wait. A wait shorter than the hold
+    /// ends at its deadline, with the worker named as the blocker, exactly as
+    /// before: the manager keeps `max_wait_secs` above the hold.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn an_interrupt_deploy_whose_deadline_precedes_the_hold_end_times_out() {
+        let f = fixture(true);
+        worker_mid_turn(&f).await;
+        let row = stage_with(&f, "short-wait", 30, true).await;
+        f.drain.set_hold_cap_secs(600);
+        let mut gate = GateState::default();
+        let late = Utc::now() + ChronoDuration::seconds(40);
+        assert_eq!(
+            poll_at(&f, &mut gate, late, true).await,
+            PollOutcome::Settled(row.id, DeployState::TimedOut)
+        );
+        let store = f.store.lock().await;
+        let wake = wakes(&store, f.owner);
+        assert!(
+            wake[0].message.contains("worker_mid_turn"),
+            "{}",
+            wake[0].message
+        );
+        assert_eq!(f.restarts.load(Ordering::SeqCst), 0);
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn restart_verification_succeeds_once_and_wakes_exactly_once() {
@@ -1403,6 +2063,54 @@ mod tests {
             wake[0].message
         );
         assert_eq!(f.restarts.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn migrated_database_rollback_waits_for_offline_supervisor_recovery() {
+        let mut f = fixture(true);
+        f.service.plan.probe = Arc::new(|path: &Path| {
+            let schema = if path
+                .extension()
+                .is_some_and(|extension| extension == "prev")
+            {
+                0
+            } else {
+                999
+            };
+            Ok((SHA.to_string(), schema))
+        });
+        let row = stage(&f, "database-rollback", 900).await;
+        swap_in(&row.manifest, row.id).unwrap();
+        let database = f._dir.path().join("rsi.db");
+        let store = Store::open(&database).unwrap();
+        let backup = prepare_database_rollback(&store, &f.service, &row)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.schema_version().unwrap(),
+            crate::store::LATEST_SCHEMA_VERSION
+        );
+        assert_eq!(std::fs::read(f.install.join("rsid.failed")).unwrap(), NEW);
+        assert_eq!(
+            std::fs::read_to_string(f.install.join("rsid.db-rollback")).unwrap(),
+            database.to_str().unwrap()
+        );
+        rollback(&row.manifest.iter().collect::<Vec<_>>());
+        assert_eq!(installed(&f), OLD);
+        assert!(backup.exists());
+        drop(store);
+        assert_eq!(
+            crate::store::migration_backup::restore(&database, 0).unwrap(),
+            Some(backup)
+        );
+        let restored = rusqlite::Connection::open(&database).unwrap();
+        assert_eq!(
+            restored
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
@@ -1491,6 +2199,37 @@ mod tests {
             std::fs::symlink_metadata(f.install.join("rsi-rolling-land")).is_err(),
             "a binary absent before the deploy is absent after the failed deploy"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn mac_restore_moves_aside_to_vacant_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let aside = dir.path().join("aside");
+        let dest = dir.path().join("dest");
+        std::fs::write(&aside, b"replacement").unwrap();
+        let identity = object_identity(&aside).unwrap();
+        restore_without_replacing(&aside, &dest).unwrap();
+        assert_eq!(object_identity(&dest), Some(identity));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"replacement");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn mac_restore_preserves_occupied_destination_and_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let aside = dir.path().join("aside");
+        let dest = dir.path().join("dest");
+        std::fs::write(&aside, b"replacement").unwrap();
+        std::fs::write(&dest, b"new install").unwrap();
+        assert_eq!(
+            restore_without_replacing(&aside, &dest).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new install");
+        assert_eq!(std::fs::read(&aside).unwrap(), b"replacement");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
@@ -1669,6 +2408,7 @@ mod tests {
                             fingerprint: deploy_fingerprint(SHA, "x", 60),
                             manifest: &manifest,
                             max_wait_secs: 60,
+                            interrupt_workers: false,
                         },
                         now,
                     )

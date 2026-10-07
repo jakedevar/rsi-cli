@@ -14,6 +14,118 @@ SUPERVISOR = Path(__file__).resolve().parents[1] / "rsid-supervisor.sh"
 
 
 class SupervisorTests(unittest.TestCase):
+    def make_supervisor(self, directory: Path) -> Path:
+        supervisor = directory / "rsid-supervisor.sh"
+        supervisor.write_text(SUPERVISOR.read_text())
+        supervisor.chmod(0o755)
+        return supervisor
+
+    def test_reexec_preserves_pid_and_restart_budget_across_every_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            supervisor = self.make_supervisor(directory)
+            # Change the script on every daemon run. Resetting history at exec
+            # would let this watchdog loop continue past the four-run budget.
+            daemon = self.make_daemon(
+                directory,
+                'cd "$(dirname "$0")"\n'
+                'echo "$$ $PPID" >> starts\n'
+                'cp rsid-supervisor.sh rsid-supervisor.sh.next\n'
+                'echo "# next incarnation $(wc -l < starts)" >> rsid-supervisor.sh.next\n'
+                'mv rsid-supervisor.sh.next rsid-supervisor.sh\n'
+                'exit 75\n',
+            )
+            process = subprocess.Popen(
+                [str(supervisor), str(daemon)], stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            _, stderr = process.communicate(timeout=15)
+            self.assertEqual(process.returncode, 75, stderr)
+            starts = (directory / "starts").read_text().splitlines()
+            self.assertEqual(len(starts), 4)
+            self.assertEqual([int(line.split()[1]) for line in starts], [process.pid] * 4)
+            self.assertEqual(stderr.count("refreshing rsid supervisor"), 3)
+            self.assertIn("restart budget exhausted", stderr)
+            self.assertTrue(supervisor.with_name("rsid-supervisor.sh.last-good").is_file())
+            self.assertEqual(list(directory.glob(".rsid-supervisor.*")), [])
+
+    def test_syntax_invalid_refresh_keeps_the_running_supervisor(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            supervisor = self.make_supervisor(directory)
+            daemon = self.make_daemon(
+                directory,
+                'cd "$(dirname "$0")"\n'
+                'echo started >> starts\n'
+                'if [[ $(wc -l < starts) -eq 1 ]]; then\n'
+                '  echo "if then" > rsid-supervisor.sh.next\n'
+                '  mv rsid-supervisor.sh.next rsid-supervisor.sh\n'
+                '  exit 75\n'
+                'fi\nexit 0\n',
+            )
+            result = subprocess.run(
+                [str(supervisor), str(daemon)], capture_output=True,
+                text=True, timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((directory / "starts").read_text().splitlines(), ["started"] * 2)
+            self.assertIn("supervisor refresh refused", result.stderr)
+            self.assertEqual(list(directory.glob(".rsid-supervisor.*")), [])
+
+    def test_refresh_preserves_fast_failure_fallback_state(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            supervisor = self.make_supervisor(directory)
+            link, real = self.deploy_layout(
+                directory,
+                'echo prev >> "$(dirname "$(readlink -f "$0")")/starts"\nexit 0\n',
+            )
+            # Swap supervisor together with rsid on the initial deploy exit.
+            script = link.resolve()
+            body = script.read_text().replace(
+                'touch "$flag"; exit 75;',
+                'touch "$flag"; '
+                f'cp "{supervisor}" "{supervisor}.next"; '
+                f'echo "# refreshed" >> "{supervisor}.next"; '
+                f'mv "{supervisor}.next" "{supervisor}"; exit 75;',
+            )
+            script.write_text(body)
+            result = subprocess.run(
+                [str(supervisor), str(link)], capture_output=True,
+                text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((real / "starts").read_text().splitlines(), ["new", "new", "prev"])
+            self.assertIn("refreshing rsid supervisor", result.stderr)
+            self.assertIn("restoring", result.stderr)
+
+    def test_refresh_preserves_the_single_fallback_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            supervisor = self.make_supervisor(directory)
+            link, real = self.deploy_layout(
+                directory,
+                'cd "$(dirname "$(readlink -f "$0")")"\n'
+                'echo prev >> starts\n'
+                'if [[ ! -e old-started ]]; then\n'
+                '  touch old-started\n'
+                f'  cp "{supervisor}" "{supervisor}.next"\n'
+                f'  echo "# refresh after fallback" >> "{supervisor}.next"\n'
+                f'  mv "{supervisor}.next" "{supervisor}"\n'
+                '  cp rsid rsid.prev\n'
+                '  echo "deploy in flight" > rsid.deploy-inflight\n'
+                '  exit 75\n'
+                'fi\nexit 3\n',
+            )
+            result = subprocess.run(
+                [str(supervisor), str(link)], capture_output=True,
+                text=True, timeout=12,
+            )
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertEqual((real / "starts").read_text().splitlines(), ["new", "new", "prev", "prev"])
+            self.assertEqual(result.stderr.count("restoring"), 1)
+            self.assertIn("refreshing rsid supervisor", result.stderr)
+
     def make_daemon(self, directory: Path, body: str) -> Path:
         daemon = directory / "fake-rsid"
         daemon.write_text("#!/usr/bin/env bash\nset -u\n" + body)
@@ -78,7 +190,7 @@ class SupervisorTests(unittest.TestCase):
             self.assertIn("restart budget exhausted", result.stderr)
 
     def deploy_layout(
-        self, directory: Path, prev_body: str | None, inflight: bool = True
+        self, directory: Path, prev_body: str | None, inflight: bool = True, recovery_status: int = 0
     ):
         """`bin/rsid` symlinks to `real/rsid` (as ~/.local/bin does); the first
         run exits 75, every later run of the "new" binary exits 1 at once."""
@@ -89,6 +201,9 @@ class SupervisorTests(unittest.TestCase):
         daemon = real / "rsid"
         daemon.write_text(
             "#!/usr/bin/env bash\n"
+            'if [[ ${1:-} == --restore-pre-migration-db ]]; then\n'
+            'echo recover >> "$(dirname "$(readlink -f "$0")")/starts"\n'
+            f"exit {recovery_status}\nfi\n"
             'echo new >> "$(dirname "$(readlink -f "$0")")/starts"\n'
             'flag="$(dirname "$(readlink -f "$0")")/flag"\n'
             'if [[ ! -e "$flag" ]]; then touch "$flag"; exit 75; fi\n'
@@ -126,6 +241,40 @@ class SupervisorTests(unittest.TestCase):
             self.assertTrue((real / "rsid.failed").exists())
             self.assertFalse((real / "rsid.prev").exists())
             self.assertFalse((real / "rsid.deploy-inflight").exists())
+
+    def test_fast_failure_restores_database_before_starting_previous_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            link, real = self.deploy_layout(
+                directory, 'echo prev >> "$(dirname "$(readlink -f "$0")")/starts"\nexit 0\n'
+            )
+            (real / "rsid.deploy-inflight").write_text(f"database={directory / 'rsi.db'}")
+            result = subprocess.run([str(SUPERVISOR), str(link)], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((real / "starts").read_text().splitlines(), ["new", "new", "recover", "prev"])
+
+    def test_failed_database_restore_refuses_binary_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            link, real = self.deploy_layout(directory, "exit 0\n", recovery_status=9)
+            (real / "rsid.deploy-inflight").write_text(f"database={directory / 'rsi.db'}")
+            result = subprocess.run([str(SUPERVISOR), str(link)], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual((real / "starts").read_text().splitlines(), ["new", "new", "recover"])
+            self.assertTrue((real / "rsid.prev").exists())
+            self.assertTrue((real / "rsid.deploy-inflight").exists())
+
+    def test_verifier_request_is_recovered_before_first_supervisor_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            daemon = self.make_daemon(directory, 'echo old >> "$(dirname "$0")/starts"\nexit 0\n')
+            recovery = daemon.with_name("fake-rsid.failed")
+            recovery.write_text('#!/usr/bin/env bash\necho recover >> "$(dirname "$0")/starts"\nexit 0\n')
+            recovery.chmod(0o755)
+            daemon.with_name("fake-rsid.db-rollback").write_text(str(directory / "rsi.db"))
+            result = subprocess.run([str(SUPERVISOR), str(daemon)], capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((directory / "starts").read_text().splitlines(), ["recover", "old"])
 
     def test_fallback_is_single_and_a_failing_prev_is_returned(self) -> None:
         with tempfile.TemporaryDirectory() as root:

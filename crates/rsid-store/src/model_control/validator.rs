@@ -683,6 +683,9 @@ fn validate_exclusion(
         AllowedExclusionOperation::CredentialHttpProbe => {
             credential_probe_is_bounded(item.block, contract.proof_ident)
         }
+        AllowedExclusionOperation::BedrockSetupHttpProbe => {
+            bedrock_setup_probe_is_bounded(item.block, contract.proof_ident)
+        }
         AllowedExclusionOperation::TransportSpawn if transport_factory_proof => true,
         _ => facts
             .operation_proofs
@@ -747,6 +750,16 @@ fn validate_exclusion(
                     && facts.spawn == 0
                     && no_model_family
             }
+            AllowedExclusionOperation::BedrockSetupHttpProbe => {
+                facts.post == contract.occurrences
+                    && facts.get == 0
+                    && facts.raw_http_send == contract.occurrences
+                    && facts.bound_post_raw_send == contract.occurrences
+                    && !facts.assigned_bindings.contains("request")
+                    && !facts.assigned_bindings.contains("url")
+                    && facts.spawn == 0
+                    && no_model_family
+            }
             AllowedExclusionOperation::QueueNoOp => {
                 facts.post == 0
                     && facts.spawn == 0
@@ -777,77 +790,91 @@ fn validate_exclusion(
     }
 }
 
-/// This credential check mixes catalog GETs with a bounded Bedrock model POST.
-/// Keep its request identity and POST payload explicit rather than treating it
-/// as a non-model HTTP operation.
-fn credential_probe_is_bounded(block: &Block, proof_ident: &str) -> bool {
-    fn method<'a>(expr: &'a Expr, name: &str) -> Option<&'a ExprMethodCall> {
-        match expr {
-            Expr::MethodCall(call) if call.method == name && call.args.len() == 1 => Some(call),
-            _ => None,
-        }
+fn method<'a>(expr: &'a Expr, name: &str) -> Option<&'a ExprMethodCall> {
+    match expr {
+        Expr::MethodCall(call) if call.method == name && call.args.len() == 1 => Some(call),
+        _ => None,
     }
+}
 
-    fn macro_matches(expr: &Expr, path: &[&str], tokens: &str) -> bool {
-        let Expr::Macro(expr) = expr else {
-            return false;
-        };
-        expr.mac
-            .path
-            .segments
-            .iter()
-            .map(|segment| segment.ident.to_string())
-            .eq(path.iter().copied())
-            && expr.mac.tokens.to_string()
-                == tokens
-                    .parse::<proc_macro2::TokenStream>()
-                    .expect("probe proof tokens")
-                    .to_string()
-    }
+fn macro_matches(expr: &Expr, path: &[&str], tokens: &str) -> bool {
+    let Expr::Macro(expr) = expr else {
+        return false;
+    };
+    expr.mac
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .eq(path.iter().copied())
+        && expr.mac.tokens.to_string()
+            == tokens
+                .parse::<proc_macro2::TokenStream>()
+                .expect("probe proof tokens")
+                .to_string()
+}
 
-    fn bounded_post(expr: &Expr) -> bool {
-        let Some(json) = method(expr, "json") else {
-            return false;
-        };
-        let Some(Expr::Reference(payload)) = json.args.first() else {
-            return false;
-        };
-        if payload.mutability.is_some()
-            || !macro_matches(
-                &payload.expr,
-                &["serde_json", "json"],
+/// Both operator credential checks use fixed one-token payloads. Their URL
+/// and request identity are checked separately at each source-bound send.
+fn bounded_probe_post(expr: &Expr, setup: bool) -> bool {
+    let Some(json) = method(expr, "json") else {
+        return false;
+    };
+    let Some(Expr::Reference(payload)) = json.args.first() else {
+        return false;
+    };
+    if payload.mutability.is_some()
+        || !macro_matches(
+            &payload.expr,
+            &["serde_json", "json"],
+            if setup {
+                r#"{
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "ping"}],
+        }"#
+            } else {
                 r#"{
             "model": crate::bedrock::BEDROCK_DEFAULT_MODEL,
             "max_tokens": 1,
             "messages": [{"role": "user", "content": "ping"}],
-        }"#,
-            )
-        {
-            return false;
-        }
-        let Some(auth) = method(&json.receiver, "bearer_auth") else {
-            return false;
-        };
-        let Some(Expr::MethodCall(secret)) = auth.args.first() else {
-            return false;
-        };
-        if secret.method != "expose"
-            || !secret.args.is_empty()
-            || !expr_is_ident(&secret.receiver, "secret")
-        {
-            return false;
-        }
-        let Some(post) = method(&auth.receiver, "post") else {
-            return false;
-        };
-        expr_is_ident(&post.receiver, "http")
-            && macro_matches(
+        }"#
+            },
+        )
+    {
+        return false;
+    }
+    let Some(auth) = method(&json.receiver, "bearer_auth") else {
+        return false;
+    };
+    let Some(Expr::MethodCall(secret)) = auth.args.first() else {
+        return false;
+    };
+    if secret.method != "expose"
+        || !secret.args.is_empty()
+        || !expr_is_ident(&secret.receiver, "secret")
+    {
+        return false;
+    }
+    let Some(post) = method(&auth.receiver, "post") else {
+        return false;
+    };
+    expr_is_ident(&post.receiver, "http")
+        && if setup {
+            expr_is_ident(post.args.first().expect("one POST argument"), "url")
+        } else {
+            macro_matches(
                 post.args.first().expect("one POST argument"),
                 &["format"],
                 r#""{base}/openai/v1/chat/completions""#,
             )
-    }
+        }
+}
 
+/// This credential check mixes catalog GETs with a bounded Bedrock model POST.
+/// Keep its request identity and POST payload explicit rather than treating it
+/// as a non-model HTTP operation.
+fn credential_probe_is_bounded(block: &Block, proof_ident: &str) -> bool {
     struct ProbeShape {
         requests: usize,
         bounded: bool,
@@ -881,7 +908,7 @@ fn credential_probe_is_bounded(block: &Block, proof_ident: &str) -> bool {
                         let Expr::Block(body) = arm.body.as_ref() else {
                             return false;
                         };
-                        matches!(body.block.stmts.last(), Some(syn::Stmt::Expr(expr, None)) if bounded_post(expr))
+                        matches!(body.block.stmts.last(), Some(syn::Stmt::Expr(expr, None)) if bounded_probe_post(expr, false))
                     });
                 }
             }
@@ -906,6 +933,104 @@ fn credential_probe_is_bounded(block: &Block, proof_ident: &str) -> bool {
     proof_ident == "BEDROCK_DEFAULT_MODEL"
         && shape.requests == 1
         && shape.bounded
+        && shape.sends == 1
+}
+
+fn bedrock_setup_probe_is_bounded(block: &Block, proof_ident: &str) -> bool {
+    fn bounded_url(expr: &Expr) -> bool {
+        let Expr::Match(url) = expr else {
+            return false;
+        };
+        let Expr::Reference(base) = url.expr.as_ref() else {
+            return false;
+        };
+        let Expr::Field(field) = base.expr.as_ref() else {
+            return false;
+        };
+        if base.mutability.is_some()
+            || !expr_is_ident(&field.base, "self")
+            || !matches!(&field.member, syn::Member::Named(ident) if ident == "base")
+            || url.arms.len() != 2
+        {
+            return false;
+        }
+        let some = &url.arms[0];
+        let none = &url.arms[1];
+        let Pat::TupleStruct(pattern) = &some.pat else {
+            return false;
+        };
+        if !pattern.path.is_ident("Some")
+            || pattern.elems.len() != 1
+            || !matches!(pattern.elems.first(), Some(Pat::Ident(ident)) if ident.ident == "base" && ident.mutability.is_none() && ident.by_ref.is_none() && ident.subpat.is_none())
+            || some.guard.is_some()
+            || none.guard.is_some()
+            // syn represents a bare unit variant as an identifier pattern.
+            || !matches!(&none.pat, Pat::Ident(ident) if ident.ident == "None" && ident.mutability.is_none() && ident.by_ref.is_none() && ident.subpat.is_none())
+            || !macro_matches(
+                &some.body,
+                &["format"],
+                r#""{base}/model/{}/invoke", model.replace(':', "%3A")"#,
+            )
+        {
+            return false;
+        }
+        let Expr::Call(call) = none.body.as_ref() else {
+            return false;
+        };
+        matches!(call.func.as_ref(), Expr::Path(path) if path.path.segments.iter().map(|segment| segment.ident.to_string()).eq(["crate", "bedrock", "runtime_invoke_url"]))
+            && call.args.len() == 3
+            && expr_is_ident(&call.args[0], "region")
+            && expr_is_ident(&call.args[1], "model")
+            && matches!(&call.args[2], Expr::Lit(lit) if matches!(&lit.lit, syn::Lit::Bool(value) if !value.value))
+    }
+
+    #[derive(Default)]
+    struct ProbeShape {
+        requests: usize,
+        urls: usize,
+        bounded_request: bool,
+        bounded_url: bool,
+        sends: usize,
+    }
+    impl<'ast> Visit<'ast> for ProbeShape {
+        fn visit_local(&mut self, local: &'ast Local) {
+            if let Pat::Ident(ident) = &local.pat {
+                if ident.ident == "request" {
+                    self.requests += 1;
+                    self.bounded_request = ident.mutability.is_none()
+                        && local
+                            .init
+                            .as_ref()
+                            .is_some_and(|init| bounded_probe_post(&init.expr, true));
+                } else if ident.ident == "url" {
+                    self.urls += 1;
+                    self.bounded_url = ident.mutability.is_none()
+                        && local
+                            .init
+                            .as_ref()
+                            .is_some_and(|init| bounded_url(&init.expr));
+                }
+            }
+            visit::visit_local(self, local);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
+            if call.method == "send"
+                && call.args.is_empty()
+                && expr_is_ident(&call.receiver, "request")
+            {
+                self.sends += 1;
+            }
+            visit::visit_expr_method_call(self, call);
+        }
+    }
+    let mut shape = ProbeShape::default();
+    shape.visit_block(block);
+    proof_ident == "runtime_invoke_url"
+        && shape.requests == 1
+        && shape.urls == 1
+        && shape.bounded_request
+        && shape.bounded_url
         && shape.sends == 1
 }
 
@@ -1543,6 +1668,9 @@ fn exclusion_covers(operation: AllowedExclusionOperation, kind: PrimitiveKind) -
             PrimitiveKind::HttpPost
         ) | (
             AllowedExclusionOperation::CredentialHttpProbe,
+            PrimitiveKind::HttpPost
+        ) | (
+            AllowedExclusionOperation::BedrockSetupHttpProbe,
             PrimitiveKind::HttpPost
         )
     )

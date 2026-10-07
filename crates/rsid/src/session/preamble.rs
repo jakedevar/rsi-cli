@@ -59,6 +59,7 @@ const EMBEDDED_EPIC_LEAD: &str = include_str!("guidance/epic_lead_v1.md");
 const EMBEDDED_MANAGER: &str = include_str!("guidance/manager_v1.md");
 const EMBEDDED_REVIEWER: &str = include_str!("guidance/assigned_reviewer_v1.md");
 const EMBEDDED_GLOBAL_MANAGER: &str = include_str!("guidance/global_manager_v1.md");
+const EMBEDDED_PORTFOLIO_MANAGER: &str = include_str!("guidance/portfolio_manager_v1.md");
 
 fn embedded_kind_preamble(kind: SessionKind) -> Option<&'static str> {
     match kind {
@@ -93,6 +94,7 @@ fn check_guidance_ids(projection: &AgentAuthorityProjection) -> Result<()> {
     }
     if projection.is_global_manager {
         expected_ids.push("global_manager");
+        expected_ids.push("portfolio_manager");
     }
     if projection.guidance_ids != expected_ids {
         return Err(DaemonError::Store(
@@ -325,6 +327,7 @@ fn role_guidance(id: &str) -> Option<&'static str> {
         "manager" => Some(EMBEDDED_MANAGER),
         "assigned_reviewer" => Some(EMBEDDED_REVIEWER),
         "global_manager" => Some(EMBEDDED_GLOBAL_MANAGER),
+        "portfolio_manager" => Some(EMBEDDED_PORTFOLIO_MANAGER),
         _ => None,
     }
 }
@@ -926,6 +929,9 @@ mod tests {
             "Continue yourself only through `AgentScheduleWake` with `mode:\"resume\"`",
             "at most one same-session `mode:\"resume\"` wake of at most 3600 s",
             "never `fresh` on your own session",
+            // bound worker: the binding limits only AgentUpdateIssue (#1602)
+            "it never restricts `AgentCreateIssue`",
+            "explicit job or wake template",
             // epic lead: topology policy and Issue lifecycle
             "`policy_refused`",
             "archive is terminal-only and restore keeps the terminal status",
@@ -935,10 +941,50 @@ mod tests {
             "before `succeed_manager`, `pause_lead` or lead replacement",
             "`AgentRequestDeploy`",
             "`AgentEnqueueLandingSource`",
+            "Batch waits, never landings",
+            "scripts/check-touched-shards --base origin/rolling",
             "there are no hot-file claims or seals",
             "`topology_bulk_fanout_min_openrouter`",
+            // manager: runaway runs and the load rule (#1337)
+            "Runaway runs (#1337), every wake: read the top CPU consumers",
+            "`runaway_process` notice",
+            "over about 20 minutes, or one that dominates a host load over 40",
+            "`AgentHalt`, then `AgentContinueChild` with a scoped instruction",
+            "Report every run you stopped in your handoff",
+            "`job_timed_out`",
+            "check `uptime` before you launch build or test work",
+            "queue it while the 1-minute load is above 40",
+            "at most 5 concurrent build-heavy sessions per project",
         ] {
             assert!(guidance.contains(phrase), "guidance lost: {phrase}");
+        }
+    }
+
+    /// #1337: the portfolio manager's guidance carries the same runaway-run
+    /// duty and load rule for the projects it manages.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn portfolio_guidance_pins_the_runaway_run_duty_and_load_rule() {
+        let mut projection = worker_projection();
+        projection.is_global_manager = true;
+        projection.guidance_ids = vec!["common", "worker", "global_manager", "portfolio_manager"];
+        let guidance = render_authority_catalog(uuid::Uuid::new_v4(), &projection, None)
+            .unwrap()
+            .guidance;
+        for phrase in [
+            "## Portfolio manager",
+            "Runaway runs (#1337): on every wake read the top CPU consumers",
+            "over about 20 minutes, or one that dominates a host load over 40",
+            "(`AgentHalt`, then `AgentContinueChild` with a scoped instruction)",
+            "check `uptime` before launching build or test work",
+            "queue it while the 1-minute load is above 40",
+            "at most 5 concurrent build-heavy sessions per project",
+            "Report every run stopped in your report up and handoff",
+        ] {
+            assert!(
+                guidance.contains(phrase),
+                "portfolio guidance lost: {phrase}"
+            );
         }
     }
 
@@ -971,6 +1017,47 @@ mod tests {
         let json = serde_json::to_value(&catalog).unwrap();
         assert_eq!(json["schema_version"], 1);
         assert!(json.get("control").is_none());
+
+        // #1332: every role's catalog carries the improvement duty and the
+        // Friction field, plus its own kaizen duty.
+        let single_role = |role: &'static str| {
+            let mut projection = worker_projection();
+            match role {
+                "epic_lead" => projection.is_lead = true,
+                "manager" => projection.is_manager = true,
+                "assigned_reviewer" => projection.is_reviewer = true,
+                _ => {}
+            }
+            if role != "worker" {
+                projection.guidance_ids.push(role);
+            }
+            render_authority_catalog(uuid::Uuid::new_v4(), &projection, None).unwrap()
+        };
+        for (role, duty) in [
+            ("worker", "End every handoff with `Friction:"),
+            (
+                "assigned_reviewer",
+                "file process findings about the review itself",
+            ),
+            ("epic_lead", "Kaizen triage for your Epic"),
+            (
+                "manager",
+                "keep at least one worker on the highest-value open kaizen",
+            ),
+        ] {
+            let catalog = single_role(role);
+            assert_eq!(catalog.roles.last().map(String::as_str), Some(role));
+            for phrase in [
+                "## Improve the line",
+                "file one kaizen Issue, then keep working",
+                "`AgentCreateIssue` with label `kaizen`",
+                "search with `title_contains` first",
+                "`Friction: none | #N[, #M] | <one line, not filed because ...>`",
+                duty,
+            ] {
+                assert!(catalog.guidance.contains(phrase), "{role} lacks {phrase}");
+            }
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -1072,6 +1159,7 @@ mod tests {
         assert!(guidance.contains("# Worker preamble — Research"));
         assert!(guidance.contains("## Current Epic lead"));
         assert!(guidance.contains("## Active assigned reviewer"));
+        assert!(guidance.contains("never set a reviewer target directory under `/tmp`"));
         assert!(guidance.contains("`AgentSpawnChild` / `rsi_control_spawn`"));
         assert!(
             guidance.contains("`AgentSubmitReviewReceipt` / `rsi_control_submit_review_receipt`")
@@ -1696,5 +1784,16 @@ mod tests {
         assert_eq!(ORCHESTRATION_ROUTER_FILENAME, "orchestration_router.md");
         // SHARED_DIR sits inside COMMANDS_DIR, never the other way around.
         assert!(SHARED_DIR.starts_with(COMMANDS_DIR));
+    }
+
+    /// #1532: a bound reviewer reads only its own review Issue, so the manager
+    /// guidance must tell the launcher to put the implementer handoff there.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn manager_guidance_requires_handoff_in_bound_review_issue() {
+        let guidance = role_guidance("manager").expect("manager guidance");
+        assert!(guidance.contains(
+            "put the implementer's handoff, the acceptance criteria and the exact source SHA in the review Issue body"
+        ));
     }
 }

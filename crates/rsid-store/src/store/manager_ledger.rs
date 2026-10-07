@@ -19,6 +19,7 @@ mod work_view;
 pub(crate) use facts::{FactReach, apply_work_facts_migration, is_work_fact};
 #[cfg(any(test, feature = "test-seam"))]
 pub(crate) use facts::{V122_CATALOG_OBJECTS, WORK_FACTS_SCHEMA_VERSION};
+pub(crate) use inspect::record_row;
 #[cfg(test)]
 mod tests;
 
@@ -154,6 +155,20 @@ pub struct DecisionRecord {
     pub answer: Option<String>,
     #[serde(default)]
     pub delivery: Option<Value>,
+    /// #1415: the asker's declared real gate (`None`: a non-gate question).
+    #[serde(default)]
+    pub gate: Option<String>,
+    /// #1415: the choices on offer, with the asker's recommendation.
+    #[serde(default)]
+    pub options: Vec<ManagerDecisionOptionV2>,
+    /// #1415: who asked, who settled, and the bounded audit trail (each actor
+    /// is `{kind, session_id, node_label, at}`).
+    #[serde(default)]
+    pub asked_by: Option<Value>,
+    #[serde(default)]
+    pub answered_by: Option<Value>,
+    #[serde(default)]
+    pub history: Vec<Value>,
 }
 
 /// Snapshot passed to bounded filesystem observation, never to an agent.

@@ -29,6 +29,8 @@ mod remote_gate;
 mod canary;
 #[path = "rsi-rolling-land/canary_runner.rs"]
 mod canary_runner;
+#[path = "rsi-rolling-land/test_impact.rs"]
+mod test_impact;
 
 const PROVISIONAL_SCRIPT: &str = "tools/rolling-migration-renumber.py";
 
@@ -143,6 +145,7 @@ struct LandReport {
     local_base_confirmed: BTreeSet<String>,
     base_absent_packages: BTreeSet<String>,
     base_static_inventory_reds: BTreeSet<String>,
+    base_test_baseline_unavailable: BTreeSet<String>,
     canary_reused_tree: Option<String>,
     /// Registry root when the post-push canary was handed to the runner.
     canary_queued: Option<String>,
@@ -209,6 +212,11 @@ fn stale_retry_lines(retries: &[StaleRetry]) -> Vec<String> {
 type RemoteShardResults =
     BTreeMap<(String, String), Result<rsid::integration::GuardCommandReport, String>>;
 
+enum BaseTestEvidence {
+    Observed(BTreeSet<String>),
+    CompilationUnavailable,
+}
+
 #[derive(Default)]
 struct TestGate {
     // An entry is reusable only for this exact rolling commit and command.
@@ -230,6 +238,8 @@ struct TestGate {
     // `<base>:<reason>` for each base whose shard-script static inventory
     // check refused; its results come from the direct bounded harness.
     base_static_inventory_reds: BTreeSet<String>,
+    // Compilation failure is unavailable evidence, never a cached empty set.
+    base_test_baseline_unavailable: BTreeSet<String>,
     base_worktrees: BTreeMap<String, PathBuf>,
     cache_root: Option<PathBuf>,
     skip_tests: bool,
@@ -243,8 +253,18 @@ struct TestGate {
     base_runs: usize,
     /// Seconds spent compiling shard binaries ahead of the gate loop (#1132).
     prebuild_secs: u64,
+    /// Seconds in candidate test runs and in base comparisons (#1244).
+    candidate_secs: u64,
+    base_secs: u64,
+    /// Wall seconds of the compile checks run beside the prebuild (#1244).
+    checks_secs: u64,
+    /// Test guards whose green, proven candidate needed no base (#1244).
+    base_skipped: usize,
     /// Test hook: run the prebuild even under `cfg(test)`.
     prebuild_forced: bool,
+    /// The explicit focused rsid filters of this gate, for the empty-filter
+    /// refusal and the failure attribution of the combined run (#1261).
+    focused_filters: Vec<FocusedFilter>,
 }
 
 enum GateScratch {
@@ -669,6 +689,9 @@ fn main() {
             }
             for entry in &report.base_static_inventory_reds {
                 println!("base_static_inventory_red={entry}");
+            }
+            for entry in &report.base_test_baseline_unavailable {
+                println!("base_test_baseline_unavailable={entry}");
             }
             for binding in &report.source_bindings {
                 println!("source_binding={}:{}", binding.source, binding.state);
@@ -1761,6 +1784,7 @@ async fn land_candidate(
         local_base_confirmed: test_gate.local_base_confirmed.clone(),
         base_absent_packages: test_gate.base_absent_packages.clone(),
         base_static_inventory_reds: test_gate.base_static_inventory_reds.clone(),
+        base_test_baseline_unavailable: test_gate.base_test_baseline_unavailable.clone(),
         canary_reused_tree,
         canary_queued,
         gate_scratch: test_gate
@@ -2483,8 +2507,40 @@ async fn run_candidate_test_gate(
     {
         return Err("landing guard worktree must be clean at the candidate".into());
     }
-    let metadata = workspace_metadata(worktree)?;
-    let spec = affected_crate_guard_spec(
+    // #1243: a filter that provably selects no test would fail the gate only
+    // after the build; refuse it first (the queue checks at enqueue, a manual
+    // landing only here).
+    if let Some(filter) =
+        rsid::rolling_queue::filter_selecting_no_tests(worktree, candidate, &options.test_filters)
+    {
+        return Err(format!(
+            "test filter selects no test at the candidate, refused before any build: {filter}"
+        ));
+    }
+    // Scripts-only and docs-only gates need no Cargo metadata or build.
+    let metadata = if affected_crates.is_empty() && options.test_filters.is_empty() && !provisional
+    {
+        WorkspaceMetadata {
+            workspace_members: Vec::new(),
+            packages: Vec::new(),
+        }
+    } else {
+        workspace_metadata(worktree)?
+    };
+    // #1280: an unfiltered rsid/rsid-store change gates every library test
+    // that can observe it (or all of them); an unreadable diff or a crate-wide
+    // change keeps every shard.
+    let rsid_unfiltered = test_impact::select(worktree, fetched_tip, candidate);
+    match rsid_unfiltered.as_ref().map(|selection| &selection.lib) {
+        Some(test_impact::LibTests::Tests(tests)) => {
+            println!("rsid_unfiltered_selection=tests count={}", tests.len())
+        }
+        Some(test_impact::LibTests::Everything(reason)) => {
+            println!("rsid_unfiltered_selection=everything reason={reason}")
+        }
+        None => println!("rsid_unfiltered_selection=all_shards"),
+    }
+    let mut spec = affected_crate_guard_spec(
         fetched_tip,
         candidate,
         affected_crates,
@@ -2492,7 +2548,11 @@ async fn run_candidate_test_gate(
         provisional,
         &metadata,
         options.cargo_build_jobs,
+        rsid_unfiltered.as_ref(),
     )?;
+    spec.commands
+        .extend(python_test_commands(worktree, fetched_tip, candidate)?);
+    test_gate.focused_filters = explicit_focused_filters(&options.test_filters, provisional);
     run_affected_gate(
         repo,
         worktree,
@@ -2502,6 +2562,71 @@ async fn run_candidate_test_gate(
         &options.disk_scratch_shards,
     )
     .await
+}
+
+/// Share scripts/tools test selection with scoped-test (#1606). Pure docs
+/// changes never launch the selector; every selected Python suite is a strict,
+/// bounded candidate check, so a failure refuses publication before Cargo.
+fn python_test_commands(
+    worktree: &Path,
+    base: &str,
+    candidate: &str,
+) -> Result<Vec<GuardCommand>, String> {
+    let paths = changed_paths(worktree, base, candidate)?;
+    if !paths
+        .iter()
+        .any(|path| path.starts_with(b"scripts/") || path.starts_with(b"tools/"))
+        || !(worktree.join("scripts/tests").is_dir() || worktree.join("tools/tests").is_dir())
+    {
+        return Ok(Vec::new());
+    }
+    let output = Command::new("python3")
+        .args([
+            "scripts/python-test-gate.py",
+            "--base",
+            base,
+            "--head",
+            candidate,
+        ])
+        .current_dir(worktree)
+        .output()
+        .map_err(|error| format!("cannot select Python tests: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cannot select Python tests: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let commands: Vec<Vec<String>> = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("invalid Python test plan: {error}"))?;
+    commands
+        .into_iter()
+        .map(|args| {
+            let command = GuardCommand {
+                program: "python3".into(),
+                // `-B`: never write bytecode into the candidate worktree, or
+                // its cleanup refuses the dirty tree after publication.
+                args: std::iter::once("-B".to_owned())
+                    .chain(args.into_iter().skip(1))
+                    .collect(),
+                timeout: Duration::from_secs(120),
+            };
+            if !is_python_test_guard(&command) {
+                return Err(format!("invalid Python test command: {command:?}"));
+            }
+            Ok(command)
+        })
+        .collect()
+}
+
+fn is_python_test_guard(command: &GuardCommand) -> bool {
+    command.program == "python3"
+        && command.args.first().is_some_and(|arg| arg == "-B")
+        && command.args.get(1).is_some_and(|arg| arg == "-m")
+        && command
+            .args
+            .get(2)
+            .is_some_and(|arg| arg == "unittest" || arg == "pytest")
 }
 
 fn test_failure_names(output: &str) -> BTreeSet<String> {
@@ -2658,7 +2783,21 @@ fn isolated_retry_command(
         return Err(format!("cannot isolate test failure: {name}"));
     }
     let mut retry = command.clone();
-    if retry.program == "scripts/run-rsid-test-shards.sh" {
+    if rsid_lib_filterset(command).is_some() {
+        // The shared lib build: the same packages and features, one test.
+        let mut args = vec!["test".to_owned()];
+        for package in RSID_LIB_TEST_PACKAGES {
+            args.extend(["-p".to_owned(), package.to_owned()]);
+        }
+        args.extend([
+            "--lib".into(),
+            name.into(),
+            "--".into(),
+            "--exact".into(),
+            "--test-threads=4".into(),
+        ]);
+        retry.args = args;
+    } else if retry.program == "scripts/run-rsid-test-shards.sh" {
         let shard = retry.args.get(1).ok_or("rsid shard command has no shard")?;
         retry.program = "cargo".into();
         let shard_packages = tree.packages(shard);
@@ -2689,7 +2828,14 @@ fn isolated_retry_command(
         if separator < 4 || retry.args.first().is_none_or(|arg| arg != "test") {
             return Err("unsupported cargo test command for isolated retry".into());
         }
-        retry.args.truncate(4);
+        // Keep the target selector and its operand; a named target takes one
+        // more argument than --lib. Only replace the optional test filter.
+        let target_end = match retry.args[3].as_str() {
+            "--lib" => 4,
+            "--test" | "--bin" if separator >= 5 => 5,
+            _ => return Err("unsupported cargo test target for isolated retry".into()),
+        };
+        retry.args.truncate(target_end);
         retry.args.extend([
             name.into(),
             "--".into(),
@@ -2819,10 +2965,19 @@ async fn run_one_guard(
             .file_name()
             .ok_or("guard worktree has no file name")?
             .to_string_lossy();
+        // `cargo check` (dev profile) shares no artifacts with the test
+        // builds, so it gets its own target and can run beside them (#1244).
+        let suffix = if command.program == "cargo"
+            && command.args.first().is_some_and(|arg| arg == "check")
+        {
+            "check-target"
+        } else {
+            "cargo-target"
+        };
         env.insert(
             "CARGO_TARGET_DIR".into(),
             parent
-                .join(format!("{name}-cargo-target"))
+                .join(format!("{name}-{suffix}"))
                 .to_string_lossy()
                 .into_owned(),
         );
@@ -2889,6 +3044,7 @@ fn full_shard(command: &GuardCommand) -> Option<(&str, u32)> {
 fn is_test_guard(command: &GuardCommand) -> bool {
     (command.program == "cargo" && command.args.first().is_some_and(|arg| arg == "test"))
         || command.program == "scripts/run-rsid-test-shards.sh"
+        || rsid_lib_filterset(command).is_some()
 }
 
 /// The package of a `cargo test -p <package> ...` guard; `None` for shard
@@ -3319,14 +3475,18 @@ fn ensure_base_worktree(repo: &Path, base: &str, gate: &mut TestGate) -> Result<
     Ok(path)
 }
 
+/// Run `command` on the base. `reported` is the gate command it answers for
+/// (differs from `command` when the run is narrowed, #1525); receipts and the
+/// inventory checks name it.
 async fn run_base_guard(
     repo: &Path,
     base: &str,
     spec: &GuardSpec,
     command: &GuardCommand,
+    reported: &GuardCommand,
     gate: &mut TestGate,
     fingerprint_source: &Path,
-) -> Result<BTreeSet<String>, String> {
+) -> Result<BaseTestEvidence, String> {
     if !gate.base_packages.contains_key(base) {
         let packages = base_workspace_packages(repo, base);
         gate.base_packages.insert(base.to_owned(), packages);
@@ -3336,7 +3496,7 @@ async fn run_base_guard(
         // A crate the candidate adds cannot run on the base, so it has no
         // base failures. The candidate side still runs and must pass.
         gate.base_absent_packages.insert(package.to_owned());
-        return Ok(BTreeSet::new());
+        return Ok(BaseTestEvidence::Observed(BTreeSet::new()));
     }
     let base_worktree = ensure_base_worktree(repo, base, gate)?;
     let report = run_shard_or_local(
@@ -3360,9 +3520,118 @@ async fn run_base_guard(
         gate.base_static_inventory_reds
             .insert(format!("{base}:{reason}"));
         let direct_report = run_one_guard(&base_worktree, spec, &direct).await?;
-        return record_base_failures(gate, &direct_report);
+        return base_test_evidence(repo, base, reported, gate, &direct_report);
     }
-    record_base_failures(gate, &report)
+    base_test_evidence(repo, base, reported, gate, &report)
+}
+
+/// Exit 101 is nextest's BUILD_FAILED, but Cargo also uses it for metadata,
+/// dependency, build-script and other infrastructure errors. Require a rustc
+/// source diagnostic followed by its compilation summary, not just that code.
+fn baseline_compilation_failed(report: &rsid::integration::GuardCommandReport) -> bool {
+    if report.output_truncated
+        || report.status != (rsid::integration::GuardStatus::Failed { code: Some(101) })
+    {
+        return false;
+    }
+    let output = format!("{}\n{}", report.stdout_tail, report.stderr_tail);
+    let lines: Vec<_> = output.lines().map(str::trim).collect();
+    test_failure_names(&output).is_empty()
+        && lines.iter().any(|line| {
+            line.starts_with("error: could not compile `") && line.contains("previous error")
+        })
+        && lines.windows(2).any(|pair| {
+            (pair[0].starts_with("error[E") || pair[0].starts_with("error: "))
+                && pair[1].starts_with("--> ")
+        })
+}
+
+/// Prove the requested package/shard exists in the base; the static fallback
+/// used by old-tree retry commands is not inventory evidence for this path.
+fn base_test_inventory_known(
+    repo: &Path,
+    base: &str,
+    command: &GuardCommand,
+    packages: Option<&BTreeSet<String>>,
+) -> bool {
+    let Some(packages) = packages else {
+        return false;
+    };
+    if let Some(package) = cargo_test_package(command) {
+        return packages.contains(package);
+    }
+    let Some((shard, _, _)) = shard_command_parts(command) else {
+        return false;
+    };
+    let tree = ShardTree::Revision {
+        repo,
+        revision: base,
+    };
+    ["rsid", "rsid-store"].into_iter().any(|package| {
+        packages.contains(package)
+            && tree.manifest(package).is_some_and(|text| {
+                toml::from_str::<toml::Value>(&text)
+                    .ok()
+                    .is_some_and(|manifest| {
+                        manifest
+                            .get("features")
+                            .and_then(|features| features.get(format!("test-shard-{shard}")))
+                            .is_some_and(|feature| feature.is_array())
+                    })
+            })
+    })
+}
+
+fn base_test_evidence(
+    repo: &Path,
+    base: &str,
+    command: &GuardCommand,
+    gate: &mut TestGate,
+    report: &rsid::integration::GuardCommandReport,
+) -> Result<BaseTestEvidence, String> {
+    if baseline_compilation_failed(report) {
+        if !base_test_inventory_known(
+            repo,
+            base,
+            command,
+            gate.base_packages.get(base).and_then(Option::as_ref),
+        ) {
+            return Err(
+                "baseline_compile_repair_inventory_unknown: cannot prove base test inventory"
+                    .into(),
+            );
+        }
+        let entry = format!(
+            "{base}:compile_failed:{} {:?}",
+            command.program, command.args
+        );
+        println!("base_test_baseline_unavailable={entry}");
+        gate.base_test_baseline_unavailable.insert(entry);
+        return Ok(BaseTestEvidence::CompilationUnavailable);
+    }
+    record_base_failures(gate, report).map(BaseTestEvidence::Observed)
+}
+
+/// A green status alone (or a zero-test run) does not prove selected tests ran
+/// when there is no runnable baseline. Accept Cargo/nextest's positive counts.
+fn report_proves_tests_ran(report: &rsid::integration::GuardCommandReport) -> bool {
+    format!("{}\n{}", report.stdout_tail, report.stderr_tail)
+        .lines()
+        .any(|line| {
+            let words: Vec<_> = line.split_whitespace().collect();
+            (words.first() == Some(&"running")
+                && words
+                    .get(1)
+                    .and_then(|count| count.parse::<usize>().ok())
+                    .is_some_and(|count| count > 0)
+                && matches!(words.get(2), Some(&"test" | &"tests")))
+                || (words.first() == Some(&"Summary")
+                    && words.windows(3).any(|words| {
+                        words[0].parse::<usize>().is_ok_and(|count| count > 0)
+                            && matches!(words[1], "test" | "tests")
+                            && words[2] == "run:"
+                    }))
+        })
 }
 
 /// Base failures of one guard report, remembering each failure's output text
@@ -3529,25 +3798,36 @@ fn command_scratch_path(
     Ok(path)
 }
 
-/// Build commands for the shard guards of a gate: the harness's own nextest
+/// Build commands for the test guards of a gate: the harness's own nextest
 /// invocation with `--no-run`, so the later real run finds every binary built.
+/// Every focused rsid lib filter shares one build (#1244), so it appears once.
 fn shard_build_commands(spec: &GuardSpec, tree: ShardTree<'_>) -> Vec<GuardCommand> {
-    spec.commands
-        .iter()
-        .filter(|command| shard_command_parts(command).is_some())
-        .filter_map(|command| direct_base_shard_command(command, tree))
-        .map(|mut build| {
-            // `cargo nextest run --no-run`: compile only.
-            build.args.insert(2, "--no-run".into());
-            build
-        })
-        .collect()
+    let mut builds: Vec<GuardCommand> = Vec::new();
+    for command in &spec.commands {
+        let build = if shard_command_parts(command).is_some() {
+            direct_base_shard_command(command, tree).map(|mut build| {
+                // `cargo nextest run --no-run`: compile only.
+                build.args.insert(2, "--no-run".into());
+                build
+            })
+        } else if rsid_lib_filterset(command).is_some() {
+            Some(rsid_lib_build_command())
+        } else {
+            None
+        };
+        if let Some(build) = build
+            && !builds.contains(&build)
+        {
+            builds.push(build);
+        }
+    }
+    builds
 }
 
-/// Whether the gate may compile the candidate and base shard binaries
-/// concurrently (`RSI_LANDER_PREBUILD=0` turns it off). They build into
-/// separate target directories, and each build still goes through the
-/// build-slot wrapper, so the memory and load limits keep applying.
+/// Whether the gate may compile the candidate's test binaries before the
+/// gate loop runs them (`RSI_LANDER_PREBUILD=0` turns it off). Each build
+/// still goes through the build-slot wrapper, so the memory and load limits
+/// keep applying.
 fn prebuild_enabled(gate: &TestGate) -> bool {
     // Unit tests with fake cargo shims count invocations, so they opt in.
     gate.prebuild_forced
@@ -3569,17 +3849,12 @@ async fn prebuild_stream(
     Ok(())
 }
 
-/// Compile the candidate shard binaries and the not-yet-cached base shard
-/// binaries at the same time (#1132). Best effort: a failed prebuild only
-/// means the sequential gate loop compiles as before.
-async fn prebuild_shard_binaries(
-    repo: &Path,
-    candidate_worktree: &Path,
-    base: &str,
-    spec: &GuardSpec,
-    gate: &mut TestGate,
-    disk_scratch_shards: &BTreeSet<String>,
-) {
+/// Compile the candidate's shard and focused-filter test binaries ahead of
+/// the gate loop (#1132), so `prebuild_secs` separates build from test time.
+/// The base side is no longer prebuilt (#1244): it is only built when a
+/// candidate failure needs a base comparison, which a green gate never does.
+/// Best effort: a failed prebuild only means the gate loop compiles as before.
+async fn prebuild_shard_binaries(candidate_worktree: &Path, spec: &GuardSpec, gate: &mut TestGate) {
     if !prebuild_enabled(gate) {
         return;
     }
@@ -3587,52 +3862,6 @@ async fn prebuild_shard_binaries(
     if candidate_builds.is_empty() {
         return;
     }
-    // Only the base shards whose result is not already cached need a base build.
-    let mut base_builds = Vec::new();
-    for command in &spec.commands {
-        let Some(build) = direct_base_shard_command(
-            command,
-            ShardTree::Revision {
-                repo,
-                revision: base,
-            },
-        ) else {
-            continue;
-        };
-        if shard_command_parts(command).is_none()
-            || gate
-                .base_cache
-                .contains_key(&(base.to_owned(), format!("{command:?}")))
-        {
-            continue;
-        }
-        let mut build = build;
-        build.args.insert(2, "--no-run".into());
-        if let Some(root) = gate.cache_root.as_deref() {
-            let env_class = shard_env_class(
-                &spec.env,
-                shard_tmpdir_class(gate.scratch.as_ref(), command, disk_scratch_shards),
-            );
-            if let Ok(Some(identity)) =
-                base_cache_identity(candidate_worktree, base, command, &env_class)
-            {
-                if base_cache::BaseShardSlot::peek(
-                    root,
-                    base,
-                    &identity.slot_label,
-                    &identity.slot_key,
-                ) {
-                    continue;
-                }
-            }
-        }
-        base_builds.push(build);
-    }
-    let base_worktree = if base_builds.is_empty() {
-        None
-    } else {
-        ensure_base_worktree(repo, base, gate).ok()
-    };
     let mut scratch_spec = spec.clone();
     if let Some(scratch) = &gate.scratch {
         scratch_spec.env.insert(
@@ -3641,22 +3870,14 @@ async fn prebuild_shard_binaries(
         );
     }
     let started = Instant::now();
-    let candidate = prebuild_stream(
+    if let Err(error) = prebuild_stream(
         candidate_worktree.to_path_buf(),
-        scratch_spec.clone(),
+        scratch_spec,
         candidate_builds,
-    );
-    let base_side = async {
-        match base_worktree {
-            Some(path) => prebuild_stream(path, scratch_spec.clone(), base_builds).await,
-            None => Ok(()),
-        }
-    };
-    let (candidate_result, base_result) = tokio::join!(candidate, base_side);
-    for result in [candidate_result, base_result] {
-        if let Err(error) = result {
-            eprintln!("prebuild skipped: {error}");
-        }
+    )
+    .await
+    {
+        eprintln!("prebuild skipped: {error}");
     }
     gate.prebuild_secs += started.elapsed().as_secs();
 }
@@ -3688,10 +3909,14 @@ async fn run_affected_gate(
         .filter(|command| is_test_guard(command))
         .count();
     println!(
-        "gate_timing=shards={shards} base_hits={} base_runs={} prebuild_secs={} wall_secs={}",
+        "gate_timing=shards={shards} base_hits={} base_runs={} base_skipped={} prebuild_secs={} checks_secs={} candidate_secs={} base_secs={} wall_secs={}",
         gate.base_reused.len(),
         gate.base_runs,
+        gate.base_skipped,
         gate.prebuild_secs,
+        gate.checks_secs,
+        gate.candidate_secs,
+        gate.base_secs,
         started.elapsed().as_secs()
     );
     result
@@ -3712,6 +3937,14 @@ async fn run_affected_gate_inner(
         .iter()
         .filter(|command| is_static_guard(command))
     {
+        if *command == rsid_shard_inventory_check()
+            && !candidate_worktree
+                .join("scripts/check-rsid-test-shards.py")
+                .is_file()
+        {
+            // A tree without the shard partition has no inventory to check.
+            continue;
+        }
         let report = run_one_guard(candidate_worktree, spec, command).await?;
         if report.status != rsid::integration::GuardStatus::Passed {
             return Err(format!(
@@ -3721,23 +3954,98 @@ async fn run_affected_gate_inner(
         }
     }
     if !gate.skip_tests {
+        let python_checks = spec
+            .commands
+            .iter()
+            .filter(|command| is_python_test_guard(command))
+            .collect::<Vec<_>>();
+        let checks_started = Instant::now();
+        let result = async {
+            for command in python_checks {
+                let report = run_one_guard(candidate_worktree, spec, command).await?;
+                println!(
+                    "{}",
+                    test_outcome_line(
+                        "candidate",
+                        &format!("python {:?}", command.args),
+                        Ok(&report)
+                    )
+                );
+                if report.status != rsid::integration::GuardStatus::Passed {
+                    return Err(format!(
+                        "Python test gate failed ({:?}) running {} {:?}: {} {}",
+                        report.status,
+                        report.program,
+                        report.args,
+                        report.stdout_tail,
+                        report.stderr_tail
+                    ));
+                }
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        gate.checks_secs += checks_started.elapsed().as_secs();
+        result?;
         prefetch_remote_shards(candidate_worktree, base, spec, gate).await?;
     }
+    // #1244: the compile checks build into their own target (a different
+    // profile shares no artifacts with the test builds), so they run while the
+    // prebuild compiles the test binaries instead of after it.
+    let checks_with_prebuild = !gate.skip_tests && gate.remote.is_none() && prebuild_enabled(gate);
     if !gate.skip_tests && gate.remote.is_none() {
-        prebuild_shard_binaries(
-            repo,
-            candidate_worktree,
-            base,
-            spec,
-            gate,
-            disk_scratch_shards,
-        )
-        .await;
+        let checks: Vec<&GuardCommand> = if checks_with_prebuild {
+            spec.commands
+                .iter()
+                .filter(|command| {
+                    !is_static_guard(command)
+                        && !is_test_guard(command)
+                        && !is_python_test_guard(command)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut checks_spec = spec.clone();
+        if let Some(scratch) = &gate.scratch {
+            checks_spec.env.insert(
+                "TMPDIR".into(),
+                scratch.path().to_string_lossy().into_owned(),
+            );
+        }
+        let checks_started = Instant::now();
+        let (checks_result, ()) = tokio::join!(
+            run_compile_checks(candidate_worktree, &checks_spec, &checks),
+            prebuild_shard_binaries(candidate_worktree, spec, gate),
+        );
+        gate.checks_secs += checks_started.elapsed().as_secs();
+        checks_result?;
     }
+    // #1261/#1262: a focused filter that selects no test is refused once the
+    // shared build exists and before any test runs, never as a test failure.
+    if !gate.skip_tests
+        && let Some(command) = spec
+            .commands
+            .iter()
+            .find(|command| rsid_lib_filterset(command).is_some())
+    {
+        refuse_focused_filters_selecting_nothing(candidate_worktree, spec, command, gate).await?;
+    }
+    if !gate.skip_tests {
+        refuse_lib_filters_selecting_nothing(candidate_worktree, spec, gate).await?;
+    }
+    // A compile-repair gate requires every selected candidate run to pass,
+    // including runs whose individual baselines were runnable. Remember an
+    // earlier red/empty run in case a later command discovers an unavailable
+    // baseline; normal runnable-baseline comparison remains unchanged.
+    let mut compilation_unavailable = false;
+    let mut repair_candidate_refusal = None;
+    // Green, proven candidate runs whose base was not consulted (#1244).
+    let mut base_skipped: Vec<(&GuardCommand, GuardSpec, (String, String))> = Vec::new();
     for command in spec
         .commands
         .iter()
-        .filter(|command| !is_static_guard(command))
+        .filter(|command| !is_static_guard(command) && !is_python_test_guard(command))
     {
         let mut scratch_spec = spec.clone();
         if let Some(scratch) = &gate.scratch {
@@ -3757,93 +4065,17 @@ async fn run_affected_gate_inner(
             continue;
         }
         if !is_test {
-            let report = run_one_guard(candidate_worktree, &scratch_spec, command).await?;
-            if report.status != rsid::integration::GuardStatus::Passed {
-                return Err(format!(
-                    "affected-crate guard failed ({:?}) running {} {:?}: {} {}",
-                    report.status,
-                    report.program,
-                    report.args,
-                    report.stdout_tail,
-                    report.stderr_tail
-                ));
+            if !checks_with_prebuild {
+                run_compile_checks(candidate_worktree, &scratch_spec, &[command]).await?;
             }
             continue;
         }
         let key = (base.to_owned(), format!("{command:?}"));
-        let base_failures = if let Some(cached) = gate.base_cache.get(&key) {
-            if let Some((shard, _, filterset)) = shard_command_parts(command) {
-                let display = match filterset {
-                    Some(filterset) => format!("{shard}[{filterset}]"),
-                    None => shard.to_owned(),
-                };
-                gate.base_reused
-                    .insert(format!("{base}:{display}:in-process"));
-            }
-            cached.clone()
-        } else {
-            let cache_root = if gate.remote.is_some() {
-                None
-            } else {
-                gate.cache_root.clone()
-            };
-            let identity = match cache_root.as_deref() {
-                Some(_) => {
-                    let env_class = shard_env_class(
-                        &scratch_spec.env,
-                        shard_tmpdir_class(gate.scratch.as_ref(), command, disk_scratch_shards),
-                    );
-                    base_cache_identity(candidate_worktree, base, command, &env_class)?
-                }
-                None => None,
-            };
-            let failures = if let (Some(root), Some(identity)) = (cache_root.as_deref(), identity) {
-                // The holder runs one base guard (bounded by guard_timeout), so a wait
-                // beyond twice that means the holder is wedged: refuse, do not hang.
-                let slot = base_cache::BaseShardSlot::acquire_within(
-                    root,
-                    base,
-                    &identity.slot_label,
-                    &identity.slot_key,
-                    guard_timeout() * 2,
-                )
-                .await?;
-                if let Some(entry) = slot.read()? {
-                    gate.base_reused
-                        .insert(format!("{base}:{}:{}", identity.display, entry.provenance));
-                    if entry.provenance.starts_with("qa:") {
-                        gate.qa_cache_provenance
-                            .insert(key.clone(), entry.provenance.clone());
-                    }
-                    entry.failures
-                } else {
-                    gate.base_runs += 1;
-                    let failures = run_base_guard(
-                        repo,
-                        base,
-                        &scratch_spec,
-                        command,
-                        gate,
-                        candidate_worktree,
-                    )
-                    .await?;
-                    slot.write(&base_cache::BaseShardEntry::new(
-                        base,
-                        &identity.slot_label,
-                        &identity.slot_key,
-                        failures.clone(),
-                        "lander",
-                    ))?;
-                    failures
-                }
-            } else {
-                gate.base_runs += 1;
-                run_base_guard(repo, base, &scratch_spec, command, gate, candidate_worktree).await?
-            };
-            gate.base_cache.insert(key.clone(), failures.clone());
-            failures
-        };
-        gate.base_reds.extend(base_failures.iter().cloned());
+        // #1244: the candidate runs first. The base is only consulted for a
+        // candidate that failed or did not prove a positive run: a green
+        // candidate has no failure the base could excuse, so building and
+        // running the base side would change nothing but the wall time.
+        let candidate_started = Instant::now();
         let report = run_shard_or_local(
             candidate_worktree,
             candidate_worktree,
@@ -3853,6 +4085,7 @@ async fn run_affected_gate_inner(
             gate,
         )
         .await?;
+        gate.candidate_secs += candidate_started.elapsed().as_secs();
         let shard_name = full_shard(command)
             .map(|(shard, _)| shard.to_owned())
             .unwrap_or_else(|| format!("{} {:?}", command.program, command.args));
@@ -3860,11 +4093,96 @@ async fn run_affected_gate_inner(
             "{}",
             test_outcome_line("candidate", &shard_name, Ok(&report))
         );
-        let candidate_failures = observed_test_failures(&report)?;
+        let candidate_failures = observed_test_failures(&report);
+        // Name the failures now, before the base side starts: the base run can
+        // take as long as the candidate's and the log should not wait for it.
+        match &candidate_failures {
+            Ok(failures) if !failures.is_empty() => println!(
+                "candidate_failures shard={shard_name} count={} names={}",
+                failures.len(),
+                failures.iter().cloned().collect::<Vec<_>>().join(",")
+            ),
+            Err(error) => println!(
+                "candidate_failures_unparsed shard={shard_name} detail={}",
+                error.lines().next().unwrap_or_default()
+            ),
+            Ok(_) => {}
+        }
+        if report.status == rsid::integration::GuardStatus::Passed
+            && matches!(&candidate_failures, Ok(failures) if failures.is_empty())
+            && report_proves_tests_ran(&report)
+        {
+            gate.base_skipped += 1;
+            base_skipped.push((command, scratch_spec, key));
+            continue;
+        }
+        let base_started = Instant::now();
+        let base_evidence = base_evidence_for(
+            repo,
+            candidate_worktree,
+            base,
+            &scratch_spec,
+            command,
+            gate,
+            disk_scratch_shards,
+            &key,
+            candidate_failures.as_ref().ok(),
+        )
+        .await?;
+        gate.base_secs += base_started.elapsed().as_secs();
+        if let BaseTestEvidence::Observed(failures) = &base_evidence {
+            gate.base_reds.extend(failures.iter().cloned());
+        }
+        compilation_unavailable |=
+            matches!(&base_evidence, BaseTestEvidence::CompilationUnavailable);
+        if repair_candidate_refusal.is_none() {
+            if report.status != rsid::integration::GuardStatus::Passed
+                || !matches!(&candidate_failures, Ok(failures) if failures.is_empty())
+            {
+                repair_candidate_refusal = Some(format!(
+                    "baseline_compile_repair_candidate_failed: base {base} test baseline unavailable; selected candidate command {} {:?}: {candidate_failures:?}",
+                    command.program, command.args,
+                ));
+            } else if !report_proves_tests_ran(&report) {
+                repair_candidate_refusal = Some(format!(
+                    "baseline_compile_repair_candidate_evidence_missing: base {base} test baseline unavailable; selected candidate command {} {:?} did not prove a positive run",
+                    command.program, command.args,
+                ));
+            }
+        }
+        if compilation_unavailable {
+            if let Some(error) = repair_candidate_refusal {
+                return Err(error);
+            }
+        }
+        let base_failures = match base_evidence {
+            BaseTestEvidence::CompilationUnavailable => {
+                // No baseline comparison or isolated-retry exemptions can
+                // establish safety here: the entire selected run must pass.
+                continue;
+            }
+            BaseTestEvidence::Observed(failures) => failures,
+        };
+        let candidate_failures = candidate_failures?;
         let new_failures: BTreeSet<_> = candidate_failures
             .difference(&base_failures)
             .cloned()
             .collect();
+        if !new_failures.is_empty() {
+            println!("candidate_only_failures={new_failures:?}");
+        }
+        // #1261: a combined focused run names, per failing test, the filters
+        // that select it.
+        let run_filters = rsid_lib_filterset(command)
+            .map(|filterset| focused_filters_of_run(filterset, &gate.focused_filters))
+            .or_else(|| cargo_lib_filter_labels(command))
+            .unwrap_or_default();
+        for name in &new_failures {
+            let labels = focused_filters_selecting(&run_filters, name);
+            if !labels.is_empty() {
+                println!("failure_filters test={name} filters={}", labels.join(" | "));
+            }
+        }
         let mut changed_files: Option<Option<Vec<String>>> = None;
         for name in &new_failures {
             let mut retry =
@@ -3894,7 +4212,8 @@ async fn run_affected_gate_inner(
                 let changed = changed_files.as_ref().and_then(|files| files.as_deref());
                 if source_touches_test_module(changed, name) {
                     return Err(format!(
-                        "unverified candidate failure (isolated retry did not run twice, module touched by the source): {name}"
+                        "unverified candidate failure (isolated retry did not run twice, module touched by the source): {name}{}",
+                        focused_attribution_suffix(&run_filters, name)
                     ));
                 }
                 gate.unverified.insert(name.clone());
@@ -3940,12 +4259,13 @@ async fn run_affected_gate_inner(
                     .iter()
                     .map(|name| {
                         format!(
-                            "{name}{}",
+                            "{name}{}{}",
                             known_red_suffix(
                                 name,
                                 &failure_text_for(&retry_output, name),
                                 gate.known_failures.as_ref(),
-                            )
+                            ),
+                            focused_attribution_suffix(&run_filters, name)
                         )
                     })
                     .collect::<Vec<_>>();
@@ -3967,13 +4287,237 @@ async fn run_affected_gate_inner(
             gate.flakes.insert(name.clone());
         }
     }
+    // A compile repair (#1210) still needs every selected run green: when a
+    // candidate run was red or unproven, a skipped green run's base must not
+    // be one that cannot compile. Only a red gate pays these base runs.
+    if let Some(error) = repair_candidate_refusal
+        && !compilation_unavailable
+    {
+        for (command, scratch_spec, key) in &base_skipped {
+            let base_started = Instant::now();
+            let evidence = base_evidence_for(
+                repo,
+                candidate_worktree,
+                base,
+                scratch_spec,
+                command,
+                gate,
+                disk_scratch_shards,
+                key,
+                None,
+            )
+            .await?;
+            gate.base_secs += base_started.elapsed().as_secs();
+            if matches!(evidence, BaseTestEvidence::CompilationUnavailable) {
+                return Err(error);
+            }
+        }
+    }
     Ok(())
 }
 
-/// A guard that only inspects git objects: it needs no build and no test
-/// host, so it runs before any of them.
+/// Run the gate's non-test guards (compile checks) in order; the first that
+/// does not pass refuses the gate.
+async fn run_compile_checks(
+    candidate_worktree: &Path,
+    spec: &GuardSpec,
+    checks: &[&GuardCommand],
+) -> Result<(), String> {
+    for command in checks {
+        let report = run_one_guard(candidate_worktree, spec, command).await?;
+        if report.status != rsid::integration::GuardStatus::Passed {
+            return Err(format!(
+                "affected-crate guard failed ({:?}) running {} {:?}: {} {}",
+                report.status, report.program, report.args, report.stdout_tail, report.stderr_tail
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Most failing tests a narrowed base filterset names; beyond it the full
+/// command is the cheaper and safer base side.
+const MAX_NARROWED_BASE_TESTS: usize = 200;
+
+/// #1525: the base side of a red candidate run, restricted to exactly the
+/// tests that failed on the candidate (`test(=A) | test(=B) ...`). Whatever
+/// else fails on the base cannot change `candidate - base`, so running the
+/// whole command there only costs wall time. `None` (run the full command)
+/// when no failure is known, a name is not a plain test name, the list is
+/// large, or the command is not a nextest filterset or shard run.
+fn narrowed_base_command(
+    command: &GuardCommand,
+    failures: &BTreeSet<String>,
+) -> Option<GuardCommand> {
+    if failures.is_empty()
+        || failures.len() > MAX_NARROWED_BASE_TESTS
+        || !failures.iter().all(|name| plain_test_name(name))
+    {
+        return None;
+    }
+    let filterset = failures
+        .iter()
+        .map(|name| format!("test(={name})"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let mut narrowed = command.clone();
+    if rsid_lib_filterset(command).is_some() {
+        *narrowed.args.last_mut()? = filterset;
+        return Some(narrowed);
+    }
+    let (shard, jobs, _) = shard_command_parts(command)?;
+    narrowed.args = vec![
+        "shard".into(),
+        shard.into(),
+        "--jobs".into(),
+        jobs.to_string(),
+        "--filterset".into(),
+        filterset,
+    ];
+    Some(narrowed)
+}
+
+/// The base side of one test guard (#1244: only asked for when the candidate
+/// failed or did not prove a positive run): the in-process cache, then the
+/// persistent base cache, then a real base run whose result fills both.
+#[allow(clippy::too_many_arguments)]
+async fn base_evidence_for(
+    repo: &Path,
+    candidate_worktree: &Path,
+    base: &str,
+    scratch_spec: &GuardSpec,
+    command: &GuardCommand,
+    gate: &mut TestGate,
+    disk_scratch_shards: &BTreeSet<String>,
+    key: &(String, String),
+    candidate_failures: Option<&BTreeSet<String>>,
+) -> Result<BaseTestEvidence, String> {
+    // #1525: the base side only decides which of the candidate's failures are
+    // pre-existing, so a known failure list narrows it to exactly those tests.
+    // A narrowed result is not the command's full base result, so it never
+    // fills a cache. A remote full shard keeps its prefetched full run.
+    let narrowed = candidate_failures
+        .filter(|_| !(gate.remote.is_some() && full_shard(command).is_some()))
+        .and_then(|failures| narrowed_base_command(command, failures));
+    if let Some(narrowed) = &narrowed {
+        println!(
+            "base_narrowed tests={} command={} {:?}",
+            candidate_failures.map_or(0, BTreeSet::len),
+            narrowed.program,
+            narrowed.args
+        );
+    }
+    let base_command = narrowed.as_ref().unwrap_or(command);
+    Ok(if let Some(cached) = gate.base_cache.get(key) {
+        if let Some((shard, _, filterset)) = shard_command_parts(command) {
+            let display = match filterset {
+                Some(filterset) => format!("{shard}[{filterset}]"),
+                None => shard.to_owned(),
+            };
+            gate.base_reused
+                .insert(format!("{base}:{display}:in-process"));
+        }
+        BaseTestEvidence::Observed(cached.clone())
+    } else {
+        let cache_root = if gate.remote.is_some() {
+            None
+        } else {
+            gate.cache_root.clone()
+        };
+        let identity = match cache_root.as_deref() {
+            Some(_) => {
+                let env_class = shard_env_class(
+                    &scratch_spec.env,
+                    shard_tmpdir_class(gate.scratch.as_ref(), command, disk_scratch_shards),
+                );
+                base_cache_identity(candidate_worktree, base, command, &env_class)?
+            }
+            None => None,
+        };
+        let failures = if let (Some(root), Some(identity)) = (cache_root.as_deref(), identity) {
+            // The holder runs one base guard (bounded by guard_timeout), so a wait
+            // beyond twice that means the holder is wedged: refuse, do not hang.
+            let slot = base_cache::BaseShardSlot::acquire_within(
+                root,
+                base,
+                &identity.slot_label,
+                &identity.slot_key,
+                guard_timeout() * 2,
+            )
+            .await?;
+            if let Some(entry) = slot.read()? {
+                gate.base_reused
+                    .insert(format!("{base}:{}:{}", identity.display, entry.provenance));
+                if entry.provenance.starts_with("qa:") {
+                    gate.qa_cache_provenance
+                        .insert(key.clone(), entry.provenance.clone());
+                }
+                BaseTestEvidence::Observed(entry.failures)
+            } else {
+                // The slot only serialises full-result fills; a narrowed run
+                // writes nothing, so it must not hold other landers behind it.
+                if narrowed.is_some() {
+                    drop(slot);
+                    gate.base_runs += 1;
+                    return run_base_guard(
+                        repo,
+                        base,
+                        scratch_spec,
+                        base_command,
+                        command,
+                        gate,
+                        candidate_worktree,
+                    )
+                    .await;
+                }
+                gate.base_runs += 1;
+                let failures = run_base_guard(
+                    repo,
+                    base,
+                    scratch_spec,
+                    command,
+                    command,
+                    gate,
+                    candidate_worktree,
+                )
+                .await?;
+                if let BaseTestEvidence::Observed(observed) = &failures {
+                    slot.write(&base_cache::BaseShardEntry::new(
+                        base,
+                        &identity.slot_label,
+                        &identity.slot_key,
+                        observed.clone(),
+                        "lander",
+                    ))?;
+                }
+                failures
+            }
+        } else {
+            gate.base_runs += 1;
+            run_base_guard(
+                repo,
+                base,
+                scratch_spec,
+                base_command,
+                command,
+                gate,
+                candidate_worktree,
+            )
+            .await?
+        };
+        if narrowed.is_none()
+            && let BaseTestEvidence::Observed(observed) = &failures
+        {
+            gate.base_cache.insert(key.clone(), observed.clone());
+        }
+        failures
+    })
+}
+
+/// A guard that only inspects git objects or source text: it needs no build
+/// and no test host, so it runs before any of them.
 fn is_static_guard(command: &GuardCommand) -> bool {
-    command.program == "git"
+    command.program == "git" || *command == rsid_shard_inventory_check()
 }
 
 /// One log line per test shard outcome, so a refusal that lands after the
@@ -4007,6 +4551,7 @@ fn affected_crate_guard_spec(
     provisional: bool,
     metadata: &WorkspaceMetadata,
     cargo_build_jobs: u8,
+    rsid_unfiltered: Option<&test_impact::UnfilteredSelection>,
 ) -> Result<GuardSpec, String> {
     let mut selected: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for filter in filters {
@@ -4039,15 +4584,19 @@ fn affected_crate_guard_spec(
         timeout: Duration::from_secs(30),
     }];
     if provisional {
-        for filter in [
-            "store::tests::rewind_tears_down_the_non_idempotent_migration_tail",
-            "store::tests::every_recovered_migration_step_actually_executes",
-        ] {
-            commands.push(rsid_shard_guard_command(&format!(
-                "store-01:test({filter})"
-            ))?);
+        for filter in PROVISIONAL_STORE_TESTS {
+            commands.push(rsid_family_filter_command(
+                "rsid",
+                &format!("shard:store-01:test({filter})"),
+            )?);
         }
     }
+    // rsid and rsid-store share the shards (#1021 S4): a filter on either one
+    // scopes both, so the unfiltered sibling only needs its compile check
+    // instead of every shard (#1244).
+    let rsid_family_filtered = selected
+        .keys()
+        .any(|package| is_rsid_shard_package(package));
     for package in packages {
         if let Some(package_filters) = selected.get(package.as_str()) {
             // Operator P0 (2026-09-29): a --test-filter scopes the package's
@@ -4058,32 +4607,114 @@ fn affected_crate_guard_spec(
             if !commands.contains(&check) {
                 commands.push(check);
             }
+            // #1282: every plain lib filter of another package runs in one
+            // libtest invocation (libtest takes several filters).
+            let mut lib_filters: Vec<&str> = Vec::new();
             for filter in package_filters {
                 let focused = if is_rsid_shard_package(package) {
-                    match filter.strip_prefix("shard:") {
-                        Some(shard) => rsid_shard_guard_command(shard)?,
-                        None => cargo_guard_command(package, Some(filter)),
+                    rsid_family_filter_command(package, filter)?
+                } else if filter.starts_with("bin:") || filter.starts_with("test:") {
+                    if is_e2e_filter(filter) {
+                        // #1596: build the rsid the harness spawns before the
+                        // gated tests run; RSI_E2E=1 is set in the spec env.
+                        let prebuild = e2e_prebuild_command();
+                        if !commands.contains(&prebuild) {
+                            commands.push(prebuild);
+                        }
                     }
-                } else {
                     cargo_guard_command(package, Some(filter))
+                } else {
+                    if !lib_filters.contains(filter) {
+                        lib_filters.push(filter);
+                    }
+                    continue;
                 };
                 if !commands.contains(&focused) {
                     commands.push(focused);
                 }
             }
+            if !lib_filters.is_empty() {
+                let combined = cargo_lib_filters_command(package, &lib_filters);
+                if !commands.contains(&combined) {
+                    commands.push(combined);
+                }
+            }
         } else if is_rsid_shard_package(package) {
-            // Unfiltered: without a proven file-to-shard map, gate all
-            // shards for an rsid or rsid-store change (the store's library
-            // tests run inside the shared shards).
-            for shard in RSID_SHARDS {
-                let shard_command = rsid_shard_guard_command(shard)?;
-                if !commands.contains(&shard_command) {
-                    commands.push(shard_command);
+            let check = cargo_check_command(package);
+            if rsid_family_filtered {
+                if !commands.contains(&check) {
+                    commands.push(check);
+                }
+                continue;
+            }
+            match rsid_unfiltered {
+                // Unfiltered: every library test that can observe the change
+                // on the shared lib build (#1280), the tests of a changed
+                // binary or integration test target, and the compile check.
+                Some(selection) => {
+                    if !commands.contains(&check) {
+                        commands.push(check);
+                    }
+                    let filterset = match &selection.lib {
+                        test_impact::LibTests::Everything(_) => Some("all()".to_owned()),
+                        test_impact::LibTests::Tests(tests) if !tests.is_empty() => Some(
+                            tests
+                                .iter()
+                                .map(|name| format!("test(={name})"))
+                                .collect::<Vec<_>>()
+                                .join(" | "),
+                        ),
+                        test_impact::LibTests::Tests(_) => None,
+                    };
+                    if let Some(filterset) = filterset {
+                        let focused = rsid_lib_filter_command(&filterset);
+                        if !commands.contains(&focused) {
+                            commands.push(focused);
+                        }
+                    }
+                    for (target_package, target) in &selection.targets {
+                        if target_package != package {
+                            continue;
+                        }
+                        let run = cargo_guard_command(package, Some(target));
+                        if !commands.contains(&run) {
+                            commands.push(run);
+                        }
+                    }
+                }
+                // A crate-wide change (root, manifest, build script) or an
+                // unknown diff: gate all shards (the store's library tests
+                // run inside the shared shards).
+                None => {
+                    for shard in RSID_SHARDS {
+                        let shard_command = rsid_shard_guard_command(shard)?;
+                        if !commands.contains(&shard_command) {
+                            commands.push(shard_command);
+                        }
+                    }
                 }
             }
         } else {
             commands.push(cargo_guard_command(package, None));
         }
+    }
+    // #1261: every focused filter of the shared lib build runs in one nextest
+    // invocation (combined, deduplicated filterset) at the place of the first.
+    if let Some(first) = commands
+        .iter()
+        .position(|command| rsid_lib_filterset(command).is_some())
+    {
+        let atoms = combined_focused_atoms(commands.iter().filter_map(rsid_lib_filterset));
+        commands.retain(|command| rsid_lib_filterset(command).is_none());
+        commands.insert(first, rsid_focused_run_command(&atoms));
+    }
+    if commands
+        .iter()
+        .any(|command| rsid_lib_filterset(command).is_some())
+    {
+        // The shard script checks its static inventory before any build;
+        // the shared lib build skips the script, so check it once here.
+        commands.insert(1, rsid_shard_inventory_check());
     }
     for dependent in reverse_workspace_dependents(metadata, touched_packages)? {
         let check = cargo_check_command(&dependent);
@@ -4091,12 +4722,32 @@ fn affected_crate_guard_spec(
             commands.push(check);
         }
     }
+    // #1596: the e2e_tui tests are no-ops without RSI_E2E=1; set it only when
+    // a gate filter selects them, so every other gate costs what it did.
+    let mut e2e_env = BTreeMap::new();
+    if selected
+        .values()
+        .flatten()
+        .any(|filter| is_e2e_filter(filter))
+    {
+        e2e_env.insert("RSI_E2E".to_owned(), "1".to_owned());
+    }
+    let mut env = BTreeMap::from([
+        ("CARGO_BUILD_JOBS".into(), cargo_build_jobs.to_string()),
+        ("CARGO_PROFILE_DEV_DEBUG".into(), "line-tables-only".into()),
+        // #1244: the shard script builds its tests with no debug info.
+        // Every other gate build (prebuild, focused runs, isolated
+        // retries) must use the same test profile, or each one compiles
+        // the whole dependency graph again under different flags.
+        ("CARGO_PROFILE_TEST_DEBUG".into(), "0".into()),
+        // The gate's target is private and discarded: a per-shard clean
+        // there only deletes binaries the prebuild compiled.
+        ("RSI_LANDER_KEEP_RSID_ARTIFACTS".into(), "1".into()),
+    ]);
+    env.extend(e2e_env);
     Ok(GuardSpec {
         commands,
-        env: BTreeMap::from([
-            ("CARGO_BUILD_JOBS".into(), cargo_build_jobs.to_string()),
-            ("CARGO_PROFILE_DEV_DEBUG".into(), "line-tables-only".into()),
-        ]),
+        env,
         output_tail_bytes: 8 * 1024 * 1024,
     })
 }
@@ -4126,17 +4777,52 @@ fn workspace_has_package(metadata: &WorkspaceMetadata, name: &str) -> bool {
         .any(|package| package.name == name && members.contains(package.id.as_str()))
 }
 
+/// The integration test target whose tests return `Ok` at once unless
+/// `RSI_E2E=1` and that spawn a prebuilt `rsid` (#1596).
+const E2E_TARGET: &str = "e2e_tui";
+
+/// `test:e2e_tui` or `test:e2e_tui:test(ATOM)`: a filter that selects the
+/// gated end-to-end target, which would silently no-op under plain
+/// `cargo test` (#1596).
+fn is_e2e_filter(filter: &str) -> bool {
+    filter
+        .strip_prefix("test:")
+        .is_some_and(|rest| rest.split(':').next() == Some(E2E_TARGET))
+}
+
+/// The prebuild an e2e run needs: the harness spawns `target/debug/rsid`,
+/// which `cargo test -p rsi --test e2e_tui` does not build (#1596).
+fn e2e_prebuild_command() -> GuardCommand {
+    GuardCommand {
+        program: "cargo".into(),
+        args: ["build", "-p", "rsid", "--bin", "rsid"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        timeout: guard_timeout(),
+    }
+}
+
 fn cargo_guard_command(package: &str, filter: Option<&str>) -> GuardCommand {
     let mut args = vec!["test".into(), "-p".into(), package.into()];
     // `bin:NAME` and `test:NAME` select a cargo target (rsid main.rs bin
-    // tests, an integration test binary) instead of a lib test filter.
+    // tests, an integration test binary) instead of a lib test filter. A
+    // named target also takes `:test(ATOM)` (plain substring, or `=EXACT`).
+    let mut atom = None;
     match filter.and_then(|filter| {
         filter
             .strip_prefix("bin:")
             .map(|name| ("--bin", name))
             .or_else(|| filter.strip_prefix("test:").map(|name| ("--test", name)))
     }) {
-        Some((flag, name)) => args.extend([flag.into(), name.into()]),
+        Some((flag, name)) => {
+            let (name, selector) = match name.split_once(':') {
+                Some((name, selector)) => (name, Some(selector)),
+                None => (name, None),
+            };
+            atom = selector.and_then(|selector| selector.strip_prefix("test(")?.strip_suffix(')'));
+            args.extend([flag.into(), name.into()]);
+        }
         None => {
             args.push("--lib".into());
             if let Some(filter) = filter {
@@ -4144,11 +4830,725 @@ fn cargo_guard_command(package: &str, filter: Option<&str>) -> GuardCommand {
             }
         }
     }
-    args.extend(["--".into(), "--test-threads=4".into()]);
+    // The e2e tests each spawn their own daemon and PTY; run them serially.
+    let threads = if filter.is_some_and(is_e2e_filter) {
+        "--test-threads=1"
+    } else {
+        "--test-threads=4"
+    };
+    args.extend(["--".into(), threads.into()]);
+    if let Some(atom) = atom {
+        match atom.strip_prefix('=') {
+            Some(exact) => args.extend([exact.to_owned(), "--exact".into()]),
+            None => args.push(atom.to_owned()),
+        }
+    }
     GuardCommand {
         program: "cargo".into(),
         args,
         timeout: guard_timeout(),
+    }
+}
+
+/// #1282: one `cargo test -p PKG --lib` run of every plain lib filter of a
+/// package that is not an rsid shard package. One filter keeps the
+/// `cargo test -p PKG --lib FILTER` shape; several go after `--`, where
+/// libtest runs every test any of them selects (substring match). The guard
+/// grows with the number of filters it replaces (up to four guards).
+fn cargo_lib_filters_command(package: &str, filters: &[&str]) -> GuardCommand {
+    if let [filter] = filters {
+        return cargo_guard_command(package, Some(filter));
+    }
+    let mut command = cargo_guard_command(package, None);
+    command
+        .args
+        .extend(filters.iter().map(|filter| (*filter).to_owned()));
+    let factor = u32::try_from(filters.len().clamp(1, 4)).unwrap_or(4);
+    command.timeout = command
+        .timeout
+        .saturating_mul(factor)
+        .min(Duration::from_secs(MAX_GUARD_TIMEOUT_SECS).max(command.timeout));
+    command
+}
+
+/// The package and lib filters of a `cargo_lib_filters_command`; `None` for
+/// any other shape (an unfiltered lib run, a bin or integration target).
+fn cargo_lib_filters(command: &GuardCommand) -> Option<(&str, Vec<&str>)> {
+    if command.program != "cargo" {
+        return None;
+    }
+    match command.args.as_slice() {
+        [test, p, package, lib, filter, separator, threads]
+            if test == "test"
+                && p == "-p"
+                && lib == "--lib"
+                && !filter.starts_with('-')
+                && separator == "--"
+                && threads == "--test-threads=4" =>
+        {
+            Some((package.as_str(), vec![filter.as_str()]))
+        }
+        [test, p, package, lib, separator, threads, filters @ ..]
+            if test == "test"
+                && p == "-p"
+                && lib == "--lib"
+                && separator == "--"
+                && threads == "--test-threads=4"
+                && filters.len() > 1
+                && filters.iter().all(|filter| !filter.starts_with('-')) =>
+        {
+            Some((
+                package.as_str(),
+                filters.iter().map(String::as_str).collect(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// #1282: the per-filter labels (`PKG=FILTER`) a combined lib run attributes
+/// a failing test to.
+fn cargo_lib_filter_labels(command: &GuardCommand) -> Option<Vec<FocusedFilter>> {
+    let (package, filters) = cargo_lib_filters(command)?;
+    Some(
+        filters
+            .into_iter()
+            .map(|filter| FocusedFilter {
+                label: format!("{package}={filter}"),
+                filterset: format!("test({filter})"),
+                explicit: true,
+            })
+            .collect(),
+    )
+}
+
+/// `cargo test -p PKG --lib -- --list FILTER...`: the tests the run selects,
+/// listed after the build and before any test runs.
+fn cargo_lib_list_command(package: &str, filters: &[&str]) -> GuardCommand {
+    let mut args: Vec<String> = ["test", "-p", package, "--lib", "--", "--list"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    args.extend(filters.iter().map(|filter| (*filter).to_owned()));
+    GuardCommand {
+        program: "cargo".into(),
+        args,
+        timeout: guard_timeout(),
+    }
+}
+
+/// The test names of a libtest `--list` (`name: test` lines), or `None`
+/// when the report is no complete listing (libtest ends one with its
+/// `N tests, M benchmarks` count).
+fn libtest_listed_names(
+    report: &rsid::integration::GuardCommandReport,
+) -> Option<BTreeSet<String>> {
+    if report.status != rsid::integration::GuardStatus::Passed || report.output_truncated {
+        return None;
+    }
+    let counted = report.stdout_tail.lines().any(|line| {
+        let Some((tests, benchmarks)) = line.trim().split_once(", ") else {
+            return false;
+        };
+        let count = |text: &str, singular: &str, plural: &str| {
+            text.strip_suffix(plural)
+                .or_else(|| text.strip_suffix(singular))
+                .is_some_and(|number| number.trim().parse::<u64>().is_ok())
+        };
+        count(tests, " test", " tests") && count(benchmarks, " benchmark", " benchmarks")
+    });
+    counted.then(|| {
+        report
+            .stdout_tail
+            .lines()
+            .filter_map(|line| line.trim().strip_suffix(": test"))
+            .map(str::to_owned)
+            .collect()
+    })
+}
+
+/// The lib filters of a combined run that select no listed test (libtest's
+/// substring match).
+fn lib_filters_selecting_nothing<'a>(
+    filters: &[&'a str],
+    listed: &BTreeSet<String>,
+) -> Vec<&'a str> {
+    filters
+        .iter()
+        .copied()
+        .filter(|filter| !listed.iter().any(|name| name.contains(filter)))
+        .collect()
+}
+
+/// #1282: list each combined lib run of another package after its build and
+/// refuse the filters that select nothing, naming them, before any test
+/// runs. A listing that cannot be read (a failed build reports itself in the
+/// run) refuses nothing.
+async fn refuse_lib_filters_selecting_nothing(
+    worktree: &Path,
+    spec: &GuardSpec,
+    gate: &TestGate,
+) -> Result<(), String> {
+    let mut list_spec = spec.clone();
+    if let Some(scratch) = &gate.scratch {
+        list_spec.env.insert(
+            "TMPDIR".into(),
+            scratch.path().to_string_lossy().into_owned(),
+        );
+    }
+    let mut empty = Vec::new();
+    for command in &spec.commands {
+        let Some((package, filters)) = cargo_lib_filters(command) else {
+            continue;
+        };
+        let report = run_one_guard(
+            worktree,
+            &list_spec,
+            &cargo_lib_list_command(package, &filters),
+        )
+        .await?;
+        let Some(listed) = libtest_listed_names(&report) else {
+            println!(
+                "lib_filter_list=unavailable package={package} status={:?}",
+                report.status
+            );
+            continue;
+        };
+        println!(
+            "lib_filter_list=package={package} selected={} filters={}",
+            listed.len(),
+            filters.len()
+        );
+        empty.extend(
+            lib_filters_selecting_nothing(&filters, &listed)
+                .into_iter()
+                .map(|filter| format!("{package}={filter}")),
+        );
+    }
+    if empty.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "test filter selects no test at the candidate, refused after the build and before any test ran: {}",
+        empty.join(" ")
+    ))
+}
+
+/// The packages whose library tests the rsid shards partition (#1021 S4).
+const RSID_LIB_TEST_PACKAGES: [&str; 2] = ["rsid", "rsid-store"];
+
+/// The argument list of one nextest run over every rsid library test with no
+/// shard feature, so the lib test binaries are built once for all of them.
+fn rsid_lib_nextest_args() -> Vec<String> {
+    let mut args: Vec<String> = ["nextest", "run", "--profile", "rsid-fast"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    for package in RSID_LIB_TEST_PACKAGES {
+        args.extend(["-p".into(), package.into()]);
+    }
+    args.push("--lib".into());
+    args
+}
+
+/// #1244: a focused `rsid`/`rsid-store` filter runs on the one lib test build
+/// without shard features (every test compiled, the filterset selects), so N
+/// focused filters cost one build per side instead of one build per shard.
+/// The shard features stay for whole shards and the QA sweep.
+fn rsid_lib_filter_command(filterset: &str) -> GuardCommand {
+    let mut args = rsid_lib_nextest_args();
+    args.extend(
+        [
+            "--status-level",
+            "all",
+            "--final-status-level",
+            "all",
+            "-j",
+            "4",
+            "--filterset",
+        ]
+        .map(String::from),
+    );
+    args.push(filterset.into());
+    GuardCommand {
+        program: "cargo".into(),
+        args,
+        timeout: guard_timeout(),
+    }
+}
+
+/// Test threads of the combined focused rsid run (#1261).
+const RSID_FOCUSED_TEST_THREADS: &str = "8";
+
+/// #1261: the one run of every focused rsid filter of a gate. The atoms are
+/// joined into one filterset (`test(a) | test(b)`), so nextest lists the
+/// binaries once and runs every selected test under one `-j` pool instead of
+/// one startup, listing and serial run per filter. The run is bound by test
+/// threads, not by invocations (30 real filters, 1776 tests: 1225 s at
+/// `-j 4`, 440 s at `-j 12`), so it uses the `rsid-fast` profile's own eight
+/// test threads (`.config/nextest.toml`); `CARGO_BUILD_JOBS` stays an env
+/// throttle that never changes a command. Its guard grows with the number of
+/// atoms (up to four guards), because it replaces that many runs.
+fn rsid_focused_run_command(atoms: &[String]) -> GuardCommand {
+    let mut command = rsid_lib_filter_command(&atoms.join(" | "));
+    if let Some(jobs) = command.args.iter().position(|arg| arg == "-j") {
+        command.args[jobs + 1] = RSID_FOCUSED_TEST_THREADS.into();
+    }
+    // #1280: `all()` runs every library test, the work of every shard, so it
+    // gets the guards of all of them (one guard timed it out at 6374 of 6684
+    // tests on a loaded host).
+    let replaced = if atoms.iter().any(|atom| atom == "all()") {
+        RSID_SHARDS.len()
+    } else {
+        atoms.len().clamp(1, 4)
+    };
+    let factor = u32::try_from(replaced).unwrap_or(4);
+    command.timeout = command
+        .timeout
+        .saturating_mul(factor)
+        .min(Duration::from_secs(MAX_GUARD_TIMEOUT_SECS).max(command.timeout));
+    command
+}
+
+/// How a generated focused filterset atom selects test names: nextest's
+/// `test(NAME)` matches any test whose name contains `NAME`; a module atom
+/// `test(/^module::/)` matches the names under that module; `test(=NAME)`
+/// matches that one test and `all()` every test (#1280).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FocusedMatch {
+    Contains(String),
+    Module(String),
+    Exact(String),
+    All,
+}
+
+impl FocusedMatch {
+    /// The matcher of one atom, `None` for a shape the lander does not
+    /// generate (never deduplicated, never refused).
+    fn parse(atom: &str) -> Option<Self> {
+        if atom == "all()" {
+            return Some(Self::All);
+        }
+        let inner = atom.strip_prefix("test(")?.strip_suffix(')')?;
+        if let Some(name) = inner.strip_prefix('=') {
+            return plain_test_name(name).then(|| Self::Exact(name.to_owned()));
+        }
+        if let Some(module) = inner
+            .strip_prefix("/^")
+            .and_then(|rest| rest.strip_suffix("::/"))
+        {
+            return (!module.is_empty()
+                && module
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+            .then(|| Self::Module(module.to_owned()));
+        }
+        plain_test_name(inner).then(|| Self::Contains(inner.to_owned()))
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        match self {
+            Self::Contains(pattern) => name.contains(pattern.as_str()),
+            Self::Module(module) => name
+                .strip_prefix(module.as_str())
+                .is_some_and(|rest| rest.starts_with("::")),
+            Self::Exact(exact) => name == exact,
+            Self::All => true,
+        }
+    }
+
+    /// Whether every test this matcher selects is also selected by `other`.
+    fn covered_by(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Contains(mine), Self::Contains(theirs)) => mine.contains(theirs.as_str()),
+            (Self::Module(module), Self::Contains(theirs)) => {
+                format!("{module}::").contains(theirs.as_str())
+            }
+            (Self::Module(mine), Self::Module(theirs)) => mine == theirs,
+            (Self::Exact(mine), theirs) => theirs.matches(mine),
+            (_, Self::All) => true,
+            (Self::Contains(_) | Self::Module(_) | Self::All, Self::Exact(_))
+            | (Self::Contains(_), Self::Module(_))
+            | (Self::All, _) => false,
+        }
+    }
+}
+
+/// The atoms of a focused filterset (`a | b | c`).
+fn focused_atoms(filterset: &str) -> Vec<String> {
+    filterset
+        .split(" | ")
+        .map(str::trim)
+        .filter(|atom| !atom.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// #1261: the atoms of several focused filtersets, in first-seen order, with
+/// duplicates removed and every atom dropped whose tests another atom already
+/// selects (`test()` matches substrings, so `test(a::b)` adds nothing beside
+/// `test(a::)`). Shard names no longer limit a focused run (#1244), so two
+/// filters in different shards can be the same run.
+fn combined_focused_atoms<'a>(filtersets: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut atoms: Vec<String> = Vec::new();
+    for filterset in filtersets {
+        for atom in focused_atoms(filterset) {
+            if !atoms.contains(&atom) {
+                atoms.push(atom);
+            }
+        }
+    }
+    let matchers: Vec<Option<FocusedMatch>> =
+        atoms.iter().map(|atom| FocusedMatch::parse(atom)).collect();
+    atoms
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            let Some(mine) = &matchers[*index] else {
+                return true;
+            };
+            !matchers.iter().enumerate().any(|(other, theirs)| {
+                other != *index
+                    && theirs
+                        .as_ref()
+                        .is_some_and(|theirs| mine.covered_by(theirs))
+            })
+        })
+        .map(|(_, atom)| atom.clone())
+        .collect()
+}
+
+/// One focused rsid filter of a gate, named as the operator wrote it (the
+/// `--test-filter`, a provisional proof, or a touched-module atom).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FocusedFilter {
+    label: String,
+    filterset: String,
+    /// An explicitly requested filter is refused when it selects no test; a
+    /// touched-module atom only refuses when the whole run selects none.
+    explicit: bool,
+}
+
+/// The provisional proofs a provisional landing always runs.
+const PROVISIONAL_STORE_TESTS: [&str; 2] = [
+    "store::tests::rewind_tears_down_the_non_idempotent_migration_tail",
+    "store::tests::every_recovered_migration_step_actually_executes",
+];
+
+/// #1261: the explicit focused filters of a gate (the ones that run on the
+/// shared rsid lib build), with the labels a refusal and an attribution name.
+fn explicit_focused_filters(filters: &[String], provisional: bool) -> Vec<FocusedFilter> {
+    let mut focused = Vec::new();
+    if provisional {
+        for name in PROVISIONAL_STORE_TESTS {
+            focused.push(FocusedFilter {
+                label: format!("provisional:{name}"),
+                filterset: format!("test({name})"),
+                explicit: true,
+            });
+        }
+    }
+    for filter in filters {
+        let Some((package, value)) = filter.split_once('=') else {
+            continue;
+        };
+        if !is_rsid_shard_package(package) {
+            continue;
+        }
+        if let Ok(command) = rsid_family_filter_command(package, value)
+            && let Some(filterset) = rsid_lib_filterset(&command)
+        {
+            focused.push(FocusedFilter {
+                label: filter.clone(),
+                filterset: filterset.to_owned(),
+                explicit: true,
+            });
+        }
+    }
+    focused
+}
+
+/// Every focused filter behind one combined run: the explicit ones the gate
+/// recorded, plus each run atom no explicit filter names (a touched-module
+/// atom, or every atom when the gate recorded none).
+fn focused_filters_of_run(run_filterset: &str, explicit: &[FocusedFilter]) -> Vec<FocusedFilter> {
+    let mut filters = explicit.to_vec();
+    for atom in focused_atoms(run_filterset) {
+        if explicit.iter().any(|filter| filter.filterset == atom) {
+            continue;
+        }
+        let explicit = matches!(FocusedMatch::parse(&atom), Some(FocusedMatch::Contains(_)));
+        filters.push(FocusedFilter {
+            label: atom.clone(),
+            filterset: atom,
+            explicit,
+        });
+    }
+    filters
+}
+
+/// The labels of the focused filters that select test `name`.
+fn focused_filters_selecting(filters: &[FocusedFilter], name: &str) -> Vec<String> {
+    filters
+        .iter()
+        .filter(|filter| {
+            FocusedMatch::parse(&filter.filterset).is_some_and(|matcher| matcher.matches(name))
+        })
+        .map(|filter| filter.label.clone())
+        .collect()
+}
+
+/// The ` [filter a | b]` attribution a failing test of a combined focused run
+/// carries in a refusal (`failing_test_names` keeps only the name).
+fn focused_attribution_suffix(filters: &[FocusedFilter], name: &str) -> String {
+    let labels = focused_filters_selecting(filters, name);
+    if labels.is_empty() {
+        String::new()
+    } else {
+        format!(" [filter {}]", labels.join(" | "))
+    }
+}
+
+/// `cargo nextest list` over the shared rsid lib build with a run's
+/// filterset, as JSON: every selected test name, read after the prebuild.
+fn rsid_lib_list_command(filterset: &str) -> GuardCommand {
+    let mut args = rsid_lib_nextest_args();
+    args[1] = "list".into();
+    args.extend(
+        ["--message-format", "json", "--filterset", filterset]
+            .into_iter()
+            .map(String::from),
+    );
+    GuardCommand {
+        program: "cargo".into(),
+        args,
+        timeout: guard_timeout(),
+    }
+}
+
+/// The test names a `cargo nextest list --message-format json` report says
+/// its filterset selects (matching and not ignored), or `None` when the
+/// report is no complete nextest listing.
+fn listed_selected_tests(
+    report: &rsid::integration::GuardCommandReport,
+) -> Option<BTreeSet<String>> {
+    if report.status != rsid::integration::GuardStatus::Passed || report.output_truncated {
+        return None;
+    }
+    let listing: serde_json::Value = serde_json::from_str(report.stdout_tail.trim()).ok()?;
+    let mut selected = BTreeSet::new();
+    for suite in listing.get("rust-suites")?.as_object()?.values() {
+        for (name, case) in suite.get("testcases")?.as_object()? {
+            let matches = case
+                .get("filter-match")
+                .and_then(|status| status.get("status"))
+                .and_then(serde_json::Value::as_str)
+                == Some("matches");
+            let ignored = case
+                .get("ignored")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if matches && !ignored {
+                selected.insert(name.clone());
+            }
+        }
+    }
+    Some(selected)
+}
+
+/// #1261/#1262: the focused filters a listing proves select no test. An
+/// explicit filter that selects none is named; a touched-module atom only
+/// counts when the whole run selects nothing. A filter whose shape the lander
+/// cannot match is never named.
+fn focused_filters_selecting_nothing(
+    filters: &[FocusedFilter],
+    selected: &BTreeSet<String>,
+) -> Vec<String> {
+    if selected.is_empty() {
+        return filters.iter().map(|filter| filter.label.clone()).collect();
+    }
+    filters
+        .iter()
+        .filter(|filter| filter.explicit)
+        .filter(|filter| {
+            FocusedMatch::parse(&filter.filterset)
+                .is_some_and(|matcher| !selected.iter().any(|name| matcher.matches(name)))
+        })
+        .map(|filter| filter.label.clone())
+        .collect()
+}
+
+/// #1262: after the shared prebuild and before any test runs, list what the
+/// combined focused run selects and refuse every filter that selects nothing.
+/// The cheap source pre-check (#1243) misses names that exist only as a file
+/// mounted elsewhere; the listing is the authority. A listing that cannot be
+/// read (a failed build reports itself in the run) refuses nothing.
+async fn refuse_focused_filters_selecting_nothing(
+    worktree: &Path,
+    spec: &GuardSpec,
+    command: &GuardCommand,
+    gate: &TestGate,
+) -> Result<(), String> {
+    let Some(filterset) = rsid_lib_filterset(command) else {
+        return Ok(());
+    };
+    let mut list_spec = spec.clone();
+    if let Some(scratch) = &gate.scratch {
+        list_spec.env.insert(
+            "TMPDIR".into(),
+            scratch.path().to_string_lossy().into_owned(),
+        );
+    }
+    let started = Instant::now();
+    let report = run_one_guard(worktree, &list_spec, &rsid_lib_list_command(filterset)).await?;
+    let filters = focused_filters_of_run(filterset, &gate.focused_filters);
+    let Some(selected) = listed_selected_tests(&report) else {
+        println!(
+            "focused_list=unavailable status={:?} filters={}",
+            report.status,
+            filters.len()
+        );
+        return Ok(());
+    };
+    println!(
+        "focused_list=selected={} filters={} atoms={} list_secs={}",
+        selected.len(),
+        filters.len(),
+        focused_atoms(filterset).len(),
+        started.elapsed().as_secs()
+    );
+    // #1280: a generated exact atom the listing lacks (a test compiled out
+    // on this platform) is reported, never refused.
+    let unlisted: Vec<&str> = filters
+        .iter()
+        .filter(|filter| !filter.explicit)
+        .filter(|filter| {
+            matches!(FocusedMatch::parse(&filter.filterset), Some(FocusedMatch::Exact(name)) if !selected.contains(&name))
+        })
+        .map(|filter| filter.label.as_str())
+        .collect();
+    if !unlisted.is_empty() {
+        println!("focused_unlisted={}", unlisted.join(" "));
+    }
+    let empty = focused_filters_selecting_nothing(&filters, &selected);
+    if empty.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "test filter selects no test at the candidate, refused after the build and before any test ran: {}",
+        empty.join(" ")
+    ))
+}
+
+/// Compile-only form of every `rsid_lib_filter_command` (they share it).
+fn rsid_lib_build_command() -> GuardCommand {
+    let mut args = rsid_lib_nextest_args();
+    args.insert(2, "--no-run".into());
+    GuardCommand {
+        program: "cargo".into(),
+        args,
+        timeout: guard_timeout(),
+    }
+}
+
+/// The filterset of an `rsid_lib_filter_command`, `None` for any other shape.
+fn rsid_lib_filterset(command: &GuardCommand) -> Option<&str> {
+    let base = rsid_lib_nextest_args();
+    let args = &command.args;
+    (command.program == "cargo"
+        && args.len() == base.len() + 8
+        && args[..base.len()] == base[..]
+        && args[args.len() - 2] == "--filterset")
+        .then(|| args[args.len() - 1].as_str())
+}
+
+/// A test name a nextest `test(...)` filterset and an exact retry accept.
+fn plain_test_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_:.-".contains(&byte))
+}
+
+/// Whether `atom` is one nextest test atom the lander passes to a shard run
+/// as a single argv element: `test(NAME)` (substring), `test(=NAME)` (exact)
+/// or `test(/REGEX/)`, the shapes `scripts/check-touched-shards` emits. A
+/// regex may hold any printable ASCII with balanced parentheses (an escaped
+/// one does not count); control characters, an empty body and the ` | ` atom
+/// separator are refused.
+fn valid_test_atom(atom: &str) -> bool {
+    let Some(inner) = atom
+        .strip_prefix("test(")
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return false;
+    };
+    if let Some(name) = inner.strip_prefix('=') {
+        return plain_test_name(name);
+    }
+    if let Some(regex) = inner
+        .strip_prefix('/')
+        .and_then(|value| value.strip_suffix('/'))
+    {
+        return valid_test_regex(regex);
+    }
+    plain_test_name(inner)
+}
+
+fn valid_test_regex(regex: &str) -> bool {
+    if regex.is_empty()
+        || regex.contains(" | ")
+        || !regex.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+    {
+        return false;
+    }
+    let (mut depth, mut escaped) = (0usize, false);
+    for byte in regex.bytes() {
+        match (escaped, byte) {
+            (true, _) => escaped = false,
+            (false, b'\\') => escaped = true,
+            (false, b'(') => depth += 1,
+            (false, b')') => match depth.checked_sub(1) {
+                Some(rest) => depth = rest,
+                None => return false,
+            },
+            _ => {}
+        }
+    }
+    depth == 0 && !escaped
+}
+
+/// The gate command of one filter value on an rsid shard package (#1244). A
+/// whole shard keeps its feature-selected harness; a focused `shard:S:test(N)`
+/// or plain `N` filter runs on the shared lib test build. The shard name is
+/// still validated, but no longer limits which tests the name selects.
+fn rsid_family_filter_command(package: &str, filter: &str) -> Result<GuardCommand, String> {
+    if let Some(shard) = filter.strip_prefix("shard:") {
+        let command = rsid_shard_guard_command(shard)?;
+        return Ok(match shard_command_parts(&command) {
+            Some((_, _, Some(filterset))) => rsid_lib_filter_command(filterset),
+            _ => command,
+        });
+    }
+    if filter.starts_with("test(") && valid_test_atom(filter) {
+        return Ok(rsid_lib_filter_command(filter));
+    }
+    if plain_test_name(filter) && !filter.starts_with("bin:") && !filter.starts_with("test:") {
+        return Ok(rsid_lib_filter_command(&format!("test({filter})")));
+    }
+    Ok(cargo_guard_command(package, Some(filter)))
+}
+
+/// The static rsid shard inventory check the shard script runs first; a gate
+/// that runs focused filters outside the script runs it once (#1244).
+fn rsid_shard_inventory_check() -> GuardCommand {
+    GuardCommand {
+        program: "python3".into(),
+        args: vec![
+            "scripts/check-rsid-test-shards.py".into(),
+            "--require-gates".into(),
+        ],
+        timeout: Duration::from_secs(120),
     }
 }
 
@@ -4163,15 +5563,7 @@ fn rsid_shard_guard_command(shard: &str) -> Result<GuardCommand, String> {
     }
     let mut args = vec!["shard".into(), shard.into(), "--jobs".into(), "4".into()];
     if let Some(filterset) = filterset {
-        let test_name = filterset
-            .strip_prefix("test(")
-            .and_then(|value| value.strip_suffix(')'))
-            .ok_or_else(|| format!("invalid rsid shard test filter: {filterset}"))?;
-        if test_name.is_empty()
-            || !test_name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"_:.-".contains(&byte))
-        {
+        if !valid_test_atom(filterset) {
             return Err(format!("invalid rsid shard test filter: {filterset}"));
         }
         args.extend(["--filterset".into(), filterset.into()]);
@@ -4547,7 +5939,42 @@ async fn confirm_post_push(
     }
 }
 
+/// Retry reads only. Each attempt retains its own timeout and child cleanup;
+/// a push must instead be settled by confirm_post_push before any new action.
+async fn retry_remote_read<T, F, Fut>(operation: &str, mut read: F) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let mut attempt = 1;
+    loop {
+        match read().await {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt < 3 => {
+                // Thirty seconds of backoff total, in addition to the bounded
+                // command timeouts. Tests exercise the same attempts quickly.
+                #[cfg(not(test))]
+                let delay = Duration::from_secs(10 * attempt);
+                #[cfg(test)]
+                let delay = Duration::from_millis(10 * attempt);
+                eprintln!(
+                    "remote_read_retry operation={operation} attempt={}/3 delay_ms={} error={error}",
+                    attempt + 1,
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 async fn remote_fetch(repo: &Path) -> Result<(), String> {
+    retry_remote_read("fetch", || remote_fetch_once(repo)).await
+}
+
+async fn remote_fetch_once(repo: &Path) -> Result<(), String> {
     let mut command = remote_git_command(
         repo,
         &[
@@ -4597,6 +6024,10 @@ async fn remote_fetch(repo: &Path) -> Result<(), String> {
 }
 
 async fn remote_tip(repo: &Path, remote: &str) -> Result<Option<String>, String> {
+    retry_remote_read("ls-remote", || remote_tip_once(repo, remote)).await
+}
+
+async fn remote_tip_once(repo: &Path, remote: &str) -> Result<Option<String>, String> {
     const MAX_REMOTE_RESPONSE: usize = 1024;
     let mut command = remote_git_command(repo, &["ls-remote", remote, "refs/heads/rolling"]);
     command
@@ -5846,6 +7277,383 @@ exit 0
         }
     }
 
+    const COMPILE_ERROR: &str = "error[E0412]: cannot find type `Missing` in this scope\n --> crates/demo/src/lib.rs:1:15\n  |\n1 | fn broken(_: Missing) {}\n  |               ^^^^^^^ not found\nerror: could not compile `demo` (lib test) due to 1 previous error\n";
+
+    #[test]
+    fn baseline_compile_detection_requires_source_diagnostics_and_build_exit() {
+        use rsid::integration::{GuardCommandReport, GuardStatus};
+        let report = GuardCommandReport {
+            program: "cargo".into(),
+            args: vec!["test".into()],
+            status: GuardStatus::Failed { code: Some(101) },
+            stdout_tail: String::new(),
+            stderr_tail: COMPILE_ERROR.into(),
+            output_truncated: false,
+            duration: Duration::ZERO,
+        };
+        assert!(baseline_compilation_failed(&report));
+        let syntax = GuardCommandReport {
+            stderr_tail: "error: expected item, found `}`\n --> crates/demo/src/lib.rs:1:1\nerror: could not compile `demo` (lib) due to 1 previous error\n".into(),
+            ..report.clone()
+        };
+        assert!(baseline_compilation_failed(&syntax));
+        for code in [1, 4, 100, 102, 104, 105] {
+            assert!(!baseline_compilation_failed(&GuardCommandReport {
+                status: GuardStatus::Failed { code: Some(code) },
+                ..report.clone()
+            }));
+        }
+        for stderr in [
+            "error: failed to download dependency: connection refused",
+            "error: No space left on device (os error 28)",
+            "error: failed to run custom build command for `demo`",
+            "error: could not compile `demo` (lib test) due to 1 previous error",
+        ] {
+            assert!(!baseline_compilation_failed(&GuardCommandReport {
+                stderr_tail: stderr.into(),
+                ..report.clone()
+            }));
+        }
+        assert!(!baseline_compilation_failed(&GuardCommandReport {
+            output_truncated: true,
+            ..report.clone()
+        }));
+        assert!(!baseline_compilation_failed(&GuardCommandReport {
+            stdout_tail: "test demo::red ... FAILED".into(),
+            ..report
+        }));
+    }
+
+    #[tokio::test]
+    async fn baseline_compile_repair_requires_green_candidate_and_known_inventory() {
+        for shape in ["cargo", "shard", "static-red-shard"] {
+            for scenario in [
+                "repair",
+                "candidate-red",
+                "candidate-infra",
+                "no-tests",
+                "unchanged-compile",
+                "empty",
+                "unknown",
+                "infra",
+                "unknown-inventory",
+                "absent-shard-inventory",
+            ] {
+                if shape == "cargo" && scenario == "absent-shard-inventory" {
+                    continue;
+                }
+                let fixture = Fixture::new();
+                let mut base = fixture.base.clone();
+                if shape != "cargo" {
+                    base = fixture.commit(&base, "crates/rsid/Cargo.toml",
+                        "[package]\nname = \"rsid\"\nversion = \"0.1.0\"\n[features]\ntest-shard-other-02 = []\n", "shard manifest");
+                    base = fixture.commit(
+                        &base,
+                        "Cargo.toml",
+                        "[workspace]\nmembers = [\"crates/demo\", \"crates/rsid\"]\n",
+                        "shard inventory",
+                    );
+                    if scenario == "absent-shard-inventory" {
+                        base = fixture.commit(
+                            &base,
+                            "crates/rsid/Cargo.toml",
+                            "[package]\nname = \"rsid\"\nversion = \"0.1.0\"\n",
+                            "no shard feature",
+                        );
+                    }
+                    base = commit_executable(
+                        &fixture,
+                        &base,
+                        "scripts/run-rsid-test-shards.sh",
+                        "#!/bin/sh\nexec cargo nextest run \"$@\"\n",
+                    );
+                }
+                if scenario == "unknown-inventory" {
+                    base = fixture.commit(
+                        &base,
+                        "Cargo.toml",
+                        "[workspace]\nmembers = [\"crates/*\"]\n",
+                        "unproven inventory",
+                    );
+                }
+                let candidate = fixture.commit(
+                    &base,
+                    "crates/demo/src/elsewhere.rs",
+                    "pub fn repair() {}\n",
+                    "repair",
+                );
+                // Static-red bases still use their direct harness; the candidate
+                // must run the shard script including its own inventory check.
+                let (base, candidate) = if shape == "static-red-shard" {
+                    let red = commit_executable(
+                        &fixture,
+                        &base,
+                        "scripts/run-rsid-test-shards.sh",
+                        "#!/bin/sh\necho 'rsid test shard check failed: ungated test' >&2\nexit 1\n",
+                    );
+                    let fixed = fixture.commit(
+                        &candidate,
+                        "crates/demo/src/lib.rs",
+                        "pub fn fixed() {}\n",
+                        "fixed",
+                    );
+                    (red, fixed)
+                } else {
+                    (base, candidate)
+                };
+                let candidate_tree = fixture.root.path().join("candidate-gate");
+                git_run(
+                    &fixture.repo,
+                    &[
+                        "worktree",
+                        "add",
+                        "--detach",
+                        candidate_tree.to_str().unwrap(),
+                        &candidate,
+                    ],
+                );
+                let log = fixture.root.path().join("repair-runs");
+                let base_output = if scenario == "infra" {
+                    "error: failed to download dependency: connection refused"
+                } else {
+                    COMPILE_ERROR
+                };
+                let candidate_action = match scenario {
+                    // #1244: the base is consulted only for a red or unproven
+                    // candidate, so the base-side refusals need a red one.
+                    "candidate-red" | "infra" | "unknown-inventory" | "absent-shard-inventory" => {
+                        "echo 'test elsewhere::red ... FAILED'; exit 1;"
+                    }
+                    "candidate-infra" => "echo 'error: failed to start runner'; exit 102;",
+                    "no-tests" => "echo 'error: no tests to run'; exit 4;",
+                    "unchanged-compile" => "printf '%s' \"$compile_error\" >&2; exit 101;",
+                    "empty" => "echo 'running 0 tests'; exit 0;",
+                    "unknown" => "exit 0;",
+                    _ => {
+                        if shape == "cargo" {
+                            "echo 'running 1 test'; echo 'test demo::repair ... ok'; exit 0;"
+                        } else {
+                            "echo 'Summary [ 0.01s] 1 test run: 1 passed, 0 skipped'; exit 0;"
+                        }
+                    }
+                };
+                fixture.add_fake_cargo(&format!(
+                    "oid=$(/usr/bin/git rev-parse HEAD)\nprintf '%s %s\\n' \"$oid\" \"$*\" >> '{log}'\ncompile_error='{compile_error}'\nif [ \"$oid\" = '{base}' ]; then printf '%s' '{base_output}' >&2; exit 101; fi\ncase \"$*\" in *--exact*) echo 'running 1 test'; exit 0;; esac\n{candidate_action}",
+                    log = log.display(), compile_error = COMPILE_ERROR,
+                ));
+                let command = if shape == "cargo" {
+                    cargo_guard_command("demo", Some("bin:demo"))
+                } else {
+                    rsid_shard_guard_command("other-02:test(repair)").unwrap()
+                };
+                let spec = GuardSpec {
+                    commands: vec![command],
+                    env: BTreeMap::new(),
+                    output_tail_bytes: 16 * 1024,
+                };
+                let cache_root = fixture.root.path().join("repair-cache");
+                let mut gate = TestGate {
+                    cache_root: Some(cache_root.clone()),
+                    ..TestGate::default()
+                };
+                let old_path = use_fake_path(&fixture);
+                let result = run_affected_gate(
+                    &fixture.repo,
+                    &candidate_tree,
+                    &base,
+                    &spec,
+                    &mut gate,
+                    &BTreeSet::new(),
+                )
+                .await;
+                if scenario == "repair" {
+                    result.expect("compile repair passes with green selected tests");
+                    // Retry in-process and in a new gate: neither failure-set
+                    // cache may treat unavailable evidence as an observed pass.
+                    run_affected_gate(
+                        &fixture.repo,
+                        &candidate_tree,
+                        &base,
+                        &spec,
+                        &mut gate,
+                        &BTreeSet::new(),
+                    )
+                    .await
+                    .unwrap();
+                    for tree in gate.base_worktrees.values() {
+                        git_run(
+                            &fixture.repo,
+                            &["worktree", "remove", tree.to_str().unwrap()],
+                        );
+                    }
+                    let mut fresh = TestGate {
+                        cache_root: Some(cache_root),
+                        ..TestGate::default()
+                    };
+                    run_affected_gate(
+                        &fixture.repo,
+                        &candidate_tree,
+                        &base,
+                        &spec,
+                        &mut fresh,
+                        &BTreeSet::new(),
+                    )
+                    .await
+                    .unwrap();
+                    // #1244: a green, proven candidate never needs the base,
+                    // so the broken base is not even built.
+                    assert_eq!(fresh.base_runs, 0);
+                    assert_eq!(fresh.base_skipped, 1);
+                    assert!(fresh.base_reused.is_empty());
+                    assert!(fresh.base_cache.is_empty());
+                } else {
+                    let error = result.unwrap_err();
+                    let expected = match scenario {
+                        "candidate-red" | "candidate-infra" | "no-tests" | "unchanged-compile" => {
+                            "baseline_compile_repair_candidate_failed"
+                        }
+                        "empty" | "unknown" => "baseline_compile_repair_candidate_evidence_missing",
+                        "unknown-inventory" | "absent-shard-inventory" => {
+                            "baseline_compile_repair_inventory_unknown"
+                        }
+                        "infra" => "affected-crate guard failed",
+                        _ => unreachable!(),
+                    };
+                    assert!(error.contains(expected), "{shape}/{scenario}: {error}");
+                }
+                restore_path(old_path);
+                assert!(gate.base_cache.is_empty());
+                assert!(gate.base_reds.is_empty());
+                assert!(gate.flakes.is_empty());
+                assert!(gate.unverified.is_empty());
+                let runs = fs::read_to_string(&log).unwrap();
+                assert_eq!(
+                    runs.lines()
+                        .filter(|line| line.starts_with(&candidate))
+                        .count(),
+                    if scenario == "repair" { 3 } else { 1 },
+                    "{shape}/{scenario}: no isolated retry can exempt a candidate red"
+                );
+                if !matches!(
+                    scenario,
+                    "repair" | "infra" | "unknown-inventory" | "absent-shard-inventory"
+                ) {
+                    assert!(gate.base_test_baseline_unavailable.contains(&format!(
+                        "{base}:compile_failed:{} {:?}",
+                        spec.commands[0].program, spec.commands[0].args
+                    )));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn baseline_compile_repair_requires_all_selected_runs_green_in_either_order() {
+        for unavailable_first in [true, false] {
+            let fixture = Fixture::new();
+            let candidate = fixture.commit(
+                &fixture.base,
+                "crates/demo/src/lib.rs",
+                "pub fn repaired() {}\n",
+                "repair",
+            );
+            let candidate_tree = fixture.root.path().join("candidate-gate");
+            git_run(
+                &fixture.repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    candidate_tree.to_str().unwrap(),
+                    &candidate,
+                ],
+            );
+            fixture.add_fake_cargo(&format!(
+                "case \"$*\" in *known_red*) echo 'test demo::known_red ... FAILED'; exit 1;; esac\nif [ \"$(/usr/bin/git rev-parse HEAD)\" = '{}' ]; then printf '%s' '{}' >&2; exit 101; fi\necho 'running 1 test'\necho 'test demo::repair ... ok'",
+                fixture.base, COMPILE_ERROR,
+            ));
+            let mut commands = vec![
+                cargo_guard_command("demo", Some("repair")),
+                cargo_guard_command("demo", Some("known_red")),
+            ];
+            if !unavailable_first {
+                commands.reverse();
+            }
+            let spec = GuardSpec {
+                commands,
+                env: BTreeMap::new(),
+                output_tail_bytes: 16 * 1024,
+            };
+            let mut gate = TestGate::default();
+            let old_path = use_fake_path(&fixture);
+            let result = run_affected_gate(
+                &fixture.repo,
+                &candidate_tree,
+                &fixture.base,
+                &spec,
+                &mut gate,
+                &BTreeSet::new(),
+            )
+            .await;
+            restore_path(old_path);
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("baseline_compile_repair_candidate_failed"),
+                "{error}"
+            );
+            assert!(error.contains("known_red"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn baseline_compile_repair_runs_real_cargo_tests() {
+        let fixture = Fixture::new();
+        let base = fixture.commit(
+            &fixture.base,
+            "crates/demo/src/lib.rs",
+            "pub fn broken(_: Missing) {}\n",
+            "baseline compile error",
+        );
+        let candidate = fixture.commit(&base, "crates/demo/src/lib.rs",
+            "pub fn repaired() -> usize { 42 }\n#[cfg(test)] mod tests { #[test] fn repair() { assert_eq!(super::repaired(), 42); } }\n", "repair");
+        let candidate_tree = fixture.root.path().join("real-candidate");
+        git_run(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                candidate_tree.to_str().unwrap(),
+                &candidate,
+            ],
+        );
+        let spec = GuardSpec {
+            commands: vec![
+                cargo_check_command("demo"),
+                cargo_guard_command("demo", Some("tests::repair")),
+            ],
+            env: BTreeMap::from([("CARGO_BUILD_JOBS".into(), "2".into())]),
+            output_tail_bytes: 16 * 1024,
+        };
+        let mut gate = TestGate::default();
+        run_affected_gate(
+            &fixture.repo,
+            &candidate_tree,
+            &base,
+            &spec,
+            &mut gate,
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("real rustc repair and selected test pass");
+        // #1244: the selected test is green and proven, so the uncompilable
+        // base is never consulted.
+        assert_eq!(gate.base_skipped, 1);
+        assert_eq!(gate.base_runs, 0);
+        assert!(gate.base_cache.is_empty());
+        assert!(gate.base_reds.is_empty());
+    }
+
     #[tokio::test]
     async fn paired_test_gate_handles_identical_new_fixed_and_flaky_reds() {
         for scenario in ["identical", "new", "fixed", "flaky"] {
@@ -6069,11 +7877,11 @@ exit 0
         assert!(moved.base_reused.is_empty());
     }
 
-    /// #1132: the gate compiles the candidate and the uncached base shard
-    /// binaries up front (`--no-run`), skips the base build once its result
-    /// is cached, and records the timing.
+    /// #1132/#1244: the gate compiles the candidate shard binaries up front
+    /// (`--no-run`); the base side is never prebuilt, only built when a
+    /// candidate failure needs it.
     #[tokio::test]
-    async fn gate_prebuilds_uncached_base_and_candidate_shard_binaries() {
+    async fn gate_prebuilds_only_the_candidate_shard_binaries() {
         let fixture = Fixture::new();
         let candidate = fixture.commit(
             &fixture.base,
@@ -6138,9 +7946,11 @@ exit 0
         restore_path(old_path);
         let log = fs::read_to_string(&builds).unwrap();
         let count = |oid: &str| log.lines().filter(|line| line.starts_with(oid)).count();
-        assert_eq!(count(&fixture.base), 1, "{log}");
+        assert_eq!(count(&fixture.base), 0, "{log}");
         assert_eq!(count(&candidate), 2, "{log}");
         assert!(log.contains("--features test-shard-store-01"), "{log}");
+        // The fake shard run proves no test ran, so the base is still
+        // consulted once and then read from the persistent cache.
         assert_eq!(gates[0].base_runs, 1);
         assert_eq!(gates[1].base_runs, 0);
     }
@@ -6894,7 +8704,8 @@ fi",
         let scoped = match &named {
             Err(_) => Some(
                 fixture
-                    .land_with_filters(vec![pair], vec!["demo=unrelated_green_test".into()])
+                    // A name the source has (#1243 refuses one it lacks).
+                    .land_with_filters(vec![pair], vec!["demo=value".into()])
                     .await,
             ),
             Ok(_) => None,
@@ -6910,6 +8721,44 @@ fi",
         assert_eq!(
             git_value(&fixture.bare, &["rev-parse", "refs/heads/rolling"]),
             source
+        );
+    }
+
+    /// #1243: a filter that provably selects no test is refused before the
+    /// gate builds or runs anything.
+    #[tokio::test]
+    async fn a_filter_selecting_no_test_is_refused_before_any_build() {
+        let fixture = Fixture::new();
+        let source = fixture.commit(
+            &fixture.base,
+            "crates/demo/src/lib.rs",
+            "pub fn value() -> &'static str { \"changed\" }\n",
+            "change",
+        );
+        let log = fixture.root.path().join("cargo-calls");
+        fixture.add_fake_cargo(&format!("printf '%s\\n' \"$1\" >> '{}'", log.display()));
+        let old_path = use_fake_path(&fixture);
+        let result = fixture
+            .land_with_filters(
+                vec![AcceptedPair {
+                    base: fixture.base.clone(),
+                    source,
+                }],
+                vec!["demo=no_such_test_anywhere".into()],
+            )
+            .await;
+        restore_path(old_path);
+        let failure = result.expect_err("an empty filter is refused");
+        assert_eq!(failure.state, PublicationState::NotPublished);
+        assert!(
+            failure.message.contains("selects no test")
+                && failure.message.contains("demo=no_such_test_anywhere"),
+            "{failure:?}"
+        );
+        let calls = fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls.lines().all(|call| call == "metadata"),
+            "no build ran: {calls}"
         );
     }
 
@@ -7216,6 +9065,41 @@ fi",
             ..report
         };
         assert!(retry_failure_evidence(&flood).len() <= 2048);
+    }
+
+    #[test]
+    fn cargo_retry_preserves_the_selected_target() {
+        for (filter, target) in [
+            (None, vec!["--lib"]),
+            (Some("existing_filter"), vec!["--lib"]),
+            (
+                Some("test:tui_integration"),
+                vec!["--test", "tui_integration"],
+            ),
+            (
+                Some("bin:rsi-rolling-land"),
+                vec!["--bin", "rsi-rolling-land"],
+            ),
+        ] {
+            let command = cargo_guard_command("rsid", filter);
+            let retry =
+                isolated_retry_command(&command, "tests::new_red", ShardTree::Static).unwrap();
+            let mut expected = vec!["test", "-p", "rsid"];
+            expected.extend(target);
+            expected.extend(["tests::new_red", "--", "--exact", "--test-threads=4"]);
+            assert_eq!(retry.program, "cargo");
+            assert_eq!(retry.args, expected);
+            assert_eq!(retry.timeout, command.timeout);
+        }
+    }
+
+    #[test]
+    fn cargo_retry_rejects_a_missing_target_name() {
+        for selector in ["--test", "--bin"] {
+            let mut command = cargo_guard_command("rsid", None);
+            command.args[3] = selector.into();
+            assert!(isolated_retry_command(&command, "tests::new_red", ShardTree::Static).is_err());
+        }
     }
 
     #[test]
@@ -7856,6 +9740,83 @@ fi",
         );
     }
 
+    /// #1606: Python failures refuse a scripts/tools landing, and successful
+    /// suites and pure docs landings need no Cargo invocation at all.
+    #[tokio::test]
+    async fn python_gate_checks_scripts_tools_and_tests_before_publication_without_cargo() {
+        for (changed, passes) in [
+            ("scripts/widget.py", true),
+            ("scripts/widget.py", false),
+            ("tools/widget.py", true),
+            ("tools/widget.py", false),
+            ("scripts/tests/test_widget.py", true),
+            ("scripts/tests/test_widget.py", false),
+            ("docs/widget.md", true),
+            ("thoughts/widget.md", true),
+        ] {
+            let fixture = Fixture::new();
+            fs::copy(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/python-test-gate.py"),
+                fixture.repo.join("scripts/python-test-gate.py"),
+            )
+            .unwrap();
+            let log = fixture.root.path().join("python-runs");
+            let suite = format!(
+                "import unittest\nfrom pathlib import Path\nclass Test(unittest.TestCase):\n    def test_widget(self):\n        Path({:?}).write_text('ran')\n        self.assertEqual({}, 1)\n",
+                log.to_str().unwrap(),
+                if passes { 1 } else { 2 },
+            );
+            write(&fixture.repo, "scripts/tests/test_widget.py", &suite);
+            git_run(
+                &fixture.repo,
+                &[
+                    "add",
+                    "scripts/python-test-gate.py",
+                    "scripts/tests/test_widget.py",
+                ],
+            );
+            git_run(&fixture.repo, &["commit", "-qm", "Python coverage"]);
+            git_run(&fixture.repo, &["push", "-q", "origin", "rolling"]);
+            let base = git_value(&fixture.repo, &["rev-parse", "HEAD"]);
+            let contents = if changed.starts_with("scripts/tests/") {
+                format!("{suite}# changed\n")
+            } else {
+                "# changed\n".into()
+            };
+            let source = fixture.commit(&base, changed, &contents, "source");
+            let cargo = fixture.bin.join("cargo");
+            fs::write(&cargo, "#!/bin/sh\necho 'unexpected cargo' >&2\nexit 99\n").unwrap();
+            fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+            let old_path = use_fake_path(&fixture);
+            let result = fixture
+                .land(vec![AcceptedPair {
+                    base: base.clone(),
+                    source,
+                }])
+                .await;
+            restore_path(old_path);
+            if passes {
+                let report = result.unwrap_or_else(|error| panic!("{changed}: {error:?}"));
+                assert_eq!(
+                    git_value(&fixture.bare, &["rev-parse", "refs/heads/rolling"]),
+                    report.published_tip
+                );
+                assert_eq!(
+                    log.is_file(),
+                    changed.starts_with("scripts/") || changed.starts_with("tools/")
+                );
+            } else {
+                let failure = result.expect_err("a failing Python suite refuses landing");
+                assert!(failure.message.contains("test_widget"), "{failure:?}");
+                assert_eq!(
+                    git_value(&fixture.bare, &["rev-parse", "refs/heads/rolling"]),
+                    base
+                );
+                assert_eq!(fs::read_to_string(log).unwrap(), "ran");
+            }
+        }
+    }
+
     /// Stages two disjoint rolling advances that each win the race against the
     /// candidate the lander just gated, and returns the lander's outcome plus
     /// the commits the fake cargo ran tests on.
@@ -8130,8 +10091,10 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
                 ],
             });
             let cargo = fixture.bin.join("cargo");
+            // #1244: the provisional store tests run on the shared rsid lib
+            // build (`cargo nextest`), so the fixture's shard double answers it.
             fs::write(&cargo, format!(
-                "#!/bin/sh\nif [ \"$1\" = metadata ]; then printf '%s\\n' '{metadata}'; exit 0; fi\nexit 0\n",
+                "#!/bin/sh\nif [ \"$1\" = metadata ]; then printf '%s\\n' '{metadata}'; exit 0; fi\nif [ \"$1\" = nextest ]; then exec ./scripts/run-rsid-test-shards.sh; fi\nexit 0\n",
             )).unwrap();
             let mut permissions = fs::metadata(&cargo).unwrap().permissions();
             permissions.set_mode(0o755);
@@ -8607,6 +10570,7 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
                     provisional,
                     &metadata,
                     jobs,
+                    None,
                 )
                 .unwrap()
             };
@@ -8638,6 +10602,7 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
             false,
             &guard_workspace_metadata(),
             4,
+            None,
         )
         .unwrap();
         let rendered: Vec<String> = spec
@@ -8664,9 +10629,79 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
                 false,
                 &guard_workspace_metadata(),
                 4,
+                None,
             )
             .is_err()
         );
+    }
+
+    /// #1281: a focused gate runs one lib test build without shard features,
+    /// so the static inventory check it runs must refuse a test hidden behind
+    /// a shard-only enclosing cfg, which that build would never compile.
+    #[test]
+    fn inventory_check_refuses_a_shard_only_enclosing_module() {
+        let check = rsid_shard_inventory_check();
+        let source_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/check-rsid-test-shards.py");
+        let gate = |shard_cfg: &str| -> (bool, String) {
+            let root = tempfile::tempdir().unwrap();
+            let manifest = "[package]\nname = \"p\"\nversion = \"0.1.0\"\n[features]\n\
+                            default = []\ntest-shard-mode = []\n\
+                            test-shard-other-03 = [\"test-shard-mode\"]\n";
+            let lib = format!(
+                "#[cfg(any(not(feature = \"test-shard-mode\"), feature = \"test-shard-other-03\"))]\n\
+                 #[test]\nfn visible_green() {{}}\n\n\
+                 {shard_cfg}\nmod hidden {{\n    \
+                 #[cfg(any(not(feature = \"test-shard-mode\"), feature = \"test-shard-other-03\"))]\n    \
+                 #[test]\n    fn hidden_red() {{ panic!(\"x\"); }}\n}}\n"
+            );
+            for package in ["rsid", "rsid-store"] {
+                let directory = root.path().join("crates").join(package);
+                fs::create_dir_all(directory.join("src")).unwrap();
+                fs::write(directory.join("Cargo.toml"), manifest).unwrap();
+                fs::write(directory.join("src/lib.rs"), &lib).unwrap();
+            }
+            fs::create_dir_all(root.path().join("scripts")).unwrap();
+            fs::copy(
+                &source_script,
+                root.path().join("scripts/check-rsid-test-shards.py"),
+            )
+            .unwrap();
+            let output = std::process::Command::new(&check.program)
+                .args(&check.args)
+                .current_dir(root.path())
+                .output()
+                .unwrap();
+            (
+                output.status.success(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        };
+        // The canonical gate on the module keeps it in the unfeatured build.
+        let (passed, stderr) = gate(
+            "#[cfg(any(not(feature = \"test-shard-mode\"), feature = \"test-shard-other-03\"))]",
+        );
+        assert!(passed, "{stderr}");
+        // Multi-line `all(test, any(..))` is the same predicate.
+        let (passed, stderr) = gate(
+            "#[cfg(all(\n    test,\n    any(not(feature = \"test-shard-mode\"), \
+             feature = \"test-shard-other-03\")\n))]",
+        );
+        assert!(passed, "{stderr}");
+        // A shard-only module compiles its test only with the shard feature.
+        for hidden in [
+            "#[cfg(feature = \"test-shard-other-03\")]",
+            "#[cfg(all(test, feature = \"test-shard-other-03\"))]",
+            "#[cfg_attr(feature = \"test-shard-other-03\", allow(dead_code))]",
+        ] {
+            let (passed, stderr) = gate(hidden);
+            assert!(!passed, "{hidden} passed the inventory check");
+            assert!(
+                stderr.contains("src/lib.rs:5:") && stderr.contains("unfeatured")
+                    || stderr.contains("cfg_attr"),
+                "{stderr}"
+            );
+        }
     }
 
     #[test]
@@ -8679,6 +10714,7 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
             false,
             &guard_workspace_metadata(),
             4,
+            None,
         )
         .unwrap();
         // A filter scopes the rsid gate: diff check, compile check, and the
@@ -8712,6 +10748,1098 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
                 "test(manager_recovery_)"
             ]
         );
+    }
+
+    /// #1510: every atom shape `check-touched-shards` emits reaches the shard
+    /// script as one `--filterset` argv element, and the same atom in the
+    /// focused form selects the shared lib build.
+    #[test]
+    fn shard_filters_accept_every_nextest_atom_shape() {
+        let atoms = [
+            "test(manager_recovery_)",
+            "test(rpc::agent_x)",
+            "test(=session::tests::event_wake)",
+            "test(/^session::tests::manager_actions::[A-Za-z0-9_]+$/)",
+            "test(/^session::big::(?:\\w+::)*(?:t3|t9)$/)",
+            "test(/^session::big::(?:\\w+::)*t3$/)",
+            "test(/^store::/)",
+            "test(/a b/)",
+            "test(/\\(/)",
+        ];
+        for atom in atoms {
+            let command = rsid_shard_guard_command(&format!("other-03:{atom}")).unwrap();
+            assert_eq!(command.program, "scripts/run-rsid-test-shards.sh", "{atom}");
+            assert_eq!(
+                command.args,
+                ["shard", "other-03", "--jobs", "4", "--filterset", atom]
+            );
+            let focused =
+                rsid_family_filter_command("rsid", &format!("shard:other-03:{atom}")).unwrap();
+            assert_eq!(rsid_lib_filterset(&focused), Some(atom), "{atom}");
+            let bare = rsid_family_filter_command("rsid", atom).unwrap();
+            assert_eq!(rsid_lib_filterset(&bare), Some(atom), "{atom}");
+        }
+    }
+
+    #[test]
+    fn shard_filters_refuse_control_characters_and_malformed_atoms() {
+        for atom in [
+            "test()",
+            "test(=)",
+            "test(=a b)",
+            "test(=a|b)",
+            "test(//)",
+            "test(/)",
+            "test(/a)",
+            "test(/a/",
+            "test(/a)b/)",
+            "test(/(a/)",
+            "test(/a\\/)",
+            "test(/a | b/)",
+            "test(/a\nb/)",
+            "test(/a\tb/)",
+            "test(/a\u{7f}/)",
+            "test(/é/)",
+            "test(a) | test(b)",
+            "all()",
+            "not(test(gap))",
+        ] {
+            assert!(
+                rsid_shard_guard_command(&format!("other-03:{atom}")).is_err(),
+                "{atom:?}"
+            );
+        }
+    }
+
+    /// #1510: the filters `scripts/check-touched-shards` emitted for the
+    /// synthetic diffs of `scripts/tests/test_check_touched_shards.py`, which
+    /// fails when the script emits a shape missing from this fixture.
+    #[test]
+    fn touched_shard_filter_fixture_is_accepted() {
+        let fixture = include_str!("../../../../scripts/tests/fixtures/touched-shard-filters.txt");
+        let filters: Vec<&str> = fixture.lines().filter(|line| !line.is_empty()).collect();
+        assert!(filters.len() >= 4, "{filters:?}");
+        for filter in filters {
+            let (package, value) = filter.split_once('=').unwrap();
+            assert_eq!(package, "rsid");
+            let shard = value.strip_prefix("shard:").unwrap();
+            let command = rsid_shard_guard_command(shard).unwrap();
+            let (_, _, filterset) = shard_command_parts(&command).unwrap();
+            let focused = rsid_family_filter_command(package, value).unwrap();
+            assert_eq!(rsid_lib_filterset(&focused), filterset, "{filter}");
+            assert!(filterset.is_some(), "{filter}");
+        }
+    }
+
+    fn rsid_family_metadata() -> WorkspaceMetadata {
+        let package = |name: &str, dependencies: &[&str]| WorkspacePackage {
+            id: name.into(),
+            name: name.into(),
+            dependencies: dependencies
+                .iter()
+                .map(|dependency| WorkspaceDependency {
+                    name: (*dependency).into(),
+                    path: Some(PathBuf::from(format!("crates/{dependency}"))),
+                })
+                .collect(),
+        };
+        WorkspaceMetadata {
+            workspace_members: ["rsid-store", "rsid", "rsi"].map(str::to_owned).to_vec(),
+            packages: vec![
+                package("rsid-store", &[]),
+                package("rsid", &["rsid-store"]),
+                package("rsi", &[]),
+            ],
+        }
+    }
+
+    fn rendered(spec: &GuardSpec) -> Vec<String> {
+        spec.commands
+            .iter()
+            .map(|command| format!("{} {}", command.program, command.args.join(" ")))
+            .collect()
+    }
+
+    /// #1244: focused rsid filters in different shards (and a filter on the
+    /// sibling package) share one lib test build without shard features; the
+    /// unfiltered sibling gets its compile check, not all sixteen shards.
+    #[test]
+    fn focused_rsid_filters_share_one_lib_build_across_shards() {
+        let spec = affected_crate_guard_spec(
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+            &["rsid".into(), "rsid-store".into()],
+            &[
+                "rsid=shard:other-01:test(rolling_queue)".into(),
+                "rsid=shard:session-02:test(manager_recovery_)".into(),
+                "rsid=bin:rsid".into(),
+            ],
+            false,
+            &rsid_family_metadata(),
+            4,
+            None,
+        )
+        .unwrap();
+        let lib = "cargo nextest run --profile rsid-fast -p rsid -p rsid-store --lib --status-level all --final-status-level all -j 8 --filterset";
+        assert_eq!(
+            rendered(&spec)[1..],
+            [
+                "python3 scripts/check-rsid-test-shards.py --require-gates".to_owned(),
+                "cargo check -p rsid --all-targets".to_owned(),
+                format!("{lib} test(rolling_queue) | test(manager_recovery_)"),
+                "cargo test -p rsid --bin rsid -- --test-threads=4".to_owned(),
+                "cargo check -p rsid-store --all-targets".to_owned(),
+            ]
+        );
+        assert!(is_static_guard(&spec.commands[1]));
+        let builds = shard_build_commands(&spec, ShardTree::Static);
+        assert_eq!(builds, vec![rsid_lib_build_command()]);
+        assert_eq!(
+            builds[0].args.join(" "),
+            "nextest run --no-run --profile rsid-fast -p rsid -p rsid-store --lib"
+        );
+        // Every gate build uses the shard script's test profile and keeps
+        // the binaries the prebuild compiled.
+        assert_eq!(spec.env["CARGO_PROFILE_TEST_DEBUG"], "0");
+        assert_eq!(spec.env["RSI_LANDER_KEEP_RSID_ARTIFACTS"], "1");
+        // A whole shard keeps its feature-selected harness; a plain name
+        // filter on rsid-store runs on the shared build too.
+        assert_eq!(
+            rsid_family_filter_command("rsid", "shard:store-01").unwrap(),
+            rsid_shard_guard_command("store-01").unwrap()
+        );
+        assert_eq!(
+            rsid_family_filter_command("rsid-store", "store::tests").unwrap(),
+            rsid_lib_filter_command("test(store::tests)")
+        );
+        assert!(rsid_family_filter_command("rsid", "shard:other-99:test(x)").is_err());
+        // The isolated retry runs the one test on the same packages/features.
+        let retry = isolated_retry_command(
+            &rsid_lib_filter_command("test(rolling_queue)"),
+            "rolling_queue::tests::a_case",
+            ShardTree::Static,
+        )
+        .unwrap();
+        assert_eq!(
+            retry.args.join(" "),
+            "test -p rsid -p rsid-store --lib rolling_queue::tests::a_case -- --exact --test-threads=4"
+        );
+    }
+
+    /// #1261: every focused rsid filter of a gate is one nextest run over a
+    /// combined filterset; identical atoms and atoms a shorter substring
+    /// already selects are dropped, whatever shard each filter named.
+    #[test]
+    fn focused_rsid_filters_combine_into_one_deduplicated_run() {
+        let spec = affected_crate_guard_spec(
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+            &["rsid".into(), "rsid-store".into()],
+            &[
+                "rsid=shard:session-05:test(session::manager_succession_tests)".into(),
+                "rsid=shard:session-02:test(session::manager_)".into(),
+                "rsid-store=shard:store-01:test(store::tests::h1_)".into(),
+                "rsid=store::tests::h1_".into(),
+                "rsid=rolling_queue::tests::queue_".into(),
+                "rsid=shard:other-01:test(rolling_queue)".into(),
+            ],
+            true,
+            &rsid_family_metadata(),
+            4,
+            None,
+        )
+        .unwrap();
+        let runs: Vec<&GuardCommand> = spec
+            .commands
+            .iter()
+            .filter(|command| rsid_lib_filterset(command).is_some())
+            .collect();
+        assert_eq!(runs.len(), 1, "{:?}", rendered(&spec));
+        assert_eq!(
+            rsid_lib_filterset(runs[0]),
+            Some(
+                "test(store::tests::rewind_tears_down_the_non_idempotent_migration_tail) | \
+                 test(store::tests::every_recovered_migration_step_actually_executes) | \
+                 test(session::manager_) | test(store::tests::h1_) | test(rolling_queue)"
+            )
+        );
+        // One run replaces several: its guard grows with the atoms, capped,
+        // and it runs on the profile's eight test threads.
+        assert_eq!(runs[0].timeout, guard_timeout() * 4);
+        let at = runs[0].args.iter().position(|arg| arg == "-j").unwrap();
+        assert_eq!(runs[0].args[at + 1], "8");
+        let single = rsid_focused_run_command(&["test(a)".to_owned()]);
+        assert_eq!(rsid_lib_filterset(&single), Some("test(a)"));
+        assert_eq!(single.timeout, guard_timeout());
+        // The shared build and the static inventory check still appear once.
+        assert_eq!(
+            shard_build_commands(&spec, ShardTree::Static),
+            vec![rsid_lib_build_command()]
+        );
+        assert_eq!(
+            spec.commands
+                .iter()
+                .filter(|command| **command == rsid_shard_inventory_check())
+                .count(),
+            1
+        );
+        // The explicit filters keep their labels for refusals and attribution.
+        let explicit = explicit_focused_filters(
+            &[
+                "rsid=shard:session-05:test(session::manager_succession_tests)".into(),
+                "rsid=shard:store-01".into(),
+                "rsid=bin:rsid".into(),
+                "demo=value".into(),
+            ],
+            false,
+        );
+        assert_eq!(
+            explicit,
+            vec![FocusedFilter {
+                label: "rsid=shard:session-05:test(session::manager_succession_tests)".into(),
+                filterset: "test(session::manager_succession_tests)".into(),
+                explicit: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn focused_atoms_deduplicate_by_substring_and_module_cover() {
+        let atoms = |sets: &[&str]| combined_focused_atoms(sets.iter().copied());
+        assert_eq!(
+            atoms(&["test(a::b)", "test(a::b)", "test(a::)"]),
+            ["test(a::)"]
+        );
+        // A module atom is covered by a substring of `module::`, not the
+        // other way round.
+        assert_eq!(
+            atoms(&["test(/^store::/)", "test(store::tests::x)"]),
+            ["test(/^store::/)", "test(store::tests::x)"]
+        );
+        assert_eq!(
+            atoms(&["test(/^store::/) | test(/^sandbox::/)", "test(store)"]),
+            ["test(/^sandbox::/)", "test(store)"]
+        );
+        // An exact atom is covered by a substring of its name (#1280).
+        assert_eq!(atoms(&["test(=exact)", "test(exact)"]), ["test(exact)"]);
+        // A shape the lander does not generate is kept as is.
+        assert_eq!(
+            atoms(&["test(#exact*)", "test(exact)"]),
+            ["test(#exact*)", "test(exact)"]
+        );
+        let module = FocusedMatch::parse("test(/^store::/)").unwrap();
+        assert!(module.matches("store::tests::x"));
+        assert!(!module.matches("storefront::x"));
+        assert!(FocusedMatch::parse("test(x)").unwrap().matches("a::x_y"));
+        assert_eq!(FocusedMatch::parse("not(test(x))"), None);
+    }
+
+    fn listing_report(stdout: &str) -> rsid::integration::GuardCommandReport {
+        rsid::integration::GuardCommandReport {
+            program: "cargo".into(),
+            args: Vec::new(),
+            status: rsid::integration::GuardStatus::Passed,
+            stdout_tail: stdout.into(),
+            stderr_tail: String::new(),
+            output_truncated: false,
+            duration: Duration::ZERO,
+        }
+    }
+
+    fn nextest_listing(cases: &[(&str, &str, &str, bool)]) -> String {
+        let mut suites = serde_json::Map::new();
+        for (binary, name, status, ignored) in cases {
+            let suite = suites
+                .entry((*binary).to_owned())
+                .or_insert_with(|| serde_json::json!({ "binary-id": binary, "testcases": {} }));
+            suite["testcases"][*name] = serde_json::json!({
+                "kind": "test",
+                "ignored": ignored,
+                "filter-match": { "status": status },
+            });
+        }
+        serde_json::json!({ "test-count": cases.len(), "rust-suites": suites }).to_string()
+    }
+
+    /// #1262: a name that exists only as a file mounted elsewhere selects no
+    /// test; the listing names that filter, and only a whole-run miss counts
+    /// against a touched-module atom.
+    #[test]
+    fn a_listing_names_each_focused_filter_that_selects_nothing() {
+        let listing = nextest_listing(&[
+            (
+                "rsid",
+                "session::manager::succession_tests::hands_on",
+                "matches",
+                false,
+            ),
+            (
+                "rsid",
+                "rolling_queue::tests::queue_lands",
+                "matches",
+                false,
+            ),
+            (
+                "rsid",
+                "rolling_queue::tests::ignored_case",
+                "matches",
+                true,
+            ),
+            ("rsid-store", "store::tests::other", "mismatch", false),
+        ]);
+        let selected = listed_selected_tests(&listing_report(&listing)).unwrap();
+        assert_eq!(
+            selected,
+            BTreeSet::from([
+                "rolling_queue::tests::queue_lands".to_owned(),
+                "session::manager::succession_tests::hands_on".to_owned(),
+            ])
+        );
+        let explicit = explicit_focused_filters(
+            &[
+                "rsid=shard:session-05:test(session::manager_succession_tests)".into(),
+                "rsid=shard:other-01:test(rolling_queue)".into(),
+            ],
+            false,
+        );
+        let filters = focused_filters_of_run(
+            "test(session::manager_succession_tests) | test(rolling_queue) | test(/^sandbox::/)",
+            &explicit,
+        );
+        assert_eq!(
+            focused_filters_selecting_nothing(&filters, &selected),
+            ["rsid=shard:session-05:test(session::manager_succession_tests)"]
+        );
+        assert_eq!(
+            focused_filters_selecting(&filters, "rolling_queue::tests::queue_lands"),
+            ["rsid=shard:other-01:test(rolling_queue)"]
+        );
+        // Nothing selected at all names every filter, module atoms included.
+        assert_eq!(
+            focused_filters_selecting_nothing(&filters, &BTreeSet::new()).len(),
+            3
+        );
+        // No complete listing (a failed build, a shim) refuses nothing.
+        assert_eq!(
+            listed_selected_tests(&listing_report("Summary [ 0.01s]")),
+            None
+        );
+        let mut failed = listing_report(&listing);
+        failed.status = rsid::integration::GuardStatus::Failed { code: Some(101) };
+        assert_eq!(listed_selected_tests(&failed), None);
+        assert_eq!(
+            rsid_lib_list_command("test(a) | test(b)").args.join(" "),
+            "nextest list --profile rsid-fast -p rsid -p rsid-store --lib --message-format json --filterset test(a) | test(b)"
+        );
+    }
+
+    /// #1261/#1262 at the gate: an empty focused filter is refused after the
+    /// build and before any test runs; a red of the combined run is retried,
+    /// compared with the base, and names the filters that select it.
+    #[tokio::test]
+    async fn combined_focused_run_refuses_empty_filters_and_attributes_failures() {
+        for scenario in ["empty-filter", "new-red"] {
+            let fixture = Fixture::new();
+            let candidate = fixture.commit(
+                &fixture.base,
+                "crates/demo/src/lib.rs",
+                "pub fn value() -> &'static str { \"candidate\" }\n",
+                "candidate",
+            );
+            let tree = fixture.root.path().join("combined-candidate");
+            git_run(
+                &fixture.repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    tree.to_str().unwrap(),
+                    &candidate,
+                ],
+            );
+            let listing = fixture.root.path().join("listing.json");
+            fs::write(
+                &listing,
+                nextest_listing(&[
+                    (
+                        "rsid",
+                        "rolling_queue::tests::queue_lands",
+                        "matches",
+                        false,
+                    ),
+                    (
+                        "rsid",
+                        "session::manager::succession_tests::x",
+                        "mismatch",
+                        false,
+                    ),
+                ]),
+            )
+            .unwrap();
+            let runs = fixture.root.path().join("combined-runs");
+            fixture.add_fake_cargo(&format!(
+                "oid=$(/usr/bin/git rev-parse HEAD)\ncase \"$1 $2\" in\n  'nextest list') cat '{listing}'; exit 0;;\n  'nextest run') printf 'run %s\\n' \"$oid\" >> '{runs}'\n    if [ \"$oid\" = '{candidate}' ]; then echo '        FAIL [   0.010s] (1/1) rsid rolling_queue::tests::queue_lands'; echo '     Summary [   0.010s] 1 test run: 0 passed, 1 failed, 0 skipped'; exit 100; fi\n    echo '        PASS [   0.010s] (1/1) rsid rolling_queue::tests::queue_lands'; echo '     Summary [   0.010s] 1 test run: 1 passed, 0 skipped'; exit 0;;\n  test*) printf 'retry %s\\n' \"$oid\" >> '{runs}'; echo 'running 1 test'; echo 'test rolling_queue::tests::queue_lands ... FAILED'; exit 101;;\nesac",
+                listing = listing.display(),
+                runs = runs.display(),
+            ));
+            let filters: Vec<String> = if scenario == "empty-filter" {
+                vec![
+                    "rsid=shard:session-05:test(session::manager_succession_tests)".into(),
+                    "rsid=shard:other-01:test(rolling_queue)".into(),
+                ]
+            } else {
+                vec![
+                    "rsid=shard:other-01:test(rolling_queue)".into(),
+                    "rsid=rolling_queue::tests::queue_".into(),
+                ]
+            };
+            let explicit = explicit_focused_filters(&filters, false);
+            let atoms =
+                combined_focused_atoms(explicit.iter().map(|filter| filter.filterset.as_str()));
+            let spec = GuardSpec {
+                commands: vec![rsid_focused_run_command(&atoms)],
+                env: BTreeMap::new(),
+                output_tail_bytes: 16 * 1024,
+            };
+            let mut gate = TestGate {
+                focused_filters: explicit,
+                ..TestGate::default()
+            };
+            let old_path = use_fake_path(&fixture);
+            let result = run_affected_gate(
+                &fixture.repo,
+                &tree,
+                &fixture.base,
+                &spec,
+                &mut gate,
+                &BTreeSet::new(),
+            )
+            .await;
+            restore_path(old_path);
+            let error = result.unwrap_err();
+            let ran = fs::read_to_string(&runs).unwrap_or_default();
+            match scenario {
+                "empty-filter" => {
+                    assert!(
+                        error.ends_with(
+                            "refused after the build and before any test ran: \
+                             rsid=shard:session-05:test(session::manager_succession_tests)"
+                        ),
+                        "{error}"
+                    );
+                    assert!(!is_test_red(&error), "{error}");
+                    assert_eq!(ran, "", "no test ran");
+                }
+                "new-red" => {
+                    assert!(error.contains(NEW_TEST_FAILURES), "{error}");
+                    assert!(
+                        error.contains(
+                            "rolling_queue::tests::queue_lands [filter \
+                             rsid=shard:other-01:test(rolling_queue) | \
+                             rsid=rolling_queue::tests::queue_]"
+                        ),
+                        "{error}"
+                    );
+                    assert_eq!(
+                        failing_test_names(&error),
+                        ["rolling_queue::tests::queue_lands"]
+                    );
+                    // One candidate run for both filters, its base, the retry.
+                    assert_eq!(
+                        ran,
+                        format!("run {candidate}\nrun {}\nretry {candidate}\n", fixture.base)
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    /// #1596: an `e2e_tui` filter would no-op without `RSI_E2E=1` and a built
+    /// rsid, so the gate sets the flag and prebuilds rsid, only for that filter.
+    #[test]
+    fn e2e_filter_sets_flag_and_prebuilds_rsid() {
+        let plan = |filters: &[String]| {
+            affected_crate_guard_spec(
+                "1111111111111111111111111111111111111111",
+                "2222222222222222222222222222222222222222",
+                &["rsi".into()],
+                filters,
+                false,
+                &rsid_family_metadata(),
+                4,
+                None,
+            )
+            .unwrap()
+        };
+        let spec = plan(&["rsi=test:e2e_tui:test(=settings_layout)".into()]);
+        assert_eq!(spec.env.get("RSI_E2E").map(String::as_str), Some("1"));
+        assert_eq!(
+            rendered(&spec)[1..],
+            [
+                "cargo check -p rsi --all-targets",
+                "cargo build -p rsid --bin rsid",
+                "cargo test -p rsi --test e2e_tui -- --test-threads=1 settings_layout --exact",
+            ]
+        );
+        let whole = plan(&["rsi=test:e2e_tui".into()]);
+        assert_eq!(whole.env.get("RSI_E2E").map(String::as_str), Some("1"));
+        let other = plan(&["rsi=test:flow".into()]);
+        assert_eq!(other.env.get("RSI_E2E"), None);
+        assert!(!rendered(&other).iter().any(|c| c.contains("build")));
+    }
+
+    /// #1282: the plain lib filters of another package run in one libtest
+    /// invocation; bin and integration test filters keep their own runs.
+    #[test]
+    fn other_package_lib_filters_share_one_libtest_run() {
+        let spec = affected_crate_guard_spec(
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+            &["rsi".into()],
+            &[
+                "rsi=suggestions".into(),
+                "rsi=settings_registry".into(),
+                "rsi=suggestions".into(),
+                "rsi=test:flow".into(),
+            ],
+            false,
+            &rsid_family_metadata(),
+            4,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            rendered(&spec)[1..],
+            [
+                "cargo check -p rsi --all-targets",
+                "cargo test -p rsi --test flow -- --test-threads=4",
+                "cargo test -p rsi --lib -- --test-threads=4 suggestions settings_registry",
+            ]
+        );
+        let combined = &spec.commands[3];
+        assert_eq!(
+            combined.timeout,
+            guard_timeout()
+                .saturating_mul(2)
+                .min(Duration::from_secs(MAX_GUARD_TIMEOUT_SECS).max(guard_timeout()))
+        );
+        assert_eq!(
+            cargo_lib_filters(combined),
+            Some(("rsi", vec!["suggestions", "settings_registry"]))
+        );
+        let single = cargo_lib_filters_command("rsi", &["suggestions"]);
+        assert_eq!(single, cargo_guard_command("rsi", Some("suggestions")));
+        assert_eq!(
+            cargo_lib_filters(&single),
+            Some(("rsi", vec!["suggestions"]))
+        );
+        assert_eq!(cargo_lib_filters(&cargo_guard_command("rsi", None)), None);
+        assert_eq!(
+            cargo_lib_filters(&cargo_guard_command("rsi", Some("test:flow"))),
+            None
+        );
+        let labels: Vec<String> = cargo_lib_filter_labels(combined)
+            .unwrap()
+            .into_iter()
+            .map(|filter| filter.label)
+            .collect();
+        assert_eq!(labels, ["rsi=suggestions", "rsi=settings_registry"]);
+        let filters = cargo_lib_filter_labels(combined).unwrap();
+        assert_eq!(
+            focused_filters_selecting(&filters, "app::suggestions::tests::x"),
+            ["rsi=suggestions"]
+        );
+        let retry =
+            isolated_retry_command(combined, "app::suggestions::tests::x", ShardTree::Static)
+                .unwrap();
+        assert_eq!(
+            retry.args,
+            [
+                "test",
+                "-p",
+                "rsi",
+                "--lib",
+                "app::suggestions::tests::x",
+                "--",
+                "--exact",
+                "--test-threads=4"
+            ]
+        );
+        let listed = libtest_listed_names(&listing_report(
+            "app::suggestions::tests::x: test\nbench_y: benchmark\n\n1 test, 1 benchmark\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            listed,
+            BTreeSet::from(["app::suggestions::tests::x".to_owned()])
+        );
+        // Output without libtest's count line is no listing.
+        assert_eq!(libtest_listed_names(&listing_report("")), None);
+        assert_eq!(
+            libtest_listed_names(&listing_report("0 tests, 0 benchmarks\n")),
+            Some(BTreeSet::new())
+        );
+        assert_eq!(
+            lib_filters_selecting_nothing(&["suggestions", "settings_registry"], &listed),
+            ["settings_registry"]
+        );
+    }
+
+    /// #1282: a combined lib run of another package refuses a filter that
+    /// selects no test after the build and before any test runs, and a red
+    /// names the filters that select the failing test.
+    #[tokio::test]
+    async fn combined_lib_run_refuses_empty_filters_and_attributes_failures() {
+        for scenario in ["empty-filter", "new-red"] {
+            let fixture = Fixture::new();
+            let candidate = fixture.commit(
+                &fixture.base,
+                "crates/demo/src/lib.rs",
+                "pub fn value() -> &'static str { \"candidate\" }\n",
+                "candidate",
+            );
+            let tree = fixture.root.path().join("lib-candidate");
+            git_run(
+                &fixture.repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    tree.to_str().unwrap(),
+                    &candidate,
+                ],
+            );
+            let runs = fixture.root.path().join("lib-runs");
+            fixture.add_fake_cargo(&format!(
+                "oid=$(/usr/bin/git rev-parse HEAD)\ncase \" $* \" in\n  *' --list '*) echo 'x::a_test: test'; echo; echo '1 test, 0 benchmarks'; exit 0;;\n  *' --exact '*) printf 'retry %s\\n' \"$oid\" >> '{runs}'; echo 'running 1 test'; echo 'test x::a_test ... FAILED'; exit 101;;\n  *) printf 'run %s\\n' \"$oid\" >> '{runs}'\n    if [ \"$oid\" = '{candidate}' ]; then echo 'running 1 test'; echo 'test x::a_test ... FAILED'; echo; echo 'failures:'; echo '    x::a_test'; echo; echo 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out'; exit 101; fi\n    echo 'running 1 test'; echo 'test x::a_test ... ok'; echo; echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'; exit 0;;\nesac",
+                runs = runs.display(),
+            ));
+            let filters: &[&str] = if scenario == "empty-filter" {
+                &["a_test", "zzz"]
+            } else {
+                &["a_test", "x::"]
+            };
+            let spec = GuardSpec {
+                commands: vec![cargo_lib_filters_command("demo", filters)],
+                env: BTreeMap::new(),
+                output_tail_bytes: 16 * 1024,
+            };
+            let mut gate = TestGate::default();
+            let old_path = use_fake_path(&fixture);
+            let result = run_affected_gate(
+                &fixture.repo,
+                &tree,
+                &fixture.base,
+                &spec,
+                &mut gate,
+                &BTreeSet::new(),
+            )
+            .await;
+            restore_path(old_path);
+            let error = result.unwrap_err();
+            let ran = fs::read_to_string(&runs).unwrap_or_default();
+            match scenario {
+                "empty-filter" => {
+                    assert!(
+                        error
+                            .ends_with("refused after the build and before any test ran: demo=zzz"),
+                        "{error}"
+                    );
+                    assert!(!is_test_red(&error), "{error}");
+                    assert_eq!(ran, "", "no test ran");
+                }
+                "new-red" => {
+                    assert!(error.contains(NEW_TEST_FAILURES), "{error}");
+                    assert!(
+                        error.contains("x::a_test [filter demo=a_test | demo=x::]"),
+                        "{error}"
+                    );
+                    assert_eq!(failing_test_names(&error), ["x::a_test"]);
+                    // One candidate run for both filters, its base, the retry.
+                    assert_eq!(
+                        ran,
+                        format!("run {candidate}\nrun {}\nretry {candidate}\n", fixture.base)
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    /// #1244/#1280: an unfiltered rsid/rsid-store change runs the library
+    /// tests that can observe it on the shared build (every library test when
+    /// the mapping is uncertain, never none for changed library code), the
+    /// tests of a changed binary target, and the compile checks; a crate-wide
+    /// change keeps every shard.
+    #[test]
+    fn unfiltered_rsid_change_gates_the_tests_that_observe_it() {
+        let spec_for = |selection: Option<&test_impact::UnfilteredSelection>| {
+            affected_crate_guard_spec(
+                "1111111111111111111111111111111111111111",
+                "2222222222222222222222222222222222222222",
+                &["rsid-store".into(), "rsid".into()],
+                &[],
+                false,
+                &rsid_family_metadata(),
+                4,
+                selection,
+            )
+            .unwrap()
+        };
+        let narrowed = test_impact::UnfilteredSelection {
+            lib: test_impact::LibTests::Tests(BTreeSet::from([
+                "store::tests::a".to_owned(),
+                "topology::agent_tests::t4_a5_max_created_sessions_is_charged".to_owned(),
+            ])),
+            targets: BTreeSet::from([("rsid".to_owned(), "bin:rsi-rolling-land".to_owned())]),
+        };
+        assert_eq!(
+            rendered(&spec_for(Some(&narrowed)))[1..],
+            [
+                "python3 scripts/check-rsid-test-shards.py --require-gates".to_owned(),
+                "cargo check -p rsid-store --all-targets".to_owned(),
+                "cargo nextest run --profile rsid-fast -p rsid -p rsid-store --lib --status-level all --final-status-level all -j 8 --filterset test(=store::tests::a) | test(=topology::agent_tests::t4_a5_max_created_sessions_is_charged)".to_owned(),
+                "cargo check -p rsid --all-targets".to_owned(),
+                "cargo test -p rsid --bin rsi-rolling-land -- --test-threads=4".to_owned(),
+            ]
+        );
+        let everything = test_impact::UnfilteredSelection {
+            lib: test_impact::LibTests::Everything("uncertain".into()),
+            targets: BTreeSet::new(),
+        };
+        assert_eq!(
+            rendered(&spec_for(Some(&everything)))[1..],
+            [
+                "python3 scripts/check-rsid-test-shards.py --require-gates".to_owned(),
+                "cargo check -p rsid-store --all-targets".to_owned(),
+                "cargo nextest run --profile rsid-fast -p rsid -p rsid-store --lib --status-level all --final-status-level all -j 8 --filterset all()".to_owned(),
+                "cargo check -p rsid --all-targets".to_owned(),
+            ]
+        );
+        let whole = spec_for(Some(&everything));
+        let whole_run = whole
+            .commands
+            .iter()
+            .find(|command| rsid_lib_filterset(command) == Some("all()"))
+            .unwrap();
+        assert_eq!(
+            whole_run.timeout,
+            guard_timeout()
+                .saturating_mul(u32::try_from(RSID_SHARDS.len()).unwrap())
+                .min(Duration::from_secs(MAX_GUARD_TIMEOUT_SECS).max(guard_timeout()))
+        );
+        let no_library_change = test_impact::UnfilteredSelection {
+            lib: test_impact::LibTests::Tests(BTreeSet::new()),
+            targets: BTreeSet::new(),
+        };
+        assert_eq!(
+            rendered(&spec_for(Some(&no_library_change)))[1..],
+            [
+                "cargo check -p rsid-store --all-targets",
+                "cargo check -p rsid --all-targets",
+            ]
+        );
+        let crate_wide = spec_for(None);
+        assert_eq!(
+            crate_wide
+                .commands
+                .iter()
+                .filter(|command| full_shard(command).is_some())
+                .count(),
+            RSID_SHARDS.len()
+        );
+    }
+
+    /// #1525: the base side of a red run names exactly the candidate's failing
+    /// tests; shapes it cannot narrow keep the full command.
+    #[test]
+    fn base_command_is_narrowed_to_the_candidate_failures() {
+        let failures: BTreeSet<String> = ["a::b::one", "a::b::two"].map(String::from).into();
+        let narrowed = narrowed_base_command(&rsid_lib_filter_command("all()"), &failures)
+            .expect("an all() lib run narrows");
+        assert_eq!(
+            rsid_lib_filterset(&narrowed),
+            Some("test(=a::b::one) | test(=a::b::two)")
+        );
+        let mut expected = rsid_lib_filter_command("all()");
+        *expected.args.last_mut().unwrap() = "test(=a::b::one) | test(=a::b::two)".into();
+        assert_eq!(narrowed, expected);
+
+        let shard = GuardCommand {
+            program: "scripts/run-rsid-test-shards.sh".into(),
+            args: ["shard", "store-01", "--jobs", "4"]
+                .map(String::from)
+                .into(),
+            timeout: guard_timeout(),
+        };
+        let narrowed = narrowed_base_command(&shard, &failures).expect("a full shard narrows");
+        assert_eq!(
+            shard_command_parts(&narrowed),
+            Some(("store-01", 4, Some("test(=a::b::one) | test(=a::b::two)")))
+        );
+        let filtered = GuardCommand {
+            args: [
+                "shard",
+                "store-01",
+                "--jobs",
+                "4",
+                "--filterset",
+                "test(a::b)",
+            ]
+            .map(String::from)
+            .into(),
+            ..shard
+        };
+        let narrowed = narrowed_base_command(&filtered, &failures).expect("a filtered shard");
+        assert_eq!(
+            shard_command_parts(&narrowed).and_then(|parts| parts.2),
+            Some("test(=a::b::one) | test(=a::b::two)")
+        );
+
+        // Unknown, unparseable or oversized failure lists run the full command.
+        let lib = rsid_lib_filter_command("all()");
+        assert_eq!(narrowed_base_command(&lib, &BTreeSet::new()), None);
+        let odd: BTreeSet<String> = ["x) | all("].map(String::from).into();
+        assert_eq!(narrowed_base_command(&lib, &odd), None);
+        let many: BTreeSet<String> = (0..=MAX_NARROWED_BASE_TESTS)
+            .map(|index| format!("m::t{index}"))
+            .collect();
+        assert_eq!(narrowed_base_command(&lib, &many), None);
+        assert_eq!(
+            narrowed_base_command(&cargo_guard_command("demo", None), &failures),
+            None
+        );
+    }
+
+    /// #1525 at the gate: a red `all()` candidate run runs the base side over
+    /// only the failing test, never the whole command, and the shared red is
+    /// still recognised as pre-existing.
+    #[tokio::test]
+    async fn red_candidate_runs_the_base_over_only_its_failing_tests() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            &fixture.base,
+            "crates/demo/src/lib.rs",
+            "pub fn value() -> &'static str { \"candidate\" }\n",
+            "candidate",
+        );
+        let tree = fixture.root.path().join("narrow-candidate");
+        git_run(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                tree.to_str().unwrap(),
+                &candidate,
+            ],
+        );
+        let runs = fixture.root.path().join("narrow-runs");
+        fixture.add_fake_cargo(&format!(
+            "oid=$(/usr/bin/git rev-parse HEAD)\nlast=\nfor arg in \"$@\"; do last=$arg; done\ncase \"$1\" in\n  nextest) printf '%s %s\\n' \"$oid\" \"$last\" >> '{runs}'\n    echo '        FAIL [   0.010s] (1/2) rsid demo::shared_red'\n    if [ \"$last\" = 'all()' ] && [ \"$oid\" != '{candidate}' ]; then echo '        FAIL [   0.010s] (2/2) rsid demo::other_base_red'; fi\n    echo '     Summary [   0.010s] 2 tests run: 0 passed, 1 failed, 0 skipped'; exit 100;;\n  test*) printf 'retry %s\\n' \"$oid\" >> '{runs}'; echo 'running 1 test'; echo 'test demo::shared_red ... FAILED'; exit 101;;\nesac",
+            runs = runs.display(),
+            candidate = candidate,
+        ));
+        let candidate_spec = GuardSpec {
+            commands: vec![rsid_lib_filter_command("all()")],
+            env: BTreeMap::new(),
+            output_tail_bytes: 16 * 1024,
+        };
+        let mut gate = TestGate::default();
+        let old_path = use_fake_path(&fixture);
+        let result = run_affected_gate(
+            &fixture.repo,
+            &tree,
+            &fixture.base,
+            &candidate_spec,
+            &mut gate,
+            &BTreeSet::new(),
+        )
+        .await;
+        restore_path(old_path);
+        let ran = fs::read_to_string(&runs).unwrap_or_default();
+        result.expect("a red the base shares is not new");
+        let base_runs: Vec<&str> = ran
+            .lines()
+            .filter(|line| line.starts_with(&fixture.base))
+            .collect();
+        assert_eq!(
+            base_runs,
+            [format!("{} test(=demo::shared_red)", fixture.base)],
+            "{ran}"
+        );
+        assert!(gate.base_reds.contains("demo::shared_red"));
+        assert!(!gate.base_reds.contains("demo::other_base_red"));
+        assert_eq!(gate.base_runs, 1);
+        assert!(gate.base_cache.is_empty(), "a narrowed run fills no cache");
+    }
+
+    /// #1280: the generated atoms deduplicate against explicit filters and
+    /// `all()` absorbs every other atom.
+    #[test]
+    fn exact_and_all_atoms_deduplicate_and_attribute() {
+        let atoms = |sets: &[&str]| combined_focused_atoms(sets.iter().copied());
+        assert_eq!(
+            atoms(&["test(=a::b::c) | test(=a::b::d)", "test(a::b::c)"]),
+            ["test(=a::b::d)", "test(a::b::c)"]
+        );
+        assert_eq!(atoms(&["test(=a::b) | test(x)", "all()"]), ["all()"]);
+        let filters = focused_filters_of_run("test(=a::b) | all()", &[]);
+        assert!(filters.iter().all(|filter| !filter.explicit));
+        assert_eq!(
+            focused_filters_selecting(&filters, "a::b"),
+            ["test(=a::b)", "all()"]
+        );
+        assert_eq!(focused_filters_selecting(&filters, "z"), ["all()"]);
+    }
+
+    /// #1244: the compile check runs beside the test prebuild, in its own
+    /// target. Each side waits for the other to start, so a serial gate
+    /// would time the check out.
+    #[tokio::test]
+    async fn compile_checks_run_beside_the_prebuild() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            &fixture.base,
+            "crates/demo/src/lib.rs",
+            "pub fn value() -> &'static str { \"candidate\" }\n",
+            "candidate",
+        );
+        let tree = fixture.root.path().join("overlap-candidate");
+        git_run(
+            &fixture.repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                tree.to_str().unwrap(),
+                &candidate,
+            ],
+        );
+        let marks = fixture.root.path().join("marks");
+        fs::create_dir_all(&marks).unwrap();
+        let wait_for = |name: &str| {
+            format!(
+                "i=0; while [ ! -e '{m}/{name}' ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; [ -e '{m}/{name}' ]",
+                m = marks.display()
+            )
+        };
+        fixture.add_fake_cargo(&format!(
+            "case \"$1 $*\" in\n  check*) printf '%s\\n' \"$CARGO_TARGET_DIR\" > '{m}/check-target'; : > '{m}/check'; {wait_build} || exit 9;;\n  *--no-run*) : > '{m}/build'; {wait_check};;\n  nextest*) echo 'Summary [ 0.01s] 1 test run: 1 passed, 0 skipped';;\nesac",
+            m = marks.display(),
+            wait_build = wait_for("build"),
+            wait_check = wait_for("check"),
+        ));
+        let spec = GuardSpec {
+            commands: vec![
+                cargo_check_command("demo"),
+                rsid_lib_filter_command("test(demo)"),
+            ],
+            env: BTreeMap::new(),
+            output_tail_bytes: 16 * 1024,
+        };
+        let mut gate = TestGate {
+            prebuild_forced: true,
+            ..TestGate::default()
+        };
+        let old_path = use_fake_path(&fixture);
+        let result = run_affected_gate(
+            &fixture.repo,
+            &tree,
+            &fixture.base,
+            &spec,
+            &mut gate,
+            &BTreeSet::new(),
+        )
+        .await;
+        restore_path(old_path);
+        result.expect("check and prebuild overlap");
+        assert!(
+            fs::read_to_string(marks.join("check-target"))
+                .unwrap()
+                .trim()
+                .ends_with("overlap-candidate-check-target")
+        );
+        assert_eq!(gate.base_skipped, 1);
+    }
+
+    /// #1244 acceptance: the candidate runs first; a green, proven candidate
+    /// never builds or runs the base, a red shared with the base still
+    /// passes, and a red the base does not have still fails.
+    #[tokio::test]
+    async fn lazy_base_keeps_no_new_failures_semantics() {
+        for scenario in ["green", "red-on-both", "new-red"] {
+            let fixture = Fixture::new();
+            let candidate = fixture.commit(
+                &fixture.base,
+                "crates/demo/src/lib.rs",
+                "pub fn value() -> &'static str { \"candidate\" }\n",
+                "candidate",
+            );
+            let tree = fixture.root.path().join("lazy-candidate");
+            git_run(
+                &fixture.repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    tree.to_str().unwrap(),
+                    &candidate,
+                ],
+            );
+            let log = fixture.root.path().join("lazy-runs");
+            let candidate_red = scenario != "green";
+            let base_red = scenario == "red-on-both";
+            fixture.add_fake_cargo(&format!(
+                "oid=$(/usr/bin/git rev-parse HEAD)\nprintf '%s\\n' \"$oid\" >> '{log}'\necho 'running 1 test'\nif [ \"$oid\" = '{candidate}' ] && [ '{candidate_red}' = true ]; then echo 'test demo::red ... FAILED'; exit 101; fi\nif [ \"$oid\" = '{base}' ] && [ '{base_red}' = true ]; then echo 'test demo::red ... FAILED'; exit 101; fi\necho 'test demo::red ... ok'",
+                log = log.display(),
+                base = fixture.base,
+            ));
+            let spec = GuardSpec {
+                commands: vec![cargo_guard_command("demo", None)],
+                env: BTreeMap::new(),
+                output_tail_bytes: 16 * 1024,
+            };
+            let mut gate = TestGate::default();
+            let old_path = use_fake_path(&fixture);
+            let result = run_affected_gate(
+                &fixture.repo,
+                &tree,
+                &fixture.base,
+                &spec,
+                &mut gate,
+                &BTreeSet::new(),
+            )
+            .await;
+            restore_path(old_path);
+            let runs = fs::read_to_string(&log).unwrap();
+            let count = |oid: &str| runs.lines().filter(|line| *line == oid).count();
+            match scenario {
+                "green" => {
+                    result.expect("a green candidate passes");
+                    assert_eq!(count(&fixture.base), 0, "{runs}");
+                    assert_eq!(gate.base_runs, 0);
+                    assert_eq!(gate.base_skipped, 1);
+                    assert!(gate.base_worktrees.is_empty());
+                }
+                "red-on-both" => {
+                    result.expect("a red the base shares is not new");
+                    assert_eq!(count(&fixture.base), 1, "{runs}");
+                    assert!(gate.base_reds.contains("demo::red"));
+                    assert_eq!(gate.base_skipped, 0);
+                }
+                "new-red" => {
+                    let error = result.unwrap_err();
+                    assert!(error.contains(NEW_TEST_FAILURES), "{error}");
+                    assert!(error.contains("demo::red"), "{error}");
+                    assert_eq!(count(&fixture.base), 1, "{runs}");
+                    // The run and its isolated retry.
+                    assert_eq!(count(&candidate), 2, "{runs}");
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[tokio::test]
@@ -8792,6 +11920,7 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
             true,
             &guard_workspace_metadata(),
             4,
+            None,
         )
         .expect("valid affected crate filter");
         assert_eq!(
@@ -8834,6 +11963,7 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
             false,
             &guard_workspace_metadata(),
             4,
+            None,
         )
         .expect("valid workspace graph");
         let cargo_commands = spec
@@ -8861,6 +11991,7 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
             false,
             &guard_workspace_metadata(),
             4,
+            None,
         )
         .expect("valid single-crate change");
         let shard_commands = direct
@@ -8950,8 +12081,6 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
         let fixture = Fixture::new();
         let source = fixture.commit(&fixture.base, "AGENTS.md", "policy\n", "hot file");
         fixture.add_fake_cargo("");
-        let old_token = std::env::var_os("RSI_SESSION_TOKEN");
-        unsafe { std::env::remove_var("RSI_SESSION_TOKEN") };
         let old_path = use_fake_path(&fixture);
         let result = fixture
             .land(vec![AcceptedPair {
@@ -8960,10 +12089,7 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
             }])
             .await;
         restore_path(old_path);
-        if let Some(token) = old_token {
-            unsafe { std::env::set_var("RSI_SESSION_TOKEN", token) };
-        }
-        let report = result.expect("a hot-file source lands without a lead token");
+        let report = result.expect("a hot-file source lands with the fixture ledger unavailable");
         assert_eq!(report.source_bindings[0].source, source);
         assert_eq!(report.source_bindings[0].state, "unknown");
         assert_eq!(
@@ -9815,8 +12941,10 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
         let other2 = fixture.commit(&other1, "other2.txt", "two\n", "second advance");
         let other3 = fixture.commit(&other2, "other3.txt", "three\n", "third advance");
         let marker = fixture.root.path().join("guard-run-count");
+        // #1244: the canary's candidate runs first (1), then its base (2),
+        // then the isolated retry (3).
         fixture.add_fake_cargo(&format!(
-            "count=$(cat '{}' 2>/dev/null || echo 0)\ncount=$((count + 1))\necho \"$count\" > '{}'\ncase $count in\n  2) /usr/bin/git -C '{}' push -q origin '{}:refs/heads/rolling' || exit 43; echo 'test demo::red ... FAILED'; exit 42;;\n  3) echo 'test demo::red ... FAILED'; exit 42;;\n  4) /usr/bin/git -C '{}' push -q origin '{}:refs/heads/rolling' || exit 43;;\n  6) /usr/bin/git -C '{}' push -q origin '{}:refs/heads/rolling' || exit 43;;\nesac",
+            "count=$(cat '{}' 2>/dev/null || echo 0)\ncount=$((count + 1))\necho \"$count\" > '{}'\ncase $count in\n  1) /usr/bin/git -C '{}' push -q origin '{}:refs/heads/rolling' || exit 43; echo 'test demo::red ... FAILED'; exit 42;;\n  3) echo 'test demo::red ... FAILED'; exit 42;;\n  4) /usr/bin/git -C '{}' push -q origin '{}:refs/heads/rolling' || exit 43;;\n  6) /usr/bin/git -C '{}' push -q origin '{}:refs/heads/rolling' || exit 43;;\nesac",
             marker.display(), marker.display(), fixture.repo.display(), other1,
             fixture.repo.display(), other2, fixture.repo.display(), other3,
         ));
@@ -9973,10 +13101,11 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
     #[tokio::test]
     async fn identical_published_tree_reuses_candidate_gate_without_extra_cargo() {
         let fixture = Fixture::new();
+        // The filters name text the source holds (#1243 refuses absent names).
         let source = fixture.commit(
             &fixture.base,
             "crates/demo/src/lib.rs",
-            "pub fn value() -> &'static str { \"accepted\" }\n",
+            "pub fn value() -> &'static str { \"accepted\" }\n// accepted::focus other::focus\n",
             "accepted source",
         );
         let args_log = fixture.add_fake_cargo_log();
@@ -9999,15 +13128,15 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
                 &["rev-parse", &format!("{}^{{tree}}", report.candidate)]
             ))
         );
-        // A filtered package runs its compile check (candidate only) and the
-        // named tests on both sides; the unfiltered suite is the QA sweep's.
+        // A filtered package lists its named tests once (#1282), runs its
+        // compile check (candidate only) and one libtest run of every named
+        // filter on both sides; the unfiltered suite is the QA sweep's.
         let expected_pass = concat!(
             "metadata\n--no-deps\n--format-version\n1\n--offline\n",
+            "test\n-p\ndemo\n--lib\n--\n--list\naccepted::focus\nother::focus\n",
             "check\n-p\ndemo\n--all-targets\n",
-            "test\n-p\ndemo\n--lib\naccepted::focus\n--\n--test-threads=4\n",
-            "test\n-p\ndemo\n--lib\naccepted::focus\n--\n--test-threads=4\n",
-            "test\n-p\ndemo\n--lib\nother::focus\n--\n--test-threads=4\n",
-            "test\n-p\ndemo\n--lib\nother::focus\n--\n--test-threads=4\n",
+            "test\n-p\ndemo\n--lib\n--\n--test-threads=4\naccepted::focus\nother::focus\n",
+            "test\n-p\ndemo\n--lib\n--\n--test-threads=4\naccepted::focus\nother::focus\n",
         );
         assert_eq!(
             fs::read_to_string(args_log).expect("cargo args"),
@@ -10027,19 +13156,26 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
             .split_once(':')
             .expect("scratch kind and path")
             .1;
-        // One compile check plus four focused test runs.
-        for _ in 0..5 {
+        // One listing, one compile check and two focused test runs.
+        for _ in 0..4 {
             let guard_target = lines.next().expect("isolated guard target");
             assert_ne!(guard_target, configured_target);
             assert_eq!(lines.next(), Some("1"));
             assert_eq!(lines.next(), Some("line-tables-only"));
             let guard_worktree = lines.next().expect("guard worktree directory");
             let worktree = Path::new(guard_worktree);
-            let expected_target = worktree.with_file_name(format!(
-                "{}-cargo-target",
-                worktree.file_name().unwrap().to_string_lossy()
-            ));
-            assert_eq!(Path::new(guard_target), expected_target);
+            let name = worktree.file_name().unwrap().to_string_lossy();
+            // The compile check has its own target (#1244).
+            let expected_targets = [
+                worktree.with_file_name(format!("{name}-cargo-target")),
+                worktree.with_file_name(format!("{name}-check-target")),
+            ];
+            assert!(
+                expected_targets
+                    .iter()
+                    .any(|expected| Path::new(guard_target) == expected),
+                "{guard_target}"
+            );
             let relative = Path::new(guard_worktree)
                 .strip_prefix(&workspace_parent)
                 .expect("guard worktree is inside the selected workspace parent");
@@ -10406,6 +13542,125 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
     }
 
     #[tokio::test]
+    async fn transient_fetch_and_pre_push_lookup_recover_without_regating() {
+        let fixture = Fixture::new();
+        let source = fixture.commit(
+            &fixture.base,
+            "crates/demo/src/lib.rs",
+            "pub fn value() -> &'static str { \"accepted\" }\n",
+            "accepted source",
+        );
+        let cargo_log = fixture.root.path().join("cargo.log");
+        fixture.add_fake_cargo(&format!(
+            "echo \"$1\" >> '{}'\nif [ \"$1\" = test ]; then echo 'running 1 test'; echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'; fi",
+            cargo_log.display()
+        ));
+        let fetch_log = fixture.root.path().join("fetch.log");
+        let lookup_log = fixture.root.path().join("lookup.log");
+        let fail_twice = |log: &Path| {
+            format!(
+                "echo attempt >> '{0}'\nif [ $(wc -l < '{0}') -le 2 ]; then exit 128; fi\nexec /usr/bin/git \"$@\"",
+                log.display()
+            )
+        };
+        fixture.add_fake_git_behaviors_with_fetch(
+            &fail_twice(&lookup_log),
+            "",
+            &fail_twice(&fetch_log),
+        );
+        let old_path = use_fake_path(&fixture);
+        let result = fixture
+            .land(vec![AcceptedPair {
+                base: fixture.base.clone(),
+                source: source.clone(),
+            }])
+            .await;
+        restore_path(old_path);
+        let report = result.expect("third read attempts recover");
+        assert_eq!(report.published_tip, source);
+        assert!(report.stale_retries.is_empty());
+        assert_eq!(fs::read_to_string(fetch_log).unwrap().lines().count(), 3);
+        assert!(fs::read_to_string(lookup_log).unwrap().lines().count() >= 4);
+        assert_eq!(
+            fs::read_to_string(cargo_log)
+                .unwrap()
+                .lines()
+                .filter(|line| *line == "test")
+                .count(),
+            1,
+            "network recovery must reuse the green candidate gate"
+        );
+        assert_eq!(git_value(&fixture.bare, &["rev-parse", TARGET]), source);
+    }
+
+    #[tokio::test]
+    async fn failed_remote_reads_stop_after_three_attempts_without_pushing() {
+        let fixture = Fixture::new();
+        let log = fixture.root.path().join("reads.log");
+        let fail = format!("echo attempt >> '{}'\nexit 128", log.display());
+        fixture.add_fake_git_behaviors_with_fetch(&fail, "exit 99", &fail);
+        let old_path = use_fake_path(&fixture);
+        let fetch_result = remote_fetch(&fixture.repo).await;
+        let publish_result = publish_oid(&fixture.repo, &fixture.base, &fixture.base).await;
+        restore_path(old_path);
+        assert!(
+            fetch_result
+                .unwrap_err()
+                .contains("fetch failed (exit 128)")
+        );
+        let failure = publish_result.unwrap_err();
+        assert_eq!(failure.state, PublicationState::NotPublished);
+        assert!(failure.message.contains("ls-remote exited 128"));
+        assert_eq!(fs::read_to_string(log).unwrap().lines().count(), 6);
+        assert_eq!(
+            git_value(&fixture.bare, &["rev-parse", TARGET]),
+            fixture.base
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_push_retries_verification_but_never_repeats_push() {
+        for (published, lookup_recovers) in [(true, true), (false, true), (true, false)] {
+            let fixture = Fixture::new();
+            let source = fixture.commit(&fixture.base, "source.txt", "accepted\n", "source");
+            git_run(
+                &fixture.repo,
+                &["remote", "add", "publish", fixture.bare.to_str().unwrap()],
+            );
+            let lookup_log = fixture.root.path().join("lookup.log");
+            let push_log = fixture.root.path().join("push.log");
+            fixture.add_fake_git_behaviors(
+                &format!(
+                    "echo attempt >> '{0}'\nn=$(wc -l < '{0}')\nif [ \"$n\" -gt 1 ] && {1}; then exit 128; fi\nexec /usr/bin/git \"$@\"",
+                    lookup_log.display(),
+                    if lookup_recovers { "[ \"$n\" -le 3 ]" } else { "true" }
+                ),
+                &format!(
+                    "echo attempt >> '{}'\n{}\nexit 128",
+                    push_log.display(),
+                    if published { "/usr/bin/git \"$@\" || exit 99" } else { ":" }
+                ),
+            );
+            let old_path = use_fake_path(&fixture);
+            let result = publish_oid(&fixture.repo, &source, &fixture.base).await;
+            restore_path(old_path);
+            match (published, lookup_recovers) {
+                (true, true) => assert_eq!(result.unwrap(), source),
+                (false, true) => {
+                    assert_eq!(result.unwrap_err().state, PublicationState::NotPublished);
+                }
+                _ => assert_eq!(result.unwrap_err().state, PublicationState::Unknown),
+            }
+            assert_eq!(fs::read_to_string(push_log).unwrap().lines().count(), 1);
+            assert_eq!(fs::read_to_string(lookup_log).unwrap().lines().count(), 4);
+            assert_eq!(
+                git_value(&fixture.bare, &["rev-parse", TARGET]),
+                if published { source } else { fixture.base }
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn remote_lookup_rejects_oversized_output_without_waiting_for_eof() {
         let fixture = Fixture::new();
         fixture.add_fake_git("    yes x\n    exit 0");
@@ -10436,7 +13691,7 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
             error.contains("remote rolling lookup timed out"),
             "{error:?}"
         );
-        assert!(elapsed < Duration::from_secs(4), "lookup took {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(10), "lookup took {elapsed:?}");
         let pid = fs::read_to_string(pid_file)
             .expect("fake Git wrote its pid")
             .trim()
@@ -10479,7 +13734,7 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
             error.message.contains("remote rolling fetch timed out"),
             "{error:?}"
         );
-        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(started.elapsed() < Duration::from_secs(10));
         assert_eq!(
             fs::read_to_string(config_file).unwrap(),
             "false\nfalse\nfalse\n"

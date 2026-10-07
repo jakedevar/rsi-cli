@@ -248,10 +248,11 @@ impl HarnessClient {
         };
         let provider_name = provider_backend.name().to_string();
         let image_input_supported = provider_backend.supports_image_input(&model);
-        let agent_mail_boundary = if config.provider
-            == Some(rsi_common::types::SessionProvider::Harness)
-            && let (Some(arbiter), Some(session_id)) =
-                (&self.agent_message_arbiter, config.rsi_session_id)
+        // #1183: every session on this tool loop takes mail between its
+        // model calls: Harness, and the Harness routes of OpenRouter and
+        // Bedrock (their Codex routes use the Codex PostToolUse hook).
+        let agent_mail_boundary = if let (Some(arbiter), Some(session_id)) =
+            (&self.agent_message_arbiter, config.rsi_session_id)
         {
             Some(Arc::new(HarnessAgentMailBoundary::new(
                 Arc::clone(&store),

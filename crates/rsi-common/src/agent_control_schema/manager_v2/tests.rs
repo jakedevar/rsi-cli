@@ -98,7 +98,9 @@ fn every_manager_action_and_update_roundtrips_and_rejects_nested_authority_injec
         json!({"update":"accept","key":"w","expected_row_version":1}),
         json!({"update":"integration","key":"w","expected_row_version":1,"source_commit":"a".repeat(40),"target_commit":"b".repeat(40),"verification":evidence}),
         json!({"update":"request","request_id":id,"expected_row_version":1,"state":"accepted","message":"accepted","work_key":"w"}),
-        json!({"update":"decision","key":"d","expected_row_version":0,"epic_id":id,"question":"Select destination","request_id":id,"work_key":"w"}),
+        json!({"update":"decision","key":"d","expected_row_version":0,"epic_id":id,"question":"Select destination","request_id":id,"work_key":"w","gate":"spend","options":[{"label":"A","detail":"cheap","recommended":true},{"label":"B"}]}),
+        json!({"update":"decision_ruling","key":"d","expected_row_version":1,"target_digest":"sha256:abc","answer":"A","owner_manager_session_id":id}),
+        json!({"update":"decision_withdraw","key":"d","expected_row_version":1,"reason":"superseded"}),
         json!({"update":"handoff","summary":"Paused by operator","next_actions":["await exact decision"]}),
     ];
     for (field, variants, schema) in [
@@ -130,6 +132,11 @@ fn every_manager_action_and_update_roundtrips_and_rejects_nested_authority_injec
             objects(&value, String::new(), &mut paths);
             for path in paths {
                 for injected in ["caller_session_id", "permissions", "admin", "project_id"] {
+                    // #1235: a top-level project_id is the optional target
+                    // project of a global seat; nested it is still forged.
+                    if path.is_empty() && injected == "project_id" {
+                        continue;
+                    }
                     let mut forged = value.clone();
                     forged
                         .pointer_mut(&path)

@@ -137,6 +137,8 @@ pub enum LcAction {
 
     /// Open the consolidated session info panel for the focused session.
     OpenSessionInfoPanel,
+    /// Open the session-detail model/effort picker (Issue #681).
+    OpenModelSwitchPicker,
 
     /// Rate the focused session on a 1–10 scale (dispatched directly from `:rate N`).
     RateSession(u32),
@@ -146,6 +148,10 @@ pub enum LcAction {
 
     /// Manually trigger context rotation on the focused session.
     RotateSession,
+
+    /// #1176: abandon the focused session's blocked rotation to a fresh
+    /// replacement (`:rotation-abandon [provider[/model]]`).
+    AbandonRotation(Option<String>),
 
     /// Open the sort order picker overlay.
     OpenSortPicker,
@@ -174,9 +180,6 @@ pub enum LcAction {
 
     /// Open the theme picker overlay.
     OpenThemePicker,
-
-    /// Open the color customizer overlay for setting per-role message border colors.
-    OpenColorCustomizer,
 
     /// Select a Catppuccin flavor by name.
     SelectTheme(String),
@@ -249,13 +252,6 @@ pub enum LcAction {
     /// Jump forward in session history (Ctrl+I).
     JumpForward,
 
-    // --- TaskRabbit ---
-    /// Open the TaskRabbit popup.
-    TaskRabbitPrompt,
-
-    /// Launch a TaskRabbit session with inline query (from :task <query>).
-    LaunchTaskRabbit(String),
-
     // --- Durable Work Context ---
     /// Set or clear the active task context for the focused session.
     /// Some(text) sets it, None clears it.
@@ -282,9 +278,6 @@ pub enum LcAction {
     // --- Direct Zone Navigation ---
     /// Switch to the sessions (main) zone in the session list.
     GoToSessionsZone,
-
-    /// Switch to the TaskRabbit zone in the session list.
-    GoToTaskRabbitZone,
 
     /// Switch to the jobs zone in the session list.
     GoToJobsZone,
@@ -335,9 +328,9 @@ pub enum LcAction {
     Quit,
 
     // --- Session List Zone Navigation ---
-    /// Switch to the next session list zone (Main → TaskRabbit).
+    /// Switch to the next session list zone (Main → Jobs → Archive → Main).
     SessionListZoneNext,
-    /// Switch to the previous session list zone (TaskRabbit → Main).
+    /// Switch to the previous session list zone (Main → Archive → Jobs → Main).
     SessionListZonePrev,
 
     // --- Session Rename ---
@@ -370,6 +363,8 @@ pub enum LcAction {
     // --- External Tools ---
     /// Suspend TUI and launch lazygit in the focused session's working directory.
     ToggleGitPanel,
+    /// Suspend TUI and launch btop when it is installed.
+    OpenBtop,
 
     // --- Sidebar Resize ---
     /// Grow the sidebar (shift content right). Ctrl+Shift+Right.
@@ -507,6 +502,15 @@ pub enum LcAction {
     ManagerNodeCommand(String),
     /// #872: operator global-manager show, appoint, configure and revoke.
     ManagerGlobalCommand(String),
+    /// #1236: operator portfolio node list, show, appoint, configure and revoke.
+    ManagerPortfolioCommand(String),
+    /// #1238: the operator escalation queue (list, rule, acknowledge).
+    ManagerEscalationsCommand(String),
+    /// #1333: the operator's friction rollup (the andon).
+    ManagerFrictionCommand(String),
+    /// #1213: open or focus the global manager workspace above all projects.
+    OpenFleet,
+    OpenGlobalManagerWorkspace,
     /// #1122: `:manager restart [status|now|cancel]` for the operator's
     /// pending quiet-point restart.
     OperatorRestartCommand(String),
@@ -656,9 +660,11 @@ impl LcAction {
             LcAction::CancelRetry => "CancelRetry",
             LcAction::OpenRatingOverlay => "OpenRatingOverlay",
             LcAction::OpenSessionInfoPanel => "OpenSessionInfoPanel",
+            LcAction::OpenModelSwitchPicker => "OpenModelSwitchPicker",
             LcAction::RateSession(..) => "RateSession",
             LcAction::ReassignSessionProject => "ReassignSessionProject",
             LcAction::RotateSession => "RotateSession",
+            LcAction::AbandonRotation(..) => "AbandonRotation",
             LcAction::OpenSortPicker => "OpenSortPicker",
             LcAction::OpenDiagnostics => "OpenDiagnostics",
             LcAction::OpenRecursiveDagBrowser => "OpenRecursiveDagBrowser",
@@ -668,7 +674,6 @@ impl LcAction {
             LcAction::ToggleModelDropdown => "ToggleModelDropdown",
             LcAction::SelectModel(..) => "SelectModel",
             LcAction::OpenThemePicker => "OpenThemePicker",
-            LcAction::OpenColorCustomizer => "OpenColorCustomizer",
             LcAction::SelectTheme(..) => "SelectTheme",
             LcAction::OpenProjectPicker => "OpenProjectPicker",
             LcAction::SwitchProject(..) => "SwitchProject",
@@ -689,8 +694,6 @@ impl LcAction {
             LcAction::CommitAndPush => "CommitAndPush",
             LcAction::JumpBack => "JumpBack",
             LcAction::JumpForward => "JumpForward",
-            LcAction::TaskRabbitPrompt => "TaskRabbitPrompt",
-            LcAction::LaunchTaskRabbit(..) => "LaunchTaskRabbit",
             LcAction::SetActiveTask(..) => "SetActiveTask",
             LcAction::BlankPrompt => "BlankPrompt",
             LcAction::LaunchBlank(..) => "LaunchBlank",
@@ -698,7 +701,6 @@ impl LcAction {
             LcAction::GoToArchiveZone => "GoToArchiveZone",
             LcAction::GoToTrash => "GoToTrash",
             LcAction::GoToSessionsZone => "GoToSessionsZone",
-            LcAction::GoToTaskRabbitZone => "GoToTaskRabbitZone",
             LcAction::GoToJobsZone => "GoToJobsZone",
             LcAction::UnarchiveSession => "UnarchiveSession",
             LcAction::OpenRecentCompletions => "OpenRecentCompletions",
@@ -723,6 +725,7 @@ impl LcAction {
             LcAction::OpenTelescope => "OpenTelescope",
             LcAction::OpenCommandPalette => "OpenCommandPalette",
             LcAction::ToggleGitPanel => "ToggleGitPanel",
+            LcAction::OpenBtop => "OpenBtop",
             LcAction::GrowSidebar => "GrowSidebar",
             LcAction::ShrinkSidebar => "ShrinkSidebar",
             LcAction::OpenGraphReview => "OpenGraphReview",
@@ -768,6 +771,11 @@ impl LcAction {
             LcAction::OpenHarnessManagerInspect => "OpenHarnessManagerInspect",
             LcAction::ManagerNodeCommand(..) => "ManagerNodeCommand",
             LcAction::ManagerGlobalCommand(..) => "ManagerGlobalCommand",
+            LcAction::ManagerPortfolioCommand(..) => "ManagerPortfolioCommand",
+            LcAction::ManagerEscalationsCommand(..) => "ManagerEscalationsCommand",
+            LcAction::ManagerFrictionCommand(..) => "ManagerFrictionCommand",
+            LcAction::OpenFleet => "OpenFleet",
+            LcAction::OpenGlobalManagerWorkspace => "OpenGlobalManagerWorkspace",
             LcAction::OperatorRestartCommand(..) => "OperatorRestartCommand",
             LcAction::RunEpicTopology => "RunEpicTopology",
             LcAction::JumpAttentionN(..) => "JumpAttentionN",
@@ -871,16 +879,16 @@ mod tests {
 
     #[test]
     fn test_lc_action_clone_eq() {
-        let a = LcAction::TaskRabbitPrompt;
+        let a = LcAction::BlankPrompt;
         let b = a.clone();
         assert_eq!(a, b);
     }
 
     #[test]
     fn test_lc_action_debug() {
-        let a = LcAction::LaunchTaskRabbit("test query".to_string());
+        let a = LcAction::LaunchBlank("test query".to_string());
         let debug = format!("{:?}", a);
-        assert!(debug.contains("LaunchTaskRabbit"));
+        assert!(debug.contains("LaunchBlank"));
         assert!(debug.contains("test query"));
     }
 
@@ -953,9 +961,11 @@ mod tests {
             LcAction::ToggleRotationDisabled,
             LcAction::OpenRatingOverlay,
             LcAction::OpenSessionInfoPanel,
+            LcAction::OpenModelSwitchPicker,
             LcAction::RateSession(7),
             LcAction::ReassignSessionProject,
             LcAction::RotateSession,
+            LcAction::AbandonRotation(None),
             LcAction::OpenSortPicker,
             LcAction::OpenDiagnostics,
             LcAction::OpenRecursiveDagBrowser,
@@ -984,14 +994,11 @@ mod tests {
             LcAction::TogglePromptPreview,
             LcAction::ExecuteDocRegBlocks,
             LcAction::CommitAndPush,
-            LcAction::TaskRabbitPrompt,
-            LcAction::LaunchTaskRabbit("q".into()),
             LcAction::JumpBack,
             LcAction::JumpForward,
             LcAction::GoToArchiveZone,
             LcAction::GoToTrash,
             LcAction::GoToSessionsZone,
-            LcAction::GoToTaskRabbitZone,
             LcAction::GoToJobsZone,
             LcAction::UnarchiveSession,
             LcAction::OpenRecentCompletions,
@@ -1020,6 +1027,7 @@ mod tests {
             LcAction::OpenTelescope,
             LcAction::OpenCommandPalette,
             LcAction::ToggleGitPanel,
+            LcAction::OpenBtop,
             LcAction::GrowSidebar,
             LcAction::ShrinkSidebar,
             LcAction::OpenGraphReview,
@@ -1038,7 +1046,6 @@ mod tests {
             LcAction::OpenSatelliteRegistry,
             LcAction::OpenRemoteSettings,
             LcAction::OpenScheduleBrowser,
-            LcAction::OpenColorCustomizer,
             LcAction::SyncMemoryModelConfig,
             LcAction::SyncPromptProcessorConfig,
             LcAction::SyncClassifierModelConfig("m".into()),
@@ -1107,6 +1114,11 @@ mod tests {
             LcAction::OpenHarnessManagerInspect,
             LcAction::ManagerNodeCommand("list".into()),
             LcAction::ManagerGlobalCommand("show".into()),
+            LcAction::ManagerPortfolioCommand("list".into()),
+            LcAction::ManagerEscalationsCommand("list".into()),
+            LcAction::ManagerFrictionCommand(String::new()),
+            LcAction::OpenFleet,
+            LcAction::OpenGlobalManagerWorkspace,
             LcAction::OperatorRestartCommand("status".into()),
             LcAction::JumpAttentionN(1),
             LcAction::OpenRecentFileN(1),

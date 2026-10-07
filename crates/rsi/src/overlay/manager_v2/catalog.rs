@@ -147,10 +147,14 @@ impl ManagerLaunchPickerState {
         }
     }
     pub fn handle_key(&mut self, key: KeyEvent) -> PickerOutcome {
-        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        if self.stage == PickerStage::Effort
+            && matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+        {
             return PickerOutcome::Dismissed;
         }
-        if key.code == KeyCode::Char('r') {
+        if key.code == KeyCode::Char('r')
+            && (self.stage == PickerStage::Effort || !self.model_dropdown.filter_editing)
+        {
             self.needs_refresh = true;
             self.status = CatalogStatus::Loading;
             self.stage = PickerStage::Model;
@@ -296,5 +300,42 @@ pub fn dispatch_result(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    #[test]
+    fn model_dropdown_manager_search_owns_retry_and_dismiss_letters() {
+        let mut picker = ManagerLaunchPickerState::new(None, None);
+        picker.status = CatalogStatus::Loaded;
+        picker.needs_refresh = false;
+        picker.model_dropdown.replace_models(vec![
+            ("first".into(), "First".into()),
+            ("rq-model".into(), "RQ Model".into()),
+        ]);
+        for c in "/rq-model".chars() {
+            assert!(matches!(
+                picker.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+                PickerOutcome::Consumed
+            ));
+        }
+        assert_eq!(picker.model_dropdown.filter_query, "rq-model");
+        assert!(!picker.needs_refresh);
+        assert_eq!(picker.status, CatalogStatus::Loaded);
+        // Esc stops typing and keeps the filter; then `q` closes as usual.
+        assert!(matches!(
+            picker.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            PickerOutcome::Consumed
+        ));
+        assert!(!picker.model_dropdown.filter_editing);
+        assert_eq!(picker.model_dropdown.filter_query, "rq-model");
+        assert!(matches!(
+            picker.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            PickerOutcome::Dismissed
+        ));
     }
 }

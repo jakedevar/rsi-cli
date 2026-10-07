@@ -9,7 +9,10 @@ mod diagnostics;
 pub(crate) mod dialectic;
 mod esp_square;
 pub mod file_explorer;
+pub mod fleet;
 pub mod global_manager_command;
+pub mod global_manager_workspace;
+pub mod global_manager_workspace_launch;
 pub mod graph;
 pub mod harness_manager;
 pub mod hook_form;
@@ -22,11 +25,16 @@ pub mod manager_v2;
 pub(crate) mod mcp_server_form;
 pub mod memory_search;
 pub mod message_bridge_form;
+pub mod model_switch;
 pub mod operator_restart_command;
 pub mod parent_picker;
+pub mod portfolio_command;
+// #1238: `:manager escalations`, the operator escalation queue.
+pub mod escalations_command;
+// #1333: `:manager friction`, the operator's friction rollup (the andon).
+pub mod friction_command;
 // Model selection handled by widget::model_dropdown (inline dropdown, not an overlay)
 pub mod cohort_settlement;
-pub mod color_customizer;
 pub mod command_palette;
 pub mod legacy_scratch;
 pub mod manager_tree;
@@ -98,17 +106,17 @@ fn selected_prompt_processor_config(
 // Re-export public items that external code depends on.
 pub use budget_policy_form::open_budget_policy_form;
 pub use cohort_settlement::open_source_worktree_settlement;
-pub use color_customizer::open_color_customizer;
 pub use create_entity_form::open_create_entity_form;
 pub use hook_form::open_hook_form;
 pub use keybindings_help::{close_keybindings_help, open_keybindings_help};
 pub use label_picker::open_label_picker;
 pub use memory_search::open_memory_search;
 pub use message_bridge_form::open_message_bridge_form;
+pub use model_switch::open_model_switch_picker;
 pub use parent_picker::open_parent_picker;
 pub use project_form::PROJECT_COLORS;
 pub use project_picker::open_project_picker;
-pub use prompt::{open_blank_popup, open_continue_popup, open_taskrabbit_popup, open_typed_prompt};
+pub use prompt::{open_blank_popup, open_continue_popup, open_typed_prompt};
 pub use prompt_preview::open_prompt_preview;
 pub use provider_credential_form::open_provider_credential_form;
 pub use provider_form::open_provider_form;
@@ -143,6 +151,17 @@ fn is_uppercase_n_key(key: KeyEvent) -> bool {
         && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
 }
 
+/// Half-typed vim commands own their next key, including a Space target.
+fn text_overlay_has_pending_vim(overlay: &OverlayState) -> bool {
+    match overlay {
+        OverlayState::Prompt { launch, .. } if launch.open => false,
+        OverlayState::Prompt { surface, .. } | OverlayState::InputModal { surface, .. } => {
+            surface.mode == PopupMode::Normal && !surface.vim_state.is_idle()
+        }
+        _ => false,
+    }
+}
+
 const fn text_entry_overlay_owns_space(overlay: &OverlayState) -> bool {
     matches!(
         overlay,
@@ -174,7 +193,21 @@ const fn text_entry_overlay_owns_space(overlay: &OverlayState) -> bool {
     )
 }
 
+/// A prompt whose model picker is taking filter text owns every printable key,
+/// Space included, so a typed query never starts a leader sequence.
+fn prompt_model_filter_typing(overlay: &OverlayState) -> bool {
+    matches!(
+        overlay,
+        OverlayState::Prompt { model_dropdown, .. }
+            if model_dropdown.open && model_dropdown.filter_editing
+    )
+}
+
 fn handle_text_overlay_prompt_leader(app: &mut App, key: KeyEvent) -> bool {
+    if text_overlay_has_pending_vim(&app.overlay) || prompt_model_filter_typing(&app.overlay) {
+        app.overlay_leader_pending = false;
+        return false;
+    }
     // These surfaces own Space directly. The explorer's finder also owns
     // printable keys, and Scheduled Jobs uses Space to toggle its selection.
     if matches!(
@@ -187,7 +220,16 @@ fn handle_text_overlay_prompt_leader(app: &mut App, key: KeyEvent) -> bool {
             | OverlayState::SatelliteRegistry(..)
             | OverlayState::Remote(..)
             | OverlayState::ManagerTree(..)
+            | OverlayState::Fleet(..)
     ) {
+        app.overlay_leader_pending = false;
+        return false;
+    }
+    // The global manager workspace owns typed text while its input bar or
+    // launch form is active (#1231).
+    if let OverlayState::GlobalManagerWorkspace(state) = &app.overlay
+        && global_manager_workspace::owns_text_entry(state)
+    {
         app.overlay_leader_pending = false;
         return false;
     }
@@ -211,14 +253,10 @@ fn handle_text_overlay_prompt_leader(app: &mut App, key: KeyEvent) -> bool {
         }
 
         // Non-text overlays (GraphReview, ThemePicker, SortPicker, etc.):
-        // Honour Space+o / Space+N to dismiss the overlay and open a session modal.
+        // Honour Space+N to dismiss the overlay and open a session modal.
         if app.overlay_leader_pending {
             app.overlay_leader_pending = false;
             match key.code {
-                KeyCode::Char('o') if key.modifiers.is_empty() => {
-                    prompt::open_taskrabbit_popup(app);
-                    return true;
-                }
                 KeyCode::Char('N') if is_uppercase_n_key(key) => {
                     prompt::open_blank_popup(app);
                     return true;
@@ -240,10 +278,6 @@ fn handle_text_overlay_prompt_leader(app: &mut App, key: KeyEvent) -> bool {
 
     if app.overlay_leader_pending {
         app.overlay_leader_pending = false;
-        if key.modifiers.is_empty() && key.code == KeyCode::Char('o') {
-            prompt::open_taskrabbit_popup(app);
-            return true;
-        }
         if is_uppercase_n_key(key) {
             prompt::open_blank_popup(app);
             return true;
@@ -266,23 +300,22 @@ fn handle_text_overlay_prompt_leader(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
-/// Handle Space+o / Space+N leader sequence for input overlay stack.
+/// Handle Space+N leader sequence for input overlay stack.
 fn handle_input_overlay_leader(app: &mut App, key: KeyEvent) -> bool {
     let focused = match app.focused_input_overlay() {
         Some(o) => o,
         None => return false,
     };
-    if !text_overlay_is_in_normal_mode(focused) {
+    if !text_overlay_is_in_normal_mode(focused)
+        || text_overlay_has_pending_vim(focused)
+        || prompt_model_filter_typing(focused)
+    {
         app.overlay_leader_pending = false;
         return false;
     }
 
     if app.overlay_leader_pending {
         app.overlay_leader_pending = false;
-        if key.modifiers.is_empty() && key.code == KeyCode::Char('o') {
-            prompt::open_taskrabbit_popup(app);
-            return true;
-        }
         if is_uppercase_n_key(key) {
             prompt::open_blank_popup(app);
             return true;
@@ -346,27 +379,23 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
         let consumed = !matches!(action, ModelDropdownAction::Ignored);
         match action {
             ModelDropdownAction::Selected(model_id) => {
-                app.selected_model = Some(model_id);
-                if let Some(model) = app.selected_model.clone() {
-                    app.reconcile_model_effort(app.selected_provider, &model);
-                }
+                // A pick commits the browsed provider, endpoint and catalog
+                // together with the model.
+                let provider = app.model_dropdown.provider;
+                let custom_provider_index = app.model_dropdown.custom_provider_index;
+                let models = app.model_dropdown.models.clone();
                 app.model_dropdown.close();
+                app.set_default_model(provider, custom_provider_index, models, model_id);
             }
             ModelDropdownAction::ProviderCycled => {
-                app.selected_provider = app.model_dropdown.provider;
-                app.custom_provider_index = app.model_dropdown.custom_provider_index;
-                app.available_models = app.model_dropdown.models.clone();
-                app.selected_model = app.available_models.first().map(|(id, _)| id.clone());
-                if let Some(model) = app.selected_model.clone() {
-                    app.reconcile_model_effort(app.selected_provider, &model);
-                } else {
-                    // Harness/custom catalogs may be empty until discovery;
-                    // without a selected model, no effort remains compatible.
-                    app.selected_effort = None;
+                // Tab only previews another provider's catalog: the default
+                // stays put until a model is picked, so Esc cancels cleanly.
+                // A custom endpoint's single model needs no discovery.
+                if app.model_dropdown.custom_provider_index.is_none() {
+                    app.model_discovery_rx = None;
+                    app.model_refresh_provider = Some(app.model_dropdown.provider);
+                    app.needs_model_refresh = true;
                 }
-                app.model_discovery_rx = None;
-                app.model_refresh_provider = Some(app.selected_provider);
-                app.needs_model_refresh = true;
             }
             ModelDropdownAction::Dismissed => {
                 app.model_dropdown.close();
@@ -378,7 +407,7 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
         }
     }
 
-    // --- Input overlay stack (Blank/TaskRabbit prompts shown simultaneously) ---
+    // --- Input overlay stack (Blank prompts shown simultaneously) ---
     // Input overlays take key priority over regular overlays — they sit on top visually.
     if !app.input_overlays.is_empty() {
         app.detail_list_focused = false;
@@ -523,6 +552,11 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
             manager_tree::handle_key(app, key).await;
             return true;
         }
+        OverlayState::Fleet(..) => fleet::handle_key(app, key).await,
+        OverlayState::GlobalManagerWorkspace(..) => {
+            global_manager_workspace::handle_key(app, key).await;
+            return true;
+        }
         OverlayState::HarnessManagerV2(..) => {
             manager_v2::handle_key(app, key).await;
         }
@@ -637,11 +671,11 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
             session_info::handle_session_info_panel_key(app, key).await;
             return true;
         }
-        OverlayState::Prompt { .. } => {}
-        OverlayState::ColorCustomizer { .. } => {
-            color_customizer::handle_color_customizer_key(app, key);
+        OverlayState::ModelSwitch(..) => {
+            model_switch::handle_model_switch_key(app, key).await;
             return true;
         }
+        OverlayState::Prompt { .. } => {}
         OverlayState::TextAreaBgEditor { .. } => {
             text_area_bg_editor::handle_text_area_bg_editor_key(app, key);
             return true;
@@ -926,7 +960,7 @@ async fn handle_overlay_prompt_keys(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
-    // Ctrl+M toggles inline model dropdown in Blank and TaskRabbit prompts.
+    // Ctrl+M toggles inline model dropdown in Blank prompts.
     if matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M'))
         && key.modifiers == KeyModifiers::CONTROL
     {
@@ -936,10 +970,7 @@ async fn handle_overlay_prompt_keys(app: &mut App, key: KeyEvent) -> bool {
             ..
         } = &mut app.overlay
         {
-            if matches!(
-                purpose,
-                crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit
-            ) {
+            if matches!(purpose, crate::types::PromptPurpose::Blank) {
                 model_dropdown.toggle();
                 if model_dropdown.open {
                     app.needs_model_refresh = true;
@@ -964,10 +995,7 @@ async fn handle_overlay_prompt_keys(app: &mut App, key: KeyEvent) -> bool {
             _ => (None, None),
         };
         if let OverlayState::Prompt { purpose, .. } = &app.overlay {
-            if matches!(
-                purpose,
-                crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit
-            ) {
+            if matches!(purpose, crate::types::PromptPurpose::Blank) {
                 cycle_effort(
                     app,
                     effort_model_override.as_deref(),
@@ -988,11 +1016,7 @@ async fn handle_overlay_prompt_keys(app: &mut App, key: KeyEvent) -> bool {
             ..
         } = &mut app.overlay
         {
-            if matches!(
-                purpose,
-                crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit
-            ) && sandbox_caps
-            {
+            if matches!(purpose, crate::types::PromptPurpose::Blank) && sandbox_caps {
                 *sandbox_enabled = !*sandbox_enabled;
                 app.mark_dirty();
                 return true;
@@ -1069,7 +1093,7 @@ async fn handle_overlay_prompt_keys(app: &mut App, key: KeyEvent) -> bool {
     true
 }
 
-/// Handle key events for the input overlay stack (multiple Blank/TaskRabbit prompts).
+/// Handle key events for the input overlay stack (multiple Blank prompts).
 async fn handle_input_overlay_key(app: &mut App, key: KeyEvent) -> bool {
     // Ctrl+J: focus next (downward) input overlay
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('j') {
@@ -1089,7 +1113,7 @@ async fn handle_input_overlay_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
-    // Leader sequence (Space+o for TaskRabbit toggle)
+    // Leader sequence (Space+N opens a Blank prompt)
     if handle_input_overlay_leader(app, key) {
         return true;
     }
@@ -1367,7 +1391,7 @@ async fn handle_focused_input_prompt_keys(app: &mut App, key: KeyEvent) -> bool 
         return true;
     }
 
-    // Ctrl+M toggles inline model dropdown in Blank and TaskRabbit prompts.
+    // Ctrl+M toggles inline model dropdown in Blank prompts.
     if matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M'))
         && key.modifiers == KeyModifiers::CONTROL
     {
@@ -1377,10 +1401,7 @@ async fn handle_focused_input_prompt_keys(app: &mut App, key: KeyEvent) -> bool 
             ..
         }) = app.input_overlays.get_mut(idx)
         {
-            if matches!(
-                purpose,
-                crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit
-            ) {
+            if matches!(purpose, crate::types::PromptPurpose::Blank) {
                 model_dropdown.toggle();
                 if model_dropdown.open {
                     app.needs_model_refresh = true;
@@ -1405,10 +1426,7 @@ async fn handle_focused_input_prompt_keys(app: &mut App, key: KeyEvent) -> bool 
             _ => (None, None),
         };
         if let Some(OverlayState::Prompt { purpose, .. }) = app.input_overlays.get(idx) {
-            if matches!(
-                purpose,
-                crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit
-            ) {
+            if matches!(purpose, crate::types::PromptPurpose::Blank) {
                 cycle_effort(
                     app,
                     effort_model_override.as_deref(),
@@ -1429,11 +1447,7 @@ async fn handle_focused_input_prompt_keys(app: &mut App, key: KeyEvent) -> bool 
             ..
         }) = app.input_overlays.get_mut(idx)
         {
-            if matches!(
-                purpose,
-                crate::types::PromptPurpose::Blank | crate::types::PromptPurpose::TaskRabbit
-            ) && sandbox_caps
-            {
+            if matches!(purpose, crate::types::PromptPurpose::Blank) && sandbox_caps {
                 *sandbox_enabled = !*sandbox_enabled;
                 app.mark_dirty();
                 return true;
@@ -2269,6 +2283,86 @@ mod text_entry_leader_tests {
 
     fn shift_key(ch: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::SHIFT)
+    }
+
+    #[tokio::test]
+    async fn new_session_modal_pending_vim_commands_capture_space_and_g() {
+        // Exercise both presentations of the new-session Prompt, plus the
+        // unified create form's body, through the outer overlay dispatcher.
+        for presentation in 0..3 {
+            for (keys, content, row, col, expected, cursor) in [
+                ("f ", "abc def ghi", 0, 0, "abc def ghi", (0, 3)),
+                ("t ", "abc def ghi", 0, 0, "abc def ghi", (0, 2)),
+                ("dt ", "abc def ghi", 0, 0, " def ghi", (0, 0)),
+                ("fg", "abc def ghi", 0, 0, "abc def ghi", (0, 8)),
+                ("r ", "abc def ghi", 0, 0, " bc def ghi", (0, 0)),
+                ("F ", "abc def ghi", 0, 10, "abc def ghi", (0, 7)),
+                ("T ", "abc def ghi", 0, 10, "abc def ghi", (0, 8)),
+                ("2f ", "abc def ghi", 0, 0, "abc def ghi", (0, 7)),
+                ("di ", "abc def ghi", 0, 0, "abc def ghi", (0, 0)),
+                ("dag", "abc def ghi", 0, 0, "abc def ghi", (0, 0)),
+                ("dgg", "one\ntwo\nthree", 1, 0, "three", (0, 0)),
+                ("gg", "one\ntwo\nthree", 1, 0, "one\ntwo\nthree", (0, 0)),
+            ] {
+                let mut app = app();
+                if presentation == 2 {
+                    create_entity_form::open_create_entity_form(
+                        &mut app,
+                        rsi_common::types::SessionKind::Standard,
+                        None,
+                    )
+                    .await;
+                    let OverlayState::CreateEntityForm { focused_field, .. } = &mut app.overlay
+                    else {
+                        panic!("create form");
+                    };
+                    *focused_field = crate::types::CreateEntityField::Body;
+                } else {
+                    prompt::open_blank_popup(&mut app);
+                    if presentation == 1 {
+                        app.overlay = app.input_overlays.pop().unwrap();
+                    }
+                }
+                let overlay = if presentation == 0 {
+                    app.focused_input_overlay_mut().unwrap()
+                } else {
+                    &mut app.overlay
+                };
+                let surface = match overlay {
+                    OverlayState::Prompt { surface, .. } => surface,
+                    OverlayState::CreateEntityForm { body, .. } => body,
+                    _ => panic!("text surface"),
+                };
+                *surface = crate::input_surface::InputSurface::new_insert_with_content(
+                    content.lines().map(str::to_string).collect(),
+                );
+                surface.mode = PopupMode::Normal;
+                surface
+                    .textarea
+                    .move_cursor(tui_textarea::CursorMove::Jump(row, col));
+                for ch in keys.chars() {
+                    assert!(handle_overlay_key(&mut app, key(ch)).await);
+                }
+                let overlay = if presentation == 0 {
+                    app.focused_input_overlay().unwrap()
+                } else {
+                    &app.overlay
+                };
+                let surface = match overlay {
+                    OverlayState::Prompt { surface, .. } => surface,
+                    OverlayState::CreateEntityForm { body, .. } => body,
+                    _ => panic!("text surface stays open"),
+                };
+                assert_eq!(surface.content(), expected, "{presentation}: {keys:?}");
+                assert_eq!(
+                    surface.textarea.cursor(),
+                    cursor,
+                    "{presentation}: {keys:?}"
+                );
+                assert!(surface.vim_state.is_idle(), "{presentation}: {keys:?}");
+                assert!(!app.overlay_leader_pending, "{presentation}: {keys:?}");
+            }
+        }
     }
 
     #[tokio::test]

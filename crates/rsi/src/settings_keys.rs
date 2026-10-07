@@ -185,8 +185,7 @@ const fn spec_position_for_ui_row(section: SettingsSection, ui_row: usize) -> us
         SettingsSection::ThemeColors => match ui_row {
             0 => 0,
             1..=17 => 1,
-            18 => 2,
-            _ => 3,
+            _ => 2,
         },
         SettingsSection::SessionList => {
             let optional_columns = crate::types::NavigatorOptionalColumn::ALL.len();
@@ -221,8 +220,7 @@ const fn ui_row_for_spec_position(section: SettingsSection, spec_position: usize
         SettingsSection::ThemeColors => match spec_position {
             0 => 0,
             1 => 1,
-            2 => 18,
-            _ => 19,
+            _ => 18,
         },
         SettingsSection::SessionList => match spec_position {
             0 => 0,
@@ -659,14 +657,20 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
             }
             ModelDropdownAction::ProviderCycled => {
                 if app.settings_state.active_dropdown_item == Some(0) {
-                    app.selected_provider = app.settings_state.model_dropdown.provider;
-                    app.custom_provider_index =
-                        app.settings_state.model_dropdown.custom_provider_index;
-                    app.available_models = app.settings_state.model_dropdown.models.clone();
-                    app.selected_model = app.available_models.first().map(|(id, _)| id.clone());
-                    app.model_discovery_rx = None;
-                    app.model_refresh_provider = Some(app.selected_provider);
-                    app.needs_model_refresh = true;
+                    // Browsing providers previews their catalogs; the default
+                    // model moves only on a pick, so Esc keeps it. The global
+                    // discovery result refreshes this dropdown by provider.
+                    if app
+                        .settings_state
+                        .model_dropdown
+                        .custom_provider_index
+                        .is_none()
+                    {
+                        app.model_discovery_rx = None;
+                        app.model_refresh_provider =
+                            Some(app.settings_state.model_dropdown.provider);
+                        app.needs_model_refresh = true;
+                    }
                 } else {
                     queue_agent_actor_dropdown_refresh(app);
                 }
@@ -1275,7 +1279,6 @@ pub fn close_settings(app: &mut App) {
                 selected_session: None,
                 scroll_offset: 0,
                 active_zone: Default::default(),
-                taskrabbit_selected_index: 0,
                 archive_selected_index: 0,
                 jobs_selected_index: 0,
             };
@@ -1314,7 +1317,7 @@ pub fn item_count(section: SettingsSection, settings: &UserSettings) -> usize {
         return daemon_feature_floor_count(section);
     }
     match section {
-        SettingsSection::ThemeColors => 20,
+        SettingsSection::ThemeColors => 19,
         SettingsSection::Screen => 6,
         SettingsSection::TranscriptDefaults => 3,
         SettingsSection::InputPrompts => 3,
@@ -1380,8 +1383,7 @@ fn activate_theme_color_row(app: &mut App) {
                 crate::overlay::open_theme_role_editor(app, role);
             }
         }
-        18 => crate::overlay::open_color_customizer(app),
-        19 => {
+        18 => {
             crate::ui::theme::clear_theme_role_overrides();
             app.notify_success("Active theme semantic overrides reset");
             app.mark_dirty();
@@ -1712,12 +1714,13 @@ fn handle_agent_actors_selection(app: &mut App, model_id: String) -> bool {
     }
     match app.settings_state.active_dropdown_item {
         Some(0) => {
-            // Default Model
-            app.selected_model = Some(model_id);
-            app.selected_provider = app.settings_state.model_dropdown.provider;
-            app.custom_provider_index = app.settings_state.model_dropdown.custom_provider_index;
-            app.available_models = app.settings_state.model_dropdown.models.clone();
+            // Default Model: the same commit as the global `Ctrl-M` picker,
+            // so effort is reconciled and the change is persisted and shown.
+            let provider = app.settings_state.model_dropdown.provider;
+            let custom_provider_index = app.settings_state.model_dropdown.custom_provider_index;
+            let models = app.settings_state.model_dropdown.models.clone();
             app.model_discovery_rx = None;
+            app.set_default_model(provider, custom_provider_index, models, model_id);
         }
         Some(1) => {
             app.settings.title_model_provider = app.settings_state.model_dropdown.provider;
@@ -1957,6 +1960,96 @@ mod tests {
         KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
     }
 
+    /// Settings ▸ Model Roles ▸ Default model: Tab previews another provider
+    /// and leaves the launch default alone; a pick commits it exactly like
+    /// the `Ctrl-M` picker and confirms it with a toast.
+    #[test]
+    fn default_model_row_moves_the_default_only_on_a_pick() {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.selected_provider = SessionProvider::Claude;
+        app.custom_provider_index = None;
+        app.selected_model = Some("claude-opus-5-5".to_string());
+        app.available_models = crate::app::models_for_provider(SessionProvider::Claude);
+        app.settings_state.section = SettingsSection::ModelRoles;
+        app.settings_state.focus = SettingsFocus::Items;
+        app.settings_state.selected_index = 0;
+
+        assert!(handle_settings_key(&mut app, key(KeyCode::Enter)));
+        assert!(app.settings_state.model_dropdown.open);
+        assert_eq!(app.settings_state.active_dropdown_item, Some(0));
+
+        assert!(handle_settings_key(&mut app, key(KeyCode::Tab)));
+        assert_eq!(
+            app.settings_state.model_dropdown.provider,
+            SessionProvider::Codex
+        );
+        assert_eq!(app.selected_provider, SessionProvider::Claude);
+        assert_eq!(app.selected_model.as_deref(), Some("claude-opus-5-5"));
+
+        let first_codex = app.settings_state.model_dropdown.models[0].0.clone();
+        assert!(handle_settings_key(&mut app, key(KeyCode::Enter)));
+        assert!(!app.settings_state.model_dropdown.open);
+        assert_eq!(app.selected_provider, SessionProvider::Codex);
+        assert_eq!(app.selected_model.as_deref(), Some(first_codex.as_str()));
+        assert!(
+            app.notifications
+                .iter()
+                .any(|notification| notification.message.starts_with("Default model ")),
+            "the new default is confirmed"
+        );
+    }
+
+    /// Esc or `q` after browsing providers (forward, back) and filtering with
+    /// `/` closes the Settings default-model picker with the launch default
+    /// untouched.
+    #[test]
+    fn default_model_row_cancel_after_browsing_keeps_the_default() {
+        for cancel in [KeyCode::Esc, KeyCode::Char('q')] {
+            let mut app = crate::app::app_test_helpers::with_session_list(0);
+            app.selected_provider = SessionProvider::Claude;
+            app.custom_provider_index = None;
+            app.selected_model = Some("claude-opus-5-5".to_string());
+            app.selected_effort = Some("max".to_string());
+            app.available_models = crate::app::models_for_provider(SessionProvider::Claude);
+            let models_before = app.available_models.clone();
+            app.settings_state.section = SettingsSection::ModelRoles;
+            app.settings_state.focus = SettingsFocus::Items;
+            app.settings_state.selected_index = 0;
+
+            assert!(handle_settings_key(&mut app, key(KeyCode::Enter)));
+            assert!(app.settings_state.model_dropdown.open);
+            for code in [
+                KeyCode::Tab,
+                KeyCode::Tab,
+                KeyCode::BackTab,
+                KeyCode::Char('j'),
+            ] {
+                handle_settings_key(&mut app, key(code));
+            }
+            assert_ne!(
+                app.settings_state.model_dropdown.provider,
+                SessionProvider::Claude,
+                "the picker really browsed away from the default"
+            );
+            for code in [KeyCode::Char('/'), KeyCode::Char('q'), KeyCode::Esc] {
+                assert!(handle_settings_key(&mut app, key(code)));
+            }
+            assert!(
+                app.settings_state.model_dropdown.open,
+                "Esc first stops filter typing"
+            );
+            assert_eq!(app.settings_state.model_dropdown.filter_query, "q");
+            assert!(handle_settings_key(&mut app, key(cancel)));
+
+            assert!(!app.settings_state.model_dropdown.open);
+            assert_eq!(app.selected_provider, SessionProvider::Claude);
+            assert_eq!(app.custom_provider_index, None);
+            assert_eq!(app.selected_model.as_deref(), Some("claude-opus-5-5"));
+            assert_eq!(app.selected_effort.as_deref(), Some("max"));
+            assert_eq!(app.available_models, models_before);
+        }
+    }
+
     /// (c) acceptance: `settings_search_commits_and_jumps_across_sections`
     /// (Epic M design D.3). `/` opens the query line, typed characters feed
     /// it (not the section's own bindings — proven by typing `d`, which
@@ -2127,7 +2220,7 @@ mod tests {
     #[test]
     fn test_item_count_per_category() {
         let settings = UserSettings::default();
-        assert_eq!(item_count(SettingsSection::ThemeColors, &settings), 20);
+        assert_eq!(item_count(SettingsSection::ThemeColors, &settings), 19);
         assert_eq!(item_count(SettingsSection::Screen, &settings), 6);
         assert_eq!(
             item_count(SettingsSection::TranscriptDefaults, &settings),
@@ -2312,12 +2405,12 @@ mod tests {
             section: SettingsSection::ThemeColors,
             ..Default::default()
         };
-        for expected in 1..=19 {
+        for expected in 1..=18 {
             nav_down(&mut state, &settings);
             assert_eq!(state.selected_index, expected);
         }
         nav_down(&mut state, &settings);
-        assert_eq!(state.selected_index, 19); // clamped at max (20 rows)
+        assert_eq!(state.selected_index, 18); // clamped at max (19 rows)
     }
 
     #[test]
@@ -2456,7 +2549,7 @@ mod tests {
         let mut settings = UserSettings::default();
         let state = SettingsState {
             section: SettingsSection::SessionList,
-            selected_index: crate::settings::NAVIGATOR_SETTINGS_ROW_COUNT, // ContextBar
+            selected_index: crate::settings::NAVIGATOR_SETTINGS_ROW_COUNT, // Cost
             focus: SettingsFocus::Items,
             ..Default::default()
         };

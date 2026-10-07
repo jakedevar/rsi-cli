@@ -2023,6 +2023,49 @@ pub struct AgentSendMessageResultV1 {
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+    /// #1183: set when the target cannot take mail mid-turn, so the sender
+    /// knows at send time that a working target only sees it when its current
+    /// turn ends. Absent for providers with a mid-turn boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_boundary: Option<AgentMessageDeliveryBoundaryV1>,
+}
+
+/// #1183: when a message can reach its target while the target is working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMessageDeliveryBoundaryV1 {
+    /// The target's provider has no mid-turn boundary: a target that is
+    /// working sees the message only when its current turn ends, and a target
+    /// that ends without another turn never sees it (the message then settles
+    /// `failed`, visibly).
+    TurnEndOnly,
+}
+
+impl AgentMessageDeliveryBoundaryV1 {
+    /// The send-time hint for a target running on `provider`. Providers with
+    /// a mid-turn boundary return `None`: Claude and the Codex CLI family
+    /// (Codex, Pioneer, and the Codex routes of OpenRouter and Bedrock) through
+    /// the `PostToolUse` boundary-mail hook, and Harness and the Harness routes
+    /// of OpenRouter and Bedrock between tool-loop model calls. Local and
+    /// Antigravity have no tool boundary rsi can reach, and a CodexAppServer
+    /// session takes mail only as its next native turn (its process outlives
+    /// the turn, so the message waits rather than expiring). Exhaustive by
+    /// construction: a new provider must decide.
+    #[must_use]
+    pub const fn for_provider(provider: crate::types::SessionProvider) -> Option<Self> {
+        use crate::types::SessionProvider;
+        match provider {
+            SessionProvider::Claude
+            | SessionProvider::Codex
+            | SessionProvider::Pioneer
+            | SessionProvider::OpenRouter
+            | SessionProvider::Bedrock
+            | SessionProvider::Harness => None,
+            SessionProvider::Local
+            | SessionProvider::Antigravity
+            | SessionProvider::CodexAppServer => Some(Self::TurnEndOnly),
+        }
+    }
 }
 
 /// Cursor-bearing durable message-state event, published ONLY after the Store

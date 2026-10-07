@@ -30,7 +30,6 @@ fn test_app() -> App {
                 selected_session: None,
                 scroll_offset: 0,
                 active_zone: Default::default(),
-                taskrabbit_selected_index: 0,
                 archive_selected_index: 0,
                 jobs_selected_index: 0,
             },
@@ -341,7 +340,6 @@ fn add_snapshot_sessions(app: &mut App) {
     app.sessions.clear();
     app.session_order.clear();
     app.filtered_session_order.clear();
-    app.filtered_taskrabbit_order.clear();
     app.filtered_archived_order.clear();
     app.filtered_jobs_order.clear();
 
@@ -445,7 +443,6 @@ fn add_snapshot_sessions(app: &mut App) {
         selected_session,
         scroll_offset,
         active_zone,
-        taskrabbit_selected_index,
         archive_selected_index,
         jobs_selected_index,
     }) = app.focused_pane_mut()
@@ -454,7 +451,6 @@ fn add_snapshot_sessions(app: &mut App) {
         *selected_session = selected;
         *scroll_offset = 0;
         *active_zone = Default::default();
-        *taskrabbit_selected_index = 0;
         *archive_selected_index = 0;
         *jobs_selected_index = 0;
     }
@@ -780,7 +776,6 @@ fn test_split_node_operations() {
                 selected_session: None,
                 scroll_offset: 0,
                 active_zone: Default::default(),
-                taskrabbit_selected_index: 0,
                 archive_selected_index: 0,
                 jobs_selected_index: 0,
             },
@@ -792,7 +787,6 @@ fn test_split_node_operations() {
                 selected_session: None,
                 scroll_offset: 0,
                 active_zone: Default::default(),
-                taskrabbit_selected_index: 0,
                 archive_selected_index: 0,
                 jobs_selected_index: 0,
             },
@@ -1130,11 +1124,16 @@ fn snap_top_status_bar_global_only() {
         .expect("top status line should render")
         .to_string();
 
-    // The compact header keeps the active count on the left. Project tab dots
-    // may render on the right.
+    // The compact header keeps the labelled active count on the left and the
+    // default launch model on the right (before any project tab dots), with
+    // the model's own effort when none was chosen.
     assert!(
-        snapshot.contains("● 1"),
+        snapshot.contains("● 1 running"),
         "missing active count:\n{snapshot}"
+    );
+    assert!(
+        snapshot.ends_with("default ✻ sonnet-5 · xhigh"),
+        "missing default launch model:\n{snapshot}"
     );
     // Chrome/leak guards (not entity identity): removed chips and per-session
     // metadata must stay out of the global header.
@@ -1149,10 +1148,6 @@ fn snap_top_status_bar_global_only() {
     assert!(
         !snapshot.contains("▸ core"),
         "project chip must not render after T2-HEADER-CUT:\n{snapshot}"
-    );
-    assert!(
-        !snapshot.contains("⚙ claude-sonnet-5"),
-        "model chip must not render after T2-HEADER-CUT:\n{snapshot}"
     );
     assert!(
         !snapshot.contains("☰4/4"),
@@ -1200,7 +1195,7 @@ fn session_detail_places_status_in_metadata_and_mode_in_bottom_input() {
         for (mode, label, pending) in [
             (rsi::types::PopupMode::Normal, "NORMAL", false),
             (rsi::types::PopupMode::Insert, "INSERT", false),
-            (rsi::types::PopupMode::Normal, "LEADER", true),
+            (rsi::types::PopupMode::Normal, "LEADER: SPACE", true),
         ] {
             app.sessions
                 .get_mut(&session_id)
@@ -1209,6 +1204,7 @@ fn session_detail_places_status_in_metadata_and_mode_in_bottom_input() {
                 .surface
                 .mode = mode;
             app.vim_machine_pending = pending;
+            app.vim_machine_prefix = pending.then_some(' ');
             let buffer = support::render_app(&mut app, width, 28);
             let metadata = support::line_text(&buffer, 2);
             assert!(metadata.contains("●  Claude  ·  Sonnet 5"), "{metadata}");
@@ -1220,6 +1216,7 @@ fn session_detail_places_status_in_metadata_and_mode_in_bottom_input() {
                 "input border must end the pane: {bottom}"
             );
             app.vim_machine_pending = false;
+            app.vim_machine_prefix = None;
         }
     }
 }
@@ -1235,8 +1232,8 @@ fn session_detail_input_grows_for_text_wrapped_after_mode_label() {
 
     let buffer = support::render_app(&mut app, 60, 28);
     assert_eq!(buffer[(0, 24)].symbol(), "┌");
-    assert!(support::line_text(&buffer, 25).contains(&"a".repeat(47)));
-    assert_eq!(buffer[(11, 26)].symbol(), "Z");
+    assert!(support::line_text(&buffer, 25).contains(&"a".repeat(40)));
+    assert_eq!(buffer[(25, 26)].symbol(), "Z");
     assert_eq!(buffer[(59, 27)].symbol(), "┘");
 }
 
@@ -2224,61 +2221,6 @@ async fn test_prompt_manual_resize_tall_content_grows_from_dynamic_height() {
     assert_eq!(
         after_rect.height, resized_rect.height,
         "content growth after manual resize should not grow the popup"
-    );
-}
-
-#[tokio::test]
-async fn test_legacy_taskrabbit_override_uses_manual_height_semantics() {
-    let mut app = test_app();
-    open_blank_prompt_with_draft(&mut app, numbered_lines(3));
-    let mut stacked = app
-        .input_overlays
-        .pop()
-        .expect("blank prompt should have opened");
-    if let OverlayState::Prompt { working_dir, .. } = &mut stacked {
-        *working_dir = PathBuf::from("/tmp/rsi-legacy-blank");
-    }
-    app.overlay_stack.push(stacked);
-    app.focused_input_idx = 0;
-
-    app.taskrabbit_draft = numbered_lines(8);
-    rsi::overlay::open_taskrabbit_popup(&mut app);
-    let mut taskrabbit = app
-        .input_overlays
-        .pop()
-        .expect("taskrabbit prompt should have opened");
-    if let OverlayState::Prompt { working_dir, .. } = &mut taskrabbit {
-        *working_dir = PathBuf::from("/tmp/rsi-legacy-taskrabbit");
-    }
-    app.overlay = taskrabbit;
-    app.focused_input_idx = 0;
-
-    let initial = support::render_app(&mut app, 100, 32);
-    let initial_rect = support::find_prompt_rect_by_marker(&initial, "/tmp/rsi-legacy-taskrabbit");
-
-    feed_key(
-        &mut app,
-        modified_key_code(
-            crossterm::event::KeyCode::Down,
-            crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::SHIFT,
-        ),
-    )
-    .await;
-    let resized = support::render_app(&mut app, 100, 32);
-    let resized_rect = support::find_prompt_rect_by_marker(&resized, "/tmp/rsi-legacy-taskrabbit");
-    assert_eq!(
-        resized_rect.height,
-        initial_rect.height + 2,
-        "legacy TaskRabbit override should grow from the content-driven height"
-    );
-
-    feed_key(&mut app, key_code(crossterm::event::KeyCode::Enter)).await;
-    let after_newline = support::render_app(&mut app, 100, 32);
-    let after_rect =
-        support::find_prompt_rect_by_marker(&after_newline, "/tmp/rsi-legacy-taskrabbit");
-    assert_eq!(
-        after_rect.height, resized_rect.height,
-        "legacy TaskRabbit override should pin manual height after content growth"
     );
 }
 

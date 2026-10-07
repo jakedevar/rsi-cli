@@ -24,6 +24,7 @@ use crate::store::target_reclaim_sweep::{
     PrepareTargetReclaimIntentResult, TargetReclaimIntentTerminalState,
 };
 use rsi_common::sandbox_storage::SandboxBuildCacheReclaimSkipReason as ReclaimSkipReason;
+use rsi_common::sandbox_storage::SandboxReclaimCheck;
 use rsi_common::types::{
     SandboxCleanupState, SandboxCustodyErrorCodeV1, SandboxCustodyErrorV1,
     SandboxCustodyRecoveryV1, SandboxCustodyTransitionV1, SandboxKind, SandboxSpec, Session,
@@ -50,6 +51,32 @@ pub(crate) type CustodyStore = Arc<Mutex<Store>>;
 struct PhasedReclaimStore {
     store: CustodyStore,
     pass: Arc<crate::sandbox::target_reclaim::ReclaimPassState>,
+}
+
+/// One reclaim attempt: its outcome and, for a refusal, the exact check that
+/// failed (#1575).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalTargetAttempt {
+    pub outcome: TargetReclaimOutcome,
+    pub check: Option<SandboxReclaimCheck>,
+}
+
+impl TerminalTargetAttempt {
+    fn refused(reason: ReclaimSkipReason, check: SandboxReclaimCheck) -> Self {
+        Self {
+            outcome: TargetReclaimOutcome::refused(reason),
+            check: Some(check),
+        }
+    }
+}
+
+impl From<TargetReclaimOutcome> for TerminalTargetAttempt {
+    fn from(outcome: TargetReclaimOutcome) -> Self {
+        Self {
+            outcome,
+            check: None,
+        }
+    }
 }
 
 trait ReclaimStoreAccess {
@@ -218,6 +245,9 @@ impl CustodyExecutionRuntime {
             }
             RotationPredecessorSource::RecoveredOpenIntent => {
                 store.capture_recovered_rotation_authority(predecessor)
+            }
+            RotationPredecessorSource::BlockedHolder => {
+                store.capture_blocked_holder_rotation_authority(predecessor)
             }
         };
         let durable_predecessor = match captured {
@@ -1077,6 +1107,36 @@ impl CustodyExecutionRuntime {
         })
     }
 
+    /// Review-only repository fork after a durable purge. Generic creates and
+    /// continuations still require executable live custody.
+    pub async fn prepare_manager_review_fork_at(
+        &self,
+        source: &Session,
+        expected_commit: &str,
+    ) -> Result<SpawnForkCandidate> {
+        let reclaimed = self
+            .store
+            .lock()
+            .await
+            .manager_review_reclaimed_source(source)?;
+        let Some(reclaimed) = reclaimed else {
+            return self
+                .prepare_manager_action_fork_at(source, expected_commit)
+                .await;
+        };
+        let repository = reclaimed.repository.clone();
+        let commit = expected_commit.to_string();
+        tokio::task::spawn_blocking(move || reclaimed.verify(&commit))
+            .await
+            .map_err(|error| {
+                DaemonError::Store(format!("review repository proof failed: {error}"))
+            })??;
+        Ok(SpawnForkCandidate {
+            fork_origin: repository,
+            fork_commit: expected_commit.to_string(),
+        })
+    }
+
     /// Private filesystem proof for root-manager admission. Unlike an ordinary
     /// child fork, committed source selection does not require a clean tree.
     pub async fn prepare_manager_handoff(
@@ -1321,6 +1381,9 @@ pub enum RotationPredecessorSource {
     /// Restart recovery: restore reconciled the predecessor `Failed`
     /// (process died) while its latest rotation intent was still open.
     RecoveredOpenIntent,
+    /// #1176: the operator abandoned a blocked rotation; the `Failed` custody
+    /// holder is rotated forward to a fresh replacement.
+    BlockedHolder,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3789,7 +3852,30 @@ impl CustodyService {
         sandbox_base: &Path,
         remove: bool,
     ) -> Result<TargetReclaimOutcome> {
-        Self::terminal_target_outcome_with_store(
+        Self::reclaim_terminal_target_attempt_phased(
+            store,
+            pass,
+            active_owner,
+            custody_id,
+            expected_generation,
+            sandbox_base,
+            remove,
+        )
+        .map(|attempt| attempt.outcome)
+    }
+
+    /// [`Self::reclaim_terminal_target_outcome_phased`] plus the exact check
+    /// that refused the candidate, for the reclaim report (#1575).
+    pub fn reclaim_terminal_target_attempt_phased(
+        store: CustodyStore,
+        pass: Arc<crate::sandbox::target_reclaim::ReclaimPassState>,
+        active_owner: &dyn Fn() -> std::result::Result<bool, ReclaimSkipReason>,
+        custody_id: Uuid,
+        expected_generation: u64,
+        sandbox_base: &Path,
+        remove: bool,
+    ) -> Result<TerminalTargetAttempt> {
+        Self::terminal_target_attempt_with_store(
             &mut PhasedReclaimStore { store, pass },
             Some(active_owner),
             custody_id,
@@ -3824,21 +3910,60 @@ impl CustodyService {
         sandbox_base: &Path,
         remove: bool,
     ) -> Result<TargetReclaimOutcome> {
+        Self::terminal_target_attempt_with_store(
+            access,
+            active_owner,
+            custody_id,
+            expected_generation,
+            sandbox_base,
+            remove,
+        )
+        .map(|attempt| attempt.outcome)
+    }
+
+    /// Authenticate one terminal candidate and, when it is clean, reclaim (or
+    /// inspect) its `target/`. A refusal names the exact check that failed
+    /// (#1575): the report keeps it so no refusal is anonymous.
+    fn terminal_target_attempt_with_store(
+        access: &mut impl ReclaimStoreAccess,
+        active_owner: Option<&dyn Fn() -> std::result::Result<bool, ReclaimSkipReason>>,
+        custody_id: Uuid,
+        expected_generation: u64,
+        sandbox_base: &Path,
+        remove: bool,
+    ) -> Result<TerminalTargetAttempt> {
+        use ReclaimSkipReason as Skip;
+        let refuse = |reason: Skip, name: &'static str| {
+            Ok(TerminalTargetAttempt::refused(
+                reason,
+                SandboxReclaimCheck::new(name),
+            ))
+        };
         let target = match access.with_store(|store| {
             store.reclaim_terminal_target_locked(custody_id, expected_generation)
         }) {
             Some(Ok(Some(target))) => target,
             Some(Ok(None)) => {
-                return Ok(TargetReclaimOutcome::refused(
-                    ReclaimSkipReason::CustodyOrGenerationDrift,
-                ));
+                // The selection already excluded rows with a live consumer; one
+                // that arrived since is the likeliest reason the row is gone.
+                let consumer = access
+                    .with_store(|store| {
+                        store.target_reclaim_live_consumer(custody_id, expected_generation)
+                    })
+                    .and_then(|found| found.ok().flatten());
+                return Ok(match consumer {
+                    Some(kind) => TerminalTargetAttempt::refused(
+                        Skip::LiveConsumer,
+                        SandboxReclaimCheck::with_subject("live_consumer", kind),
+                    ),
+                    None => TerminalTargetAttempt::refused(
+                        Skip::CustodyOrGenerationDrift,
+                        SandboxReclaimCheck::new("custody_row_no_longer_reclaimable"),
+                    ),
+                });
             }
             Some(Err(error)) => return Err(error),
-            None => {
-                return Ok(TargetReclaimOutcome::refused(
-                    ReclaimSkipReason::DurationBudget,
-                ));
-            }
+            None => return refuse(Skip::DurationBudget, "duration_budget"),
         };
         // The database selection only establishes a generation/idle fence. It
         // is not filesystem authority: every identity fact is authenticated
@@ -3846,62 +3971,95 @@ impl CustodyService {
         if target.owner_session_id != target.session_id
             || target.validated_generation != expected_generation
         {
-            return Ok(TargetReclaimOutcome::refused(
-                ReclaimSkipReason::CustodyOrGenerationDrift,
-            ));
+            return refuse(
+                Skip::CustodyOrGenerationDrift,
+                "custody_owner_or_generation_drift",
+            );
         }
-        let pinned =
-            match PinnedSandboxRoot::open(sandbox_base, &target.sandbox_root, target.allocation_id)
-            {
-                Ok(pinned) => pinned,
-                Err(reason) => return Ok(TargetReclaimOutcome::refused(reason)),
-            };
+        let pinned = match PinnedSandboxRoot::open_checked(
+            sandbox_base,
+            &target.sandbox_root,
+            target.allocation_id,
+        ) {
+            Ok(pinned) => pinned,
+            Err((reason, check)) => return Ok(TerminalTargetAttempt::refused(reason, check)),
+        };
         let root = pinned.root_path();
         let canonical = match std::fs::canonicalize(&target.canonical_repo_dir) {
             Ok(canonical) => canonical,
-            Err(_) => {
-                return Ok(TargetReclaimOutcome::refused(
-                    ReclaimSkipReason::GitOrRootIdentityRefusal,
-                ));
-            }
+            Err(_) => return refuse(Skip::GitOrRootIdentityRefusal, "repo_dir_unresolvable"),
         };
         if !git_output(&root, ["rev-parse", "--show-toplevel"])
             .is_some_and(|top| PathBuf::from(top) == root)
-            || git_output(&root, ["branch", "--show-current"]).as_deref()
-                != Some(target.sandbox_branch.as_str())
-            || !git_is_ancestor(&root, &target.source_commit)
         {
-            return Ok(TargetReclaimOutcome::refused(
-                ReclaimSkipReason::GitOrRootIdentityRefusal,
-            ));
+            return refuse(Skip::GitOrRootIdentityRefusal, "git_toplevel_mismatch");
+        }
+        if git_output(&root, ["branch", "--show-current"]).as_deref()
+            != Some(target.sandbox_branch.as_str())
+        {
+            return refuse(Skip::GitOrRootIdentityRefusal, "git_branch_mismatch");
+        }
+        if !git_is_ancestor(&root, &target.source_commit) {
+            return refuse(Skip::GitOrRootIdentityRefusal, "source_commit_not_ancestor");
         }
         let Some(common_dir) = git_output(
             &root,
             ["rev-parse", "--path-format=absolute", "--git-common-dir"],
         ) else {
-            return Ok(TargetReclaimOutcome::refused(
-                ReclaimSkipReason::GitOrRootIdentityRefusal,
-            ));
+            return refuse(Skip::GitOrRootIdentityRefusal, "git_common_dir_unavailable");
         };
         if std::fs::canonicalize(common_dir)
             .ok()
             .map(|path| path.to_string_lossy().to_string())
             != Some(target.repository_identity)
         {
-            return Ok(TargetReclaimOutcome::refused(
-                ReclaimSkipReason::GitOrRootIdentityRefusal,
-            ));
+            return refuse(Skip::GitOrRootIdentityRefusal, "git_common_dir_mismatch");
         }
         let Some(registered) = git_output(&canonical, ["worktree", "list", "--porcelain"]) else {
-            return Ok(TargetReclaimOutcome::refused(
-                ReclaimSkipReason::GitOrRootIdentityRefusal,
-            ));
+            return refuse(Skip::GitOrRootIdentityRefusal, "worktree_list_unavailable");
         };
         if !has_matching_worktree_stanza(&registered, &root, &target.sandbox_branch) {
-            return Ok(TargetReclaimOutcome::refused(
-                ReclaimSkipReason::GitOrRootIdentityRefusal,
-            ));
+            return refuse(Skip::GitOrRootIdentityRefusal, "worktree_not_registered");
         }
+        if let Err((reason, check)) = pinned.ensure_idle_cargo_target_checked() {
+            return Ok(TerminalTargetAttempt::refused(reason, check));
+        }
+        // Preview and deletion must agree about in-memory consumers, even
+        // when the persisted owner is already terminal. Keep the later check
+        // under the preparation fence too: a consumer can arrive meanwhile.
+        if let Some(active_owner) = active_owner {
+            match active_owner() {
+                Ok(false) => {}
+                Ok(true) => return refuse(Skip::ActiveOwner, "in_memory_active_owner"),
+                Err(reason) => return refuse(reason, reason.as_str()),
+            }
+        }
+        Self::terminal_target_effect_with_store(
+            access,
+            active_owner,
+            custody_id,
+            expected_generation,
+            target.allocation_id,
+            sandbox_base,
+            &pinned,
+            remove,
+        )
+        .map(TerminalTargetAttempt::from)
+    }
+
+    /// The effect half of a candidate attempt: the root and the target tree
+    /// are already authenticated and idle.
+    #[allow(clippy::too_many_arguments)]
+    fn terminal_target_effect_with_store(
+        access: &mut impl ReclaimStoreAccess,
+        active_owner: Option<&dyn Fn() -> std::result::Result<bool, ReclaimSkipReason>>,
+        custody_id: Uuid,
+        expected_generation: u64,
+        allocation_id: Uuid,
+        sandbox_base: &Path,
+        pinned: &PinnedSandboxRoot,
+        remove: bool,
+    ) -> Result<TargetReclaimOutcome> {
         if !remove {
             return Ok(pinned.inspect_target());
         }
@@ -3983,7 +4141,7 @@ impl CustodyService {
                 );
                 if event.custody_id != custody_id
                     || event.generation != expected_generation
-                    || event.allocation_id != target.allocation_id
+                    || event.allocation_id != allocation_id
                     || event.expected_device != store_device
                     || event.expected_inode != identity.inode
                 {
@@ -4035,6 +4193,15 @@ impl CustodyService {
             .0,
             expected_inode: intent.expected_inode,
         };
+        // Detached processes can outlive a terminal provider turn. Check again
+        // at the effect boundary; the durable Prepared fence prevents an RSI
+        // continuation from entering between preparation and publication.
+        if let Err(reason) = pinned.ensure_idle_cargo_target() {
+            access.with_store(|store| {
+                store.abandon_target_reclaim_intent(&intent, "live_consumer_or_non_cache")
+            });
+            return Ok(TargetReclaimOutcome::refused(reason));
+        }
         let staged_outcome = pinned.stage_registered_target(&filesystem_intent);
         if staged_outcome.kind == TargetReclaimKind::Refused || staged_outcome.reason.is_some() {
             return Ok(staged_outcome);

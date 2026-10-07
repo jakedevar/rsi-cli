@@ -353,6 +353,7 @@ mod tests {
             worker_slice_memory_pressure: None,
             process_memory: report(),
             provider_credentials: None,
+            supervisor_mode: None,
         })
         .expect("serialize health");
         assert!(value["process_memory"]["rss_bytes"].as_u64().is_some());

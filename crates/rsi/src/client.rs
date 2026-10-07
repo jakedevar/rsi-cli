@@ -130,6 +130,85 @@ pub enum OperatorPauseLevel {
     Hard,
 }
 
+/// Operator pause read model from `GetOperatorPause` (#1541). Older daemons
+/// return only `pause_level`; the other fields default.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OperatorPauseInfo {
+    pub pause_level: OperatorPauseLevel,
+    /// RFC3339 time the marker was last written.
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub set_by: Option<String>,
+    /// A manager succession is queued behind this pause.
+    #[serde(default)]
+    pub held_succession: bool,
+}
+
+impl OperatorPauseInfo {
+    pub fn level_only(level: OperatorPauseLevel) -> Self {
+        Self {
+            pause_level: level,
+            since: None,
+            set_by: None,
+            held_succession: false,
+        }
+    }
+
+    /// Compact seat label: `HARD 7d` / `SOFT 2h`, plus ` HELD` while a
+    /// succession waits. Empty when there is no pause.
+    pub fn seat_label(&self, now: chrono::DateTime<chrono::Utc>) -> String {
+        let level = match self.pause_level {
+            OperatorPauseLevel::None => return String::new(),
+            OperatorPauseLevel::Soft => "SOFT",
+            OperatorPauseLevel::Hard => "HARD",
+        };
+        let mut label = level.to_string();
+        if let Some(age) = self.age_label(now) {
+            label.push(' ');
+            label.push_str(&age);
+        }
+        if self.held_succession {
+            label.push_str(" HELD");
+        }
+        label
+    }
+
+    /// `7d`, `3h`, `12m`, `5s` since the marker was written.
+    pub fn age_label(&self, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+        let since = chrono::DateTime::parse_from_rfc3339(self.since.as_deref()?).ok()?;
+        let secs = (now - since.with_timezone(&chrono::Utc))
+            .num_seconds()
+            .max(0);
+        Some(match secs {
+            s if s >= 86_400 => format!("{}d", s / 86_400),
+            s if s >= 3_600 => format!("{}h", s / 3_600),
+            s if s >= 60 => format!("{}m", s / 60),
+            s => format!("{s}s"),
+        })
+    }
+
+    /// Sentence for the clear confirmation.
+    pub fn describe(&self, now: chrono::DateTime<chrono::Utc>) -> String {
+        let level = match self.pause_level {
+            OperatorPauseLevel::None => "no",
+            OperatorPauseLevel::Soft => "SOFT",
+            OperatorPauseLevel::Hard => "HARD",
+        };
+        let mut text = format!("{level} operator pause");
+        if let Some(by) = &self.set_by {
+            text.push_str(&format!(" set by {by}"));
+        }
+        if let Some(age) = self.age_label(now) {
+            text.push_str(&format!(" {age} ago"));
+        }
+        if self.held_succession {
+            text.push_str("; a manager succession is held behind it");
+        }
+        text
+    }
+}
+
 impl ClientError {
     pub fn reclaim_prepared_retry_ms(&self) -> Option<u64> {
         let Self::Rpc {
@@ -415,6 +494,45 @@ fn recursive_artifact_summary_list_params(
 }
 
 impl DaemonClient {
+    /// Operator-only (#1406): write a clean bundle of this install's durable
+    /// state (no history, no secrets) to the absolute `path`.
+    ///
+    /// # Errors
+    ///
+    /// Connection failures and the daemon's refusal.
+    pub async fn export_portable_bundle(&mut self, path: &str, overwrite: bool) -> Result<Value> {
+        self.request(
+            "ExportPortableBundle",
+            serde_json::json!({ "path": path, "overwrite": overwrite }),
+        )
+        .await
+    }
+
+    /// Operator-only (#1406): import a bundle into this daemon's database.
+    /// `path_remaps` is a list of `{from, to}` project path prefixes.
+    ///
+    /// # Errors
+    ///
+    /// Connection failures and the daemon's refusal.
+    pub async fn import_portable_bundle(
+        &mut self,
+        path: &str,
+        merge: bool,
+        path_remaps: Value,
+        dry_run: bool,
+    ) -> Result<Value> {
+        self.request(
+            "ImportPortableBundle",
+            serde_json::json!({
+                "path": path,
+                "merge": merge,
+                "path_remaps": path_remaps,
+                "dry_run": dry_run,
+            }),
+        )
+        .await
+    }
+
     /// Operator-only RSI Remote status (#1096).
     pub async fn remote_get_status(
         &mut self,
@@ -884,12 +1002,57 @@ impl DaemonClient {
             .await?;
         Ok(serde_json::from_value(result)?)
     }
+    /// #1213: operator-only global manager workspace snapshot.
+    pub async fn get_fleet_overview(&mut self) -> Result<rsi_common::fleet::FleetOverview> {
+        let value = self
+            .request("GetFleetOverview", serde_json::json!({}))
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    pub async fn get_global_manager_workspace(
+        &mut self,
+    ) -> Result<rsi_common::global_manager::GlobalManagerWorkspaceV1> {
+        let result = self
+            .request("GetGlobalManagerWorkspace", serde_json::json!({}))
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    /// #1240: operator-only snapshot of any manager node.
+    pub async fn get_manager_node_workspace(
+        &mut self,
+        node: rsi_common::manager_tier_routing::ManagerNodeRefV1,
+    ) -> Result<rsi_common::manager_node_workspace::ManagerNodeWorkspaceV1> {
+        let result = self
+            .request(
+                "GetManagerNodeWorkspace",
+                serde_json::to_value(
+                    rsi_common::manager_node_workspace::GetManagerNodeWorkspaceRequestV1 { node },
+                )?,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
     pub async fn configure_global_manager(
         &mut self,
         request: rsi_common::global_manager::ConfigureGlobalManagerRequestV1,
     ) -> Result<rsi_common::global_manager::GlobalManagerGrantV1> {
+        self.configure_global_manager_confirmed(request, false)
+            .await
+    }
+    pub async fn configure_global_manager_confirmed(
+        &mut self,
+        request: rsi_common::global_manager::ConfigureGlobalManagerRequestV1,
+        confirm_cap_reductions: bool,
+    ) -> Result<rsi_common::global_manager::GlobalManagerGrantV1> {
         let result = self
-            .request("ConfigureGlobalManager", serde_json::to_value(request)?)
+            .request(
+                "ConfigureGlobalManager",
+                serde_json::to_value(rsi_common::portfolio_nodes::PortfolioCapConfirmation {
+                    request,
+                    confirm_cap_reductions,
+                })?,
+            )
             .await?;
         Ok(serde_json::from_value(result)?)
     }
@@ -899,6 +1062,123 @@ impl DaemonClient {
     ) -> Result<rsi_common::global_manager::GlobalManagerGrantV1> {
         let result = self
             .request("RevokeGlobalManager", serde_json::to_value(request)?)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    /// #1236: operator-only portfolio node list.
+    pub async fn list_portfolio_nodes(
+        &mut self,
+        include_revoked: bool,
+    ) -> Result<Vec<rsi_common::portfolio_nodes::PortfolioNodeV1>> {
+        let result = self
+            .request(
+                "ListPortfolioNodes",
+                serde_json::to_value(rsi_common::portfolio_nodes::ListPortfolioNodesRequestV1 {
+                    include_revoked,
+                })?,
+            )
+            .await?;
+        let list: rsi_common::portfolio_nodes::ListPortfolioNodesResultV1 =
+            serde_json::from_value(result)?;
+        Ok(list.nodes)
+    }
+    pub async fn get_portfolio_node(
+        &mut self,
+        node_id: uuid::Uuid,
+    ) -> Result<Option<rsi_common::portfolio_nodes::PortfolioNodeV1>> {
+        let result = self
+            .request(
+                "GetPortfolioNode",
+                serde_json::to_value(rsi_common::portfolio_nodes::GetPortfolioNodeRequestV1 {
+                    node_id,
+                })?,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    pub async fn configure_portfolio_node(
+        &mut self,
+        request: rsi_common::portfolio_nodes::ConfigurePortfolioNodeRequestV1,
+    ) -> Result<rsi_common::portfolio_nodes::PortfolioNodeV1> {
+        self.configure_portfolio_node_confirmed(request, false)
+            .await
+    }
+    pub async fn configure_portfolio_node_confirmed(
+        &mut self,
+        request: rsi_common::portfolio_nodes::ConfigurePortfolioNodeRequestV1,
+        confirm_cap_reductions: bool,
+    ) -> Result<rsi_common::portfolio_nodes::PortfolioNodeV1> {
+        let result = self
+            .request(
+                "ConfigurePortfolioNode",
+                serde_json::to_value(rsi_common::portfolio_nodes::PortfolioCapConfirmation {
+                    request,
+                    confirm_cap_reductions,
+                })?,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    pub async fn revoke_portfolio_node(
+        &mut self,
+        request: rsi_common::portfolio_nodes::RevokePortfolioNodeRequestV1,
+    ) -> Result<rsi_common::portfolio_nodes::PortfolioNodeV1> {
+        let result = self
+            .request("RevokePortfolioNode", serde_json::to_value(request)?)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    /// #1333: operator-only friction rollup (the andon).
+    pub async fn list_friction_rollup(
+        &mut self,
+        request: rsi_common::friction::ListFrictionRollupRequestV1,
+    ) -> Result<rsi_common::friction::ListFrictionRollupResultV1> {
+        let result = self
+            .request("ListFrictionRollup", serde_json::to_value(request)?)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    /// #1238: operator-only escalation queue and top-of-chain notices.
+    pub async fn list_operator_escalations(
+        &mut self,
+        include_closed: bool,
+        undelivered_after: Option<String>,
+    ) -> Result<rsi_common::manager_tier_routing::ListOperatorEscalationsResultV1> {
+        let result = self
+            .request(
+                "ListOperatorEscalations",
+                serde_json::to_value(
+                    rsi_common::manager_tier_routing::ListOperatorEscalationsRequestV1 {
+                        include_closed,
+                        undelivered_after,
+                    },
+                )?,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    pub async fn rule_operator_escalation(
+        &mut self,
+        request: rsi_common::manager_tier_routing::RuleOperatorEscalationRequestV1,
+    ) -> Result<rsi_common::manager_tier_routing::ManagerTierEscalationHopV1> {
+        let result = self
+            .request("RuleOperatorEscalation", serde_json::to_value(request)?)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    pub async fn acknowledge_operator_notice(
+        &mut self,
+        message_id: uuid::Uuid,
+    ) -> Result<rsi_common::manager_tier_routing::OperatorNoticeV1> {
+        let result = self
+            .request(
+                "AcknowledgeOperatorNotice",
+                serde_json::to_value(
+                    rsi_common::manager_tier_routing::AcknowledgeOperatorNoticeRequestV1 {
+                        message_id,
+                    },
+                )?,
+            )
             .await?;
         Ok(serde_json::from_value(result)?)
     }
@@ -913,6 +1193,30 @@ impl DaemonClient {
             )
             .await?;
         Ok(result)
+    }
+
+    /// Operator-only (#1415): pending decision records that are stale.
+    pub async fn list_stale_manager_decisions(
+        &mut self,
+        request: rsi_common::harness_manager_v2::ListStaleManagerDecisionsRequestV2,
+    ) -> Result<rsi_common::harness_manager_v2::ListStaleManagerDecisionsResponseV2> {
+        let result = self
+            .request("ListStaleManagerDecisions", serde_json::to_value(request)?)
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+    /// Operator-only (#1415): archive (never delete) stale decision records.
+    pub async fn archive_stale_manager_decisions(
+        &mut self,
+        request: rsi_common::harness_manager_v2::ArchiveStaleManagerDecisionsRequestV2,
+    ) -> Result<rsi_common::harness_manager_v2::ArchiveStaleManagerDecisionsResponseV2> {
+        let result = self
+            .request(
+                "ArchiveStaleManagerDecisions",
+                serde_json::to_value(request)?,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
     }
 
     /// Launch a new session (fire-and-forget).
@@ -1216,13 +1520,21 @@ impl DaemonClient {
         &mut self,
         session_id: uuid::Uuid,
     ) -> Result<OperatorPauseLevel> {
+        Ok(self.get_operator_pause_info(session_id).await?.pause_level)
+    }
+
+    /// Read one operator pause marker with its age, setter and held succession.
+    pub async fn get_operator_pause_info(
+        &mut self,
+        session_id: uuid::Uuid,
+    ) -> Result<OperatorPauseInfo> {
         let response = self
             .request(
                 "GetOperatorPause",
                 serde_json::json!({ "session_id": session_id }),
             )
             .await?;
-        Ok(serde_json::from_value(response["pause_level"].clone())?)
+        Ok(serde_json::from_value(response)?)
     }
 
     /// Downgrade or clear a persisted operator pause marker.
@@ -1466,6 +1778,17 @@ impl DaemonClient {
         .await
     }
 
+    /// #1176 operator-only: abandon a blocked rotation to a fresh replacement.
+    pub async fn abandon_blocked_rotation(
+        &mut self,
+        params: rsi_common::rpc::AbandonBlockedRotationParams,
+    ) -> Result<rsi_common::rpc::AbandonBlockedRotationResult> {
+        Ok(serde_json::from_value(
+            self.request("AbandonBlockedRotation", serde_json::to_value(params)?)
+                .await?,
+        )?)
+    }
+
     /// List archived sessions, optionally filtered by project.
     pub async fn list_archived_sessions(
         &mut self,
@@ -1564,6 +1887,44 @@ impl DaemonClient {
             "session_id": session_id, "content": content, "idempotency_key": idempotency_key.to_string(),
         })).await?;
         Ok(serde_json::from_value(response)?)
+    }
+
+    /// Fetch what the session-detail model/effort picker needs: the current
+    /// tuple, the invocation fence, the allowlist and any queued switch.
+    pub async fn get_session_model_switch_options(
+        &mut self,
+        session_id: uuid::Uuid,
+    ) -> Result<rsi_common::rpc::SessionModelSwitchOptions> {
+        let response = self
+            .request(
+                "GetSessionModelSwitchOptions",
+                serde_json::json!({"session_id": session_id}),
+            )
+            .await?;
+        Ok(serde_json::from_value(response)?)
+    }
+
+    /// Queue a model/effort switch for the session's next turn. `new_effort`
+    /// of `None` selects the model's own default effort.
+    pub async fn queue_session_model_update(
+        &mut self,
+        session_id: uuid::Uuid,
+        expected_model_invocation_id: uuid::Uuid,
+        new_model: &str,
+        new_effort: Option<&str>,
+        idempotency_key: uuid::Uuid,
+    ) -> Result<Value> {
+        self.request(
+            "QueueSessionModelUpdate",
+            serde_json::json!({
+                "session_id": session_id,
+                "expected_model_invocation_id": expected_model_invocation_id,
+                "new_model": new_model,
+                "new_effort": new_effort,
+                "idempotency_key": idempotency_key.to_string(),
+            }),
+        )
+        .await
     }
 
     pub async fn list_operator_messages(
@@ -1948,6 +2309,27 @@ impl DaemonClient {
                 serde_json::to_value(
                     rsi_common::provider_credentials::ProviderCredentialSlotParams { slot },
                 )?,
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `VerifyBedrockSetup` (#1407, operator-only): one live Bedrock call with
+    /// the configured region and vault credential; the result is secret-free.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport or daemon RPC error (secret-free).
+    pub async fn verify_bedrock_setup(
+        &mut self,
+        model: Option<String>,
+    ) -> Result<rsi_common::provider_profile::BedrockSetupCheck> {
+        let result = self
+            .request(
+                rsi_common::provider_profile::METHOD_VERIFY_BEDROCK_SETUP,
+                serde_json::to_value(rsi_common::provider_profile::VerifyBedrockSetupParams {
+                    model,
+                })?,
             )
             .await?;
         Ok(serde_json::from_value(result)?)
@@ -3635,6 +4017,41 @@ mod tests {
         std::fs::remove_file(socket_path).unwrap();
     }
 
+    #[test]
+    fn operator_pause_info_labels_age_level_and_held_succession() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-07T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let info: OperatorPauseInfo = serde_json::from_value(serde_json::json!({
+            "session_id": uuid::Uuid::new_v4(),
+            "pause_level": "hard",
+            "since": "2026-09-30T12:00:00.000000000Z",
+            "set_by": "operator",
+            "held_succession": true,
+        }))
+        .unwrap();
+        assert_eq!(info.seat_label(now), "HARD 7d HELD");
+        assert_eq!(
+            info.describe(now),
+            "HARD operator pause set by operator 7d ago; a manager succession is held behind it"
+        );
+        let soft = OperatorPauseInfo {
+            pause_level: OperatorPauseLevel::Soft,
+            since: Some("2026-10-07T09:30:00Z".into()),
+            set_by: Some("operator".into()),
+            held_succession: false,
+        };
+        assert_eq!(soft.seat_label(now), "SOFT 2h");
+        // An older daemon sends only the level.
+        let legacy: OperatorPauseInfo =
+            serde_json::from_value(serde_json::json!({"pause_level": "soft"})).unwrap();
+        assert_eq!(legacy.seat_label(now), "SOFT");
+        assert_eq!(
+            OperatorPauseInfo::level_only(OperatorPauseLevel::None).seat_label(now),
+            ""
+        );
+    }
+
     #[tokio::test]
     async fn operator_pause_rpcs_send_strength_and_decode_readback() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -3997,6 +4414,8 @@ mod tests {
             },
             recovery_sweep: SandboxTargetRecoverySweepV2::default(),
             pass_contention: None,
+            refusals: Vec::new(),
+            shared_target: None,
         };
         let decoded = decode_sandbox_storage_report(serde_json::to_value(v2).unwrap()).unwrap();
         assert!(matches!(decoded, SandboxBuildCacheReclaimReportWire::V2(_)));

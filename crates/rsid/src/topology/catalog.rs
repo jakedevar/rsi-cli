@@ -25,7 +25,6 @@ use uuid::Uuid;
 use crate::error::{DaemonError, Result};
 use crate::process_control::{
     CaptureLimits, OverflowBehavior, ProcessContainment, capture_bounded_with_spawn,
-    terminate_process_group,
 };
 
 /// The daemon-derived effect class of every v1 catalog op.
@@ -275,11 +274,110 @@ pub(crate) async fn run(
     outcome
 }
 
-/// Kill a group left behind by an earlier daemon incarnation (plan §2.4).
-pub(crate) fn kill_group(pgid: i32) {
-    if pgid > 1 {
-        terminate_process_group(nix::unistd::Pid::from_raw(pgid));
+/// What [`kill_group`] found for a recorded process group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StaleGroup {
+    /// No live process is in the group: nothing to kill.
+    Empty,
+    /// Every live member runs inside the attempt's sandbox: it is still the
+    /// catalog op's group, and it was killed.
+    Owned { members: usize },
+    /// A member runs outside the sandbox (or could not be read): the number
+    /// was reused by an unrelated group, which is left alone (#1227).
+    Foreign { pid: i32, cwd: Option<PathBuf> },
+    /// No sandbox root was recorded, or the platform has no `/proc` to prove
+    /// the group's identity with: nothing is signalled.
+    Unproven,
+}
+
+/// Kill a group left behind by an earlier daemon incarnation (plan §2.4),
+/// only once it is proven to still be that op's group (#1227).
+///
+/// The id is a number persisted before a daemon restart. By now the op may
+/// have exited and the kernel may have handed the number to any new process
+/// group, such as another agent's `systemd-run` test unit, whose main process
+/// leads its own group. So the group is signalled only when every live member
+/// is still running inside the attempt's sandbox (catalog ops run there).
+pub(crate) fn kill_group(pgid: i32, sandbox: Option<&Path>) -> StaleGroup {
+    if pgid <= 1 {
+        return StaleGroup::Empty;
     }
+    let found = match sandbox {
+        Some(sandbox) => stale_group_identity(Path::new("/proc"), pgid, sandbox),
+        None => StaleGroup::Unproven,
+    };
+    match &found {
+        StaleGroup::Owned { .. } => crate::process_control::terminate_process_group_because(
+            nix::unistd::Pid::from_raw(pgid),
+            "topology catalog op group left by an earlier daemon incarnation",
+        ),
+        StaleGroup::Foreign { pid, cwd } => tracing::warn!(
+            target: "rsid::signal",
+            pgid,
+            pid,
+            cwd = ?cwd,
+            sandbox = ?sandbox,
+            unit = crate::process_control::SignalTarget::describe(*pid).unit.as_deref().unwrap_or("-"),
+            "stale catalog op group id now belongs to a process outside the sandbox; not signalled"
+        ),
+        StaleGroup::Unproven => tracing::warn!(
+            target: "rsid::signal",
+            pgid,
+            sandbox = ?sandbox,
+            "stale catalog op group cannot be proven to be the op's own; not signalled"
+        ),
+        StaleGroup::Empty => {}
+    }
+    found
+}
+
+/// Classify the live members of process group `pgid` under `proc_root`
+/// against `sandbox` (Linux `/proc` layout).
+#[cfg(target_os = "linux")]
+pub(crate) fn stale_group_identity(proc_root: &Path, pgid: i32, sandbox: &Path) -> StaleGroup {
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return StaleGroup::Unproven;
+    };
+    let sandbox = std::fs::canonicalize(sandbox).unwrap_or_else(|_| sandbox.to_path_buf());
+    let mut members = 0;
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue; // exited during the scan
+        };
+        if proc_stat_process_group(&stat) != Some(pgid) {
+            continue;
+        }
+        let cwd = std::fs::read_link(entry.path().join("cwd")).ok();
+        match &cwd {
+            Some(cwd) if cwd.starts_with(&sandbox) => members += 1,
+            _ => return StaleGroup::Foreign { pid, cwd },
+        }
+    }
+    if members == 0 {
+        StaleGroup::Empty
+    } else {
+        StaleGroup::Owned { members }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn stale_group_identity(_proc_root: &Path, _pgid: i32, _sandbox: &Path) -> StaleGroup {
+    StaleGroup::Unproven
+}
+
+/// The process group id (field 5) of a `/proc/<pid>/stat` line. The command
+/// name may hold spaces and parentheses, so fields are read after its last `)`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn proc_stat_process_group(stat: &str) -> Option<i32> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_whitespace().nth(2)?.parse().ok()
 }
 
 /// Plan §3.2 postcondition: HEAD is `pre_head` and the tree is clean,
@@ -572,5 +670,110 @@ mod tests {
         assert_eq!(outcome.output(&op)["op"], "cargo_check_crate");
         runner.forget(attempt);
         assert!(runner.poll(attempt).is_none());
+    }
+
+    /// A `sleep` in its own process group with `cwd` as its working directory.
+    #[cfg(target_os = "linux")]
+    fn group_leader_in(cwd: &Path) -> (std::process::Child, i32) {
+        use std::os::unix::process::CommandExt;
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(cwd)
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep");
+        let pgid = i32::try_from(child.id()).expect("pid fits");
+        // Until it execs, the forked child may still sit in the parent's cwd.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while crate::process_control::SignalTarget::describe(pgid)
+            .comm
+            .as_deref()
+            != Some("sleep")
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (child, pgid)
+    }
+
+    /// #1227: a stale group id still held by the op (running in its sandbox)
+    /// is killed.
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn stale_group_inside_the_sandbox_is_killed() {
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let (mut child, pgid) = group_leader_in(sandbox.path());
+        assert_eq!(
+            kill_group(pgid, Some(sandbox.path())),
+            StaleGroup::Owned { members: 1 }
+        );
+        let status = child.wait().expect("reap");
+        assert!(!status.success(), "the op group was killed: {status:?}");
+    }
+
+    /// #1227: a stale group id the kernel has handed to an unrelated group
+    /// (here: a process running outside the sandbox, like another agent's
+    /// test unit) is left alone.
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn stale_group_id_reused_outside_the_sandbox_is_not_signalled() {
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let (mut child, pgid) = group_leader_in(elsewhere.path());
+        let found = kill_group(pgid, Some(sandbox.path()));
+        assert!(
+            matches!(found, StaleGroup::Foreign { pid, .. } if pid == pgid),
+            "{found:?}"
+        );
+        assert!(
+            child.try_wait().expect("poll").is_none(),
+            "the unrelated group is still running"
+        );
+        let unproven = kill_group(pgid, None);
+        assert_eq!(unproven, StaleGroup::Unproven);
+        assert!(child.try_wait().expect("poll").is_none());
+        child.kill().expect("kill stand-in");
+        child.wait().expect("reap");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn stale_group_identity_reads_group_and_cwd_from_proc() {
+        let proc_root = tempfile::TempDir::new().unwrap();
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let process = |pid: i32, pgid: i32, cwd: &Path| {
+            let dir = proc_root.path().join(pid.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            // A command name with spaces and a `)` must not shift the fields.
+            std::fs::write(
+                dir.join("stat"),
+                format!("{pid} (odd) name) S 1 {pgid} {pgid} 0 -1 4194560"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(cwd, dir.join("cwd")).unwrap();
+        };
+        process(4100, 4100, &sandbox.path().join("crates"));
+        process(4101, 4100, sandbox.path());
+        process(4200, 4200, elsewhere.path());
+        std::fs::create_dir_all(proc_root.path().join("self")).unwrap();
+        assert_eq!(
+            stale_group_identity(proc_root.path(), 4100, sandbox.path()),
+            StaleGroup::Owned { members: 2 }
+        );
+        assert_eq!(
+            stale_group_identity(proc_root.path(), 4200, sandbox.path()),
+            StaleGroup::Foreign {
+                pid: 4200,
+                cwd: Some(elsewhere.path().to_path_buf())
+            }
+        );
+        assert_eq!(
+            stale_group_identity(proc_root.path(), 4300, sandbox.path()),
+            StaleGroup::Empty
+        );
     }
 }

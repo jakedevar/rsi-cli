@@ -21,20 +21,80 @@ For the diff merge-base(base, head)..head it:
   * reports whether head merges cleanly into base and which migrations it adds;
   * suggests landing filters (rsid=shard:<shard>:test(<module>), rsi-common=,
     rsi=, plus the cross-cutting pins the worker contract names).
+    Module paths follow `mod` and `#[path]` mounts (and `include!`) from each crate
+    root, so a test file mounted under another module gets its real path; a
+    shard filter that no test of that shard satisfies is dropped and listed in the
+    receipt's `dropped_filters` with the reason (#1260, #1253). Migration rewind
+    helper-only edits select their callers and fixture guards, not all of
+    store::tests (#1341); when every added migration only adds columns or
+    indexes, only the migration-chain pins (#1618). No test is run.
+    The list is bounded and precise (#1440, #1418, #1438, #1263), so a worker can
+    run it inside its 10-minute test budget:
+      - a test module that mounts test submodules (`session::tests::manager_actions`
+        with `#[path] mod issue_worker;`) gets `test(/^<module>::[A-Za-z0-9_]+$/)`:
+        its own tests, not the `test(<module>)` prefix that spills into every
+        submodule. Receipt `narrowed_filters[].excludes` lists what is not selected:
+        add `test(<submodule>)` after editing a helper they share;
+      - a shard filter that would select more than BROAD_TEST_LIMIT (60) tests is
+        narrowed to the tests that mention the diff: the changed functions traced
+        through their callers (a word match in the body, transitively, never through
+        a function over 60 lines) to the tests that mention them; inside a large
+        function (a dispatch table) the rare identifiers of the changed lines;
+        named struct fields and explicit re-exports trace their rare identifiers
+        through consuming helpers too; a
+        `mod x;` registration selects x's tests. The filter is a named set,
+        `test(/^<module>::(?:\\w+::)*(?:a|b)$/)`, one per shard and module. A
+        complete trace that no test mentions yields no filter (`narrowed_filters`
+        tests 0: the shard compile is all that observes it). Named sets split at
+        256 characters; same-shard module coverage absorbs redundant filters.
+        When the aggregate exceeds 12 filters, smaller modules are traced too,
+        accepting only reductions in the merged list;
+      - the agent verb catalog pins (a change that adds AGENT_VERBS/READ_VERBS or
+        touches rpc/agent* or harness/tools) are the named tests of `rpc::` and
+        `session::harness::tools::` whose name says operator_only, catalog,
+        agent_verb, read_verb or agent_gate, or whose body names AGENT_VERBS or
+        READ_VERBS, never the whole `rpc::tests` or `harness::tools` modules;
+      - a diff confined to the functions a rule in scripts/test-coverage.json names
+        (the Store::open lifecycle hooks, #1585; the terminal-watch planner, #1593) selects that rule's named tests
+        instead of the module's. The shard compile still covers the source. The
+        receipt's `declared_coverage` lists each use; a change outside the named
+        functions, or an unresolvable rule, derives the module filters as usual;
+      - when the diff cannot be traced (a const, struct header, wildcard use, or
+        impl header), the trace names more than 24 tests or 150
+        functions, or an identifier is too common, the module filter is kept and
+        the receipt says so: `broad: true`, `broad_filters` (filter, test count,
+        reason), a `BROAD` token in the summary line and a stderr warning. A broad
+        filter may not finish in 10 minutes: run it in parts or ask for more time.
+        Uncertain coverage can retain more than 12 filters; none are truncated.
+      - `#[path]` and `include!` mounts (a `../` mount, a mount from a mounted
+        file) resolve to the module path the compiler gives their tests.
+      The filters are nextest atoms (`test(name)` substring, `test(=name)` exact,
+      `test(/regex/)`), which rsi-rolling-land and scripts/scoped-test accept.
+      Scope: the narrowing covers rsid and rsid-store shard filters; rsi, rsi-common
+      and the other crates keep `<package>=<module>`.
+  * when every shard compile fails with the same error it reports
+    `shards.shard_compile_suspect_stale` (a stale path-dependency artifact in a
+    reused target, #1260); CHECK_TOUCHED_SHARDS_CLEAN=1 opts in to a
+    `cargo clean -p` of the workspace packages first, only for a target under the repo.
   * with --run-filters, runs the suggested (and any --filter) rsid shard
     landing filters under a private tmpfs TMPDIR (/dev/shm, override with
     CHECK_TOUCHED_SHARDS_TMPDIR), as the merge-queue lander does (#1182).
 
-Output: one summary line, then the JSON receipt (--json: only JSON).
+Output: one summary line, then the JSON receipt (--json: only JSON). The receipt's
+`suggested_filters`, `dropped_filters`, `narrowed_filters`, `broad` and `broad_filters`
+describe the landing filters above.
 Exit 0 when every verdict is ok/skipped, 1 otherwise.
 """
 
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
+import posixpath
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -54,7 +114,29 @@ MIGRATION_FILE = re.compile(r"^" + re.escape(MIGRATIONS) + r"v(\d+)\.rs$")
 PRE_SPLIT_MIGRATION_FILE = re.compile(r"^" + re.escape(PRE_SPLIT_MIGRATIONS) + r"v(\d+)\.rs$")
 SQL_WORDS = re.compile(r"\b(SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|CREATE\s+(?:TABLE|INDEX)|ALTER\s+TABLE|DROP\s+(?:TABLE|INDEX))\b")
 SQL_OK = "sql-dynamic-ok"
-AGENT_VERB_PINS = ["rsid=shard:other-01:test(rpc::tests)", "rsid=shard:session-05:test(harness::tools)"]
+# #1440: a change that touches the agent verb catalog pins the catalog and
+# operator-only tests by name; it never pins whole modules (`rpc::tests` alone is
+# ~240 slow fixtures, more than a worker's 10-minute test budget).
+AGENT_VERB_PIN_MODULES = ("rpc::", "session::harness::tools::")
+AGENT_VERB_PIN_NAME = re.compile(r"operator_only|catalog|agent_verb|read_verb|agent_gate")
+AGENT_VERB_PIN_BODY = re.compile(r"\b(?:AGENT_VERBS|READ_VERBS)\b")
+AGENT_VERB_PIN_CAP = 80
+# #1418/#1438: a filter that selects more tests than a worker's 10-minute budget
+# can run is narrowed to the tests that observe the diff, or flagged `broad`.
+BROAD_TEST_LIMIT = 60
+GATE_FILTER_LIMIT = 12
+GATE_FILTER_LENGTH = 256
+NARROW_TEST_CAP = 24
+NARROW_FUNCTION_CAP = 150
+# A function this long (a dispatch table, a big match) is traced by the rare
+# identifiers on the changed lines, not by its own name, which every test reaches.
+LARGE_FUNCTION_LINES = 60
+RARE_TOKEN_FUNCTIONS = 10
+NOISE_WORDS = frozenset(
+    "self Self super crate pub let mut impl struct enum match return async await move true false None Some Ok Err "
+    "where trait type const static mod use while loop else for ref dyn Box Vec Option Result String str bool "
+    "u8 u16 u32 u64 usize i32 i64 f64 serde json into from with this that".split()
+)
 
 
 def run(args, cwd, check=False, env=None, timeout=None):
@@ -72,20 +154,658 @@ def git_out(repo, *args):
     return result.stdout
 
 
+CRATE_SRC = re.compile(r"^crates/([A-Za-z0-9_-]+)/src/(.+)\.rs$")
+
+
+def package_for(path: str) -> str | None:
+    """The package that owns a source path: its crate directory under crates/ (names match)."""
+    found = CRATE_SRC.match(path)
+    return found.group(1) if found else None
+
+
 def module_of(path: str) -> str | None:
     """crates/rsid/src/a/b.rs -> a::b ; a/mod.rs -> a ; lib.rs/main.rs -> None."""
-    for prefix in (*SHARDED_SRCS, "crates/rsi-common/src/", "crates/rsi/src/"):
-        if path.startswith(prefix) and path.endswith(".rs"):
-            parts = path[len(prefix):-3].split("/")
-            if parts[-1] == "mod":
-                parts.pop()
-            if parts and parts != ["lib"] and parts != ["main"]:
-                return "::".join(parts)
+    found = CRATE_SRC.match(path)
+    if found:
+        parts = found.group(2).split("/")
+        if parts[-1] == "mod":
+            parts.pop()
+        if parts and parts != ["lib"] and parts != ["main"]:
+            return "::".join(parts)
     return None
 
 
+MOD_DECL = re.compile(r"^([ \t]*)(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z_0-9]*)\s*(;|\{)")
+PATH_ATTR = re.compile(r'#\[\s*path\s*=\s*"([^"]+)"\s*\]')
+INCLUDE = re.compile(r'^\s*include!\(\s*"([^"]+)"\s*\)\s*;')
+ATTR_LINE = re.compile(r"^\s*#\[")
+MOD_ROOTS = ("lib.rs", "main.rs")
+
+
+def read_blobs(repo, head, paths):
+    """{path: text} for `paths` at `head` in one `git cat-file --batch` round trip."""
+    request = "".join(f"{head}:{p}\n" for p in paths)
+    result = subprocess.run(["git", "cat-file", "--batch"], cwd=repo, input=request.encode(), capture_output=True)
+    out, data, position = {}, result.stdout, 0
+    for path in paths:
+        end = data.find(b"\n", position)
+        if end < 0:
+            break
+        header = data[position:end].split()
+        position = end + 1
+        if len(header) == 3 and header[1] == b"blob":
+            size = int(header[2])
+            out[path] = data[position : position + size].decode("utf-8", "replace")
+            position += size + 1
+    return out
+
+
+def mod_declarations(text):
+    """[(name, path_attr or None, inline_stack)] for the `mod x;` lines of one source.
+
+    An `include!("x.rs");` line yields (None, "x.rs", inline_stack).
+
+    `inline_stack` is the chain of enclosing `mod y {` blocks (rustfmt indentation
+    pairs each block's closing brace with its opener).
+    """
+    found, stack, lines = [], [], text.split("\n")
+    for index, line in enumerate(lines):
+        indent = line[: len(line) - len(line.lstrip())]
+        if stack and line.startswith(stack[-1][0] + "}") and line.rstrip() in (stack[-1][0] + "}", stack[-1][0] + "};"):
+            stack.pop()
+            continue
+        include = INCLUDE.match(line)
+        if include:
+            # `include!("x.rs");` splices the file into the enclosing module.
+            found.append((None, include.group(1), [n for _, n in stack]))
+            continue
+        if "mod " not in line:
+            continue
+        # `#[path = "x.rs"] mod m;` on one line: peel the leading attributes.
+        rest, attr = line, None
+        while rest.lstrip().startswith("#[") and "]" in rest:
+            attr = PATH_ATTR.search(rest) or attr
+            rest = rest.split("]", 1)[1]
+        match = MOD_DECL.match(indent + rest.lstrip())
+        if not match:
+            continue
+        _, name, terminator = match.groups()
+        if terminator == "{":
+            stack.append((indent, name))
+            continue
+        back = index - 1
+        while attr is None and back >= 0 and ATTR_LINE.match(lines[back]):
+            attr = PATH_ATTR.search(lines[back])
+            back -= 1
+        found.append((name, attr.group(1) if attr else None, [n for _, n in stack]))
+    return found
+
+
+def module_map(files):
+    """{source path: crate-relative module path} by following `mod` and `#[path]` from each crate root.
+
+    The module path is what a test's name starts with, so a test mounted with
+    `#[path = "manager_issue_worker.rs"] mod issue_worker;` in `manager_actions.rs`
+    is `...::manager_actions::issue_worker`, not what its file name suggests.
+    """
+    mapped = {}
+    roots = sorted(p for p in files if re.fullmatch(r"crates/[^/]+/src/(?:lib|main)\.rs", p))
+    # One root per crate: lib.rs wins over main.rs (a bin target's modules are its own).
+    chosen = {}
+    for root in roots:
+        crate = root.rsplit("/", 1)[0]
+        if crate not in chosen or root.endswith("lib.rs"):
+            chosen[crate] = root
+    for root in chosen.values():
+        mapped.setdefault(root, "")
+        queue = [root]
+        while queue:
+            parent = queue.pop(0)
+            directory, _, base = parent.rpartition("/")
+            own = directory if base in ("mod.rs", *MOD_ROOTS) else f"{directory}/{base[:-3]}"
+            for name, attr, inline in mod_declarations(files[parent]):
+                if name is None:
+                    target = posixpath.normpath(posixpath.join(directory, attr))
+                    if target in files and target not in mapped:
+                        mapped[target] = "::".join(part for part in (mapped[parent], *inline) if part)
+                        queue.append(target)
+                    continue
+                if attr is not None:
+                    anchor = posixpath.join(directory if not inline else posixpath.join(own, *inline), attr)
+                    candidates = [posixpath.normpath(anchor)]
+                else:
+                    anchor = posixpath.join(own, *inline)
+                    candidates = [f"{anchor}/{name}.rs", f"{anchor}/{name}/mod.rs"]
+                target = next((c for c in candidates if c in files), None)
+                if target is None or target in mapped:
+                    continue
+                prefix = [part for part in (mapped[parent], *inline, name) if part]
+                mapped[target] = "::".join(prefix)
+                queue.append(target)
+    return mapped
+
+
+class SourceTree:
+    """The head tree's Rust sources, their real module paths and test shards."""
+
+    def __init__(self, repo, head, tree_files):
+        self.repo, self.head, self.tree_files = repo, head, tree_files
+        sources = [f for f in tree_files if f.endswith(".rs") and re.match(r"crates/[^/]+/src/", f)]
+        self.texts = read_blobs(repo, head, sources)
+        self.modules = module_map(self.texts)
+        self._test_files = None
+        self._shard_counts = None
+        self._functions = None
+        self._frequency = None
+
+    def text(self, path):
+        if path not in self.texts:
+            shown = git(self.repo, "show", f"{self.head}:{path}")
+            self.texts[path] = shown.stdout if shown.returncode == 0 else ""
+        return self.texts[path]
+
+    def module(self, path):
+        """Module path of a source: the mounted one, else the one its file name implies."""
+        return self.modules.get(path) or module_of(path)
+
+    def child_sources(self, path):
+        """The file, its module-directory children and every module mounted beneath it."""
+        found = child_sources(path, self.tree_files)
+        mounted = self.modules.get(path)
+        if mounted:
+            found += [f for f, m in self.modules.items() if m.startswith(mounted + "::") and f not in found]
+        return found
+
+    def has_tests(self, path):
+        return any(TEST_ATTR.search(self.text(source)) for source in self.child_sources(path))
+
+    def shards_for(self, path):
+        found = set()
+        for source in self.child_sources(path):
+            found |= shards_in(self.text(source))
+        return found
+
+    def filter_matches(self, shard, module):
+        """Whether `test(module)` selects a test of `shard`: some test-bearing library
+        source gated for the shard has `module` in its module path (nextest's `test()`
+        is a substring match on `module::path::fn`)."""
+        if self._test_files is None:
+            self._test_files = [
+                (self.module(f), test_shards(t), [name for name, _, _, attrs, _ in rust_functions(t) if TEST_ATTR.search(attrs)])
+                for f, t in self.texts.items()
+                if lib_source(f) and TEST_ATTR.search(t)
+            ]
+        return any(shard in shards and (module in mod or any(module in f"{mod}::{name}" for name in names))
+                   for mod, shards, names in self._test_files if mod)
+
+
+    def shard_test_counts(self):
+        """[(module, {shard: tests})] of the sharded library sources (a cheap scan, no parsing)."""
+        if self._shard_counts is None:
+            self._shard_counts = []
+            for path, text in self.texts.items():
+                if not lib_source(path) or not TEST_ATTR.search(text):
+                    continue
+                module, counts, lines = self.module(path), {}, text.split("\n")
+                for index in range(1, len(lines)):
+                    gate = TEST_GATE.match(lines[index - 1])
+                    if gate and TEST_ATTR.match(lines[index].lstrip()):
+                        counts[gate.group(1)] = counts.get(gate.group(1), 0) + 1
+                if module and counts:
+                    self._shard_counts.append((module, counts))
+        return self._shard_counts
+
+    def tests_selected(self, shard, module):
+        """How many tests of `shard` the nextest filter `test(module)` selects (substring match)."""
+        return sum(counts.get(shard, 0) for mod, counts in self.shard_test_counts() if module in mod)
+
+    def direct_tests(self, shard, module):
+        """Tests of `shard` declared directly in `module`, not in a module mounted beneath it."""
+        return sum(counts.get(shard, 0) for mod, counts in self.shard_test_counts() if mod == module)
+
+    def test_children(self, module):
+        """Modules mounted beneath `module` whose sources hold sharded tests."""
+        return sorted(mod for mod, _ in self.shard_test_counts() if mod.startswith(module + "::"))
+
+    def functions(self):
+        """Every function of the sharded library sources: (name, module, is_test, shards, words, lines)."""
+        if self._functions is None:
+            self._functions = []
+            for path, text in self.texts.items():
+                module = self.module(path) if lib_source(path) else None
+                if not module:
+                    continue
+                for name, start, end, attrs, body in rust_functions(text):
+                    self._functions.append((name, module, bool(TEST_ATTR.search(attrs)), shards_in(attrs),
+                                            set(WORD.findall(body)) - {name}, end - start))
+        return self._functions
+
+    def token_frequency(self):
+        """{identifier: how many functions mention it}, to tell a rare identifier from a common one."""
+        if self._frequency is None:
+            self._frequency = {}
+            for *_, words, _ in self.functions():
+                for word in words:
+                    self._frequency[word] = self._frequency.get(word, 0) + 1
+        return self._frequency
+
+
+WORD = re.compile(r"[A-Za-z_]\w*")
 TEST_ATTR = re.compile(r"#\[(?:[a-z_]+::)?test\b")
-TARGET = re.compile(r"^crates/([a-z0-9_-]+)/(?:src/bin/([A-Za-z0-9_-]+)(?:\.rs|/main\.rs)|tests/([A-Za-z0-9_-]+)\.rs)$")
+TARGET = re.compile(r"^crates/([a-z0-9_-]+)/(?:src/bin/([A-Za-z0-9_-]+)(?:\.rs|/.+)|tests/([A-Za-z0-9_-]+)\.rs)$")
+
+
+def registration_sources(path, sources, old_sources):
+    """Narrow a mod.rs registration-only edit to its referenced source modules.
+
+    Inspect both sides so removals and replacements count too. Unresolved uses,
+    attributes, inline modules and any code change retain the root's coverage.
+    """
+    if not path.endswith("/mod.rs"):
+        return [path]
+    parent = sources.module(path)
+    if not parent:
+        return [path]
+    modules = {**old_sources.modules, **sources.modules}
+    # Keep the existing filename fallback for trees without crate root mounts.
+    for source in (*old_sources.texts, *sources.texts):
+        modules.setdefault(source, module_of(source))
+    targets = []
+    for line in difflib.ndiff(old_sources.text(path).splitlines(), sources.text(path).splitlines()):
+        if line[:2] not in ("+ ", "- "):
+            continue
+        declaration = line[2:].split("//", 1)[0].rstrip()
+        if not declaration.strip():
+            continue
+        mod = re.fullmatch(r"(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z_0-9]*)\s*;", declaration)
+        use = re.fullmatch(
+            r"pub(?:\([^)]*\))?\s+use\s+([A-Za-z_][A-Za-z_0-9]*(?:::[A-Za-z_][A-Za-z_0-9]*)*)"
+            r"(?:::(?:\*|\{[^{};]+\}))?(?:\s+as\s+[A-Za-z_][A-Za-z_0-9]*)?\s*;",
+            declaration,
+        )
+        if mod:
+            module = f"{parent}::{mod.group(1)}"
+        elif use:
+            parts = use.group(1).split("::")
+            prefix = parent.split("::")
+            if parts[0] == "crate":
+                prefix, parts = [], parts[1:]
+            elif parts[0] == "self":
+                parts = parts[1:]
+            while parts and parts[0] == "super":
+                prefix, parts = prefix[:-1], parts[1:]
+            module = "::".join(prefix + parts)
+        else:
+            return [path]
+        candidates = [
+            (source, mounted) for source, mounted in modules.items()
+            if source != path and package_for(source) == package_for(path) and mounted
+            and (module == mounted or (use and module.startswith(mounted + "::")))
+        ]
+        if not candidates:
+            return [path]
+        longest = max(len(mounted) for _, mounted in candidates)
+        targets.extend(source for source, mounted in candidates if len(mounted) == longest)
+    return list(dict.fromkeys(targets)) or [path]
+
+
+# #1341: migration fixture maintenance must not select the entire store suite.
+REWIND_FIXTURE = RSID_STORE_SRC + "store/tests.rs"
+REWIND_HELPERS = {
+    "rewind_post_v121_tail_to", "assert_fixture_matches_claimed_version",
+    "assert_post_v77_chain_replayed",
+}
+RUST_FN = re.compile(r"^([ \t]*)(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(\w+)\b", re.M)
+
+
+def rust_functions(text):
+    """Rustfmt function spans, including test attributes and their shard gate.
+
+    Match the closing brace at the declaration's indentation, as module_map
+    does for modules. Ambiguous/unclosed declarations are omitted, so the
+    fixture-only diff check falls back to the full module.
+    """
+    lines = text.splitlines()
+    offsets, offset = {}, 0
+    for index, line in enumerate(lines):
+        offsets[offset] = index
+        offset += len(line) + 1
+    for match in RUST_FN.finditer(text):
+        start = offsets[match.start()]
+        indent, name = match.groups()
+        if "{" in lines[start] and lines[start].rstrip().endswith("}"):
+            end = start + 1
+        else:
+            end = next((i + 1 for i in range(start + 1, len(lines))
+                        if lines[i] == indent + "}"), None)
+        if end is None:
+            continue
+        attr = start
+        while attr and lines[attr - 1].lstrip().startswith("#["):
+            attr -= 1
+        attributes = "\n".join(lines[attr:start])
+        yield name, start, end, attributes, "\n".join(lines[start:end])
+
+
+def rewind_only_change(before, after):
+    def covered(text):
+        result = set()
+        for name, start, end, _, _ in rust_functions(text):
+            if name in REWIND_HELPERS:
+                result.update(range(start, end))
+        result.update(i for i, line in enumerate(text.splitlines()) if re.fullmatch(
+            r"const REWIND_TEARDOWN_COVERED_THROUGH: i32 = \d+;", line))
+        return result
+
+    old, new = before.splitlines(), after.splitlines()
+    old_allowed, new_allowed = covered(before), covered(after)
+    # Trim the identical prefix/suffix before matching: this file has tens of
+    # thousands of repetitive lines, but migration maintenance changes a short tail.
+    start, old_end, new_end = 0, len(old), len(new)
+    while start < min(old_end, new_end) and old[start] == new[start]:
+        start += 1
+    while old_end > start and new_end > start and old[old_end - 1] == new[new_end - 1]:
+        old_end -= 1
+        new_end -= 1
+    changes = [op for op in difflib.SequenceMatcher(
+        None, old[start:old_end], new[start:new_end], autojunk=False).get_opcodes()
+        if op[0] != "equal"]
+    return bool(changes) and all(
+        set(range(start + i, start + j)) <= old_allowed
+        and set(range(start + k, start + l)) <= new_allowed
+        for _, i, j, k, l in changes
+    )
+
+
+# #1618: an additive migration (add column / create index) cannot change what
+# any ordinary rewind caller observes; the migration-chain pins observe it.
+ADDITIVE_SQL = re.compile(r"add_column_if_not_exists(?:_tx)?\s*\(|\bCREATE\s+(?:UNIQUE\s+)?INDEX\b", re.I)
+DESTRUCTIVE_SQL = re.compile(
+    r"\b(?:DROP|DELETE|UPDATE|INSERT|REPLACE|RENAME|TRIGGER|VIEW|SELECT|CREATE\s+TABLE|"
+    r"CREATE\s+VIRTUAL|execute_batch|table_rebuild\w*|rebuild_\w+)\b", re.I)
+MIGRATION_CHAIN_PINS = re.compile(
+    r"every_recovered_migration_step_actually_executes|_fixture_rewinds|previous_schema_upgrades_")
+
+
+def additive_migration(text):
+    """True when a migration unit only adds columns and indexes (no data or table rewrite)."""
+    code = "\n".join(line.split("//", 1)[0] for line in text.splitlines())
+    return bool(ADDITIVE_SQL.search(code)) and not DESTRUCTIVE_SQL.search(code)
+
+
+def rewind_test_filters(sources, pins_only=False):
+    """Scan direct and indirect callers, including fixtures in other modules.
+
+    `pins_only` keeps only the migration-chain pins (#1618).
+    """
+    functions = []
+    for path, text in sources.texts.items():
+        if not lib_source(path):
+            continue
+        for name, _, _, attrs, body in rust_functions(text):
+            calls = set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", body)) - {name}
+            functions.append((name, attrs, calls))
+    callers = {"rewind_store_to_schema_version", "rewind_post_v121_tail_to",
+               "assert_post_v77_chain_replayed", "assert_fixture_matches_claimed_version"}
+    while True:
+        expanded = callers | {name for name, _, calls in functions if calls & callers}
+        if expanded == callers:
+            break
+        callers = expanded
+    filters = set()
+    for name, attrs, _ in functions:
+        if TEST_ATTR.search(attrs) and (name in callers or "_rewinds" in name or "fixture_guard" in name):
+            if pins_only and not MIGRATION_CHAIN_PINS.search(name):
+                continue
+            for shard in shards_in(attrs):
+                filters.add(f"rsid=shard:{shard}:test({name})")
+    return sorted(filters)
+
+
+HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def changed_line_numbers(repo, merge_base, head, path):
+    """(old lines, new lines) a zero-context diff of `path` removes and adds (1-based)."""
+    diff = git_out(repo, "diff", "-U0", "--no-color", f"{merge_base}..{head}", "--", path)
+    old, new = [], []
+    for raw in diff.splitlines():
+        hunk = HUNK.match(raw)
+        if hunk:
+            start, length, begin, count = hunk.groups()
+            old += range(int(start), int(start) + int(length if length is not None else 1))
+            new += range(int(begin), int(begin) + int(count if count is not None else 1))
+    return old, new
+
+
+def function_spans(text):
+    """[(name, first line, last line)] (1-based, attributes included) of every function."""
+    return [(name, start - (attrs.count("\n") + 1 if attrs else 0) + 1, end)
+            for name, start, end, attrs, _ in rust_functions(text)]
+
+
+def trace_seeds(text, lines, frequency, parent):
+    """(function names, rare identifiers, mounted modules) that the changed `lines` of `text` trace
+    to; None for an unrecognized declaration or a common field/re-export name.
+
+    Rustfmt's named struct fields and explicit re-exports can be traced by their
+    identifiers too. Never infer coverage from a type's common plumbing names
+    (Option, String, etc.), a wildcard export, or a changed struct header.
+    """
+    spans, rows, names, tokens, modules = function_spans(text), text.splitlines(), set(), set(), set()
+    for number in lines:
+        row = rows[number - 1].strip() if 0 < number <= len(rows) else ""
+        if not row or row.startswith("//"):
+            continue
+        inside = [span for span in spans if span[1] <= number <= span[2]]
+        if not inside:
+            mounted = re.match(r"(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_]\w*)\s*;", row)
+            if mounted:
+                modules.add(f"{parent}::{mounted.group(1)}" if parent else mounted.group(1))
+                continue
+            exported = re.fullmatch(
+                r"pub(?:\([^)]*\))?\s+use\s+(?:[A-Za-z_]\w*::)+([A-Za-z_]\w*)\s*;", row)
+            field = re.fullmatch(r"(?:pub(?:\([^)]*\))?\s+)?([A-Za-z_]\w*)\s*:\s*[^{};]+,", row)
+            # A field-shaped row in an enum, macro, or impl is not proof of a
+            # named struct field. Only accept a simple, rustfmt struct span.
+            if field:
+                prefix = rows[:number - 1]
+                header = next((i for i in range(len(prefix) - 1, -1, -1)
+                               if re.match(r"^(?:pub(?:\([^)]*\))?\s+)?struct\s+\w+\s*\{$", prefix[i])), None)
+                if header is None or any(line == "}" for line in prefix[header + 1:]):
+                    field = None
+            identifier = exported.group(1) if exported else field.group(1) if field else None
+            if (identifier is None or identifier in NOISE_WORDS
+                    or frequency.get(identifier, 0) > RARE_TOKEN_FUNCTIONS):
+                return None
+            tokens.add(identifier)
+            continue
+        name, first, last = min(inside, key=lambda span: span[2] - span[1])
+        if last - first + 1 > LARGE_FUNCTION_LINES:
+            rare = {word for word in WORD.findall(row)
+                    if len(word) >= 4 and word not in NOISE_WORDS and frequency.get(word, 0) <= RARE_TOKEN_FUNCTIONS}
+            if rare:
+                tokens |= rare
+                continue
+        names.add(name)
+    return names, tokens, modules
+
+
+def narrow_tests(sources, old_sources, repo, merge_base, head, path):
+    """The tests that can observe the diff of `path`: [(module, name, shard)], or None.
+
+    Traces each changed function through its callers (a word match in the body,
+    transitively, across the sharded library sources, never through a large
+    function) to the tests that mention it; a change inside a large function is
+    traced by the rare identifiers of its changed lines instead. [] when the trace
+    is complete and no test mentions the change (the compile check is all that
+    observes it). None when a declaration cannot be traced, the trace names too
+    many functions or tests, or an identifier is too common:
+    the caller then keeps the module filter and flags it broad.
+    """
+    old_lines, new_lines = changed_line_numbers(repo, merge_base, head, path)
+    frequency = sources.token_frequency()
+    parent = sources.module(path)
+    new = trace_seeds(sources.text(path), new_lines, frequency, parent)
+    old = trace_seeds(old_sources.text(path), old_lines, frequency, parent) if old_lines else (set(), set(), set())
+    if new is None or old is None:
+        return None
+    changed, tokens, mounted = new[0] | old[0], new[1] | old[1], new[2] | old[2]
+    if not changed and not tokens and not mounted:
+        return None
+    functions = sources.functions()
+    # Field reads and exported types can occur in helper bodies/signatures;
+    # follow their consumers just as we follow changed function names.
+    reached = changed | tokens
+    while True:
+        callers = {name for name, _, is_test, _, words, size in functions
+                   if not is_test and size <= LARGE_FUNCTION_LINES and name not in reached and words & reached}
+        if not callers:
+            break
+        reached |= callers
+        if len(reached) > NARROW_FUNCTION_CAP:
+            return None
+    found = sorted({(module, name, shard)
+                    for name, module, is_test, shards, words, _ in functions
+                    if is_test and (name in changed or words & reached or words & tokens
+                                    or any(f"{module}::".startswith(m + "::") for m in mounted))
+                    for shard in shards})
+    return found if len({(m, n) for m, n, _ in found}) <= NARROW_TEST_CAP else None
+
+
+def direct_filterset(module):
+    """Nextest filterset for the tests declared directly in `module` (none of its submodules')."""
+    return f"test(/^{module}::[A-Za-z0-9_]+$/)"
+
+
+def named_filterset(module, names):
+    """Nextest filterset for the named tests of `module`, wherever an inline `mod` nests them."""
+    names = sorted(set(names))
+    alternatives = names[0] if len(names) == 1 else "(?:" + "|".join(names) + ")"
+    return f"test(/^{module}::(?:\\w+::)*{alternatives}$/)"
+
+
+def traced_filters(picked):
+    grouped = {}
+    for module, name, shard in picked:
+        grouped.setdefault((shard, module), []).append(name)
+    filters = []
+    for (shard, module), names in sorted(grouped.items()):
+        prefix, chunk = f"rsid=shard:{shard}:", []
+        for name in sorted(set(names)):
+            if chunk and len(prefix + named_filterset(module, chunk + [name])) > GATE_FILTER_LENGTH:
+                filters.append(prefix + named_filterset(module, chunk))
+                chunk = []
+            chunk.append(name)
+        filters.append(prefix + named_filterset(module, chunk))
+    return filters
+
+
+def covered_filters(filters, merged=None):
+    """Deduplicate and remove filters already covered by a same-shard module.
+
+    Use only syntactically proven containment; don't shorten the list by
+    broadening a regex or assuming that different shards select the same tests.
+    """
+    filters = list(dict.fromkeys(filters))
+    modules = []
+    for value in filters:
+        match = SHARD_FILTER.match(value)
+        simple = re.fullmatch(r"test\(([A-Za-z0-9_:]+)\)", match.group(2)) if match else None
+        if simple:
+            modules.append((value, match.group(1), simple.group(1)))
+    kept = []
+    for value in filters:
+        match = SHARD_FILTER.match(value)
+        # The prefix before the regex's first metacharacter is guaranteed to
+        # appear in every selected test name, including inline test modules.
+        prefix = re.match(r"test\(/\^([A-Za-z0-9_:]+)", match.group(2)) if match else None
+        simple = re.fullmatch(r"test\(([A-Za-z0-9_:]+)\)", match.group(2)) if match else None
+        scope = prefix.group(1) if prefix else simple.group(1) if simple else None
+        covering = next((other for other, shard, module in modules
+                         if scope and other != value and shard == match.group(1) and module in scope), None)
+        if covering:
+            if merged is not None:
+                merged.append({"filter": value, "covered_by": covering,
+                               "reason": "same-shard module filter already selects every matching test"})
+            continue
+        kept.append(value)
+    return kept
+
+
+def is_test_module(module):
+    return any(part == "tests" or part.endswith("_tests") for part in module.split("::"))
+
+
+def verb_pin_filters(sources):
+    """Named filters for the agent verb catalog tests (#1440), one per shard and module."""
+    found = {}
+    for name, module, is_test, shards, words, _ in sources.functions():
+        if (is_test and f"{module}::".startswith(AGENT_VERB_PIN_MODULES)
+                and (AGENT_VERB_PIN_NAME.search(name) or words & {"AGENT_VERBS", "READ_VERBS"})):
+            for shard in shards:
+                found.setdefault((shard, module), set()).add(name)
+    return found
+
+
+COVERAGE_DECLARATIONS = "scripts/test-coverage.json"
+
+
+def declared_coverage(repo, merge_base, head, path, sources):
+    """(filters, rule) a declared rule gives the diff of `path`, or None (#1585).
+
+    Used only when every changed line, old and new, lies in a function the rule
+    names (blank lines and `//` comments are free) and the rule's tests resolve to
+    at most NARROW_TEST_CAP sharded tests, every exact name included. Anything
+    else returns None and the caller derives the module filters.
+    """
+    declared = git(repo, "show", f"{head}:{COVERAGE_DECLARATIONS}")
+    if declared.returncode != 0:
+        return None
+    try:
+        rules = json.loads(declared.stdout).get("rules", [])
+    except ValueError:
+        return None
+    rule = next((r for r in rules if r.get("path") == path), None)
+    old_text = git(repo, "show", f"{merge_base}:{path}")
+    if rule is None or old_text.returncode != 0:
+        return None
+    names, prefixes = set(rule.get("functions", [])), tuple(rule.get("function_prefixes", ()))
+
+    def contained(text, lines):
+        rows, spans = text.splitlines(), function_spans(text)
+        for number in lines:
+            row = rows[number - 1].strip() if 0 < number <= len(rows) else ""
+            if not row or row.startswith("//"):
+                continue
+            if not any(first <= number <= last and (name in names or (prefixes and name.startswith(prefixes)))
+                       for name, first, last in spans):
+                return False
+        return True
+
+    old_lines, new_lines = changed_line_numbers(repo, merge_base, head, path)
+    if not (old_lines or new_lines) or not contained(old_text.stdout, old_lines) \
+            or not contained(sources.text(path), new_lines):
+        return None
+    # `tests` is one spec or a list of specs (one per test module); the cap and
+    # the every-exact-name check apply to the whole rule.
+    specs = rule.get("tests", {})
+    specs = specs if isinstance(specs, list) else [specs]
+    candidates = list(sources.functions())
+    picked = set()
+    for spec in specs:
+        exact, test_prefixes = set(spec.get("names", [])), tuple(spec.get("prefixes", ()))
+        got = {(module, name, shard) for name, module, is_test, shards, _, _ in candidates
+               if is_test and module == spec.get("module")
+               and (name in exact or (test_prefixes and name.startswith(test_prefixes)))
+               for shard in shards}
+        if not got or not exact <= {name for _, name, _ in got}:
+            return None
+        picked |= got
+    picked = sorted(picked)
+    if not picked or len({(m, n) for m, n, _ in picked}) > NARROW_TEST_CAP:
+        return None
+    return traced_filters(picked), rule
 
 
 def lib_source(path: str) -> bool:
@@ -128,27 +848,22 @@ def child_sources(path, tree_files):
     return [path] + [f for f in tree_files if f.startswith(stem + "/")]
 
 
-def has_tests(repo, head, path, tree_files):
-    """Static check that the file or its child modules hold at least one test."""
-    for source in child_sources(path, tree_files):
-        shown = git(repo, "show", f"{head}:{source}")
-        if shown.returncode == 0 and TEST_ATTR.search(shown.stdout):
-            return True
-    return False
-
-
 def shards_in(text: str) -> set[str]:
     return set(GATE.findall(text))
 
 
-def shards_for(repo, head, path, tree_files):
-    """Shards gating tests in the changed file or its child module directory."""
-    found = set()
-    for source in child_sources(path, tree_files):
-        shown = git(repo, "show", f"{head}:{source}")
-        if shown.returncode == 0:
-            found |= shards_in(shown.stdout)
-    return found
+TEST_GATE = re.compile(r'^\s*#\[cfg\(any\(not\(feature = "test-shard-mode"\), feature = "test-shard-([a-z]+-[0-9]+)"\)\)\]\s*$')
+
+
+def test_shards(text: str) -> set[str]:
+    """Shards of the tests themselves: the gate line right above a test attribute.
+
+    A shared helper gated for several shards (`any(.., store-01, store-02)`) puts
+    its shards in `shards_in` but holds no test, so a `test(module)` filter for
+    them would select nothing (#1260: `store::tests` on store-02).
+    """
+    lines = text.split("\n")
+    return {m.group(1) for i in range(1, len(lines)) if TEST_ATTR.match(lines[i].lstrip()) and (m := TEST_GATE.match(lines[i - 1]))}
 
 
 def added_lines(repo, merge_base, head):
@@ -187,8 +902,87 @@ def cargo_prefix():
     if override is not None:
         return override.split()
     slot = Path.home() / ".rsi/bin/cargo-slot"
-    prefix = [str(slot)] if slot.exists() else []
+    # An outer cargo-slot (a declared job recipe, #1560) already holds a governor
+    # slot and marks its child; acquiring again would reserve two slots.
+    held = bool(os.environ.get("RSI_CARGO_SLOT_HELD"))
+    prefix = [str(slot)] if slot.exists() and not held else []
     return prefix + ["env", "-u", "RSI_PROCESS_OWNERSHIP_NAMESPACE", "cargo"]
+
+
+def workspace_packages(repo):
+    """Package names of the workspace members under crates/ (path dependencies)."""
+    names = []
+    for manifest in sorted((repo / "crates").glob("*/Cargo.toml")):
+        found = re.search(r'^\s*name\s*=\s*"([^"]+)"', manifest.read_text(errors="replace").split("[dependencies]")[0], re.M)
+        if found:
+            names.append(found.group(1))
+    return names
+
+
+def target_directory(repo):
+    """The target dir cargo would use in `repo`: CARGO_TARGET_DIR, else what cargo reports."""
+    env = os.environ.get("CARGO_TARGET_DIR")
+    if env:
+        return Path(env)
+    result = run(["cargo", "metadata", "--no-deps", "--format-version", "1"], repo)
+    try:
+        return Path(json.loads(result.stdout)["target_directory"])
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def clean_workspace_packages(repo):
+    """Opt-in (CHECK_TOUCHED_SHARDS_CLEAN=1): drop cached artifacts of every workspace package.
+
+    A target reused after a branch switch can hold a stale rsi-common whose
+    fingerprint still looks fresh, so every shard fails with "no field X on ..."
+    on a tree that compiles directly (#1260). Off by default: a shared target
+    (~/.cargo/shared-target) holds artifacts other agents' builds use, and the
+    clean forces a workspace recompile. Never cleans a target directory that is
+    not under the repo being checked. Third-party dependencies stay cached.
+    """
+    if not os.environ.get("CHECK_TOUCHED_SHARDS_CLEAN"):
+        return
+    target = target_directory(repo)
+    if target is None or not target.resolve().is_relative_to(repo.resolve()):
+        sys.stderr.write(f"check-touched-shards: not cleaning {target}: the target directory is not under {repo}\n")
+        return
+    packages = workspace_packages(repo)
+    if not packages:
+        return
+    result = run(cargo_prefix() + ["clean", *[flag for name in packages for flag in ("-p", name)]], repo)
+    if result.returncode != 0:
+        sys.stderr.write(f"check-touched-shards: cargo clean of workspace packages failed (continuing):\n{result.stderr[-500:]}\n")
+
+
+def error_signature(stderr):
+    """The distinct `error...` lines of a cargo run, for comparing failures across shards."""
+    return "\n".join(sorted({line.strip() for line in stderr.splitlines() if line.startswith("error") and "could not compile" not in line}))
+
+
+def failure_excerpt(stderr):
+    """Keep the first error blocks and spans (40 lines/4000 chars) ahead of the tail."""
+    diagnostics = []
+    in_error = False
+    for line in stderr.splitlines():
+        if re.match(r"^error(?:\[[^\]]+\])?:", line):
+            in_error = True
+        elif re.match(r"^warning(?:\[[^\]]+\])?:", line):
+            in_error = False
+        if in_error:
+            diagnostics.append(line)
+            if len(diagnostics) >= 40:
+                break
+    first_errors = "\n".join(diagnostics)[:4000].rstrip()
+    tail = stderr[-2000:]
+    return f"{first_errors}\n\nstderr tail:\n{tail}" if first_errors else tail
+
+
+STALE_HINT = (
+    "every shard compile failed with the same error while the tree may compile directly: a stale "
+    "workspace-package artifact in a reused target is suspected; retry with CHECK_TOUCHED_SHARDS_CLEAN=1 "
+    "(cleans only a target under the repo) or point CARGO_TARGET_DIR at a private directory (#1260)"
+)
 
 
 TMPFS_FIXTURE = re.compile(r"\b(?:TempDir::new|tempfile::tempdir|tempdir)\(\)")
@@ -258,11 +1052,21 @@ def main() -> int:
 
     # shard mapping
     tree_files = [f for f in git_out(repo, "ls-tree", "-r", "--name-only", head, "crates").splitlines()]
+    sources = SourceTree(repo, head, tree_files)
+    affected = changed
+    old_sources = None
+    if any(p.endswith("/mod.rs") for p in changed):
+        old_files = git_out(repo, "ls-tree", "-r", "--name-only", merge_base, "crates").splitlines()
+        old_sources = SourceTree(repo, merge_base, old_files)
+        affected = list(dict.fromkeys(
+            target for path in changed
+            for target in registration_sources(path, sources, old_sources)
+        ))
     shard_files: dict[str, list[str]] = {}
-    rsid_changed = [p for p in changed if lib_source(p)]
+    rsid_changed = [p for p in affected if lib_source(p)]
     packages_of_shard = shard_packages(repo)
     for path in rsid_changed:
-        for shard in shards_for(repo, head, path, tree_files):
+        for shard in sources.shards_for(path):
             shard_files.setdefault(shard, []).append(path)
     fallback = None
     if rsid_changed and not shard_files:
@@ -283,15 +1087,23 @@ def main() -> int:
             shard_files[dependent_shard] = []
 
     compiled = {"ok": [], "failed": [], "skipped": args.no_compile}
+    failure_signatures = {}
     if not args.no_compile:
+        clean_workspace_packages(repo)
         for shard in sorted(shard_files):
             package_flags = [flag for pkg in packages_of_shard.get(shard, ["rsid"]) for flag in ("-p", pkg)]
             cmd = cargo_prefix() + ["check", *package_flags, "--lib", "--tests", "--no-default-features", "--features", f"test-shard-{shard}"]
             result = run(cmd, repo)
             (compiled["ok"] if result.returncode == 0 else compiled["failed"]).append(shard)
             if result.returncode != 0:
-                sys.stderr.write(f"shard {shard} compile failed:\n{result.stderr[-2000:]}\n")
+                failure_signatures[shard] = error_signature(result.stderr)
+                sys.stderr.write(f"shard {shard} compile failed:\ncommand: {shlex.join(cmd)}\n"
+                                 f"exit code: {result.returncode}\n{failure_excerpt(result.stderr)}\n")
 
+    suspect_stale = None
+    if len(compiled["failed"]) >= 2 and not compiled["ok"] and len(set(failure_signatures.values())) == 1 and next(iter(failure_signatures.values())):
+        suspect_stale = {"hint": STALE_HINT, "error": next(iter(failure_signatures.values()))[:500]}
+        sys.stderr.write(f"check-touched-shards: shard_compile_suspect_stale: {STALE_HINT}\n")
     audits = {}
     filter_runs = {"ok": [], "failed": [], "skipped": not args.run_filters}
     if (repo / "scripts/check-rsid-test-shards.py").exists():
@@ -345,30 +1157,141 @@ def main() -> int:
     # its child modules) holds a test, never a filter that would match nothing
     # (a 40-minute landing gate was refused for one, #1129).
     suggested = []
-    for path in changed:
+    rewind_filters = None
+    narrowed, broad, declared_used = [], [], []
+    derived_by_path = {}
+
+    def shard_filters(path, module, shards):
+        """Landing filters of one changed sharded source; bounded, or flagged `broad` (#1418, #1438).
+
+        A test module that mounts test submodules gets only its own tests (the
+        `test(module)` prefix also selects every submodule). A filter selecting
+        more than BROAD_TEST_LIMIT tests is narrowed to the tests that mention
+        the changed functions; when that cannot be traced it is kept and flagged.
+        """
+        nonlocal old_sources
+        children = sources.test_children(module) if is_test_module(module) else []
+        if children and not any(sources.direct_tests(s, module) for s in shards):
+            children = []
+        count = (lambda s: sources.direct_tests(s, module)) if children else (lambda s: sources.tests_selected(s, module))
+        if children:
+            shards = [s for s in shards if count(s)]
+        scope = direct_filterset(module) if children else f"test({module})"
+        over = {s: count(s) for s in shards if count(s) > BROAD_TEST_LIMIT}
+        if over and path in changed:
+            if old_sources is None:
+                old_files = git_out(repo, "ls-tree", "-r", "--name-only", merge_base, "crates").splitlines()
+                old_sources = SourceTree(repo, merge_base, old_files)
+            picked = narrow_tests(sources, old_sources, repo, merge_base, head, path)
+            if picked is not None:
+                narrowed.append({"path": path, "module": module, "tests": len({(m, n) for m, n, _ in picked}),
+                                 "reason": f"`{scope}` selects {max(over.values())} tests; " + (
+                                     "narrowed to the tests that mention the change"
+                                     if picked else "no test mentions the change, so only the compile check observes it")})
+                return traced_filters(picked)
+        if children and shards:
+            narrowed.append({"path": path, "module": module, "filter": scope, "excludes": children,
+                             "reason": "a test module that mounts test submodules selects its own tests only; add test(<submodule>) after editing a helper they share"})
+        for shard, tests in over.items():
+            broad.append({"filter": f"rsid=shard:{shard}:{scope}", "tests": tests, "path": path,
+                          "reason": "selects more than %d tests and the diff cannot be traced to the few tests that observe it" % BROAD_TEST_LIMIT})
+        return [f"rsid=shard:{s}:{scope}" for s in shards]
+
+    if REWIND_FIXTURE in affected:
+        before = git(repo, "show", f"{merge_base}:{REWIND_FIXTURE}").stdout
+        if rewind_only_change(before, sources.text(REWIND_FIXTURE)):
+            added_units = sorted(p for p in added_files if MIGRATION_FILE.match(p))
+            additive = bool(added_units) and all(additive_migration(sources.text(p)) for p in added_units)
+            rewind_filters = (additive and rewind_test_filters(sources, pins_only=True)
+                              or rewind_test_filters(sources) or None)
+    for path in affected:
+        if path == REWIND_FIXTURE and rewind_filters:
+            suggested.extend(rewind_filters)
+            continue
         target = TARGET.match(path)
         if target:
             package, binary, integration = target.groups()
-            if has_tests(repo, head, path, tree_files):
+            # A helper may hold no tests itself; select the owning binary's tests.
+            root = f"crates/{package}/src/bin/{binary}.rs" if binary else path
+            if sources.has_tests(root):
                 suggested.append(f"{package}=bin:{binary}" if binary else f"{package}=test:{integration}")
             continue
-        module = module_of(path)
+        module = sources.module(path)
         if module is None or (path.startswith(SHARDED_SRCS) and not lib_source(path)):
             continue
         if path.startswith(SHARDED_SRCS):
             shards = sorted(s for s, files in shard_files.items() if path in files and s != fallback)
-            suggested += [f"rsid=shard:{s}:test({module})" for s in shards]
-        elif has_tests(repo, head, path, tree_files):
-            package = "rsi-common" if path.startswith("crates/rsi-common/") else "rsi"
-            suggested.append(f"{package}={module}")
+            declared = declared_coverage(repo, merge_base, head, path, sources) if path in changed else None
+            if declared:
+                derived_by_path[path] = declared[0]
+                declared_used.append({"path": path, "filters": declared[0], "reason": declared[1].get("reason", "")})
+            else:
+                derived_by_path[path] = shard_filters(path, module, shards)
+            suggested += derived_by_path[path]
+        elif sources.has_tests(path):
+            # The owning package: `rsid-core=process_control`, not `rsi=process_control`.
+            suggested.append(f"{package_for(path)}={module}")
     pins = []
     added_text = "\n".join(t for lines in added.values() for _, t in lines)
     if re.search(r"\b(AGENT_VERBS|READ_VERBS)\b", added_text) or any(p.startswith(("crates/rsid/src/rpc/agent", "crates/rsid/src/harness/tools")) for p in changed):
-        pins += AGENT_VERB_PINS
+        named = verb_pin_filters(sources)
+        pins += [f"rsid=shard:{shard}:{named_filterset(module, names)}" for (shard, module), names in sorted(named.items())]
+        if sum(len(names) for names in named.values()) > AGENT_VERB_PIN_CAP:
+            broad.append({"filter": "agent verb catalog pins", "tests": sum(len(n) for n in named.values()),
+                          "reason": "more than %d catalog/operator_only tests" % AGENT_VERB_PIN_CAP})
     manual_docs_changed = "docs/keybindings.md" in changed
     if any(Path(p).name in ("settings_registry.rs", "key_tables.rs") for p in changed):
         pins.append("rsi=manual::")
-    suggested = list(dict.fromkeys(suggested + pins))
+    derived_filters = {f for filters in derived_by_path.values() for f in filters}
+    other_filters = [f for f in suggested if f not in derived_filters] + pins
+    suggested = covered_filters(suggested + pins)
+    # Small per-module inventories can still exceed the worker's gate budget
+    # in aggregate. Try the same observer trace on those modules too, accepting
+    # only reductions after merging overlapping coverage. An uncertain trace
+    # retains its original filters, even when that leaves more than the budget.
+    if len(suggested) > GATE_FILTER_LIMIT:
+        if old_sources is None:
+            old_files = git_out(repo, "ls-tree", "-r", "--name-only", merge_base, "crates").splitlines()
+            old_sources = SourceTree(repo, merge_base, old_files)
+        for path, original in list(derived_by_path.items()):
+            if path not in changed or not original:
+                continue
+            picked = narrow_tests(sources, old_sources, repo, merge_base, head, path)
+            if picked is None:
+                continue
+            replacement = traced_filters(picked)
+            candidate = covered_filters(other_filters + [
+                f for source, filters in derived_by_path.items()
+                for f in (replacement if source == path else filters)
+            ])
+            if len(candidate) >= len(suggested):
+                continue
+            derived_by_path[path] = replacement
+            suggested = candidate
+            narrowed.append({"path": path, "module": sources.module(path),
+                             "tests": len({(m, n) for m, n, _ in picked}),
+                             "reason": "aggregate gate budget: traced field, export and function consumers; merged already-covered tests"})
+            if len(suggested) <= GATE_FILTER_LIMIT:
+                break
+    merged = []
+    suggested = covered_filters(other_filters + [f for filters in derived_by_path.values() for f in filters], merged)
+    # #1260/#1253: a filter that selects no test fails the gate after a long build.
+    # Keep a shard filter only when a test of that shard sits under the module.
+    dropped = []
+    kept = []
+    for flt in suggested:
+        match = SHARD_FILTER.match(flt)
+        simple = re.fullmatch(r"test\(([A-Za-z0-9_:]+)\)", match.group(2)) if match else None
+        if simple and not sources.filter_matches(match.group(1), simple.group(1)):
+            dropped.append({"filter": flt, "reason": f"no test of shard {match.group(1)} has `{simple.group(1)}` in its module path"})
+            continue
+        kept.append(flt)
+    suggested = kept
+    for item in dropped:
+        sys.stderr.write(f"check-touched-shards: dropped {item['filter']}: {item['reason']}\n")
+    for item in broad:
+        sys.stderr.write(f"check-touched-shards: BROAD {item['filter']} ({item['tests']} tests): {item['reason']}; "
+                         "split the run or run it with a longer budget\n")
     impact = impact_filters(repo, merge_base, head)
 
     if args.run_filters:
@@ -396,7 +1319,7 @@ def main() -> int:
         "merge_base": merge_base,
         "merge_clean": merge_clean,
         "changed_files": len(changed),
-        "shards": {"compiled_ok": compiled["ok"], "compiled_failed": compiled["failed"], "compile_skipped": compiled["skipped"], "fallback": fallback, "map": shard_files},
+        "shards": {"compiled_ok": compiled["ok"], "compiled_failed": compiled["failed"], "compile_skipped": compiled["skipped"], "shard_compile_suspect_stale": suspect_stale, "fallback": fallback, "map": shard_files},
         "audits": audits,
         "filter_runs": filter_runs,
         "migrations": {
@@ -406,6 +1329,14 @@ def main() -> int:
             "stray_pre_split": stray_pre_split,
         },
         "suggested_filters": suggested,
+        "dropped_filters": dropped,
+        "broad": bool(broad),
+        "broad_filters": broad,
+        "narrowed_filters": narrowed,
+        "declared_coverage": declared_used,
+        "merged_filters": merged,
+        "filter_budget": {"limit": GATE_FILTER_LIMIT, "over": len(suggested) > GATE_FILTER_LIMIT,
+                          "reason": "uncertain coverage is retained rather than truncated"},
         "impact_filters": impact,
         "manual_docs_changed": manual_docs_changed,
         "ok": not failed,
@@ -419,6 +1350,7 @@ def main() -> int:
         f"migrations={','.join('V%d' % n for n in new_migrations) or '-'}"
         f"{' RENUMBER' if migration_conflict else ''}"
         f"{' STRAY_PRE_SPLIT_MIGRATION' if stray_pre_split else ''} filters={len(suggested)}"
+        f"{' BROAD' if broad else ''}"
     )
     if args.receipt:
         Path(args.receipt).write_text(json.dumps(receipt, indent=2) + "\n")

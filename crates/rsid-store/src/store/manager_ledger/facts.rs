@@ -297,6 +297,10 @@ impl Store {
     /// provenance (`None` only when the project never had a V2 grant; every
     /// agent path has already required one through `manager_v2_authorize`).
     fn manager_v2_fact_writer(&self, config: &HarnessManagerConfigV1) -> Result<Option<i64>> {
+        // #1235: the global seat writes facts under its own principal.
+        if let Some(authority) = self.global_authority_for_config(config)? {
+            return Ok(Some(authority.grant.row_version));
+        }
         if let Some(caller) = config.current_session_id
             && let Some(authority) = self.manager_area_authority_current(caller)?
         {

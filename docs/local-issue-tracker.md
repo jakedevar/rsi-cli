@@ -93,7 +93,7 @@ eight operator verbs for lifecycle, dependency, and one-time linkage changes;
 operator `CreateIssue` allocates UUIDv4 with a null creator and null linkage.
 
 `AgentCreateIssue` and `rsi_control_create_issue` have the same strict schema:
-only `title`, `body`, `priority`, `labels`, `assignee`, and `idempotency_key`.
+only `title`, `body`, `priority`, `labels`, `assignee`, `idempotency_key`, and the optional `harness`/`source_issue` pair below.
 They reject caller/session/creator/id/status/display-number/timestamp fields.
 The daemon binds caller identity and applies `created_by_session_id`; a stable,
 NUL-free 1–128-byte key maps to a durable UUIDv5. Matching replay preserves the
@@ -101,6 +101,21 @@ first row, including after restart; a changed create field is an error, never an
 update. The native tools are available to Harness and CodexAppServer, while the
 tokened RPC is for CLI providers. Neither grants list/read/update/dependency
 authority and all eight generic operator verbs remain denied to attributed callers.
+
+`harness: true` (with optional `source_issue`, a display number in the caller's
+own project) files the Issue into the RSI harness project instead of the
+caller's: for defects in RSI itself found while working elsewhere, so the Rsi
+kaizen lane sees them (#1389). The daemon resolves the harness project (the one
+whose path uniquely matches the daemon's harness root), appends
+a provenance line for cross-project filings with source project/session UUIDs
+and an optional Issue number validated in the caller's persisted project, and adds the
+`harness-filed` label. It is create-only and needs no manager grant; it is
+rejected together with `project_id`, and refused if harness discovery is missing
+or the path match is absent or ambiguous. A project display name such as `Rsi`
+does not grant cross-project filing authority. Keys are session-scoped: using
+the same key for an own-project and harness filing is a conflict, so use a
+distinct key for each filing. Names and filesystem paths are not copied into
+provenance.
 
 ## V97 guarded project Issue control and audit
 

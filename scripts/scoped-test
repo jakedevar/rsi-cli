@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+"""Build once and run the touched tests within a per-package wall-clock/CPU budget.
+
+Usage: scripts/scoped-test [--base origin/rolling] [--head HEAD] [--dry-run]
+       scripts/scoped-test --filter PACKAGE=FILTER [--filter PACKAGE=FILTER ...]
+Explicit filters replace diff-derived filters, including on an unchanged base.
+Use --repo PATH to reproduce in an existing base worktree; execution always
+requires --head to match that worktree's HEAD. Filters use the lander's plain
+library names, shard:SHARD:test(ATOM), bin:TARGET and test:TARGET forms. Named
+targets also accept :test(ATOM), e.g. --filter 'rsid=bin:tool:test(=tests::one)'.
+An ATOM is a substring, =exact::name, or /regex/.
+--total-max-sec caps the whole run: each package's budget is the lesser of
+--runtime-max-sec and the time left, and a package with none left is not run
+(`scoped_test_timeout: total budget exhausted`, exit 1). The durable recipes
+use it so their sequential package budgets fit the job's own cap (#1584).
+RSI_SCOPED_TEST_FILTERS (newline-separated PACKAGE=FILTER, set by the daemon's
+recipe `filters` param) acts as --filter when no --filter is given.
+Use --reclaim-incremental to remove Cargo incremental caches after each successful
+package when another selected package remains; compiled dependencies and test
+binaries stay available.
+Linux uses a foreground systemd service; other platforms use a plain process
+timeout (no CPU quota). Logs and the derived plan live in /tmp/rsi-scoped-test-*.
+Static guards run even for dry runs, declined plans, and explicit filters.
+Use --tmpfs for the merge-queue lander's tmpfs parity (#1182, #1577): the selected
+test binaries run with a private TMPDIR under /dev/shm (override the parent with
+CHECK_TOUCHED_SHARDS_TMPDIR); the build still uses the host TMPDIR and the same
+Cargo target, so an earlier scoped-test run's binaries are reused, not rebuilt.
+Where no tmpfs exists (non-Linux, no usable /dev/shm) it prints `TMPFS_PARITY
+unavailable: ...` and exits 0 without running anything.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+from pathlib import Path
+import queue
+import re
+import runpy
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+
+SCRIPT = Path(__file__).resolve()
+_python_spec = importlib.util.spec_from_file_location("python_test_gate", SCRIPT.with_name("python-test-gate.py"))
+PYTHON_GATE = importlib.util.module_from_spec(_python_spec)
+_python_spec.loader.exec_module(PYTHON_GATE)
+
+
+def command_text(command):
+    return shlex.join(map(str, command))
+
+
+def stop_process(process, own_tree=True):
+    """Stop only the process tree we created (never search for other processes)."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], check=False)
+    elif own_tree:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    else:
+        process.terminate()
+    process.wait()
+
+
+def stream(command, emit, timeout=None, stop=None, own_tree=True, cwd=None, env=None):
+    """Tee output live; a timeout covers silent commands as well as noisy ones."""
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, errors="replace", start_new_session=own_tree and os.name != "nt", cwd=cwd, env=env)
+    lines = queue.Queue()
+
+    def read():
+        try:
+            for line in process.stdout:
+                lines.put(line)
+        finally:
+            lines.put(None)
+            process.stdout.close()
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    try:
+        while True:
+            remaining = None if deadline is None else max(0, deadline - time.monotonic())
+            try:
+                line = lines.get(timeout=remaining)
+            except queue.Empty:
+                raise subprocess.TimeoutExpired(command, timeout)
+            if line is None:
+                remaining = None if deadline is None else max(0, deadline - time.monotonic())
+                return process.wait(timeout=remaining)
+            emit(line)
+    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+        try:
+            if stop:
+                stop()
+        finally:
+            stop_process(process, own_tree)
+        raise
+
+
+def tmpfs_parent():
+    """The tmpfs directory the lander gates on, or (None, reason) when unavailable."""
+    if not sys.platform.startswith("linux"):
+        return None, "no tmpfs on " + sys.platform
+    parent = os.environ.get("CHECK_TOUCHED_SHARDS_TMPDIR", "/dev/shm")
+    if not (os.path.isdir(parent) and os.access(parent, os.W_OK | os.X_OK)):
+        return None, f"{parent} is not a writable directory"
+    return parent, ""
+
+
+def selection_plan(filters, shard_packages):
+    plan = {}
+    for value in filters:
+        package, sep, expression = value.partition("=")
+        if not sep or not re.fullmatch(r"[\w-]+", package) or not expression:
+            raise ValueError(f"refusing unscoped filter: {value}")
+        packages, kind, target, substring = [package], "lib", "", expression
+        exact = regex = atom = None
+        if expression.startswith("shard:"):
+            match = re.fullmatch(r"shard:([\w-]+):test\((.+)\)", expression)
+            if not match or package not in ("rsid", "rsid-store"):
+                raise ValueError(f"unsupported shard filter: {value}")
+            shard, atom = match.groups()
+            packages = shard_packages.get(shard)
+            if not packages:
+                raise ValueError(f"unknown shard: {shard}")
+        elif expression.startswith(("bin:", "test:")):
+            match = re.fullmatch(r"(bin|test):([\w-]+)(?::test\((.+)\))?", expression)
+            if not match:
+                raise ValueError(f"invalid test target: {value}")
+            kind, target, atom = match.groups()
+            substring = ""
+        elif not re.fullmatch(r"[\w:]+", expression):
+            raise ValueError(f"unsupported filter: {value}")
+        if atom is not None:
+            # `test(name)` is a substring; `test(=name)` one exact test; `test(/regex/)` a
+            # regular expression (check-touched-shards emits it for exact module paths, #1440).
+            if re.fullmatch(r"[\w:]+", atom):
+                substring = atom
+            elif atom.startswith("=") and re.fullmatch(r"[\w:]+", atom[1:]):
+                exact = atom[1:]
+            elif re.fullmatch(r"/[\w:^$|()?.*+\[\]\\-]+/", atom):
+                regex = atom[1:-1]
+                re.compile(regex)
+            else:
+                raise ValueError(f"unsupported test atom: {value}")
+        for owner in packages:
+            plan.setdefault(owner, []).append({"filter": value, "kind": kind,
+                                               "target": target, "substring": substring,
+                                               "exact": exact, "regex": regex})
+    return plan
+
+
+# The integration target whose tests return Ok at once unless RSI_E2E=1 and that spawn a
+# prebuilt rsid; selecting it must set the flag and build rsid, or UI drift passes (#1596).
+E2E_TARGET = "e2e_tui"
+
+
+def selects_e2e(selections):
+    return any(s["kind"] == "test" and s["target"] == E2E_TARGET for s in selections)
+
+
+def e2e_prebuild_command(cargo):
+    return [*cargo, "build", "-p", "rsid", "--bin", "rsid"]
+
+
+def build_command(package, selections, cargo):
+    # execute_package removes this variable itself; Windows has no env -u.
+    if os.name == "nt" and cargo[:3] == ["env", "-u", "RSI_PROCESS_OWNERSHIP_NAMESPACE"]:
+        cargo = cargo[3:]
+    targets = []
+    if any(s["kind"] == "lib" for s in selections):
+        targets.append("--lib")
+    for kind, target in sorted({(s["kind"], s["target"]) for s in selections if s["kind"] != "lib"}):
+        targets.extend(["--" + kind, target])
+    return [*cargo, "test", "-p", package, *targets, "--no-run", "--message-format=json"]
+
+
+def execute_package(plan):
+    """Inside the budget: one build, list binaries, run each selected test once."""
+    os.chdir(plan["repo"])
+    os.environ.pop("RSI_PROCESS_OWNERSHIP_NAMESPACE", None)
+    artifacts = {}
+
+    def build_line(line):
+        try:
+            message = json.loads(line)
+        except ValueError:
+            print(line, end="", flush=True)
+            return
+        if message.get("reason") == "compiler-artifact" and message.get("executable") and message.get("profile", {}).get("test"):
+            artifacts[message["executable"]] = (
+                message["target"], str(Path(message.get("manifest_path", Path(plan["repo"]) / "Cargo.toml")).parent))
+        elif message.get("reason") == "compiler-message":
+            print(message["message"].get("rendered", line), end="", flush=True)
+        elif message.get("reason") != "compiler-artifact":
+            print(line, end="", flush=True)
+
+    result = stream(plan["build"], build_line, own_tree=False)
+    if result:
+        return result
+    if plan.get("e2e"):
+        os.environ["RSI_E2E"] = "1"
+        print("scoped-test: e2e_tui selected; RSI_E2E=1 and building rsid for the harness", flush=True)
+        result = stream(plan["e2e"]["prebuild"], lambda line: print(line, end="", flush=True), own_tree=False)
+        if result:
+            return result
+    if not artifacts:
+        print("scoped-test: build produced no test binaries", flush=True)
+        return 1
+    test_env, scratch = None, None
+    if plan.get("tmpfs"):
+        scratch = tempfile.mkdtemp(prefix="rsi-scoped-test-tmpfs-", dir=plan["tmpfs"])
+        test_env = {**os.environ, "TMPDIR": scratch, "TMP": scratch, "TEMP": scratch}
+        print(f"TMPFS_PARITY tmpfs={scratch}", flush=True)
+    try:
+        return run_selected(plan, artifacts, test_env)
+    finally:
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+
+def run_selected(plan, artifacts, test_env):
+    failed, count = False, 0
+    for binary, (target, directory) in artifacts.items():
+        selections = [s for s in plan["selections"]
+                      if s["kind"] in target["kind"] and (s["kind"] == "lib" or s["target"] == target["name"])]
+        if not selections:
+            continue
+        listing = []
+        result = stream([binary, "--list", "--format=terse"], listing.append, own_tree=False, cwd=directory)
+        if result:
+            print("".join(listing), end="", flush=True)
+            return result
+        names = [line[:-len(": test\n")] for line in listing if line.endswith(": test\n")]
+        selected = set()
+        for selection in selections:
+            if selection.get("regex"):
+                matches = {name for name in names if re.search(selection["regex"], name)}
+            elif selection.get("exact"):
+                matches = {name for name in names if name == selection["exact"]}
+            else:
+                matches = {name for name in names if selection["substring"] in name}
+            if matches:
+                print("SCOPED_MATCH " + selection["filter"], flush=True)
+                selected.update(matches)
+        for name in sorted(selected):
+            print("SCOPED_START " + name, flush=True)
+            result = stream([binary, name, "--exact", "--nocapture", "--test-threads=1"],
+                            lambda line: print(line, end="", flush=True), own_tree=False, cwd=directory,
+                            env=test_env)
+            count += 1
+            print("SCOPED_END " + name, flush=True)
+            failed |= result != 0
+    print(f"scoped-test: {plan['package']} executed {count} tests", flush=True)
+    if failed:
+        return 1
+    # A shared filter may match only in another package. The parent checks
+    # that every filter selects something across the complete package union.
+    print(f"SCOPED_COMPLETE {plan['package']} {count}", flush=True)
+    return 0
+
+
+def bounded_command(plan, plan_path, seconds, cpu_quota, linux):
+    worker = [sys.executable, "-u", str(SCRIPT), "--execute-plan", str(plan_path)]
+    if not linux:
+        return worker, None
+    unit = "rsi-scoped-test-" + uuid.uuid4().hex
+    # Copy only build/runtime knobs; never transport authority or credentials.
+    environment = ["--setenv=" + name for name in (
+        "PATH", "CARGO_TARGET_DIR", "CARGO_BUILD_JOBS", "RUSTUP_TOOLCHAIN",
+        "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RSI_CARGO_SLOT_HELD", "TMPDIR", "TMP", "TEMP", "RUST_BACKTRACE",
+        "CHECK_TOUCHED_SHARDS_TMPDIR",
+    ) if name in os.environ]
+    return ["systemd-run", "--user", "--collect", "--wait", "--pipe", "--service-type=exec",
+            "--unit=" + unit, "--working-directory=" + plan["repo"],
+            "-p", f"RuntimeMaxSec={seconds:g}", "-p", f"CPUQuota={cpu_quota:g}%",
+            "-p", "TimeoutStopSec=2", "-p", "KillMode=control-group",
+            *environment, *worker], unit
+
+
+def positive(value):
+    number = float(value)
+    if not 0 < number < float("inf"):
+        raise argparse.ArgumentTypeError("must be positive and finite")
+    return number
+
+
+def reclaim_incremental(repo):
+    """Remove only Cargo's disposable incremental cache for this target tree."""
+    target_dir = Path(os.environ.get("CARGO_TARGET_DIR", Path(repo) / "target"))
+    if not target_dir.is_absolute():
+        target_dir = Path(repo) / target_dir
+    cache = target_dir / "debug" / "incremental"
+    if not cache.is_dir():
+        return 0
+    reclaimed = sum(path.stat().st_size for path in cache.rglob("*") if path.is_file())
+    shutil.rmtree(cache)
+    return reclaimed
+
+
+def static_guards(repo, base, head, audits):
+    """Reuse completed derivation audits; narrowing a plan must not skip guards."""
+    commands = {
+        "shard_gates": [sys.executable, "scripts/check-rsid-test-shards.py", "--require-gates"],
+        "released_migrations": [sys.executable, "tools/check-released-migrations.py", base, head],
+        "identity_assertions": [sys.executable, "tools/check_identity_assertions.py"],
+    }
+    failed = False
+    for name, command in commands.items():
+        audit = audits.get(name, {})
+        if audit.get("verdict") in ("ok", "fail"):
+            status, detail = audit["verdict"], audit.get("detail", "")
+        else:
+            print("static guard: " + command_text(command), flush=True)
+            try:
+                result = subprocess.run(command, cwd=repo, text=True, capture_output=True)
+                status = "ok" if result.returncode == 0 else "fail"
+                detail = (result.stdout + result.stderr).strip()
+            except OSError as error:
+                status, detail = "fail", str(error)
+        print(f"scoped-test: static guard {name}={status}" + (f": {detail}" if detail else ""), flush=True)
+        failed |= status != "ok"
+    return failed
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base", default="origin/rolling")
+    parser.add_argument("--head", default="HEAD")
+    parser.add_argument("--repo", default=".")
+    parser.add_argument("--filter", "--test-filter", action="append", dest="filters", metavar="PACKAGE=FILTER",
+                        help="explicit focused selection, repeatable; replaces diff-derived filters")
+    parser.add_argument("--runtime-max-sec", type=positive, default=1800,
+                        help="wall-clock cap per package, including build (default 1800)")
+    parser.add_argument("--total-max-sec", type=positive, default=None,
+                        help="wall-clock cap for the whole run; later packages get only the time left")
+    parser.add_argument("--cpu-quota", type=positive, default=200,
+                        help="Linux CPU quota in percent (default 200, two CPUs)")
+    parser.add_argument("--reclaim-incremental", action="store_true",
+                        help="remove Cargo incremental caches after a successful package before the next package")
+    parser.add_argument("--tmpfs", action="store_true",
+                        help="run the selected test binaries under a private tmpfs TMPDIR, as the lander does")
+    parser.add_argument("--dry-run", action="store_true", help="derive and print the plan without cargo or systemd")
+    parser.add_argument("--execute-plan", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.execute_plan:
+        return execute_package(json.loads(Path(args.execute_plan).read_text()))
+    repo = Path(args.repo).resolve()
+    run_started = time.monotonic()
+    if args.filters is None and os.environ.get("RSI_SCOPED_TEST_FILTERS"):
+        args.filters = [line for line in os.environ["RSI_SCOPED_TEST_FILTERS"].split("\n") if line]
+    tmpfs = None
+    if args.tmpfs:
+        tmpfs, reason = tmpfs_parent()
+        if tmpfs is None:
+            print(f"TMPFS_PARITY unavailable: {reason}; lander tmpfs parity was not checked", flush=True)
+            return 0
+    checker_path = SCRIPT.with_name("check-touched-shards")
+    checker = runpy.run_path(str(checker_path))
+    receipt_data, derive_code = {}, 0
+    if args.filters is not None:
+        filters = args.filters
+        head = checker["git_out"](repo, "rev-parse", "--verify", args.head + "^{commit}").strip()
+        print(f"explicit filters: head={head} repo={repo}", flush=True)
+    else:
+        derive = [sys.executable, str(checker_path), "--repo", str(repo), "--base", args.base,
+                  "--head", args.head, "--no-compile", "--json"]
+        print("derive: " + command_text(derive), flush=True)
+        receipt = subprocess.run(derive, text=True, capture_output=True)
+        if receipt.stderr:
+            print(receipt.stderr, end="", file=sys.stderr)
+        derive_code = receipt.returncode
+        try:
+            receipt_data = json.loads(receipt.stdout)
+        except ValueError:
+            if not derive_code:
+                raise
+        if derive_code:
+            print(receipt.stdout, end="")
+        else:
+            filters, head = receipt_data["suggested_filters"], receipt_data["head"]
+    guards_failed = static_guards(repo, receipt_data.get("merge_base", args.base),
+                                  receipt_data.get("head", args.head), receipt_data.get("audits", {}))
+    if derive_code or guards_failed:
+        return derive_code or 1
+    if not args.dry_run and checker["git_out"](repo, "rev-parse", "HEAD").strip() != head:
+        raise ValueError("--head differs from this worktree's HEAD; use --dry-run to inspect another candidate")
+    plan = selection_plan(filters, checker["shard_packages"](repo))
+    python_tests = PYTHON_GATE.selected_tests(
+        repo, PYTHON_GATE.changed_paths(repo, receipt_data.get("merge_base", args.base), head))
+    python_commands = PYTHON_GATE.test_commands(repo, python_tests, sys.executable)
+    linux = sys.platform.startswith("linux")
+    if not linux:
+        print("scoped-test: systemd unavailable on this platform; plain wall-clock timeout, no CPU cap", flush=True)
+    log_dir = Path(tempfile.mkdtemp(prefix="rsi-scoped-test-", dir="/tmp" if Path("/tmp").is_dir() else None))
+    print(f"logs: {log_dir}", flush=True)
+    if not plan and not python_commands:
+        print("scoped-test: no test filters derived; no tests run", flush=True)
+    matched, failed, summaries = set(), False, []
+    for index, command in enumerate(python_commands):
+        print("python test: " + command_text(command), flush=True)
+        if args.dry_run:
+            continue
+        budget = min(args.runtime_max_sec, 120)
+        if args.total_max_sec is not None:
+            budget = min(budget, args.total_max_sec - (time.monotonic() - run_started))
+        if budget <= 0:
+            print("scoped_test_timeout: total budget exhausted before Python tests", flush=True)
+            return 1
+        with (log_dir / f"python-{index}.log").open("w") as log:
+            def emit_python(line):
+                print(line, end="", flush=True)
+                log.write(line)
+                log.flush()
+            try:
+                code = stream(command, emit_python, timeout=budget, cwd=repo)
+            except subprocess.TimeoutExpired:
+                print("scoped_test_timeout: " + command_text(command), flush=True)
+                return 1
+        if code:
+            print("scoped-test: Python test failed: " + command_text(command), flush=True)
+            return code
+    packages = list(plan.items())
+    for package_index, (package, selections) in enumerate(packages):
+        package_plan = {"repo": str(repo), "package": package, "selections": selections,
+                        "build": build_command(package, selections, checker["cargo_prefix"]())}
+        if selects_e2e(selections):
+            package_plan["e2e"] = {"prebuild": e2e_prebuild_command(checker["cargo_prefix"]())}
+        if tmpfs:
+            package_plan["tmpfs"] = tmpfs
+        plan_path = log_dir / f"{package}.json"
+        plan_path.write_text(json.dumps(package_plan, indent=2) + "\n")
+        budget = args.runtime_max_sec
+        if args.total_max_sec is not None:
+            left = args.total_max_sec - (time.monotonic() - run_started)
+            if left < 1 and not args.dry_run:
+                print(f"scoped_test_timeout: total budget exhausted before {package}: --total-max-sec "
+                      f"{args.total_max_sec:g}; {package} was not run", flush=True)
+                failed = True
+                summaries.append((package, selections, True, 1, 0))
+                continue
+            budget = min(budget, max(left, 1))
+        command, unit = bounded_command(package_plan, plan_path, budget, args.cpu_quota, linux)
+        print(f"{package} filters: " + " ".join(s["filter"] for s in selections), flush=True)
+        print("build once: " + command_text(package_plan["build"]), flush=True)
+        if "e2e" in package_plan:
+            print("e2e prebuild (RSI_E2E=1): " + command_text(package_plan["e2e"]["prebuild"]), flush=True)
+        print("budget: " + command_text(command), flush=True)
+        if args.dry_run:
+            continue
+        active, timed_out, terminated = {}, False, False
+        completed, completion = 0, None
+        with (log_dir / f"{package}.log").open("w") as log:
+            def emit(line):
+                nonlocal timed_out, terminated, completed, completion
+                print(line, end="", flush=True)
+                log.write(line)
+                log.flush()
+                if line.startswith("SCOPED_START "):
+                    active[line.strip().split(" ", 1)[1]] = time.monotonic()
+                elif line.startswith("SCOPED_END "):
+                    if active.pop(line.strip().split(" ", 1)[1], None) is not None:
+                        completed += 1
+                elif line.startswith("SCOPED_MATCH "):
+                    matched.add(line.strip().split(" ", 1)[1])
+                else:
+                    receipt = re.fullmatch(r"SCOPED_COMPLETE " + re.escape(package) + r" ([0-9]+)\n?", line)
+                    if receipt:
+                        completion = int(receipt[1])
+                if re.search(r"(?:result[:= ]+|Result=)['\"]?timeout", line, re.I):
+                    timed_out = True
+                if re.search(r"code=(?:killed|dumped)\b", line):
+                    terminated = True
+                outcome = re.search(r"(?:Finished with result:|Result=)\s*['\"]?([\w-]+)", line)
+                if outcome and outcome[1] != "success":
+                    terminated = True
+
+            def stop_unit():
+                # The unique unit name belongs to this invocation only.
+                subprocess.run(["systemctl", "--user", "stop", unit], check=False, timeout=30)
+
+            started = time.monotonic()
+            try:
+                # systemd owns the primary deadline; this watchdog also bounds
+                # a stuck systemd client. Other platforms use the plain timeout.
+                code = stream(command, emit, budget + (5 if linux else 0),
+                              stop_unit if linux else None)
+                timed_out |= code != 0 and time.monotonic() - started >= budget
+            except subprocess.TimeoutExpired:
+                code, timed_out = 124, True
+            except OSError as error:
+                emit(f"scoped-test: unable to start bounded run: {error}\n")
+                code = 1
+            # systemd-run can exit zero after systemctl stop. Only the worker
+            # can attest that every selected test finished successfully.
+            if terminated or active or completion != completed:
+                emit(f"scoped_test_incomplete: missing successful package completion or terminated run; "
+                     f"{completed} completed tests\n")
+                code = code or 1
+            if timed_out:
+                emit("scoped_test_timeout: slowest still-running tests: " +
+                     (", ".join(f"{name} ({time.monotonic() - since:.1f}s)" for name, since in
+                                sorted(active.items(), key=lambda item: item[1])) or "none (build/list/startup)") + "\n")
+            summaries.append((package, selections, timed_out, code, completed))
+            failed |= timed_out or code != 0
+            if (args.reclaim_incremental and package_index + 1 < len(packages) and
+                    code == 0 and not timed_out and completion == completed):
+                reclaimed = reclaim_incremental(repo)
+                print(f"scoped-test: reclaimed {reclaimed} bytes of Cargo incremental cache before next package",
+                      flush=True)
+    if not args.dry_run:
+        missing = set(filters) - matched
+        if missing:
+            print("scoped-test: filters selected no tests: " + ", ".join(sorted(missing)), file=sys.stderr)
+            failed = True
+        for package, selections, timed_out, code, completed in summaries:
+            unmatched = any(s["filter"] in missing for s in selections)
+            status = ("timed out" if timed_out else "failed" if code or unmatched else
+                      "passed" if completed else "not applicable")
+            summary = f"scoped-test: {package}: {status} ({completed} completed tests)\n"
+            print(summary, end="", flush=True)
+            with (log_dir / f"{package}.log").open("a") as log:
+                log.write(summary)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError) as error:
+        sys.exit(f"scoped-test: {error}")
+    except KeyboardInterrupt:
+        sys.exit(130)

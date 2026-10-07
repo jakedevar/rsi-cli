@@ -94,6 +94,7 @@ pub(super) fn fresh_replacement_sandbox_binding(
             None,
         )?;
         let binding = super::launch::new_root_binding_from_allocation(
+            session.id,
             &allocation,
             &working_dir,
             Some(&source_commit),
@@ -137,6 +138,7 @@ pub(super) fn fresh_replacement_sandbox_binding(
         )
     })?;
     let binding = super::launch::new_root_binding_from_allocation(
+        session.id,
         &allocation,
         &working_dir,
         Some(&source_commit),
@@ -1293,6 +1295,7 @@ impl SessionManager {
             worker_slice_memory_pressure,
             process_memory: crate::process_memory::report(),
             provider_credentials: Some(crate::vault::global().health_summary()),
+            supervisor_mode: crate::daemon_info::supervisor_mode(),
         }
     }
 

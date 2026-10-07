@@ -72,7 +72,14 @@ async fn capped_idle_lead_rotates_once_to_a_successor_holding_the_lead() -> anyh
             ],
         )?;
         assert_eq!(
-            evaluate_cap_crossing(&store, &lead, 210_000, Some(200_000), chrono::Utc::now())?,
+            evaluate_cap_crossing(
+                &store,
+                &lead,
+                210_000,
+                Some(200_000),
+                None,
+                chrono::Utc::now()
+            )?,
             CapCrossing::Recorded(true)
         );
     }
@@ -192,8 +199,15 @@ async fn lead_cap_fixture(manager: &SessionManager, dir: &tempfile::TempDir) -> 
         store.insert_session(&child).expect("child");
         store.publish_startup_ordinary(lead.id).expect("custody");
         assert_eq!(
-            evaluate_cap_crossing(&store, &lead, 210_000, Some(200_000), chrono::Utc::now())
-                .expect("crossing"),
+            evaluate_cap_crossing(
+                &store,
+                &lead,
+                210_000,
+                Some(200_000),
+                None,
+                chrono::Utc::now()
+            )
+            .expect("crossing"),
             CapCrossing::Recorded(true)
         );
     }
@@ -580,8 +594,15 @@ async fn global_cap_fixture(
             )
             .expect("grant");
         assert_eq!(
-            evaluate_cap_crossing(&store, &seat, 210_000, Some(200_000), chrono::Utc::now())
-                .expect("crossing"),
+            evaluate_cap_crossing(
+                &store,
+                &seat,
+                210_000,
+                Some(200_000),
+                None,
+                chrono::Utc::now()
+            )
+            .expect("crossing"),
             CapCrossing::Recorded(true)
         );
         grant
@@ -1738,7 +1759,14 @@ async fn blocked_cap_rotation_settles_after_the_operator_continues_its_successor
     {
         let store = manager.store.lock().await;
         assert_eq!(
-            evaluate_cap_crossing(&store, &parent, 210_000, Some(200_000), chrono::Utc::now())?,
+            evaluate_cap_crossing(
+                &store,
+                &parent,
+                210_000,
+                Some(200_000),
+                None,
+                chrono::Utc::now()
+            )?,
             CapCrossing::Recorded(true)
         );
     }

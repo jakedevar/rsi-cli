@@ -174,7 +174,21 @@ Idle ─────────────────────────
 ```
 
 Automatic rotation now applies only to coordinating seats (#959, #1005).
-Workers keep working through native compaction. When a coordinating seat
+Workers are never rotated; instead they pass the baton (#1254): when a
+non-seat session with a launching manager or Epic lead crosses
+`worker_context_cap_tokens` (default 60 = 60% of its known context window;
+`1..=100` is a percentage, `32000..=2000000` tokens, `0` off;
+`worker_context_cap.<Provider>[/<model>]` overrides set by
+`:worker-context-cap`; a curated `ProposeDaemonSetting` key), the daemon
+records one durable `worker_baton:<id>` record, queues one agent mail telling
+the worker to commit, append a handoff to its Issue and end its turn with
+`PIPELINE HANDOFF — BATON <sha>`, and records one typed
+`worker_context_cap` notice for the launcher (a manager-inbox notice, or a
+mail to an Epic lead). Both effects are idempotent across a restart
+(`deliver_pending_worker_batons`). The manager relaunches with
+`AgentManagerLaunchIssueWorker {continue_from}`, which branches from the
+predecessor's committed HEAD, sets `continued_from` and prepends its final
+message and the Issue's latest handoff to the brief. When a coordinating seat
 (the project manager seat, the live seat of an area manager node, an Epic
 lead, the global manager seat) reaches the hard context cap
 (`coordinator_context_cap_tokens`, default 0 = off until #1156 closes, then
@@ -235,6 +249,23 @@ Safety of the automatic rotation (#1142):
   successor in the same boot, moving the Epic lead pointers and the global
   grant to it in the one publication commit. Nothing is moved back to the
   predecessor, and no other row is ever published under the rotation.
+- When that successor can never start (provider gone, model refused), the
+  operator abandons the blocked rotation (#1176): `AbandonBlockedRotation`
+  (operator-only RPC) or `:rotation-abandon [provider[/model]]` in the TUI.
+  The daemon records one `abandon_requested` event on the blocked intent
+  (idempotency key in its metadata) and runs the ordinary rotation decider
+  with the `Failed` custody holder as predecessor: a fresh replacement becomes
+  its `continued_from` successor, takes the sandbox forward (cause `rotation`;
+  every session owns the root once, custody never moves back) and starts on
+  the holder's first prompt with the operator's provider/model. Its
+  publication settles the whole chain in one commit: each unpublished hop
+  P → S (→ …) → holder gets its `completed{successor_id}`, the global grant
+  follows the chain, every Epic lead on it moves to the replacement, and each
+  hop's predecessor is archived with its manager rotation edge. A crash before
+  the replacement was reserved closes the request (`refused:abandon_interrupted`)
+  and the rotation stays blocked on the same holder; a crash after the custody
+  bind blocks it on the replacement (escalated once per holder), which the
+  operator abandons in turn. The idea controller is not moved yet (#1186).
 - A rotation acts only on the successor it reserved (#1153). Its own
   `successor_reserved` marker names that row exactly, whatever status a restart
   left it in (`rotation_request_successor`); no newer row, timestamp or other

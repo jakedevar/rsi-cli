@@ -169,16 +169,16 @@ fn tool_result_message(call_id: &str, result: ToolResult) -> ChatMessage {
     let is_error = result.is_error();
     let has_typed_blocks = result.has_typed_blocks();
     let content = if is_error {
-        result
-            .error_msg
-            .map(|error| format!("Error: {error}"))
-            .unwrap_or_else(|| {
-                if has_typed_blocks {
-                    result.output
-                } else {
-                    format!("Error: {}", result.output)
-                }
-            })
+        if has_typed_blocks {
+            // Typed blocks keep their structure; `error_msg` is set for
+            // callers that only read the message.
+            result.output
+        } else {
+            match result.error_msg {
+                Some(error) => format!("Error: {error}"),
+                None => format!("Error: {}", result.output),
+            }
+        }
     } else {
         result.output
     };

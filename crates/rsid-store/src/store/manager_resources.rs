@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use chrono::Utc;
 use rsi_common::harness_manager::HarnessManagerConfigV1;
+use rsi_common::harness_manager_v2::ManagerPolicyV2;
 use rsi_common::types::{Session, SessionKind, SessionProvider, SessionStatus};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,7 @@ const ROTATION_LIMIT: i64 = 64;
 const SPEND_KIND: &str = "resource_spend";
 const ORIGIN_KIND: &str = "resource_launch_origin";
 
+mod charge;
 mod launch_origin;
 
 /// Daemon-only witness for a new child, never deserialized from an RPC request.
@@ -327,6 +329,22 @@ impl Store {
                 .manager_succession_resource_gate(claim, existing_session)
                 .map(|config| Some((config, None)));
         }
+        if origin.is_appointment() {
+            // #1314: the effect-time recheck of a delegated appointment, in
+            // the admission transaction: the grantor (same epoch) and every
+            // current cap. The reservation is recorded in its ledger.
+            let appointment = self.launched_appointment_for_session(origin.session_id)?;
+            return self
+                .manager_v2_appointment_resource_gate(
+                    appointment.grantor_node_id,
+                    appointment.grantor_authority_epoch,
+                    appointment.launch_project_id,
+                    provider,
+                    existing_session,
+                    appointment.charged,
+                )
+                .map(|config| Some((config, None)));
+        }
         let scope = self.manager_v2_launch_parent_scope(
             origin
                 .parent_id
@@ -350,7 +368,26 @@ impl Store {
             {
                 return Err(refused("manager_v2_launch_scope_changed"));
             }
-            self.manager_v2_resource_gate(config, *epic, provider, existing_session)?;
+            let subject: Vec<Uuid> = std::iter::once(origin.session_id)
+                .chain(origin.parent_id)
+                .collect();
+            self.manager_v2_resource_gate_for_launch(
+                config,
+                *epic,
+                provider,
+                existing_session,
+                &subject,
+            )?;
+        } else if let Some(project) = origin.project_id {
+            // #1274: no manager cohort accounts for this launch; every
+            // portfolio node covering the project still caps it.
+            self.manager_v2_portfolio_gate(
+                project,
+                existing_session,
+                origin.parent_id,
+                provider,
+                true,
+            )?;
         }
         Ok(scope)
     }
@@ -584,18 +621,43 @@ impl Store {
     /// SQL keeps the historical identity set and per-session maxima inside
     /// `SQLite`. Only the two totals cross into the manager snapshot.
     fn manager_v2_historical_spend(&self, config: &HarnessManagerConfigV1) -> Result<(f64, i64)> {
+        self.manager_v2_scoped_spend(
+            config,
+            &[(config.manager_session_id, config.row_version)],
+            &[],
+        )
+    }
+
+    /// [`Store::manager_v2_historical_spend`] over the seeds of every ledger
+    /// in `ledgers` (`config`'s own first), without any session a node of
+    /// `foreign` originated (#1309, see `charge`).
+    fn manager_v2_scoped_spend(
+        &self,
+        config: &HarnessManagerConfigV1,
+        ledgers: &[(Uuid, i64)],
+        foreign: &[Uuid],
+    ) -> Result<(f64, i64)> {
+        let ledgers = serde_json::to_string(
+            &ledgers
+                .iter()
+                .map(|(manager, version)| json!([manager.to_string(), version]))
+                .collect::<Vec<_>>(),
+        )?;
+        let foreign_ctes = charge::foreign_ctes("?2", "?6");
         let totals = self.conn.query_row(
-            "WITH RECURSIVE descendants(id,depth) AS (
+            &format!(
+                // sql-dynamic-ok: the static foreign-origin CTE text (#1309).
+                "WITH RECURSIVE {foreign_ctes}, descendants(id,depth) AS (
                 SELECT value,0 FROM json_each(?1)
                 UNION ALL SELECT s.id,d.depth+1 FROM sessions s
                   JOIN descendants d ON s.parent_id=d.id WHERE d.depth<64
              ), seeds(id) AS (
                 SELECT id FROM descendants
                 UNION SELECT session_id FROM harness_manager_v2_entities
-                  WHERE project_id=?2 AND manager_session_id=?3 AND scope_version=?4
+                  WHERE project_id=?2 AND (manager_session_id,scope_version) IN (SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(?5))
                     AND kind NOT IN ('Epic','Group')
                 UNION SELECT record_key FROM harness_manager_v2_records
-                  WHERE project_id=?2 AND manager_session_id=?3 AND scope_version=?4
+                  WHERE project_id=?2 AND (manager_session_id,scope_version) IN (SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(?5))
                     AND kind='resource_spend'
                 UNION SELECT record_key FROM harness_manager_v2_records
                   WHERE project_id=?2 AND kind='resource_launch_origin'
@@ -623,7 +685,8 @@ impl Store {
                     c.scope_version DESC) rank
                 FROM harness_manager_v2_records c JOIN ids ON ids.id=c.record_key
                 WHERE c.project_id=?2 AND c.kind='resource_spend'
-                  AND ((c.manager_session_id=?3 AND c.scope_version=?4)
+                  AND ((c.manager_session_id,c.scope_version) IN
+                      (SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(?5))
                     OR (c.epic_id IN (SELECT value FROM json_each(?1))
                       AND EXISTS(SELECT 1 FROM harness_manager_v2_records o
                         WHERE o.project_id=c.project_id AND o.manager_session_id=c.manager_session_id
@@ -644,6 +707,7 @@ impl Store {
                   LEFT JOIN manager_root_resource_origins r ON r.session_id=ids.id AND r.project_id=?2
                   LEFT JOIN checkpoints c ON c.record_key=ids.id AND c.rank=1
                 WHERE (s.id IS NULL OR (s.project_id=?2 AND s.session_kind NOT IN ('Epic','Group')))
+                  AND (json_array_length(?6)=0 OR ids.id NOT IN (SELECT id FROM foreign_ids))
              )
              SELECT COALESCE(SUM(MAX(ledger,COALESCE(legacy,0),
                          COALESCE(root_floor,checkpoint_floor,0))),0),
@@ -651,9 +715,10 @@ impl Store {
                        missing + (COALESCE(root_zero,checkpoint_zero,0)=0)
                       WHEN count=0 THEN (legacy IS NULL OR (root_zero IS NOT NULL AND root_zero=0))
                       ELSE missing + (COALESCE(root_zero,checkpoint_zero,0)=0) END),0)
-             FROM measured",
+             FROM measured"), // sql-dynamic-ok: static foreign-origin CTE text
             params![serde_json::to_string(&config.epic_ids)?,config.project_id.to_string(),
-                config.manager_session_id.to_string(),config.row_version],
+                config.manager_session_id.to_string(),config.row_version,ledgers,
+                serde_json::to_string(foreign)?],
             |row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?)),
         )?;
         Ok(totals)
@@ -1154,13 +1219,17 @@ impl Store {
         Ok(())
     }
 
-    pub fn manager_v2_resource_snapshot(&self, config: &HarnessManagerConfigV1) -> Result<Value> {
-        let cohort = self.manager_v2_cohort(config)?;
+    /// The active leaves and rotation reservations of one cohort, by id: a
+    /// live status or a running, capacity-holding admitted invocation.
+    fn manager_v2_active_members(
+        &self,
+        cohort: &[ManagerCohortMemberV2],
+        rotation: &BTreeMap<Uuid, (SessionProvider, Option<Uuid>)>,
+    ) -> Result<BTreeMap<Uuid, SessionProvider>> {
         let leaves: Vec<_> = cohort
             .iter()
             .filter(|m| rsi_common::is_leaf_kind(m.session.session_kind))
             .collect();
-        let rotation = self.manager_v2_resource_reservations(config, &cohort)?;
         let ids = serde_json::to_string(
             &leaves
                 .iter()
@@ -1168,8 +1237,7 @@ impl Store {
                 .chain(rotation.keys().copied())
                 .collect::<Vec<_>>(),
         )?;
-        let mut active = HashSet::new();
-        let mut by_provider = BTreeMap::<String, usize>::new();
+        let mut running = HashSet::new();
         let helper_purposes =
             rsi_common::model_control::ModelInvocationPurpose::background_helper_json_array();
         let mut stmt = self.conn.prepare(
@@ -1182,31 +1250,78 @@ impl Store {
         for id in stmt.query_map(params![&ids, &helper_purposes, &released], |r| {
             r.get::<_, String>(0)
         })? {
-            active.insert(id?);
+            running.insert(id?);
         }
-        for member in &leaves {
-            if matches!(
-                member.session.status,
-                SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingApproval
-            ) {
-                active.insert(member.session.id.to_string());
-            }
-        }
-        let (known, unknown) = self.manager_v2_historical_spend(config)?;
+        let mut active = BTreeMap::new();
         for member in &leaves {
             let session = &member.session;
-            if active.contains(&session.id.to_string()) {
-                *by_provider
-                    .entry(super::row_mappers::session_provider_to_str(session.provider).into())
-                    .or_default() += 1;
+            if running.contains(&session.id.to_string())
+                || matches!(
+                    session.status,
+                    SessionStatus::Starting
+                        | SessionStatus::Running
+                        | SessionStatus::WaitingApproval
+                )
+            {
+                active.insert(session.id, session.provider);
             }
         }
         for (id, (provider, _)) in rotation {
-            if active.contains(&id.to_string()) {
-                *by_provider
-                    .entry(super::row_mappers::session_provider_to_str(provider).into())
-                    .or_default() += 1;
+            if running.contains(&id.to_string()) {
+                active.entry(*id).or_insert(*provider);
             }
+        }
+        Ok(active)
+    }
+
+    /// The resources `config`'s own policy is charged for, as the resource
+    /// gate counts them (#1336): with a portfolio node covering the project
+    /// the live sessions and spend come from the same charged-usage path as
+    /// the gate (#1309: the node's own ledger plus the chain ledgers below
+    /// it, minus every foreign origin); otherwise the plain cohort snapshot,
+    /// which the plain gate reads directly.
+    pub fn manager_v2_resource_snapshot(&self, config: &HarnessManagerConfigV1) -> Result<Value> {
+        let charge = self.manager_v2_own_charge(config)?;
+        if charge.is_plain() {
+            return self.manager_v2_plain_resource_snapshot(config);
+        }
+        let members = self.manager_v2_charged_members(config, &charge, false)?;
+        let mut snapshot = self.manager_v2_plain_resource_snapshot_from(
+            config,
+            &members.active,
+            members.known_spend,
+            members.unknown_spend,
+        )?;
+        snapshot["accounting"] = json!("charged");
+        snapshot["charged_ledgers"] = json!(members.ledgers);
+        snapshot["cohort_complete"] = json!(members.active.len() <= COHORT_BUDGET);
+        Ok(snapshot)
+    }
+
+    /// The unattributed snapshot of `config`'s own cohort and ledger.
+    fn manager_v2_plain_resource_snapshot(&self, config: &HarnessManagerConfigV1) -> Result<Value> {
+        let cohort = self.manager_v2_cohort(config)?;
+        let rotation = self.manager_v2_resource_reservations(config, &cohort)?;
+        let active = self.manager_v2_active_members(&cohort, &rotation)?;
+        let (known, unknown) = self.manager_v2_historical_spend(config)?;
+        let mut snapshot =
+            self.manager_v2_plain_resource_snapshot_from(config, &active, known, unknown)?;
+        snapshot["accounting"] = json!("plain");
+        Ok(snapshot)
+    }
+
+    fn manager_v2_plain_resource_snapshot_from(
+        &self,
+        config: &HarnessManagerConfigV1,
+        active: &BTreeMap<Uuid, SessionProvider>,
+        known: f64,
+        unknown: i64,
+    ) -> Result<Value> {
+        let mut by_provider = BTreeMap::<String, usize>::new();
+        for provider in active.values() {
+            *by_provider
+                .entry(super::row_mappers::session_provider_to_str(*provider).into())
+                .or_default() += 1;
         }
         let pending: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM harness_manager_v2_operations WHERE project_id=?1
@@ -1248,10 +1363,40 @@ impl Store {
         self.manager_v2_resource_gate_scoped(config, epic_id, provider, existing_session, true)
     }
 
+    /// [`Store::manager_v2_resource_gate`] for a new launch whose origin
+    /// (#1309) is that of `subject`: its pre-allocated session id and the
+    /// parent that spawns it.
+    fn manager_v2_resource_gate_for_launch(
+        &self,
+        config: &HarnessManagerConfigV1,
+        epic_id: Option<Uuid>,
+        provider: SessionProvider,
+        existing_session: Option<Uuid>,
+        subject: &[Uuid],
+    ) -> Result<()> {
+        let own = self
+            .manager_policy_for_config(config)?
+            .filter(|grant| !grant.revoked);
+        self.manager_v2_resource_gate_with(
+            config,
+            own.as_ref().map(|grant| &grant.policy),
+            epic_id,
+            provider,
+            existing_session,
+            true,
+            subject,
+        )
+    }
+
     /// `enforce_concurrency=false` is for background helper calls (#940): they
     /// neither occupy nor are refused by the lead concurrency/provider-count
     /// caps, but the operator pause, spend and provider usage-limit checks
     /// still apply so a pause or spend cap stops helper spend too.
+    ///
+    /// #1274: the caps are the acting principal's own policy (the project
+    /// manager's row, an area node's grant, or a portfolio seat's granted
+    /// project policy) and every policy above it: each portfolio node covering
+    /// the project, plus the project manager above an area node.
     pub(crate) fn manager_v2_resource_gate_scoped(
         &self,
         config: &HarnessManagerConfigV1,
@@ -1260,17 +1405,158 @@ impl Store {
         existing_session: Option<Uuid>,
         enforce_concurrency: bool,
     ) -> Result<()> {
-        let Some(grant) = self.get_harness_manager_policy(config.project_id)? else {
-            return Ok(());
+        let own = self
+            .manager_policy_for_config(config)?
+            .filter(|grant| !grant.revoked);
+        self.manager_v2_resource_gate_with(
+            config,
+            own.as_ref().map(|grant| &grant.policy),
+            epic_id,
+            provider,
+            existing_session,
+            enforce_concurrency,
+            existing_session.as_slice(),
+        )
+    }
+
+    /// [`Store::manager_v2_resource_gate_scoped`] with the acting principal's
+    /// already-resolved policy (`None` when it has no live policy).
+    ///
+    /// #1309, plan §2.3(d): each policy counts only the live sessions and
+    /// spend charged to its principal (see `charge`), and a launch whose
+    /// `subject` another node's lineage originated is not charged to it.
+    #[allow(clippy::too_many_arguments)] // One gate; the arguments are its inputs.
+    pub(crate) fn manager_v2_resource_gate_with(
+        &self,
+        config: &HarnessManagerConfigV1,
+        own: Option<&ManagerPolicyV2>,
+        epic_id: Option<Uuid>,
+        provider: SessionProvider,
+        existing_session: Option<Uuid>,
+        enforce_concurrency: bool,
+        subject: &[Uuid],
+    ) -> Result<()> {
+        let chain = self.portfolio_chain_heads(config.project_id)?;
+        let position = chain.iter().position(|head| {
+            config.manager_session_id == head.seat_root && config.row_version == head.epoch
+        });
+        let epics = if chain.is_empty() {
+            Vec::new()
+        } else {
+            self.global_project_epics(config.project_id)?
         };
-        if grant.revoked {
-            return Ok(());
+        let manager_charge = || -> Result<charge::ChargeScope> {
+            if chain.is_empty() {
+                Ok(charge::ChargeScope::plain())
+            } else {
+                self.manager_v2_manager_charge()
+            }
+        };
+        let check = |config: &HarnessManagerConfigV1,
+                     policy: &ManagerPolicyV2,
+                     charge: &charge::ChargeScope| {
+            self.manager_v2_policy_limits(
+                config,
+                policy,
+                charge,
+                epic_id,
+                provider,
+                existing_session,
+                enforce_concurrency,
+                subject,
+            )
+        };
+        let mut enforced = false;
+        if let Some(policy) = own {
+            let charge = match position {
+                Some(index) => {
+                    self.manager_v2_node_charge(config.project_id, &chain, index, &epics)?
+                }
+                None => manager_charge()?,
+            };
+            check(config, policy, &charge)?;
+            enforced = true;
         }
-        if grant.policy.paused || epic_id.is_some_and(|e| grant.policy.paused_epic_ids.contains(&e))
+        // An area node sits below its project's manager: that policy and its
+        // cohort count are an ancestor's caps too.
+        if position.is_none()
+            && let Some(root) = self.get_harness_manager(config.project_id)?
+            && root.manager_session_id != config.manager_session_id
+            && let Some(grant) = self
+                .get_harness_manager_policy(config.project_id)?
+                .filter(|grant| !grant.revoked)
         {
+            check(&root, &grant.policy, &manager_charge()?)?;
+            enforced = true;
+        }
+        let ancestors = position.unwrap_or(chain.len());
+        for (index, head) in chain[..ancestors].iter().enumerate() {
+            check(
+                &portfolio_coverage_config(config.project_id, head, &epics),
+                &head.record.grant.project_policy,
+                &self.manager_v2_node_charge(config.project_id, &chain, index, &epics)?,
+            )?;
+            enforced = true;
+        }
+        if enforced {
+            self.manager_v2_provider_usage_gate(provider)?;
+        }
+        Ok(())
+    }
+
+    /// One policy's pause, concurrency, provider-count and spend caps over the
+    /// usage `charge` pays for in the cohort `config` accounts for. A launch
+    /// whose `subject` carries an origin `charge` does not pay for is not
+    /// counted here (#1309); the pause still holds it.
+    #[allow(clippy::too_many_arguments)] // One check; the arguments are its inputs.
+    fn manager_v2_policy_limits(
+        &self,
+        config: &HarnessManagerConfigV1,
+        policy: &ManagerPolicyV2,
+        charge: &charge::ChargeScope,
+        epic_id: Option<Uuid>,
+        provider: SessionProvider,
+        existing_session: Option<Uuid>,
+        enforce_concurrency: bool,
+        subject: &[Uuid],
+    ) -> Result<()> {
+        if policy.paused || epic_id.is_some_and(|e| policy.paused_epic_ids.contains(&e)) {
             return Err(refused("manager_v2_policy_paused"));
         }
-        let snapshot = self.manager_v2_resource_snapshot(config)?;
+        if charge.is_plain() {
+            return self.manager_v2_plain_policy_limits(
+                config,
+                policy,
+                provider,
+                existing_session,
+                enforce_concurrency,
+            );
+        }
+        if self.manager_v2_charge_excludes(config.project_id, charge, subject)? {
+            return Ok(());
+        }
+        let usage = self.manager_v2_charged_usage(config, charge, provider, existing_session)?;
+        Self::manager_v2_check_usage(
+            policy,
+            provider,
+            enforce_concurrency,
+            usage.active,
+            usage.provider_active,
+            usage.known_spend_usd,
+            usage.unknown_spend_observations,
+        )
+    }
+
+    /// The unattributed caps: no portfolio node exists to attribute against.
+    fn manager_v2_plain_policy_limits(
+        &self,
+        config: &HarnessManagerConfigV1,
+        policy: &ManagerPolicyV2,
+        provider: SessionProvider,
+        existing_session: Option<Uuid>,
+        enforce_concurrency: bool,
+    ) -> Result<()> {
+        let snapshot = self.manager_v2_plain_resource_snapshot(config)?;
         let mut active = snapshot["active_sessions"].as_u64().unwrap_or(u64::MAX);
         let mut provider_active = snapshot["active_by_provider"]
             [super::row_mappers::session_provider_to_str(provider)]
@@ -1309,31 +1595,51 @@ impl Store {
                 }
             }
         }
-        if enforce_concurrency && active >= u64::from(grant.policy.max_active_sessions) {
+        Self::manager_v2_check_usage(
+            policy,
+            provider,
+            enforce_concurrency,
+            active,
+            provider_active,
+            snapshot["known_spend_usd"].as_f64(),
+            snapshot["unknown_spend_observations"]
+                .as_u64()
+                .unwrap_or(u64::MAX),
+        )
+    }
+
+    fn manager_v2_check_usage(
+        policy: &ManagerPolicyV2,
+        provider: SessionProvider,
+        enforce_concurrency: bool,
+        active: u64,
+        provider_active: u64,
+        known_spend_usd: Option<f64>,
+        unknown_spend_observations: u64,
+    ) -> Result<()> {
+        if enforce_concurrency && active >= u64::from(policy.max_active_sessions) {
             return Err(refused("manager_v2_concurrency_capacity"));
         }
         if enforce_concurrency
-            && grant
-                .policy
+            && policy
                 .provider_limits
                 .iter()
                 .any(|p| p.provider == provider && provider_active >= u64::from(p.max_active))
         {
             return Err(refused("manager_v2_provider_capacity"));
         }
-        if let Some(cap) = grant.policy.max_spend_usd {
-            if snapshot["unknown_spend_observations"].as_u64() != Some(0)
-                || snapshot["known_spend_usd"].as_f64().is_none()
-            {
+        if let Some(cap) = policy.max_spend_usd {
+            if unknown_spend_observations != 0 || known_spend_usd.is_none() {
                 return Err(refused("manager_v2_spend_unknown"));
             }
-            if snapshot["known_spend_usd"]
-                .as_f64()
-                .is_none_or(|spent| spent >= cap)
-            {
+            if known_spend_usd.is_none_or(|spent| spent >= cap) {
                 return Err(refused("manager_v2_spend_exhausted"));
             }
         }
+        Ok(())
+    }
+
+    fn manager_v2_provider_usage_gate(&self, provider: SessionProvider) -> Result<()> {
         let now_epoch = Utc::now().timestamp();
         for snapshot in self.load_provider_rate_limit_snapshots()? {
             if snapshot.provider == provider
@@ -1345,6 +1651,143 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// #1274: the caps of every portfolio node covering `project`, for a
+    /// launch no project-manager cohort accounts for (a project without a
+    /// manager, or an Epic outside its selection). `session` is the launching
+    /// session when it exists; otherwise `parent` is the new child's parent.
+    /// A session outside every live Epic of the project is not charged.
+    fn manager_v2_portfolio_gate(
+        &self,
+        project: Uuid,
+        session: Option<Uuid>,
+        parent: Option<Uuid>,
+        provider: SessionProvider,
+        enforce_concurrency: bool,
+    ) -> Result<()> {
+        let heads = self.portfolio_chain_heads(project)?;
+        if heads.is_empty() {
+            return Ok(());
+        }
+        let epics = self.global_project_epics(project)?;
+        let subject: Vec<Uuid> = session.into_iter().chain(parent).collect();
+        let mut enforced = false;
+        for (index, head) in heads.iter().enumerate() {
+            let config = portfolio_coverage_config(project, head, &epics);
+            let epic = if let Some(id) = session {
+                let cohort = self.manager_v2_cohort(&config)?;
+                if let Some(member) = cohort.iter().find(|m| m.session.id == id) {
+                    Some(member.epic_id)
+                } else if let Some((_, epic)) = self
+                    .manager_v2_resource_reservations(&config, &cohort)?
+                    .get(&id)
+                {
+                    Some(*epic)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let epic = match epic {
+                Some(epic) => epic,
+                None => match parent {
+                    Some(parent) => {
+                        let Some(epic) =
+                            self.manager_v2_live_epic_above(parent, project, &epics)?
+                        else {
+                            continue;
+                        };
+                        Some(epic)
+                    }
+                    None => continue,
+                },
+            };
+            self.manager_v2_policy_limits(
+                &config,
+                &head.record.grant.project_policy,
+                &self.manager_v2_node_charge(project, &heads, index, &epics)?,
+                epic,
+                provider,
+                session,
+                enforce_concurrency,
+                &subject,
+            )?;
+            enforced = true;
+        }
+        if enforced {
+            self.manager_v2_provider_usage_gate(provider)?;
+        }
+        Ok(())
+    }
+
+    /// #1314: a delegated appointment's launch (a PM or a portfolio seat)
+    /// is a session its grantor node creates in `project`, so it passes the
+    /// gates of that node's own `create_session`: the node's granted project
+    /// policy and every ancestor's pause, concurrency, provider, spend and
+    /// usage-window caps ([`Store::manager_v2_resource_gate_with`]), and the
+    /// lifetime creation allowance of the node and each ancestor (#1301;
+    /// `counted` when the appointment is already charged). A grantor that is
+    /// no longer active under `epoch` is `global_manager_not_seat`. Returns
+    /// the node's ledger config, which records the launch reservation.
+    pub(crate) fn manager_v2_appointment_resource_gate(
+        &self,
+        node: Uuid,
+        epoch: i64,
+        project: Uuid,
+        provider: SessionProvider,
+        existing_session: Option<Uuid>,
+        counted: bool,
+    ) -> Result<HarnessManagerConfigV1> {
+        let head = self
+            .portfolio_chain_heads(project)?
+            .into_iter()
+            .find(|head| head.node_id == node && head.epoch == epoch)
+            .ok_or_else(|| refused(rsi_common::global_manager::GLOBAL_MANAGER_NOT_SEAT))?;
+        let config =
+            portfolio_coverage_config(project, &head, &self.global_project_epics(project)?);
+        self.manager_v2_resource_gate_with(
+            &config,
+            Some(&head.record.grant.project_policy),
+            None,
+            provider,
+            existing_session,
+            true,
+            existing_session.as_slice(),
+        )?;
+        self.manager_ancestor_creation_allowance(&config, false, 1, i64::from(counted))?;
+        Ok(config)
+    }
+
+    /// The nearest Epic of `epics` at or above `start` in `project`.
+    fn manager_v2_live_epic_above(
+        &self,
+        start: Uuid,
+        project: Uuid,
+        epics: &[Uuid],
+    ) -> Result<Option<Uuid>> {
+        let mut cursor = Some(start);
+        let mut seen = HashSet::new();
+        for _ in 0..64 {
+            let Some(id) = cursor else {
+                return Ok(None);
+            };
+            if !seen.insert(id) {
+                return Err(refused("manager_v2_cohort_cycle"));
+            }
+            let Some(row) = self.get_session(id)? else {
+                return Ok(None);
+            };
+            if row.project_id != Some(project) {
+                return Ok(None);
+            }
+            if row.session_kind == SessionKind::Epic && epics.contains(&id) {
+                return Ok(Some(id));
+            }
+            cursor = row.parent_id;
+        }
+        Err(refused("manager_v2_cohort_subdivision_required"))
     }
 
     pub(crate) fn manager_v2_resource_gate_for_session(
@@ -1367,12 +1810,22 @@ impl Store {
         let Some(project) = session.project_id else {
             return Ok(());
         };
+        let portfolio = || {
+            self.manager_v2_portfolio_gate(
+                project,
+                Some(session_id),
+                session.parent_id,
+                provider,
+                enforce_concurrency,
+            )
+        };
         let Some(config) = self.get_harness_manager(project)? else {
-            return Ok(());
+            return portfolio();
         };
         if self
             .get_harness_manager_policy(project)?
             .is_none_or(|g| g.revoked)
+            && self.portfolio_chain_heads(project)?.is_empty()
         {
             return Ok(());
         }
@@ -1410,6 +1863,9 @@ impl Store {
                 Some(session_id),
                 enforce_concurrency,
             )?;
+        } else {
+            // Outside the manager's selection the portfolio still covers it.
+            portfolio()?;
         }
         Ok(())
     }
@@ -1428,7 +1884,7 @@ impl Store {
             return Ok(());
         };
         let Some(config) = self.get_harness_manager(project)? else {
-            return Ok(());
+            return self.manager_v2_portfolio_gate(project, None, Some(parent), provider, true);
         };
         let mut seen = HashSet::new();
         for _ in 0..64 {
@@ -1436,19 +1892,46 @@ impl Store {
                 return Err(refused("manager_v2_cohort_cycle"));
             }
             if current.session_kind == SessionKind::Epic && config.epic_ids.contains(&current.id) {
-                return self.manager_v2_resource_gate(&config, Some(current.id), provider, None);
+                return self.manager_v2_resource_gate_for_launch(
+                    &config,
+                    Some(current.id),
+                    provider,
+                    None,
+                    &[parent],
+                );
             }
-            let Some(parent) = current.parent_id else {
-                return Ok(());
+            let Some(parent_id) = current.parent_id else {
+                return self.manager_v2_portfolio_gate(project, None, Some(parent), provider, true);
             };
             current = self
-                .get_session(parent)?
+                .get_session(parent_id)?
                 .ok_or_else(|| refused("manager_v2_illegal_parent"))?;
             if current.project_id != Some(project) {
                 return Err(refused("manager_v2_cohort_project_mismatch"));
             }
         }
         Err(refused("manager_v2_cohort_subdivision_required"))
+    }
+}
+
+/// #1274: the accounting config of one portfolio node in `project`. Its
+/// coverage is the whole project, so its cohort is every live Epic's work
+/// plus the node's own ledger (seat root, authority epoch).
+pub(crate) fn portfolio_coverage_config(
+    project: Uuid,
+    head: &super::harness_manager_v2::PortfolioHead,
+    epics: &[Uuid],
+) -> HarnessManagerConfigV1 {
+    HarnessManagerConfigV1 {
+        project_id: project,
+        manager_session_id: head.seat_root,
+        current_session_id: None,
+        epic_ids: epics.to_vec(),
+        scope_mode: rsi_common::harness_manager::HarnessManagerScopeModeV1::Project,
+        selected_epic_ids: Some(epics.to_vec()),
+        group_ids: Vec::new(),
+        row_version: head.epoch,
+        updated_at: head.record.grant.updated_at,
     }
 }
 

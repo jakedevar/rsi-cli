@@ -24,7 +24,7 @@ use crate::agent_deploy::{
 use crate::agent_jobs::{
     JOB_DIR_NOT_ALLOWED, JOB_INVALID_PARAMS, JOB_INVALID_REQUEST, JOB_KEY_CONFLICT,
     JOB_KEY_INVALID, JOB_KIND_NOT_AUTHORIZED, JOB_KIND_UNSUPPORTED, JOB_LAUNCH_FAILED,
-    JOB_NAME_INVALID, JOB_NOT_FOUND,
+    JOB_NAME_INVALID, JOB_NOT_FOUND, JOB_PLATFORM_UNSUPPORTED,
 };
 use crate::agent_provider_status::PROVIDER_STATUS_UNKNOWN_PROVIDER;
 use crate::agent_session_events::AGENT_READ_EVENTS_SCOPE_DENIED;
@@ -33,9 +33,22 @@ use crate::global_manager::{
     GLOBAL_MANAGER_NOT_SEAT, GLOBAL_PROJECT_HAS_NO_MANAGER, GLOBAL_PROJECT_NOT_IN_GRANT,
     GLOBAL_REPORT_NOT_AUTHORIZED,
 };
+use crate::manager_tier_routing::{
+    MANAGER_TARGET_NOT_DESCENDANT, MANAGER_TIER_IDEMPOTENCY_CONFLICT, MANAGER_TIER_MAILBOX_FULL,
+    MANAGER_TIER_NOT_NODE_SEAT, MANAGER_TIER_TARGET_UNKNOWN, MANAGER_TIER_TARGET_VACANT,
+};
+use crate::portfolio_delegation::{
+    MANAGER_CHILD_OPERATOR_GRANTED, MANAGER_DIRECT_REPORT_CAP, MANAGER_NODE_NOT_IN_SCOPE,
+    MANAGER_SCOPE_NOT_NARROWED,
+};
+use crate::portfolio_nodes::{
+    MANAGER_ALLOWANCE_EXCEEDED, MANAGER_CAPABILITY_WIDENED, MANAGER_NODE_ROOT_OPERATOR_ONLY,
+    MANAGER_NODE_STALE, MANAGER_SCOPE_OVERLAP, PORTFOLIO_IDEMPOTENCY_CONFLICT,
+};
 use crate::rolling_queue::{
     QUEUE_DISABLED, QUEUE_DUPLICATE_SOURCE, QUEUE_FILTER_INVALID, QUEUE_FILTER_MATCHES_NO_TESTS,
-    QUEUE_KEY_INVALID, QUEUE_NOT_AUTHORIZED, QUEUE_REGATE_EXHAUSTED, QUEUE_SOURCE_INVALID,
+    QUEUE_GATE_TIMEOUT, QUEUE_KEY_INVALID, QUEUE_NOT_AUTHORIZED, QUEUE_REGATE_EXHAUSTED,
+    QUEUE_SOURCE_INVALID,
 };
 use crate::rpc::AgentIssueErrorCodeV1;
 use crate::satellite_dispatch::{
@@ -132,7 +145,7 @@ impl AgentControlVerbV1 {
                 "idempotency_key": "review-receipt-v1"
             }),
             AgentControlVerbV1::ManagerControl => {
-                serde_json::json!({"fence":{"scope_version":1,"policy_version":1},"idempotency_key":"control","operation":{"action":"create_container","kind":"Group","parent_id":null,"name":"Group","tags":[]}})
+                serde_json::json!({"fence":{"scope_version":1,"policy_version":1},"idempotency_key":"control","operation":{"action":"create_session","parent_id":issue,"kind":"Task","query":"Build the change.","launch":{"provider":"Claude","model":"claude-sonnet-5-5","effort":"high"},"sandbox_source":{"path":"/home/you/.rsi/sandboxes/your-session-id"}}})
             }
             AgentControlVerbV1::ManagerPrepareControl => {
                 serde_json::json!({"operation":{"action":"resume_lead","epic_id":issue,"message":"continue"}})
@@ -146,7 +159,8 @@ impl AgentControlVerbV1 {
             AgentControlVerbV1::ManagerLaunchIssueWorker => serde_json::json!({
                 "issue": 1100, "brief": "Build the Issue you are bound to; read it with AgentGetIssue.",
                 "launch": {"provider": "Claude", "model": "claude-sonnet-5-5", "effort": "high"},
-                "parent_epic_id": issue, "idempotency_key": "launch-issue-1100-worker-1"
+                "parent_epic_id": issue, "idempotency_key": "launch-issue-1100-worker-1",
+                "sandbox_source": {"rolling": {}}
             }),
             AgentControlVerbV1::ManagerProgress => serde_json::json!({}),
             AgentControlVerbV1::ManagerInbox => serde_json::json!({
@@ -226,7 +240,8 @@ impl AgentControlVerbV1 {
             }),
             AgentControlVerbV1::ReadSessionEvents => serde_json::json!({
                 "session_id": issue, "after_sequence": 0, "limit": 20,
-                "event_types": ["Message"], "max_bytes": 32768
+                "event_types": ["Message"], "max_bytes": 32768,
+                "final_message_full": true
             }),
             AgentControlVerbV1::GetProviderStatus => serde_json::json!({"provider": "openrouter"}),
             AgentControlVerbV1::SendSatelliteMessage => serde_json::json!({
@@ -241,6 +256,7 @@ impl AgentControlVerbV1 {
                 "test_id": "session::launch::tests::example_test"
             }),
             AgentControlVerbV1::GlobalOverview => serde_json::json!({}),
+            AgentControlVerbV1::ManagerOverview => serde_json::json!({}),
             AgentControlVerbV1::GlobalSend => serde_json::json!({
                 "project_id": issue, "message": "Land #872 and report back.",
                 "idempotency_key": "gm-rsi-route-1"
@@ -254,6 +270,25 @@ impl AgentControlVerbV1 {
             AgentControlVerbV1::ReportToGlobal => serde_json::json!({
                 "message": "Landed #872 on rolling; no gate pending.",
                 "idempotency_key": "pm-report-1"
+            }),
+            AgentControlVerbV1::ReportUp => serde_json::json!({
+                "message": "Landed #1238 on rolling; no gate pending.",
+                "idempotency_key": "report-up-1"
+            }),
+            AgentControlVerbV1::SendDown => serde_json::json!({
+                "target": {"kind": "project", "project_id": issue},
+                "message": "Land #1238 and report back with AgentReportUp.",
+                "idempotency_key": "send-down-1"
+            }),
+            AgentControlVerbV1::ManagerAppointChild => serde_json::json!({
+                "target": {"kind": "project", "project_id": issue},
+                "launch": {"provider": "Claude", "model": "claude-opus-5-5", "effort": "high"},
+                "query": "You are the project manager of this project. Call AgentGetAuthorityCatalog {} first.",
+                "idempotency_key": "node-appoint-pm-1"
+            }),
+            AgentControlVerbV1::ManagerRevokeChild => serde_json::json!({
+                "node_id": issue, "expected_grant_version": 7,
+                "idempotency_key": "node-revoke-child-1"
             }),
             AgentControlVerbV1::RequestDeploy => serde_json::json!({
                 "sha": "0123456789abcdef0123456789abcdef01234567",
@@ -270,48 +305,84 @@ impl AgentControlVerbV1 {
 
 // Typed families shared by several verbs.
 
-const ISSUE_REFUSALS: &[AgentControlRefusalV1] = &[
+/// #1235: a `project_id` outside every manager arm of the caller.
+const MANAGER_PROJECT_NOT_IN_SCOPE: AgentControlRefusalV1 = refusal(
+    crate::global_manager::MANAGER_PROJECT_NOT_IN_SCOPE,
+    "name a project in your global grant, or omit project_id for your own project",
+);
+
+/// The refusals every Issue verb shares, then any verb-specific extras.
+macro_rules! issue_refusals {
+    ($($extra:expr),* $(,)?) => {
+        &[
+        MANAGER_PROJECT_NOT_IN_SCOPE,
+        refusal(
+            AgentIssueErrorCodeV1::InvalidRequest.as_str(),
+            "correct the request fields and retry",
+        ),
+        refusal(
+            AgentIssueErrorCodeV1::AuthorityDenied.as_str(),
+            "use the current lead of the Issue project's owning Epic; a worker launched for an Issue may only append to that Issue's body while its binding is live",
+        ),
+        refusal(
+            AgentIssueErrorCodeV1::NotFoundInScope.as_str(),
+            "verify the Issue id from the current owning Epic project",
+        ),
+        refusal(
+            AgentIssueErrorCodeV1::IdempotencyConflict.as_str(),
+            "retry the original semantic request or choose a new idempotency_key",
+        ),
+        refusal(
+            AgentIssueErrorCodeV1::StaleVersion.as_str(),
+            "refresh the Issue and retry with its row_version",
+        ),
+        refusal(
+            AgentIssueErrorCodeV1::NoSemanticChange.as_str(),
+            "make a semantic change before retrying",
+        ),
+        refusal(
+            AgentIssueErrorCodeV1::InvalidTransition.as_str(),
+            "use a lifecycle transition allowed from the current Issue status",
+        ),
+        refusal(
+            AgentIssueErrorCodeV1::Archived.as_str(),
+            "restore the Issue before updating it",
+        ),
+        refusal(
+            AgentIssueErrorCodeV1::NotArchived.as_str(),
+            "archive the terminal Issue before restoring it",
+        ),
+        refusal(
+            AgentIssueErrorCodeV1::StorageFailure.as_str(),
+            "retry later; the Issue mutation did not commit",
+        ),
+            $($extra),*
+        ]
+    };
+}
+
+const ISSUE_REFUSALS: &[AgentControlRefusalV1] = issue_refusals!();
+
+/// `AgentUpdateIssue` also serves an Issue-bound worker's body append (#1284):
+/// each way that arm can refuse is its own code (#1545).
+const UPDATE_ISSUE_REFUSALS: &[AgentControlRefusalV1] = issue_refusals!(
     refusal(
-        AgentIssueErrorCodeV1::InvalidRequest.as_str(),
-        "correct the request fields and retry",
+        AgentIssueErrorCodeV1::BoundIssueBindingNotLive.as_str(),
+        "your Issue binding ended or was superseded by a later launch of the Issue; report through your parent instead of updating the Issue",
     ),
     refusal(
-        AgentIssueErrorCodeV1::AuthorityDenied.as_str(),
-        "use the current lead of the Issue project's owning Epic",
+        AgentIssueErrorCodeV1::BoundIssueWrongIssue.as_str(),
+        "a bound worker may update only the Issue it was launched for; omit project_id or name that Issue",
     ),
     refusal(
-        AgentIssueErrorCodeV1::NotFoundInScope.as_str(),
-        "verify the Issue id from the current owning Epic project",
+        AgentIssueErrorCodeV1::BoundIssueFieldNotAllowed.as_str(),
+        "send only body, expected_row_version and idempotency_key; omit title, labels, priority and assignee",
     ),
     refusal(
-        AgentIssueErrorCodeV1::IdempotencyConflict.as_str(),
-        "retry the original semantic request or choose a new idempotency_key",
+        AgentIssueErrorCodeV1::BoundIssueNotAppendOnly.as_str(),
+        "re-read the Issue with AgentGetIssue and send its current body byte for byte followed by your appended text",
     ),
-    refusal(
-        AgentIssueErrorCodeV1::StaleVersion.as_str(),
-        "refresh the Issue and retry with its row_version",
-    ),
-    refusal(
-        AgentIssueErrorCodeV1::NoSemanticChange.as_str(),
-        "make a semantic change before retrying",
-    ),
-    refusal(
-        AgentIssueErrorCodeV1::InvalidTransition.as_str(),
-        "use a lifecycle transition allowed from the current Issue status",
-    ),
-    refusal(
-        AgentIssueErrorCodeV1::Archived.as_str(),
-        "restore the Issue before updating it",
-    ),
-    refusal(
-        AgentIssueErrorCodeV1::NotArchived.as_str(),
-        "archive the terminal Issue before restoring it",
-    ),
-    refusal(
-        AgentIssueErrorCodeV1::StorageFailure.as_str(),
-        "retry later; the Issue mutation did not commit",
-    ),
-];
+);
 
 const MESSAGE_REFUSALS: &[AgentControlRefusalV1] = &[
     refusal(
@@ -504,9 +575,17 @@ const SPAWN_REFUSALS: &[AgentControlRefusalV1] = &[
         "agent_spawn_rejected:ToolPolicyProviderUnsupported",
         "your Harness tool policy is inherited; pick a provider that can enforce it",
     ),
+    refusal(
+        "agent_spawn_rejected:ProviderProfileRefused",
+        "the operator provider profile is aws_only; launch Claude on a Bedrock Claude model id ([<geo>.]anthropic.claude-*)",
+    ),
 ];
 
 const JOB_REFUSALS: &[AgentControlRefusalV1] = &[
+    refusal(
+        crate::agent_jobs::JOB_SANDBOX_SESSION_LIVE,
+        "sandbox_session_id must name a terminal session; wait for it to finish",
+    ),
     refusal(
         JOB_INVALID_REQUEST,
         "correct the request fields using the AgentSubmitJob schema and retry",
@@ -515,12 +594,36 @@ const JOB_REFUSALS: &[AgentControlRefusalV1] = &[
         JOB_INVALID_PARAMS,
         "fix the kind-specific params; see the schema description for the kind",
     ),
+    refusal(
+        crate::agent_jobs::JOB_TIMEOUT_NOT_AUTHORIZED,
+        "ordinary test raises need the manager/Epic lead; QA shard jobs need a live unsuperseded manager Issue-launch binding with explicit qa_lane:true delegation or manager/Epic lead",
+    ),
+    refusal(
+        crate::agent_jobs::JOB_QA_LANE_LIMIT,
+        "wait for or cancel one of your two running QA shard jobs before submitting another",
+    ),
+    refusal(
+        crate::agent_jobs::JOB_QA_LANE_SHA_MISMATCH,
+        "pin qa_lane.sha to the owner sandbox submission-time HEAD and retry; probe failure also refuses; dirtiness is not checked",
+    ),
+    refusal(
+        crate::agent_jobs::JOB_RECIPE_NOT_ALLOWED,
+        "declare this recipe in the worktree .rsi/jobs.toml before submitting it",
+    ),
+    refusal(
+        crate::agent_jobs::JOB_RECIPE_INVALID,
+        "fix .rsi/jobs.toml: version 1, at most 64 recipes, just/make targets, timeout and CPU caps; keep the manifest inside the worktree",
+    ),
     refusal(JOB_NAME_INVALID, "use a name of at most 80 bytes"),
     refusal(
         JOB_KEY_INVALID,
         "use an idempotency_key of at most 128 bytes without NUL",
     ),
     refusal(JOB_KIND_UNSUPPORTED, "use a kind the schema enumerates"),
+    refusal(
+        JOB_PLATFORM_UNSUPPORTED,
+        "macOS supports package test, build and recipe jobs; use Linux for shard, candidate-receipt, landing and cloud jobs; other operating systems have no durable backend",
+    ),
     refusal(
         JOB_DIR_NOT_ALLOWED,
         "run the job from your own sandbox directory",
@@ -610,16 +713,15 @@ impl AgentControlVerbV1 {
             Self::CreateIssue
             | Self::ListIssues
             | Self::GetIssue
-            | Self::UpdateIssue
             | Self::UpdateIssueStatus
             | Self::ArchiveIssue
             | Self::RestoreIssue
             | Self::ListIssueEvents => ISSUE_REFUSALS,
-            Self::ManagerInspect
-            | Self::ManagerProgress
-            | Self::ManagerInbox
-            | Self::ManagerGetAction
-            | Self::ManagerReply => &[MANAGER_INVALID_REQUEST],
+            Self::UpdateIssue => UPDATE_ISSUE_REFUSALS,
+            Self::ManagerInspect | Self::ManagerProgress | Self::ManagerGetAction => {
+                &[MANAGER_INVALID_REQUEST, MANAGER_PROJECT_NOT_IN_SCOPE]
+            }
+            Self::ManagerInbox | Self::ManagerReply => &[MANAGER_INVALID_REQUEST],
             Self::ManagerNotify => {
                 const R: &[AgentControlRefusalV1] = &[
                     MANAGER_INVALID_REQUEST,
@@ -641,14 +743,33 @@ impl AgentControlVerbV1 {
                 ];
                 R
             }
-            Self::ManagerUpdate
-            | Self::ManagerSend
-            | Self::ManagerPrepareControl
-            | Self::ManagerCommitPreparedControl => {
+            Self::ManagerSend => {
                 const R: &[AgentControlRefusalV1] = &[
                     MANAGER_INVALID_REQUEST,
                     MANAGER_IDEMPOTENCY_CONFLICT,
                     MANAGER_CAPABILITY_DENIED,
+                ];
+                R
+            }
+            Self::ManagerUpdate => {
+                const R: &[AgentControlRefusalV1] = &[
+                    MANAGER_INVALID_REQUEST,
+                    MANAGER_IDEMPOTENCY_CONFLICT,
+                    MANAGER_CAPABILITY_DENIED,
+                    MANAGER_PROJECT_NOT_IN_SCOPE,
+                    refusal(
+                        "manager_review_work_version_changed",
+                        "request_review expected_row_version is the work row's current row_version; the refusal names it (current_row_version=N), or read AgentManagerInspect with section work",
+                    ),
+                ];
+                R
+            }
+            Self::ManagerPrepareControl | Self::ManagerCommitPreparedControl => {
+                const R: &[AgentControlRefusalV1] = &[
+                    MANAGER_INVALID_REQUEST,
+                    MANAGER_IDEMPOTENCY_CONFLICT,
+                    MANAGER_CAPABILITY_DENIED,
+                    MANAGER_PROJECT_NOT_IN_SCOPE,
                 ];
                 R
             }
@@ -659,6 +780,15 @@ impl AgentControlVerbV1 {
                     MANAGER_CAPABILITY_DENIED,
                     MANAGER_PAUSED,
                     MANAGER_HUMAN_OR_RECOVERY_OWNER,
+                    MANAGER_PROJECT_NOT_IN_SCOPE,
+                    refusal(
+                        crate::global_manager::MANAGER_TARGET_OWNED_BY_ANCESTOR,
+                        "a global manager owns that session; ask it, do not retry",
+                    ),
+                    refusal(
+                        crate::global_manager::MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED,
+                        "the covering global grant's creation budget for this project is spent; ask the global manager",
+                    ),
                     refusal(
                         "manager_v2_daemon_setting_not_allowlisted",
                         "ProposeDaemonSetting changes only the curated settings; spend and credentials are never adjustable",
@@ -670,6 +800,18 @@ impl AgentControlVerbV1 {
                     refusal(
                         "manager_v2_daemon_setting_out_of_bounds",
                         "propose a value inside the operator's per-key min and max",
+                    ),
+                    refusal(
+                        "manager_sandbox_source_invalid",
+                        "sandbox_source is {\"rolling\":{}}, {\"commit\":\"<40 lowercase hex>\"} or {\"path\":\"<absolute path>\"}; nothing was changed",
+                    ),
+                    refusal(
+                        "manager_sandbox_source_not_worktree",
+                        "the path is not a registered worktree of the project repository (git worktree list); name your sandbox_root itself",
+                    ),
+                    refusal(
+                        "manager_sandbox_source_commit_unknown",
+                        "that commit is not in the project repository; commit and name an existing SHA",
                     ),
                 ];
                 R
@@ -798,6 +940,10 @@ impl AgentControlVerbV1 {
                     refusal(
                         QUEUE_REGATE_EXHAUSTED,
                         "an out-of-band push to rolling cost a second regate; merge the new tip and enqueue again",
+                    ),
+                    refusal(
+                        QUEUE_GATE_TIMEOUT,
+                        "the batch ran past the operator's gate wall-time budget (rolling_queue_gate_timeout_mins); nothing was published: enqueue again, with narrower test filters if you can",
                     ),
                 ];
                 R
@@ -969,6 +1115,43 @@ impl AgentControlVerbV1 {
                         "manager_issue_worker_authority_denied",
                         "needs the IssueCoordinate grant as well as SessionCreate; re-check AgentGetAuthorityCatalog",
                     ),
+                    refusal(
+                        crate::global_manager::MANAGER_ISSUE_WORKER_ALREADY_LIVE,
+                        "another manager's worker on this Issue is still live; watch it instead of launching a second",
+                    ),
+                    MANAGER_PROJECT_NOT_IN_SCOPE,
+                    refusal(
+                        "manager_sandbox_source_invalid",
+                        "sandbox_source is {\"rolling\":{}}, {\"commit\":\"<40 lowercase hex>\"} or {\"path\":\"<absolute path>\"}; nothing was changed",
+                    ),
+                    refusal(
+                        "manager_sandbox_source_not_worktree",
+                        "the path is not a registered worktree of the project repository (git worktree list); name your sandbox_root itself",
+                    ),
+                    refusal(
+                        "manager_sandbox_source_commit_unknown",
+                        "that commit is not in the project repository; commit and name an existing SHA",
+                    ),
+                    refusal(
+                        crate::manager_issue_worker::MANAGER_ISSUE_WORKER_PREDECESSOR_LIVE,
+                        "continue_from names a worker that is still running; wait for its turn to end (your terminal watch fires) or halt it first",
+                    ),
+                    refusal(
+                        crate::manager_issue_worker::MANAGER_ISSUE_WORKER_PREDECESSOR_OTHER_ISSUE,
+                        "continue_from names a worker bound to a different Issue; launch for that Issue or omit continue_from",
+                    ),
+                    refusal(
+                        crate::manager_issue_worker::MANAGER_ISSUE_WORKER_REVIEWED_UNAVAILABLE,
+                        "review_of names no Issue of this project; pass the implementer Issue's display number, or omit review_of",
+                    ),
+                    refusal(
+                        crate::manager_issue_worker::MANAGER_ISSUE_WORKER_PREDECESSOR_OUT_OF_SCOPE,
+                        "continue_from names no Issue-bound worker of this project; name the session id from your worker_context_cap notice",
+                    ),
+                    refusal(
+                        crate::manager_issue_worker::MANAGER_ISSUE_WORKER_PREDECESSOR_SANDBOX_UNAVAILABLE,
+                        "the predecessor's sandbox is gone; launch with sandbox_source {\"commit\": \"<its last SHA>\"} instead",
+                    ),
                 ];
                 R
             }
@@ -976,6 +1159,13 @@ impl AgentControlVerbV1 {
                 const R: &[AgentControlRefusalV1] = &[refusal(
                     GLOBAL_MANAGER_NOT_SEAT,
                     "only the operator-appointed global seat may call it; re-check AgentGetAuthorityCatalog",
+                )];
+                R
+            }
+            Self::ManagerOverview => {
+                const R: &[AgentControlRefusalV1] = &[refusal(
+                    MANAGER_TIER_NOT_NODE_SEAT,
+                    "only a manager seat (area, project or portfolio node) has a node to read; re-check AgentGetAuthorityCatalog",
                 )];
                 R
             }
@@ -1026,6 +1216,92 @@ impl AgentControlVerbV1 {
                         "manager_node_root_has_active_delegates",
                         "the current project manager has active area delegates; ask it to revoke them first",
                     ),
+                    refusal(
+                        MANAGER_DIRECT_REPORT_CAP,
+                        "you already have max_direct_reports children and project managers; revoke one or ask the operator",
+                    ),
+                ];
+                R
+            }
+            Self::ManagerAppointChild => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        GLOBAL_MANAGER_NOT_SEAT,
+                        "only an active portfolio node seat may call it; re-check AgentGetAuthorityCatalog",
+                    ),
+                    refusal(
+                        crate::global_manager::MANAGER_PROJECT_NOT_IN_SCOPE,
+                        "name projects of your own coverage; a child's coverage is a strict subset of yours",
+                    ),
+                    refusal(
+                        GLOBAL_LAUNCH_NOT_ALLOWED,
+                        "pick a launch from your grant's allowed_launches",
+                    ),
+                    refusal(
+                        MANAGER_SCOPE_NOT_NARROWED,
+                        "a child covers a strict subset of your projects; act in the rest yourself",
+                    ),
+                    refusal(
+                        MANAGER_SCOPE_OVERLAP,
+                        "another child already covers one of these projects; narrow the set or revoke that child",
+                    ),
+                    refusal(
+                        MANAGER_DIRECT_REPORT_CAP,
+                        "you already have max_direct_reports children and project managers; revoke one or ask the operator",
+                    ),
+                    refusal(
+                        MANAGER_CAPABILITY_WIDENED,
+                        "give the child only capabilities and launches you hold",
+                    ),
+                    refusal(
+                        MANAGER_ALLOWANCE_EXCEEDED,
+                        "set every finite allowance strictly below yours and max_direct_reports at most yours",
+                    ),
+                    refusal(
+                        MANAGER_CHILD_OPERATOR_GRANTED,
+                        "the operator granted that child; only the operator re-seats it",
+                    ),
+                    refusal(
+                        MANAGER_NODE_NOT_IN_SCOPE,
+                        "name a child node your node granted",
+                    ),
+                    refusal(
+                        MANAGER_NODE_ROOT_OPERATOR_ONLY,
+                        "only the operator creates roots, adopts or re-parents",
+                    ),
+                    refusal(
+                        MANAGER_NODE_STALE,
+                        "re-read the child's grant version and retry",
+                    ),
+                    refusal(
+                        PORTFOLIO_IDEMPOTENCY_CONFLICT,
+                        "replay the original content or use a new idempotency_key",
+                    ),
+                    refusal(
+                        "manager_node_root_has_active_delegates",
+                        "the current project manager has active area delegates; ask it to revoke them first",
+                    ),
+                ];
+                R
+            }
+            Self::ManagerRevokeChild => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        GLOBAL_MANAGER_NOT_SEAT,
+                        "only an active portfolio node seat may call it; re-check AgentGetAuthorityCatalog",
+                    ),
+                    refusal(
+                        MANAGER_CHILD_OPERATOR_GRANTED,
+                        "the operator granted that child; ask the operator to revoke it",
+                    ),
+                    refusal(
+                        MANAGER_NODE_NOT_IN_SCOPE,
+                        "name a child node your node granted",
+                    ),
+                    refusal(
+                        MANAGER_NODE_STALE,
+                        "re-read the child's grant version and retry",
+                    ),
                 ];
                 R
             }
@@ -1042,6 +1318,57 @@ impl AgentControlVerbV1 {
                     refusal(
                         GLOBAL_MANAGER_MAILBOX_FULL,
                         "wait for the global manager to take its queued messages",
+                    ),
+                ];
+                R
+            }
+            Self::ReportUp => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        MANAGER_TIER_NOT_NODE_SEAT,
+                        "only a manager seat (area, project or portfolio node) reports up; re-check AgentGetAuthorityCatalog",
+                    ),
+                    refusal(
+                        MANAGER_TIER_TARGET_VACANT,
+                        "the manager above you has no live seat; ask the operator to appoint one",
+                    ),
+                    refusal(
+                        MANAGER_TIER_IDEMPOTENCY_CONFLICT,
+                        "replay the original content or use a new idempotency_key",
+                    ),
+                    refusal(
+                        MANAGER_TIER_MAILBOX_FULL,
+                        "wait for the recipient to take its queued messages",
+                    ),
+                ];
+                R
+            }
+            Self::SendDown => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        MANAGER_TIER_NOT_NODE_SEAT,
+                        "only a manager seat (area, project or portfolio node) sends down; re-check AgentGetAuthorityCatalog",
+                    ),
+                    refusal(
+                        MANAGER_TARGET_NOT_DESCENDANT,
+                        "mail goes down only: name a node below yours, never your own or an ancestor (report up with AgentReportUp)",
+                    ),
+                    MANAGER_PROJECT_NOT_IN_SCOPE,
+                    refusal(
+                        MANAGER_TIER_TARGET_UNKNOWN,
+                        "name an existing node (AgentGlobalOverview lists your projects)",
+                    ),
+                    refusal(
+                        MANAGER_TIER_TARGET_VACANT,
+                        "that node has no live seat; appoint one first",
+                    ),
+                    refusal(
+                        MANAGER_TIER_IDEMPOTENCY_CONFLICT,
+                        "replay the original content or use a new idempotency_key",
+                    ),
+                    refusal(
+                        MANAGER_TIER_MAILBOX_FULL,
+                        "wait for the recipient to take its queued messages",
                     ),
                 ];
                 R
@@ -1171,5 +1498,9 @@ mod tests {
         assert!(codes(AgentControlVerbV1::SendMessage).contains(&"agent_message_target_terminal"));
         assert!(codes(AgentControlVerbV1::UpdateIssue).contains(&"stale_version"));
         assert!(codes(AgentControlVerbV1::SubmitJob).contains(&"job_kind_not_authorized"));
+        assert!(
+            codes(AgentControlVerbV1::SubmitJob)
+                .contains(&crate::agent_jobs::JOB_PLATFORM_UNSUPPORTED)
+        );
     }
 }

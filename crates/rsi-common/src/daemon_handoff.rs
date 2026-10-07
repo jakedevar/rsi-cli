@@ -56,7 +56,7 @@ impl CoordinatorSeatV1 {
                 ".claude/skills/rsi-project-manager/SKILL.md"
             }
             Self::EpicLead { .. } => "thoughts/shared/manager/worker-contract.md",
-            Self::GlobalManager => ".claude/skills/rsi-global-manager/SKILL.md",
+            Self::GlobalManager => ".claude/skills/rsi-portfolio-manager/SKILL.md",
         }
     }
 }

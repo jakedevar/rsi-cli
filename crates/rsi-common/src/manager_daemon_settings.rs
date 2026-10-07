@@ -18,6 +18,10 @@ pub struct AdjustableDaemonSetting {
     pub label: &'static str,
     pub hard_min: u64,
     pub hard_max: u64,
+    /// Values strictly between these two are refused although they sit in
+    /// the hard range (a field with two units, e.g. #1254's percentage or
+    /// tokens worker cap).
+    pub excluded_between: Option<(u64, u64)>,
 }
 
 /// The closed allowlist. Order is the TUI row order.
@@ -27,26 +31,50 @@ pub const MANAGER_ADJUSTABLE_DAEMON_SETTINGS: &[AdjustableDaemonSetting] = &[
         label: "Maximum sandbox roots",
         hard_min: 1,
         hard_max: 65_536,
+        excluded_between: None,
     },
     AdjustableDaemonSetting {
         key: "sandbox_min_free_gib",
         label: "Minimum free space (GiB)",
         hard_min: 0,
         hard_max: 1024,
+        excluded_between: None,
     },
     AdjustableDaemonSetting {
         key: "sandbox_build_cache_reclaim_high_watermark_pct",
         label: "Cache pressure high",
         hard_min: 2,
         hard_max: 99,
+        excluded_between: None,
     },
     AdjustableDaemonSetting {
         key: "sandbox_build_cache_reclaim_low_watermark_pct",
         label: "Cache pressure low",
         hard_min: 1,
         hard_max: 98,
+        excluded_between: None,
+    },
+    // #1254: `0` off, `1..=100` percent of the context window, or tokens in
+    // `32_000..=2_000_000`; the daemon applies it with the same validation.
+    AdjustableDaemonSetting {
+        key: "worker_context_cap_tokens",
+        label: "Worker context cap (0 off, 1-100 = % of window)",
+        hard_min: 0,
+        hard_max: 2_000_000,
+        excluded_between: Some((100, 32_000)),
     },
 ];
+
+impl AdjustableDaemonSetting {
+    /// Whether `value` is one the daemon accepts for this key.
+    #[must_use]
+    pub fn accepts(&self, value: u64) -> bool {
+        (self.hard_min..=self.hard_max).contains(&value)
+            && self
+                .excluded_between
+                .is_none_or(|(low, high)| value <= low || value >= high)
+    }
+}
 
 /// Refusal: the key is not in the curated allowlist.
 pub const DAEMON_SETTING_NOT_ALLOWLISTED: &str = "manager_v2_daemon_setting_not_allowlisted";
@@ -104,12 +132,12 @@ pub fn check_daemon_setting_proposal(
     key: &str,
     value: u64,
 ) -> Result<(), &'static str> {
-    adjustable_daemon_setting(key).ok_or(DAEMON_SETTING_NOT_ALLOWLISTED)?;
+    let setting = adjustable_daemon_setting(key).ok_or(DAEMON_SETTING_NOT_ALLOWLISTED)?;
     let bound = bounds
         .iter()
         .find(|bound| bound.key == key)
         .ok_or(DAEMON_SETTING_NOT_ADJUSTABLE)?;
-    if value < bound.min || value > bound.max {
+    if value < bound.min || value > bound.max || !setting.accepts(value) {
         return Err(DAEMON_SETTING_OUT_OF_BOUNDS);
     }
     Ok(())
@@ -184,6 +212,30 @@ mod tests {
             check_daemon_setting_proposal(&[], "sandbox_max_source_roots", 16_384),
             Err(DAEMON_SETTING_NOT_ADJUSTABLE)
         );
+    }
+
+    /// #1254: the worker cap is curated; a proposal inside the operator's
+    /// bounds passes only when the daemon accepts it (percent or tokens).
+    #[test]
+    fn worker_context_cap_is_curated_and_its_unit_gap_is_refused() {
+        let setting = adjustable_daemon_setting("worker_context_cap_tokens").expect("curated");
+        assert_eq!((setting.hard_min, setting.hard_max), (0, 2_000_000));
+        let bounds = vec![bound("worker_context_cap_tokens", 0, 400_000)];
+        assert!(validate_daemon_setting_bounds(&bounds).is_ok());
+        for value in [0, 1, 60, 100, 32_000, 200_000, 400_000] {
+            assert_eq!(
+                check_daemon_setting_proposal(&bounds, "worker_context_cap_tokens", value),
+                Ok(()),
+                "{value}"
+            );
+        }
+        for value in [101, 31_999, 400_001] {
+            assert_eq!(
+                check_daemon_setting_proposal(&bounds, "worker_context_cap_tokens", value),
+                Err(DAEMON_SETTING_OUT_OF_BOUNDS),
+                "{value}"
+            );
+        }
     }
 
     #[test]

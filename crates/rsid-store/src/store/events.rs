@@ -49,6 +49,11 @@ impl Store {
             )?;
         }
         tx.commit()?;
+        // #1343: telemetry has its own transaction after the event is durable;
+        // even a database error that rolls it back cannot undo ingestion.
+        if let Err(error) = super::friction::note_repeated_tool_error(&self.conn, event, event_id) {
+            tracing::warn!(%error, "tool error friction not recorded");
+        }
         // #46: an assistant event answers the mail handed to this session.
         // Best effort and after the commit: the event itself is already durable.
         if let Err(error) = self.acknowledge_injected_agent_mail_for_event_v1(event, event_id) {

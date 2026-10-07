@@ -45,6 +45,29 @@ shard_check() {
   return 0
 }
 
+# Operator identifiers (#1454): a push to refs/heads/rolling must not add a line
+# containing an identifier from the operator's private list
+# (~/.rsi/operator-identifiers). Checked against the commits the push adds.
+# A no-op without the list, for a new ref, or when the remote tip is unknown here.
+operator_identifier_check() {
+  oid=$1
+  remote=$2
+  case "$oid" in 0000000000000000000000000000000000000000) return 0 ;; esac
+  case "$remote" in 0000000000000000000000000000000000000000) return 0 ;; esac
+  git cat-file -e "$oid:tools/check_operator_identifiers.py" 2>/dev/null || return 0
+  git cat-file -e "$remote^{commit}" 2>/dev/null || return 0
+  tool=$(mktemp "${TMPDIR:-/tmp}/rsi-pre-push-ids-XXXXXX") || return 0
+  git show "$oid:tools/check_operator_identifiers.py" >"$tool" 2>/dev/null || { rm -f "$tool"; return 0; }
+  python3 "$tool" --range "$remote..$oid" >&2
+  status=$?
+  rm -f "$tool"
+  if [ "$status" -ne 0 ]; then
+    echo "pre-push: $oid adds operator personal data (check_operator_identifiers.py); refusing to update refs/heads/rolling" >&2
+    return 1
+  fi
+  return 0
+}
+
 agent_session=0
 if [ -n "${RSI_SESSION_ID:-}" ] || [ -n "${RSI_SESSION_TOKEN:-}" ]; then
   agent_session=1
@@ -64,6 +87,7 @@ while read -r local_ref local_oid remote_ref remote_oid; do
         exit 1
       fi
       shard_check "$local_oid" || exit 1
+      operator_identifier_check "$local_oid" "$remote_oid" || exit 1
       ;;
   esac
 done

@@ -172,8 +172,6 @@ enum ValueWidget {
     },
     /// A color value with its live swatch (`None`: no color of its own).
     Swatch { color: Option<Color>, text: String },
-    /// A row of color swatches.
-    Palette(Vec<Color>),
     /// An explicit operator action as a button, with its latest result.
     Action { button: String, detail: String },
     /// A state dot with its text.
@@ -204,7 +202,6 @@ impl ValueWidget {
             Self::Toggle(false) => "OFF".to_string(),
             Self::Choice { value, .. } | Self::Picker { value, .. } => value.clone(),
             Self::Swatch { text, .. } | Self::Badge { text, .. } | Self::Text(text) => text.clone(),
-            Self::Palette(colors) => format!("{} colors", colors.len()),
             Self::Action { button, detail } if detail.is_empty() => button.clone(),
             Self::Action { button, detail } => format!("{button} {detail}"),
             Self::Activity { status, detail, .. } => format!("{status} {detail}"),
@@ -480,8 +477,11 @@ pub fn render_settings(app: &App, frame: &mut Frame, area: Rect) {
         && let Some(anchor) = dropdown_anchor
     {
         let item_idx = app.settings_state.active_dropdown_item.unwrap_or(selected);
+        let dropdown = &app.settings_state.model_dropdown;
         let current_model: Option<&str> = match item_idx {
-            0 => app.selected_model.as_deref(),
+            // Browsing another provider previews it; only the default's own
+            // provider and endpoint carry its check mark.
+            0 => app.default_model_in(dropdown),
             1 => Some(app.settings.title_model_local.as_str()),
             2 => Some(app.settings.prompt_processor.model.as_str()),
             3 => Some(app.settings.memory_model_fallback.as_str()),
@@ -493,9 +493,9 @@ pub fn render_settings(app: &App, frame: &mut Frame, area: Rect) {
             frame,
             area,
             anchor,
-            &app.settings_state.model_dropdown,
+            dropdown,
             current_model,
-            app.is_provider_available(app.settings_state.model_dropdown.provider),
+            app.is_provider_available(dropdown.provider),
         );
     }
 }
@@ -1380,17 +1380,6 @@ fn widget_spans(row: &SettingsRow, accent: Color, choice_width: usize) -> Vec<Sp
             Span::raw(" "),
             Span::styled(text.clone(), Style::default().fg(tone)),
         ],
-        ValueWidget::Palette(colors) => {
-            let mut spans: Vec<Span<'static>> = colors
-                .iter()
-                .map(|color| Span::styled("█", Style::default().fg(*color)))
-                .collect();
-            spans.push(Span::styled(
-                format!("  {} slots", colors.len()),
-                Style::default().fg(theme::subtext0()),
-            ));
-            spans
-        }
         ValueWidget::Action { button, detail } => {
             let bg = if row.destructive {
                 theme::error_status()
@@ -1736,6 +1725,7 @@ fn apply_chip(apply: SettingApply) -> (&'static str, &'static str, Color) {
         SettingApply::Immediate | SettingApply::Daemon(ApplyClass::Live) => {
             ("✓", "applies now", theme::green())
         }
+        SettingApply::BridgeRestart => ("↻", "after bridge restart", theme::warning_status()),
         SettingApply::Daemon(ApplyClass::NextSpawn) => ("◷", "next spawn", theme::sky()),
         SettingApply::Daemon(ApplyClass::PartialLive) => ("◐", "new launches now", theme::sky()),
         SettingApply::Daemon(ApplyClass::LiveOffRestartOn) => {
@@ -1904,11 +1894,16 @@ fn section_rows(app: &App) -> Vec<SettingsRow> {
         .collect()
 }
 
-/// A daemon field's Epic M design D.5 restart badge: shown only for
-/// `DaemonRestart`-classed rows (the class that never applies live). The
-/// info card's apply chip names every other class.
+/// Mark every row with a restart boundary. The info card distinguishes
+/// full daemon, conditional enable/restore, and independent bridge restarts.
 fn restart_badge(spec: &SettingSpec) -> bool {
-    matches!(spec.apply, SettingApply::Daemon(ApplyClass::DaemonRestart))
+    matches!(
+        spec.apply,
+        SettingApply::BridgeRestart
+            | SettingApply::Daemon(
+                ApplyClass::DaemonRestart | ApplyClass::LiveOffRestartOn | ApplyClass::PartialLive
+            )
+    )
 }
 
 fn base_row(
@@ -2624,21 +2619,7 @@ fn theme_colors_row(idx: usize) -> SettingsRow {
                 )
             }
         }
-        18 => base_row(
-            "Legacy message/editor colors",
-            ValueWidget::Palette(vec![
-                theme::assistant_message_border(),
-                theme::user_message_border(),
-                theme::tool_call_border(),
-                theme::tool_call_selected_border(),
-                theme::cursor_normal_bg(),
-                theme::cursor_insert_bg(),
-                theme::visual_selection_bg(),
-            ]),
-            "open the legacy color editor",
-            "Edit the compatible message-border and editor cursor color slots.",
-        ),
-        19 => SettingsRow {
+        18 => SettingsRow {
             tone: ValueTone::Warning,
             ..base_row(
                 "Reset active theme",
@@ -2647,7 +2628,7 @@ fn theme_colors_row(idx: usize) -> SettingsRow {
                     detail: "clears semantic overrides".to_string(),
                 },
                 "reset the active theme",
-                "Clear all semantic overrides without changing the selected built-in theme or legacy colors.",
+                "Clear all semantic overrides without changing the selected built-in theme.",
             )
         },
         _ => unknown_row(),
@@ -2765,8 +2746,7 @@ fn model_role_row(app: &App, idx: usize) -> SettingsRow {
                 .unwrap_or("?")
                 .to_string(),
             "Model the stall classifier calls to judge a stalled session. \
-             The classifier is built when the daemon starts, so a new model \
-             applies after a daemon restart.",
+             The next classification uses the saved model.",
         ),
         _ => return unknown_row(),
     };
@@ -2853,7 +2833,6 @@ fn spec_for_row(
             0 => section_specs.first().copied(),
             1..=17 => section_specs.get(1).copied(),
             18 => section_specs.get(2).copied(),
-            19 => section_specs.get(3).copied(),
             _ => None,
         },
         SettingsSection::SessionList => {
@@ -2902,6 +2881,7 @@ fn settings_contract(app: &App, section: SettingsSection, idx: usize) -> Setting
     };
     let restart = match spec.apply {
         SettingApply::Immediate => "not required",
+        SettingApply::BridgeRestart => "bridge process only",
         SettingApply::Daemon(ApplyClass::DaemonRestart) => "required",
         SettingApply::Daemon(ApplyClass::LiveOffRestartOn) => "on enable only",
         SettingApply::Daemon(ApplyClass::PartialLive) => "resumed sessions only",
@@ -2940,6 +2920,7 @@ fn truncate_command(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings_registry::SettingId;
     use ratatui::buffer::Buffer;
 
     fn settings_app(section: SettingsSection, focus: SettingsFocus) -> App {
@@ -3281,33 +3262,33 @@ mod tests {
         assert!(row.keys.contains(&REFRESH_KEY));
     }
 
-    /// (c) acceptance: `restart_badge_rendered_for_daemon_restart_rows`
-    /// (Epic M design D.5). `stall_detection_enabled` is classed
-    /// `DaemonRestart`; its row carries the `↻` badge, matching the info
-    /// card's "after daemon restart" chip.
     #[test]
-    fn restart_badge_rendered_for_daemon_restart_rows() {
-        let mut app = settings_app(SettingsSection::StallDetection, SettingsFocus::Items);
-        let row = settings_row(&app, 0); // StallDetection (stall_detection_enabled)
-        assert_eq!(row.label, "Stall detection");
-        assert!(row.restart, "DaemonRestart rows carry the restart badge");
-
-        // A Live-classed row in the same section gets no badge.
-        let live_row = settings_row(&app, 6); // ClassifierConfidenceFloor (Live)
-        assert_eq!(live_row.label, "Classifier confidence floor");
-        assert!(!live_row.restart);
-
-        app.settings_state.selected_index = 0;
-        let buffer = rendered_settings(&app, 200, 58);
-        let text = buffer_text(&buffer);
-        let Some(line) = text
-            .lines()
-            .find(|line| line.contains("▌ Stall detection  "))
-        else {
-            panic!("selected stall row:\n{text}");
-        };
-        assert!(line.contains('↻'), "{line}");
+    fn restart_badges_match_live_and_restart_only_consumers() {
+        for (id, expected) in [
+            (SettingId::StallDetection, false),
+            (SettingId::ClassifierModel, false),
+            (SettingId::ObservationThreshold, false),
+            (SettingId::DreamCooldown, false),
+            (SettingId::RsidScopeMemoryHigh, true),
+            (SettingId::MemorySystem, true),
+            (SettingId::ContextRotation, true),
+            (SettingId::SignalBridge, true),
+            (SettingId::ImessageBridge, true),
+        ] {
+            let spec = SETTINGS.iter().find(|spec| spec.id == id).unwrap();
+            assert_eq!(restart_badge(spec), expected, "{id:?}");
+        }
+        let mut app = settings_app(SettingsSection::Orchestration, SettingsFocus::Items);
+        app.settings_state.selected_index = SETTINGS
+            .iter()
+            .filter(|spec| spec.section == SettingsSection::Orchestration)
+            .position(|spec| spec.id == SettingId::RsidScopeMemoryHigh)
+            .unwrap();
+        let text = buffer_text(&rendered_settings(&app, 200, 58));
         assert!(text.contains("↻ after daemon restart"), "{text}");
+        let app = settings_app(SettingsSection::MessageBridges, SettingsFocus::Items);
+        let text = buffer_text(&rendered_settings(&app, 200, 58));
+        assert!(text.contains("↻ after bridge restart"), "{text}");
     }
 
     /// (c) acceptance: `codegraph_row_lives_in_code_intelligence`. Never
@@ -3649,6 +3630,7 @@ mod tests {
     }
     #[test]
     fn usage_dashboard_renders_groups_names_and_semantic_status_color() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
         let mut app = crate::model_control_stats::tests::named_work_app();
         app.settings_state.section = SettingsSection::Usage;
         app.settings_state.focus = SettingsFocus::Items;

@@ -136,6 +136,40 @@ fn refused(code: &str) -> DaemonError {
     DaemonError::InvalidParam(code.into())
 }
 
+/// Called in the same proven seat-publication transaction as durable job
+/// transfer. Source and replay identity remain unchanged; only delivery moves.
+pub(crate) fn transfer_manager_queue_wakes_on(
+    conn: &rusqlite::Connection,
+    predecessor: Uuid,
+    successor: Uuid,
+) -> Result<()> {
+    if conn.is_autocommit() {
+        return Err(DaemonError::Store(
+            "manager queue wake transfer requires a transaction".into(),
+        ));
+    }
+    if predecessor == successor {
+        return Ok(());
+    }
+    let old = predecessor.to_string();
+    let new = successor.to_string();
+    conn.execute(
+        "UPDATE rolling_queue_entries SET wake_session_id=?2,row_version=row_version+1
+         WHERE COALESCE(wake_session_id,source_session_id)=?1
+           AND state IN ('queued','admitted','gating')",
+        params![old, new],
+    )?;
+    // Settlement can win the transaction race with succession. Move an
+    // unfired outcome too, without touching its immutable terminal entry.
+    conn.execute(
+        "UPDATE scheduled_jobs SET wake_session_id=?2,updated_at=?3
+         WHERE enabled=1 AND wake_mode='resume' AND wake_session_id=?1
+           AND id IN (SELECT wake_job_id FROM rolling_queue_entries WHERE wake_job_id IS NOT NULL)",
+        params![old, new, stamp(Utc::now())],
+    )?;
+    Ok(())
+}
+
 /// Everything the enqueue verb resolves before the store write.
 #[derive(Debug, Clone)]
 pub struct NewQueueEntry {
@@ -169,12 +203,13 @@ pub struct ClaimedQueueEntry {
     pub batch_id: Uuid,
 }
 
-const ENTRY_COLUMNS: &str = "sequence, id, project_id, repo_path, source_commit, source_session_id, owner_epic_id, binding, work_key, migration_version, hot_files_json, test_filters_json, state, outcome_json, enqueued_at, finished_at";
+const ENTRY_COLUMNS: &str = "sequence, id, project_id, repo_path, source_commit, source_session_id, owner_epic_id, binding, work_key, migration_version, hot_files_json, test_filters_json, state, outcome_json, enqueued_at, finished_at, wake_session_id";
 
 struct EntryRow {
     entry: RollingQueueEntryV1,
     repo_path: String,
     project_id: Option<String>,
+    wake_session_id: Option<Uuid>,
 }
 
 fn parse_uuid(value: &str) -> rusqlite::Result<Uuid> {
@@ -205,6 +240,11 @@ fn map_entry(row: &Row<'_>) -> rusqlite::Result<EntryRow> {
         .map(|text| serde_json::from_str::<RollingQueueOutcome>(&text).map_err(json_error))
         .transpose()?;
     Ok(EntryRow {
+        wake_session_id: row
+            .get::<_, Option<String>>(16)?
+            .as_deref()
+            .map(parse_uuid)
+            .transpose()?,
         repo_path: row.get(3)?,
         project_id: row.get(2)?,
         entry: RollingQueueEntryV1 {
@@ -684,7 +724,8 @@ impl Store {
                 continue;
             };
             let entry = row.entry;
-            let target = self.queue_wake_target(entry.source_session_id);
+            let target =
+                self.queue_wake_target(row.wake_session_id.unwrap_or(entry.source_session_id));
             let position = groups.iter().position(|group| group.target == target);
             let group = match position {
                 Some(position) => &mut groups[position],
@@ -718,6 +759,7 @@ impl Store {
             group.lines.push(wake_message(&entry, outcome));
             settled.push((*id, group.wake_id));
             self.settle_batch_bookkeeping(&tx, *id, terminal.as_str(), outcome, now)?;
+            super::friction::note_lander_friction_in(&tx, &entry, *terminal, outcome, now);
         }
         for group in groups {
             if group.lines.is_empty() {
@@ -1006,6 +1048,52 @@ mod tests {
         store
             .enqueue_rolling_queue_source(&new_entry(Uuid::new_v4(), 'a', "k3"), Utc::now())
             .unwrap();
+    }
+
+    /// #1333: a refused landing records `lander:refused:<code>` friction for
+    /// the source session, with the entry as evidence.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn refused_landings_record_lander_friction() {
+        let store = store();
+        let session = Uuid::new_v4();
+        store
+            .enqueue_rolling_queue_source(&new_entry(session, 'a', "k1"), Utc::now())
+            .unwrap();
+        let claimed = store
+            .claim_next_rolling_queue_entry(Utc::now())
+            .unwrap()
+            .unwrap();
+        let refusal = RollingQueueOutcome {
+            refusal: Some("queue_empty_filter".into()),
+            detail: Some("free text that must never be recorded".into()),
+            ..RollingQueueOutcome::default()
+        };
+        store
+            .settle_rolling_queue_entry(
+                claimed.entry.id,
+                RollingQueueEntryState::Refused,
+                &refusal,
+                Utc::now(),
+            )
+            .unwrap()
+            .unwrap();
+        let row: (String, String, String) = store
+            .conn
+            .query_row(
+                "SELECT signature, session_id, evidence_ref FROM friction_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "lander:refused:queue_empty_filter".to_string(),
+                session.to_string(),
+                format!("merge_queue:{}", claimed.entry.id)
+            )
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
@@ -1356,6 +1444,255 @@ mod tests {
             .filter(|job| job.name.starts_with("merge-queue-"))
             .map(|job| job.wake_session_id)
             .collect()
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn outcome_wake_follows_displaced_live_manager_through_repeated_appointments() {
+        use crate::store::manager_coordinator::tests::fixture;
+        use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
+
+        for state in ["queued", "admitted", "gating"] {
+            let store = store();
+            let (mut config, lead) = fixture(&store, Default::default());
+            let seat_a = config.current_session_id.unwrap();
+            store
+                .update_session_status(seat_a, rsi_common::types::SessionStatus::Running)
+                .unwrap();
+            let mut new = new_entry(seat_a, 'a', "seat");
+            new.project_id = Some(config.project_id);
+            let entry = store
+                .enqueue_rolling_queue_source(&new, Utc::now())
+                .unwrap()
+                .0;
+            if state == "gating" {
+                store
+                    .claim_next_rolling_queue_entry(Utc::now())
+                    .unwrap()
+                    .unwrap();
+            } else if state == "admitted" {
+                store
+                    .conn
+                    .execute(
+                        "UPDATE rolling_queue_entries SET state='admitted' WHERE id=?1",
+                        [entry.id.to_string()],
+                    )
+                    .unwrap();
+            }
+            let unrelated = new_entry(Uuid::new_v4(), 'b', "worker");
+            let foreign = store
+                .enqueue_rolling_queue_source(&unrelated, Utc::now())
+                .unwrap()
+                .0;
+            let mut target = seat_a;
+            for _ in 0..2 {
+                let mut next = store.get_session(target).unwrap().unwrap();
+                next.id = Uuid::new_v4();
+                next.status = rsi_common::types::SessionStatus::Completed;
+                next.continued_from = None;
+                store.insert_session(&next).unwrap();
+                config = store
+                    .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                        project_id: config.project_id,
+                        session_id: next.id,
+                        epic_ids: Some(vec![lead.parent_id.unwrap()]),
+                        group_ids: Vec::new(),
+                        expected_row_version: config.row_version,
+                    })
+                    .unwrap();
+                target = next.id;
+            }
+            assert_eq!(
+                store.get_session(seat_a).unwrap().unwrap().status,
+                rsi_common::types::SessionStatus::Running
+            );
+            // A retry by the original enqueuer still addresses the same row.
+            let (replay, duplicate) = store
+                .enqueue_rolling_queue_source(&new, Utc::now())
+                .unwrap();
+            assert!(duplicate);
+            assert_eq!(replay.id, entry.id);
+            assert_eq!(replay.source_session_id, seat_a);
+            let untouched: Option<String> = store
+                .conn
+                .query_row(
+                    "SELECT wake_session_id FROM rolling_queue_entries WHERE id=?1",
+                    [foreign.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(untouched, None);
+            // Admitted entries are normally promoted by the queue runner.
+            store
+                .conn
+                .execute(
+                    "UPDATE rolling_queue_entries SET state='gating' WHERE id=?1",
+                    [entry.id.to_string()],
+                )
+                .unwrap();
+            let wake_id = store
+                .settle_rolling_queue_entry(
+                    entry.id,
+                    RollingQueueEntryState::Refused,
+                    &RollingQueueOutcome::default(),
+                    Utc::now(),
+                )
+                .unwrap()
+                .unwrap();
+            let wake = store.get_scheduled_job(&wake_id).unwrap().unwrap();
+            assert_eq!(wake.wake_session_id, Some(target), "pending state {state}");
+            assert!(wake.enabled);
+            assert_eq!(
+                store
+                    .get_rolling_queue_entry(entry.id)
+                    .unwrap()
+                    .unwrap()
+                    .source_session_id,
+                seat_a
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn queue_wake_transfer_preserves_terminal_rows_and_rolls_back_with_publication() {
+        let store = store();
+        let old = Uuid::new_v4();
+        let next = Uuid::new_v4();
+        let source = new_entry(old, 'a', "settled");
+        let terminal = store
+            .enqueue_rolling_queue_source(&source, Utc::now())
+            .unwrap()
+            .0;
+        store
+            .claim_next_rolling_queue_entry(Utc::now())
+            .unwrap()
+            .unwrap();
+        let wake_id = store
+            .settle_rolling_queue_entry(
+                terminal.id,
+                RollingQueueEntryState::Published,
+                &published(&"9".repeat(40)),
+                Utc::now(),
+            )
+            .unwrap()
+            .unwrap();
+        let pending = store
+            .enqueue_rolling_queue_source(&new_entry(old, 'b', "pending"), Utc::now())
+            .unwrap()
+            .0;
+        let before: (Option<String>, i64) = store
+            .conn
+            .query_row(
+                "SELECT wake_session_id,row_version FROM rolling_queue_entries WHERE id=?1",
+                [terminal.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(transfer_manager_queue_wakes_on(&store.conn, old, next).is_err());
+        {
+            let tx =
+                Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate).unwrap();
+            transfer_manager_queue_wakes_on(&tx, old, next).unwrap();
+            assert_eq!(
+                store
+                    .get_scheduled_job(&wake_id)
+                    .unwrap()
+                    .unwrap()
+                    .wake_session_id,
+                Some(next)
+            );
+            tx.rollback().unwrap();
+        }
+        assert_eq!(
+            store
+                .get_scheduled_job(&wake_id)
+                .unwrap()
+                .unwrap()
+                .wake_session_id,
+            Some(old)
+        );
+        let pending_target: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT wake_session_id FROM rolling_queue_entries WHERE id=?1",
+                [pending.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_target, None);
+        let tx = Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate).unwrap();
+        transfer_manager_queue_wakes_on(&tx, old, next).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            store
+                .get_scheduled_job(&wake_id)
+                .unwrap()
+                .unwrap()
+                .wake_session_id,
+            Some(next)
+        );
+        let after: (Option<String>, i64) = store
+            .conn
+            .query_row(
+                "SELECT wake_session_id,row_version FROM rolling_queue_entries WHERE id=?1",
+                [terminal.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn queue_wake_migration_preserves_existing_rows_and_replays() {
+        let store = store();
+        let source = Uuid::new_v4();
+        let entry = store
+            .enqueue_rolling_queue_source(&new_entry(source, 'a', "legacy"), Utc::now())
+            .unwrap()
+            .0;
+        store
+            .conn
+            .execute_batch("ALTER TABLE rolling_queue_entries DROP COLUMN wake_session_id")
+            .unwrap();
+        // The latest step is the queue wake migration; derive its predecessor
+        // so the fixture remains valid if landing renumbers it.
+        store
+            .conn
+            .pragma_update(
+                None,
+                "user_version",
+                super::super::LATEST_SCHEMA_VERSION - 1,
+            )
+            .unwrap();
+        store.init_schema().unwrap();
+        store.init_schema().unwrap();
+        assert_eq!(
+            store.get_rolling_queue_entry(entry.id).unwrap().unwrap(),
+            entry
+        );
+        store
+            .claim_next_rolling_queue_entry(Utc::now())
+            .unwrap()
+            .unwrap();
+        let wake = store
+            .settle_rolling_queue_entry(
+                entry.id,
+                RollingQueueEntryState::Published,
+                &published(&"9".repeat(40)),
+                Utc::now(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .get_scheduled_job(&wake)
+                .unwrap()
+                .unwrap()
+                .wake_session_id,
+            Some(source)
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]

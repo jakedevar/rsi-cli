@@ -181,6 +181,7 @@ async fn queued_create(p: &Pilot, key: &str) -> Uuid {
                 kind: SessionKind::Feature,
                 query: "implement scoped work".into(),
                 launch: p.policy.allowed_launches[0].clone(),
+                sandbox_source: None,
             },
         )
         .await;
@@ -259,22 +260,11 @@ async fn create_session_behind_a_held_repository_mutex_keeps_the_store_free() {
     report.assert_live("a launch behind a held repository mutex");
 }
 
-/// Hold every custody stripe (one id per shard) on a plain thread for `hold`,
-/// the way a long maintenance proof does. Returns once all 64 are held.
-fn hold_every_stripe(hold: std::time::Duration) -> std::thread::JoinHandle<()> {
+/// Hold this fixture's exact custody root on a plain maintenance thread.
+fn hold_root(custody_id: Uuid, hold: std::time::Duration) -> std::thread::JoinHandle<()> {
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
-        let mut ids: Vec<Option<Uuid>> = vec![None; 64];
-        while ids.iter().any(Option::is_none) {
-            let id = Uuid::new_v4();
-            let shard = crate::store::sandbox_custody::custody_root_lock_shard(id);
-            ids[shard].get_or_insert(id);
-        }
-        let _guards: Vec<_> = ids
-            .into_iter()
-            .flatten()
-            .map(crate::store::sandbox_custody::lock_custody_root)
-            .collect();
+        let _guard = crate::store::sandbox_custody::lock_custody_root(custody_id);
         held_tx.send(()).unwrap();
         std::thread::sleep(hold);
     });
@@ -294,7 +284,9 @@ fn hold_every_stripe(hold: std::time::Duration) -> std::thread::JoinHandle<()> {
 async fn create_session_behind_held_stripes_keeps_the_store_free_and_establishes() {
     let p = pilot().await;
     let child = queued_create(&p, "liveness-stripes").await;
-    let holder = hold_every_stripe(std::time::Duration::from_secs(3));
+    let (fresh_root, _reservation) =
+        crate::store::stripe_liveness_support::reserve_fresh_root(child);
+    let holder = hold_root(fresh_root, std::time::Duration::from_secs(3));
     let (launched, report) = execute_with_probe(&p, Some((child, "custody_bind"))).await;
     holder.join().unwrap();
     report.assert_live("a launch blocked on a custody stripe");
@@ -311,8 +303,8 @@ async fn create_session_behind_held_stripes_keeps_the_store_free_and_establishes
 }
 
 /// The lead-assignment commit authenticates the candidate under the Store and
-/// the active map. Park a replacement right before that commit, hold every
-/// stripe, and let it run: the Store must stay free for unrelated users.
+/// the active map. Park a replacement right before that commit, hold its
+/// root, and let it run: the Store must stay free for unrelated users.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replace_lead_assignment_commit_behind_held_stripes_keeps_the_store_free() {
@@ -357,7 +349,15 @@ async fn replace_lead_assignment_commit_behind_held_stripes_keeps_the_store_free
         result = &mut exec => panic!("the replacement finished before its assignment commit: {result:?}"),
         reached = reached => reached.unwrap(),
     }
-    let holder = hold_every_stripe(std::time::Duration::from_secs(3));
+    let custody_id = p
+        .manager
+        .store
+        .lock()
+        .await
+        .live_custody_for_session(successor)
+        .unwrap()
+        .custody_id;
+    let holder = hold_root(custody_id, std::time::Duration::from_secs(3));
     let probe = StoreProbe::start(p.manager.store.clone());
     resume.send(()).unwrap();
     let launched = tokio::time::timeout(std::time::Duration::from_secs(60), exec)
@@ -370,7 +370,7 @@ async fn replace_lead_assignment_commit_behind_held_stripes_keeps_the_store_free
 }
 
 /// #1166: a manager `resume_lead` authenticates the sandboxed lead's custody
-/// before the provider restarts. Holding every stripe during the resume used to
+/// before the provider restarts. Holding the lead's root during the resume used to
 /// pin the Store (a blocking stripe wait under the Store guard in the
 /// continuation); it now waits asynchronously and the Store stays free.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
@@ -452,7 +452,15 @@ async fn resume_lead_behind_held_stripes_keeps_the_store_free_and_resumes() {
     #[cfg(target_os = "linux")]
     let _orphan_guard = orphan_fixture.scoped_runtime_reap_root(id).unwrap();
 
-    let holder = hold_every_stripe(std::time::Duration::from_secs(3));
+    let custody_id = p
+        .manager
+        .store
+        .lock()
+        .await
+        .live_custody_for_session(id)
+        .unwrap()
+        .custody_id;
+    let holder = hold_root(custody_id, std::time::Duration::from_secs(3));
     let (resumed, report) = execute_with_probe(&p, None).await;
     holder.join().unwrap();
     report.assert_live("a resume blocked on a custody stripe");
@@ -499,8 +507,17 @@ async fn codex_create_session_with_cli(script: &str, launch_bound: std::time::Du
     let mut p = pilot().await;
     open_launch_policy(&mut p, "codex-launches").await;
     let parent = second_epic(&p).await;
-    let receipt =
-        admit_create_session_with(&p, "codex-create", 1, parent, SessionProvider::Codex).await;
+    // The scripted-provider model passes #1506 model validation (the fake CLI
+    // under test is not a real catalog), so the launch reaches the CLI probe.
+    let receipt = admit_create_session_with_model(
+        &p,
+        "codex-create",
+        1,
+        parent,
+        SessionProvider::Codex,
+        "manager-scripted-provider",
+    )
+    .await;
     let child = receipt.target_session_id.unwrap();
     let _process = crate::session::launch::install_controller_candidate_test_process(child);
     let _cli = FakeCodex::install(&p.manager, script);

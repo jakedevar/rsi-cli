@@ -17,6 +17,14 @@ pub const SANDBOX_BUILD_CACHE_RECLAIM_LOW_WATERMARK_PCT_MIN: u8 = 1;
 pub const SANDBOX_BUILD_CACHE_RECLAIM_LOW_WATERMARK_PCT_MAX: u8 = 98;
 pub const SANDBOX_BUILD_CACHE_RECLAIM_MAX_CANDIDATES_MIN: u32 = 1;
 pub const SANDBOX_BUILD_CACHE_RECLAIM_MAX_CANDIDATES_MAX: u32 = 1024;
+/// Refusal samples one pass reports, and how many of them one skip reason may
+/// hold, so a single noisy reason cannot hide the others (#1575).
+pub const SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_MAX: usize = 24;
+pub const SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_PER_REASON: usize = 4;
+/// Longest subject (a top-level `target/` entry name, a process id) a refusal
+/// check carries; longer names are cut, never rejected.
+pub const SANDBOX_RECLAIM_CHECK_SUBJECT_MAX: usize = 40;
+const SANDBOX_RECLAIM_CHECK_TOKEN_MAX: usize = 96;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -102,6 +110,74 @@ pub enum SandboxBuildCacheReclaimSkipReason {
     ByteBudget,
     DurationBudget,
     DepthBudget,
+    /// An enabled wake, pending restart intent, manager seat or running job
+    /// still needs the owner's `target/` (#1564).
+    LiveConsumer,
+    /// `target/` holds a top-level entry that is neither Cargo output nor RSI
+    /// scratch; it may be someone's state, so the whole tree is retained.
+    TargetUnrecognizedContent,
+}
+
+impl SandboxBuildCacheReclaimSkipReason {
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 25] = [
+        Self::FreshOrInvalidTimestamp,
+        Self::ActiveOwner,
+        Self::ActiveMapBusy,
+        Self::StoreBusy,
+        Self::RootBusy,
+        Self::CustodyOrGenerationDrift,
+        Self::GitOrRootIdentityRefusal,
+        Self::TargetAbsent,
+        Self::TargetNotDirectory,
+        Self::TargetSymlink,
+        Self::MountOrDeviceCrossing,
+        Self::TargetIdentityChanged,
+        Self::StageConflict,
+        Self::InvalidRecoveryEntry,
+        Self::RejectedRecoveryEntry,
+        Self::Openat2Unavailable,
+        Self::UnreadableEntry,
+        Self::StagedDeletionIncomplete,
+        Self::RecoveryEntryBudget,
+        Self::FilesystemEntryBudget,
+        Self::ByteBudget,
+        Self::DurationBudget,
+        Self::DepthBudget,
+        Self::LiveConsumer,
+        Self::TargetUnrecognizedContent,
+    ];
+
+    /// The serde spelling, for reports and logs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FreshOrInvalidTimestamp => "fresh_or_invalid_timestamp",
+            Self::ActiveOwner => "active_owner",
+            Self::ActiveMapBusy => "active_map_busy",
+            Self::StoreBusy => "store_busy",
+            Self::RootBusy => "root_busy",
+            Self::CustodyOrGenerationDrift => "custody_or_generation_drift",
+            Self::GitOrRootIdentityRefusal => "git_or_root_identity_refusal",
+            Self::TargetAbsent => "target_absent",
+            Self::TargetNotDirectory => "target_not_directory",
+            Self::TargetSymlink => "target_symlink",
+            Self::MountOrDeviceCrossing => "mount_or_device_crossing",
+            Self::TargetIdentityChanged => "target_identity_changed",
+            Self::StageConflict => "stage_conflict",
+            Self::InvalidRecoveryEntry => "invalid_recovery_entry",
+            Self::RejectedRecoveryEntry => "rejected_recovery_entry",
+            Self::Openat2Unavailable => "openat2_unavailable",
+            Self::UnreadableEntry => "unreadable_entry",
+            Self::StagedDeletionIncomplete => "staged_deletion_incomplete",
+            Self::RecoveryEntryBudget => "recovery_entry_budget",
+            Self::FilesystemEntryBudget => "filesystem_entry_budget",
+            Self::ByteBudget => "byte_budget",
+            Self::DurationBudget => "duration_budget",
+            Self::DepthBudget => "depth_budget",
+            Self::LiveConsumer => "live_consumer",
+            Self::TargetUnrecognizedContent => "target_unrecognized_content",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -119,6 +195,76 @@ pub enum SandboxBuildCacheReclaimStopReason {
     ByteBudget,
     DurationBudget,
     DepthBudget,
+}
+
+/// The exact check that refused one reclaim candidate: a stable snake_case
+/// name, optionally with a short subject (the offending top-level `target/`
+/// entry, a process id). `Copy` so it rides in the store's reclaim outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SandboxReclaimCheck {
+    name: &'static str,
+    subject: [u8; SANDBOX_RECLAIM_CHECK_SUBJECT_MAX],
+    subject_len: u8,
+}
+
+impl SandboxReclaimCheck {
+    pub const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            subject: [0; SANDBOX_RECLAIM_CHECK_SUBJECT_MAX],
+            subject_len: 0,
+        }
+    }
+
+    /// Attach a subject. Bytes outside printable ASCII (and the `:` separator)
+    /// become `?`, so an arbitrary file name is safe to log and report.
+    pub fn with_subject(name: &'static str, subject: impl AsRef<[u8]>) -> Self {
+        let mut check = Self::new(name);
+        for byte in subject
+            .as_ref()
+            .iter()
+            .take(SANDBOX_RECLAIM_CHECK_SUBJECT_MAX)
+        {
+            check.subject[usize::from(check.subject_len)] =
+                if byte.is_ascii_graphic() && *byte != b':' {
+                    *byte
+                } else {
+                    b'?'
+                };
+            check.subject_len += 1;
+        }
+        check
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub fn subject(&self) -> Option<&str> {
+        (self.subject_len > 0)
+            .then(|| std::str::from_utf8(&self.subject[..usize::from(self.subject_len)]).ok())
+            .flatten()
+    }
+
+    /// `name` or `name:subject`: the wire spelling.
+    pub fn token(&self) -> String {
+        match self.subject() {
+            Some(subject) => format!("{}:{subject}", self.name),
+            None => self.name.to_string(),
+        }
+    }
+}
+
+/// One refused candidate, named. Reports keep a bounded sample (see
+/// [`SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_MAX`]) so a manager can see which
+/// sandbox failed which check without reading daemon logs.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxBuildCacheReclaimRefusalV2 {
+    pub session_id: Uuid,
+    pub custody_id: Uuid,
+    pub reason: SandboxBuildCacheReclaimSkipReason,
+    pub check: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -262,6 +408,80 @@ pub struct SandboxBuildCacheReclaimReportV2 {
     pub candidate_sweep: SandboxTargetReclaimSweepV2,
     pub recovery_sweep: SandboxTargetRecoverySweepV2,
     pub pass_contention: Option<SandboxBuildCacheReclaimPassContentionV2>,
+    /// A bounded sample of refused candidates and the exact check each failed.
+    /// Payloads from before #1575 decode it as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refusals: Vec<SandboxBuildCacheReclaimRefusalV2>,
+    /// The hub's shared cargo `debug/` cache, which no sandbox owns (#1607).
+    /// Payloads from before #1607 decode it as absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_target: Option<SandboxSharedTargetReclaimV1>,
+}
+
+/// What one pass decided about the shared cargo `debug/` directory.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxSharedTargetReclaimOutcome {
+    /// No shared target directory resolved, or it has no `debug/`.
+    Absent,
+    /// `debug/` is a symlink or not a directory; it is never followed.
+    Unsafe,
+    /// The platform cannot prove the cache has no live consumer.
+    Unsupported,
+    /// Newest write is younger than the idle floor.
+    Fresh,
+    /// A cargo build holds `debug/.cargo-lock`.
+    LockHeld,
+    /// A process still uses the cache (the check names its pid).
+    LiveConsumer,
+    /// The cache could not be inspected completely; nothing was touched.
+    Unreadable,
+    /// Idle and unused, but disk pressure is not active (or the pass is
+    /// disabled), so the cache is kept.
+    PressureInactive,
+    /// Dry-run: a pressure pass would reclaim it.
+    WouldReclaim,
+    /// Removed in full.
+    Reclaimed,
+    /// Staged out of place; deletion continues on the next pass.
+    Partial,
+}
+
+/// Shared cargo `debug/` reclaim evidence. `release/` is never considered.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxSharedTargetReclaimV1 {
+    pub outcome: SandboxSharedTargetReclaimOutcome,
+    /// The exact refusing check (`name` or `name:subject`), when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
+    /// Seconds since the newest write seen, when the cache was inspected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_secs: Option<u64>,
+    /// Idle floor applied: 30 minutes under pressure (which bypasses the
+    /// target-cache TTL, as for sandbox targets), else the TTL.
+    pub min_idle_secs: u64,
+    /// Allocated bytes seen by a bounded dry-run walk (a lower bound when
+    /// `measured_truncated`), or by the removal itself.
+    pub measured_bytes: u64,
+    pub measured_truncated: bool,
+    pub reclaimed_bytes: u64,
+    /// An earlier pass's staged deletion is still unfinished.
+    pub staged_pending: bool,
+}
+
+impl SandboxSharedTargetReclaimV1 {
+    pub fn validate_wire(&self) -> Result<(), &'static str> {
+        if let Some(check) = &self.check {
+            if check.is_empty()
+                || check.len() > SANDBOX_RECLAIM_CHECK_TOKEN_MAX
+                || !check.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                return Err("shared-target reclaim check is not a bounded token");
+            }
+        }
+        Ok(())
+    }
 }
 
 impl SandboxBuildCacheReclaimReportV2 {
@@ -272,8 +492,33 @@ impl SandboxBuildCacheReclaimReportV2 {
         self.report.clone().validate_wire()?;
         validate_candidate_sweep(&self.candidate_sweep)?;
         validate_recovery_sweep(&self.recovery_sweep)?;
+        validate_refusals(&self.refusals)?;
+        if let Some(shared) = &self.shared_target {
+            shared.validate_wire()?;
+        }
         Ok(self)
     }
+}
+
+fn validate_refusals(refusals: &[SandboxBuildCacheReclaimRefusalV2]) -> Result<(), &'static str> {
+    if refusals.len() > SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_MAX {
+        return Err("sandbox target-cache refusal sample is unbounded");
+    }
+    let mut per_reason: BTreeMap<SandboxBuildCacheReclaimSkipReason, usize> = BTreeMap::new();
+    for refusal in refusals {
+        if refusal.check.is_empty()
+            || refusal.check.len() > SANDBOX_RECLAIM_CHECK_TOKEN_MAX
+            || !refusal.check.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err("sandbox target-cache refusal check is not a bounded token");
+        }
+        let count = per_reason.entry(refusal.reason).or_insert(0);
+        *count += 1;
+        if *count > SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_PER_REASON {
+            return Err("sandbox target-cache refusal sample exceeds its per-reason bound");
+        }
+    }
+    Ok(())
 }
 
 /// Backward-compatible decoder for persisted/report-stream JSON.
@@ -678,7 +923,111 @@ mod tests {
                 }),
             },
             pass_contention: None,
+            refusals: Vec::new(),
+            shared_target: None,
         }
+    }
+
+    fn refusal(
+        reason: SandboxBuildCacheReclaimSkipReason,
+        check: &str,
+    ) -> SandboxBuildCacheReclaimRefusalV2 {
+        SandboxBuildCacheReclaimRefusalV2 {
+            session_id: Uuid::parse_str("00000000-0000-4000-8000-0000000000a1").unwrap(),
+            custody_id: Uuid::parse_str("00000000-0000-4000-8000-0000000000b1").unwrap(),
+            reason,
+            check: check.to_string(),
+        }
+    }
+
+    #[test]
+    fn skip_reason_as_str_is_the_serde_spelling_for_every_variant() {
+        for reason in SandboxBuildCacheReclaimSkipReason::ALL {
+            assert_eq!(
+                serde_json::to_value(reason).unwrap(),
+                serde_json::json!(reason.as_str())
+            );
+            assert_eq!(
+                serde_json::from_value::<SandboxBuildCacheReclaimSkipReason>(serde_json::json!(
+                    reason.as_str()
+                ))
+                .unwrap(),
+                reason
+            );
+        }
+        let names: std::collections::BTreeSet<_> = SandboxBuildCacheReclaimSkipReason::ALL
+            .iter()
+            .map(|reason| reason.as_str())
+            .collect();
+        assert_eq!(names.len(), SandboxBuildCacheReclaimSkipReason::ALL.len());
+    }
+
+    #[test]
+    fn reclaim_check_token_names_the_check_and_sanitizes_its_subject() {
+        let plain = SandboxReclaimCheck::new("git_branch_mismatch");
+        assert_eq!(plain.token(), "git_branch_mismatch");
+        assert_eq!(plain.subject(), None);
+
+        let entry = SandboxReclaimCheck::with_subject("target_entry_unrecognized", "lander");
+        assert_eq!(entry.token(), "target_entry_unrecognized:lander");
+        assert_eq!(entry.name(), "target_entry_unrecognized");
+
+        // Separators, whitespace, control and non-ASCII bytes never reach the wire.
+        let hostile = SandboxReclaimCheck::with_subject("x", "a:b c\nd\u{e9}");
+        assert!(hostile.token().bytes().all(|byte| byte.is_ascii_graphic()));
+        assert_eq!(hostile.token().matches(':').count(), 1);
+
+        let long = SandboxReclaimCheck::with_subject("x", "n".repeat(500));
+        assert_eq!(
+            long.subject().map(str::len),
+            Some(SANDBOX_RECLAIM_CHECK_SUBJECT_MAX)
+        );
+        assert!(long.token().len() <= SANDBOX_RECLAIM_CHECK_TOKEN_MAX);
+    }
+
+    #[test]
+    fn sandbox_storage_v2_refusal_samples_round_trip_stay_bounded_and_default_empty() {
+        use SandboxBuildCacheReclaimSkipReason as Reason;
+        let mut v2 = report_v2();
+        v2.refusals = vec![
+            refusal(
+                Reason::TargetUnrecognizedContent,
+                "target_entry_unrecognized:lander",
+            ),
+            refusal(Reason::GitOrRootIdentityRefusal, "git_branch_mismatch"),
+        ];
+        let value = serde_json::to_value(&v2).unwrap();
+        let decoded = serde_json::from_value::<SandboxBuildCacheReclaimReportWire>(value)
+            .unwrap()
+            .validate_wire()
+            .unwrap();
+        assert_eq!(decoded.v2().unwrap().refusals.len(), 2);
+
+        // A payload from before #1575 has no `refusals` key and decodes empty.
+        let mut legacy = serde_json::to_value(report_v2()).unwrap();
+        assert!(legacy.get("refusals").is_none());
+        legacy.as_object_mut().unwrap().remove("refusals");
+        let legacy = serde_json::from_value::<SandboxBuildCacheReclaimReportWire>(legacy).unwrap();
+        assert!(legacy.v2().unwrap().refusals.is_empty());
+
+        let mut too_many = report_v2();
+        too_many.refusals = (0..=SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_MAX)
+            .map(|_| refusal(Reason::TargetAbsent, "target_absent"))
+            .collect();
+        assert!(too_many.validate_wire().is_err());
+
+        let mut one_noisy_reason = report_v2();
+        one_noisy_reason.refusals = (0..=SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_PER_REASON)
+            .map(|_| refusal(Reason::TargetAbsent, "target_absent"))
+            .collect();
+        assert!(one_noisy_reason.validate_wire().is_err());
+
+        let mut bad_token = report_v2();
+        bad_token.refusals = vec![refusal(Reason::LiveConsumer, "has space")];
+        assert!(bad_token.validate_wire().is_err());
+        let mut empty_token = report_v2();
+        empty_token.refusals = vec![refusal(Reason::LiveConsumer, "")];
+        assert!(empty_token.validate_wire().is_err());
     }
 
     #[test]

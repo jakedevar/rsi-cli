@@ -28,6 +28,23 @@ pub enum ContainmentError {
     CycleDetected { chain: Vec<Uuid> },
 }
 
+/// Refusal text for a launch that asks for the retired `TaskRabbit` kind.
+pub const TASKRABBIT_REMOVED_MESSAGE: &str =
+    "TaskRabbit sessions were removed; launch a Standard session";
+
+/// Refuse a new launch of a retired session kind.
+///
+/// `SessionKind::TaskRabbit` stays in the enum (and its serde string) so
+/// existing rows still load, but nothing may create one any more. Pure: callers
+/// run this before any side effect and map the message to `InvalidParam`.
+pub fn refuse_removed_session_kind(kind: Option<SessionKind>) -> Result<(), &'static str> {
+    if kind == Some(SessionKind::TaskRabbit) {
+        Err(TASKRABBIT_REMOVED_MESSAGE)
+    } else {
+        Ok(())
+    }
+}
+
 /// Check that `child_kind` is allowed inside `parent_kind`. `None` parent
 /// means "being placed at root".
 ///
@@ -101,6 +118,23 @@ pub fn detect_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn removed_taskrabbit_kind_is_refused_and_other_kinds_pass() {
+        assert_eq!(
+            refuse_removed_session_kind(Some(SessionKind::TaskRabbit)),
+            Err("TaskRabbit sessions were removed; launch a Standard session")
+        );
+        for kind in [
+            None,
+            Some(SessionKind::Standard),
+            Some(SessionKind::Bug),
+            Some(SessionKind::Task),
+        ] {
+            assert_eq!(refuse_removed_session_kind(kind), Ok(()));
+        }
+    }
     use std::collections::HashMap;
 
     const ALL_KINDS: &[SessionKind] = &[

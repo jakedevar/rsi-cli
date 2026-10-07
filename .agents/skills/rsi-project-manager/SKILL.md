@@ -21,17 +21,24 @@ artifact is the handoff you write at baton pass.
 
 ## Operator directives (restate them in every handoff)
 
+- Never copy operator personal data (e-mail, phone, address, names beyond
+  the handle) into a handoff, Issue body or any committed file, even when
+  restating an instruction verbatim; paraphrase it as "the operator's
+  <purpose> contact (local config)". Pushed history cannot be rewritten by
+  agents (#1454).
 - 2026-09-24, autonomous management: use your engineering judgment. Find what is
   wrong or inefficient, reuse or file an Issue with a stated intent and
   acceptance criteria, and get it done. Never ask the operator to approve a
-  routine decision. Ask only for new authority: `main` or releases, spending
-  beyond a grant, credentials, deleting user data, or a genuine product choice.
+  routine decision. Escalate only new authority through the global manager:
+  `main` or releases, spending beyond a grant, credentials, deleting user data.
   Name the exact gate when you do.
 - Models (2026-09-30 05:25Z, widened; supersedes "no Codex"): the manager and
   its successor run on Claude Opus 5.5 (`claude-opus-5-5`). Workers may run on
-  Claude Sonnet 5.5 (`claude-sonnet-5-5`), Claude Haiku 5.5 if available, Codex
+  Claude Sonnet 5.5 (`claude-sonnet-5-5`), Codex
   `gpt-6.1-sol` and `gpt-6-luna`, or OpenRouter (`z-ai/glm-5.3`,
-  `deepseek/deepseek-v4.1-flash`). Reviews for migrations and credential, IAM
+  `deepseek/deepseek-v4.1-flash`). Claude Code rejects `claude-haiku-5-5` as
+  `unrecognized_model` (#1484); the only Claude Haiku in the provider catalog is
+  `claude-haiku-4-5-20251001`, so do not allow-list Haiku 5.5. Reviews for migrations and credential, IAM
   or network changes still come from a family other than the author's.
 - 2026-09-27: "The ground truth is the principle we are trying to achieve."
   Tests assert the Issue's intent, not the code as it happens to be.
@@ -50,6 +57,65 @@ artifact is the handoff you write at baton pass.
   once, an uncertain result is shown, never auto-replayed.
 - 2026-09-29 18:30Z: operator messages must not kill in-flight tool calls
   (soft interrupt; delivered at tool boundaries since #1049, afd6fe541).
+- 2026-10-06 ~07:10Z, technical decisions: "don't ask me what the right
+  decision is." Decide yourself; for a second opinion consult another model
+  (Codex `gpt-6-astra` or `gpt-6.1-sol`, or Fable 5.1), never the operator.
+  The gates in the 2026-09-24 directive (main or releases, spending, credentials,
+  deleting user data) go to the operator through the global manager.
+  Cut builds and tests that are not needed.
+- 2026-10-06 ~07:10Z, batons: pass the manager baton when your context is
+  heavy, and make workers pass theirs when their context fills. Every worker
+  brief carries the baton rule: once compacted, or past about 60% of the
+  window, commit (WIP is fine), append a handoff to the Issue and end the turn
+  with `PIPELINE HANDOFF — BATON <sha>`; the manager relaunches a fresh worker
+  from that commit (`sandbox_source: {"commit": ...}`). The daemon caps only
+  seats (#1005); workers are latched and compact in place
+  (`context_cap.rs` `CapCrossing::Worker`).
+- 2026-10-06, every agent improves RSI (#1332): improving the line for the
+  operator and for every agent is part of every agent's job. Run the kaizen
+  lane below, and every brief asks for a closing `Friction:` line.
+- 2026-10-07: managers decide non-gate questions, including census-access,
+  which contact to use, and product choices. A PM decides or asks its portfolio
+  manager, who decides. Only real gates go to the operator, through the global
+  manager: main or releases, real money, credentials, deleting user data.
+- 2026-10-07, load rule (global manager): run at most 5 concurrent build-heavy
+  sessions per project. The daemon applies the load check itself (#1417): it
+  holds your `create_session` (Issue workers and topology nodes included) while
+  the host's 1-minute load is above the operator's
+  `host_load_admission_threshold` (default 40; 0 disables). A held create stays
+  queued, never refused, shows `held: {reason: host_load, load, threshold}` in
+  `AgentManagerGetAction` (and `host_load` in `AgentGetDaemonInfo`) and starts on
+  its own when the load drops, oldest first across projects. Do not poll
+  `uptime` or re-create it; lead recovery and your workers' own spawns are never
+  held.
+
+## Runaway runs (#1337)
+
+On 2026-10-06 a worker ran the full `rsid-store` suite and a broad `rsid` run
+for about two hours at 12-14 cores each (host load 60-83 on 32 cores). The
+manager saw it at 41 and 83 minutes and let it continue; the operator stopped
+it. Do not repeat that:
+
+- **Every wake, read the top CPU consumers**: `uptime`, then
+  `ps -eo pid,etimes,pcpu,args --sort=-pcpu | head` (or `systemd-cgtop`), and
+  any `runaway_process` notice in your inbox. The daemon's CPU-time andon
+  samples each agent process tree once a minute; past the operator's
+  `cpu_andon_cpu_minutes` (default 240) or when one tree dominates a host load
+  of `cpu_andon_host_load` (default 40) it records a friction event and
+  notifies you with the session id and a suggested halt. It never stops the
+  tree itself: that is your call.
+- **Stop at once, do not rationalise**: a worker verification run over about
+  20 minutes, or one dominating a load over 40, gets `AgentHalt`, then
+  `AgentContinueChild` with a scoped instruction (filters from
+  `scripts/check-touched-shards --base origin/rolling`, run through
+  `scripts/scoped-test`).
+- **Job timeouts**: an `AgentSubmitJob` `test` job is stopped and fails
+  `job_timed_out` after the operator's `job_test_timeout_mins` (default 20),
+  counted from unit launch; a job held behind a deploy drain past the hold cap
+  plus 5 minutes fails `job_admission_timed_out` instead (resubmit).
+  Raise one job with `params.timeout_minutes` (up to 180) only when a scoped
+  run is known to need it; workers cannot raise it.
+- **Report every stopped run in your handoff** (session, what ran, how long).
 
 ## The integrator model
 
@@ -67,24 +133,38 @@ artifact is the handoff you write at baton pass.
   is a leaf; do not assign it as a lead. Arm an `on_terminal` wake on it so its
   end wakes you. Read its result from git (branch `rsi/<worker-session-id>`) and
   its final line.
+- **Worker sandbox base (#1195).** A `create_session` (and
+  `AgentManagerLaunchIssueWorker`) sandbox branches from the freshly fetched
+  `origin/rolling` tip by default, never from the shared checkout's local
+  `HEAD`. To build on your own unlanded commits, pass `"sandbox_source":
+  {"path": "<your sandbox_root>"}`: the worker branches from that worktree's
+  committed `HEAD`, pinned when the action is admitted (uncommitted changes are
+  not used; the receipt then reports `source_dirty: true`). Use `{"commit":
+  "<40-hex>"}` for an exact commit. A bad source refuses before any effect
+  (`manager_sandbox_source_invalid`, `_not_worktree`, `_commit_unknown`).
+- **Manager state.** Keep lander copies, gate filter files, chain scripts and
+  other seat state in `~/.rsi/mgr/<seat>/`. Reserve `target/` for Cargo outputs;
+  detached jobs may outlive a provider turn, and cache reclaim must retain
+  targets with a live consumer or unknown top-level content (#1429).
 - **Integration loop.** Use a detached worktree off `origin/rolling` (never your
   sandbox branch):
-  1. `git merge --no-ff` each ready source; batch small independent ones.
+  1. `git merge --no-ff` one ready source. Land one accepted change per gate,
+     filtered to what it touches (AGENTS.md "Landing"); do not batch landings.
   2. `cargo check --workspace --all-targets`.
-  3. Run the tests for the modules the batch touched, with
+  3. Run the tests for the modules the change touched, with
      `env -u RSI_PROCESS_OWNERSHIP_NAMESPACE` (otherwise some tests hang), and
      skip the very slow `h1_v83` startup tests (the QA sweep covers them). Hand
      long full-suite runs to the cloud or the satellite. Choose them with
      `rsi-test-impact --repo . --base <old tip> --head HEAD` (#1021) rather than
      by eye: on 2026-09-29 a hand-picked filter for #793 (agent mail) missed
      25 session-02 phase2 reds that its full gate would have run (#1034).
-     Also compile each rsid shard the batch's tests live in, in shard mode:
+     Also compile each rsid shard the change's tests live in, in shard mode:
      `cargo check -p rsid --lib --tests --no-default-features --features
      test-shard-<shard>` (map files to shards with
      `grep -o 'test-shard-[a-z]*-[0-9]*' <file>`). On 2026-09-30 an ungated
      test helper compiled in the unsharded build but broke 15 of the 16 shard
      builds (994bc471c); the shard-gate script checks `#[test]`s only.
-     Run the batch as daemon jobs with one wake, not one wake per job (#1006):
+     Run the checks as daemon jobs with one wake, not one wake per job (#1006):
      submit the workspace check and each shard's test job with `wake:"none"`, arm
      ONE `mode:"when"` `jobs_terminal` wake with a `timeout_seconds`, and end the
      turn; a per-job wake costs a turn that re-reads the whole cached context for
@@ -106,6 +186,11 @@ artifact is the handoff you write at baton pass.
   network-exposure changes: one plain reviewer pass by a different model family,
   verdict noted in the merge commit. Other authority or custody changes land
   first and get one post-land review; findings become follow-up fixes.
+  A bound reviewer can read only its own review Issue. Launch it with
+  `review_of: <implementer Issue number>` (#1590): the daemon copies that
+  Issue's text, acceptance criteria and complete latest handoff (landing
+  filters included) into the reviewer's brief. Name the source SHA in `brief`;
+  never paste a handoff yourself (a pasted copy gets truncated).
 - **Merge pitfalls.** A stale branch can carry an old copy of work that already
   landed differently (#923 A carried #961's `55d76f011`); on such a conflict,
   prefer rolling's version. Conflicts cluster in
@@ -123,7 +208,7 @@ artifact is the handoff you write at baton pass.
   - `~/.rsi/mgr4/lap.sh <laptop_session_id> <message>`, which delivers only when
     that laptop session is idle.
 - Use it for every rolling-tip QA sweep (its QA lead), long test runs for
-  integration batches, and extra workers whose commits come back to you.
+  integration runs, and extra workers whose commits come back to you.
 - You own its health. On every wake: `ssh arch-laptop`, then `pgrep -x rsid` and
   the tail of `~/rsi-satellite/OUTBOX.md`. Replace stuck sessions.
 - Never restart a satellite's rsid from inside a session that daemon manages
@@ -189,7 +274,20 @@ Preferred since 2026-09-30 (#1045, #1017 slice 2): `AgentRequestDeploy`
 restarts the hub through the supervisor's exit-75 path at a quiet point and wakes
 you once; `peer_id` deploys a paired satellite over the link. It needs the
 operator's Deploy grant (and, for the laptop, the hub on its inbound allowlist
-with a scope root). Confirm with `AgentGetDaemonInfo`. Until those grants exist,
+with a scope root). Confirm with `AgentGetDaemonInfo`. A restart interrupts any worker
+still mid-turn (provider processes are not re-adopted; the turn is resumed
+after the restart), so the deploy waits for workers. It holds new worker starts,
+your own creates included, for at most the operator's `deploy_drain_hold_secs`
+(default 600 s), then waits for a lull without holding anything until
+`max_wait_secs` (#1320, #1311). When a busy fleet never reaches a lull, send
+`interrupt_workers: true` (#1461, keep `max_wait_secs` above the hold): past the
+hold a worker mid-turn stops blocking, the restart interrupts it, the existing
+post-restart path resumes it with a continue prompt, the outcome wake names the
+interrupted worker sessions and each is a `deploy_interrupt` friction event; a
+landing or a local test/build/landing job still blocks, so use it when the
+fixes are worth interrupting workers for. Send the same SHA and idempotency key with `cancel: true` (omit
+`interrupt_workers`) to withdraw a deploy you no longer want to wait for; a held create shows
+`held.reason: deploy_draining` in `AgentManagerGetAction`. Until those grants exist,
 use the manual steps below or the scripts `~/.rsi/mgr/deploy-hub-c7b1-v2.sh`
 (hub: waits for the build and a quiet point, backs up the DB, restarts with the
 TUI environment) and `~/rsi-satellite/sat-deploy.sh <sha> <bins> <rsid_sha256>`
@@ -255,7 +353,16 @@ Execute or Full project control, confirm the capability rows, and save with `s`.
   first. Calling `AgentScheduleWake` again with the same explicit name replaces
   the first job rather than adding a second.
 - The handoff carries the operator directives above, the current state, exact
-  SHAs, open Issues and the next actions, and names this skill's path.
+  SHAs, open Issues, the kaizen filed, fixed and still open, and the next
+  actions, and names this skill's path.
+- When an appointment hands the seat to another session (a new anchor and scope
+  version), the displaced holder's pending work does not vanish (#1553): its
+  terminal watches and live deploy (and the deploy's outcome wake) move to the
+  new seat, `AgentManagerGetAction` reads its queued actions by id, and a queued
+  Issue launch of the old scope version no longer holds the Issue (relaunch it).
+  A launch that ends `failed`, `blocked` or `revoked` appends an Issue note.
+  Queued actions themselves never run under the new scope: re-issue what you
+  still want.
 
 ## Control-surface facts
 
@@ -299,9 +406,10 @@ Execute or Full project control, confirm the capability rows, and save with `s`.
 
 When your authority catalog lists `AgentReportToGlobal`, the operator has
 appointed a global manager over this project. Its playbook is
-`.claude/skills/rsi-global-manager/SKILL.md`. It manages project managers and
+`.claude/skills/rsi-portfolio-manager/SKILL.md` (any tier). It manages project managers and
 does no project work.
-- **Report up only at milestones.** Call `AgentReportToGlobal` once per
+- **Report up only at milestones.** Call `AgentReportUp` (alias
+  `AgentReportToGlobal`) once per
   event: work landed (Issue and SHA), blocked on an operator gate (name the
   gate), or handing off (the handoff path). Do not send status chatter: it
   reads your state through `AgentGlobalOverview`.
@@ -318,10 +426,11 @@ newest Issues (`AgentListIssues` with `order:"desc"`), pick the Open ones
 labelled `operator-request` (filed by the operator's `/intake` command), dedupe
 each against the other open Issues (comment on or merge into a duplicate rather
 than dispatching twice), then dispatch them ahead of the rest of the queue.
-Then triage new `kaizen` Issues (the jidoka channel: any agent may log an
-improvement without stopping its work): close duplicates and noise with a
-one-line note, give the rest a priority, and fold the useful ones into the
-queue. Log your own improvements the same way.
+Then run the kaizen lane ("Kaizen lane" in your catalog guidance): close
+duplicates and noise with a one-line note linking the survivor, link related
+Issues, prioritise the rest, file each handoff's unfiled `Friction:` line, and
+keep at least one worker on the highest-value open kaizen whenever capacity
+allows. Log your own improvements the same way.
 
 Dispatch work and end the turn. Worker terminal watches, durable units and mail
 wake you by event; a batch of jobs wakes you once through a `mode:"when"`

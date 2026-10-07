@@ -236,12 +236,9 @@ fn tier2_work_requires_configured_reviewer_model_tier() {
     .unwrap();
 }
 
-#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
-#[test]
-fn lead_request_review_for_another_epics_work_is_out_of_scope() {
-    let f = fixture();
-    let policy_version = review_policy(&f, false);
-    lead_review(&f, "own-first", policy_version);
+/// A second Epic (with its own lead) inside the same manager scope. Returns
+/// `(epic, lead)`; the manager scope and policy are re-configured to cover it.
+fn second_epic(f: &Fixture) -> (Uuid, Uuid) {
     let group = f
         .store
         .get_session(f.epic)
@@ -249,19 +246,19 @@ fn lead_request_review_for_another_epics_work_is_out_of_scope() {
         .unwrap()
         .parent_id
         .unwrap();
-    let mut other_epic = f.store.get_session(f.epic).unwrap().unwrap();
-    other_epic.id = Uuid::new_v4();
-    other_epic.parent_id = Some(group);
-    f.store.insert_session(&other_epic).unwrap();
-    let mut other_lead = f.store.get_session(f.lead).unwrap().unwrap();
-    other_lead.id = Uuid::new_v4();
-    other_lead.parent_id = Some(other_epic.id);
-    f.store.insert_session(&other_lead).unwrap();
+    let mut epic = f.store.get_session(f.epic).unwrap().unwrap();
+    epic.id = Uuid::new_v4();
+    epic.parent_id = Some(group);
+    f.store.insert_session(&epic).unwrap();
+    let mut lead = f.store.get_session(f.lead).unwrap().unwrap();
+    lead.id = Uuid::new_v4();
+    lead.parent_id = Some(epic.id);
+    f.store.insert_session(&lead).unwrap();
     f.store
         .conn
         .execute(
             "UPDATE sessions SET lead_session_id=?2 WHERE id=?1",
-            params![other_epic.id.to_string(), other_lead.id.to_string()],
+            params![epic.id.to_string(), lead.id.to_string()],
         )
         .unwrap();
     let config = f.store.get_harness_manager(f.project).unwrap().unwrap();
@@ -270,7 +267,7 @@ fn lead_request_review_for_another_epics_work_is_out_of_scope() {
             group_ids: vec![],
             project_id: f.project,
             session_id: f.manager,
-            epic_ids: Some(vec![f.epic, other_epic.id]),
+            epic_ids: Some(vec![f.epic, epic.id]),
             expected_row_version: config.row_version,
         })
         .unwrap();
@@ -288,11 +285,21 @@ fn lead_request_review_for_another_epics_work_is_out_of_scope() {
             policy: policy.policy,
         })
         .unwrap();
+    (epic.id, lead.id)
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn lead_request_review_for_another_epics_work_is_out_of_scope() {
+    let f = fixture();
+    let policy_version = review_policy(&f, false);
+    lead_review(&f, "own-first", policy_version);
+    let (other_epic, other_lead) = second_epic(&f);
     let mut request = review("other-work", 1, policy_version + 1, "claude-sonnet-5");
     request.fence.scope_version = 2;
     let before = reserve(&f, f.lead, &request).unwrap_err().to_string();
     assert!(before.contains("manager_v2_work_missing"), "{before}");
-    let version = source_work(&f, "other-work", other_epic.id, other_lead.id);
+    let version = source_work(&f, "other-work", other_epic, other_lead);
     if let ManagerUpdateV2::RequestReview {
         expected_row_version,
         ..
@@ -330,6 +337,47 @@ fn lead_request_review_for_another_epics_work_is_out_of_scope() {
         )
         .unwrap();
     assert_eq!(count, 0);
+}
+
+/// #1493: a Work's review evidence may come from any Epic of the manager
+/// scope; an author outside the scope is still refused.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn manager_review_accepts_an_author_under_another_epic_of_the_scope() {
+    let f = fixture();
+    review_policy(&f, false);
+    let (_, other_lead) = second_epic(&f);
+    let version = source_work(&f, "cross-epic", f.epic, other_lead);
+    let config = f.store.get_harness_manager(f.project).unwrap().unwrap();
+    let policy = f
+        .store
+        .get_harness_manager_policy(f.project)
+        .unwrap()
+        .unwrap();
+    let mut request = review("cross-epic", version, policy.row_version, "claude-sonnet-5");
+    request.fence.scope_version = config.row_version;
+    let receipt = reserve(&f, f.manager, &request).unwrap();
+    let author: String = f
+        .store
+        .conn
+        .query_row(
+            "SELECT author_session_id FROM manager_review_assignments WHERE assignment_id=?1",
+            [&receipt.key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(author, other_lead.to_string());
+
+    // An author under an Epic outside the manager scope stays refused.
+    let mut stranger = f.store.get_session(other_lead).unwrap().unwrap();
+    stranger.id = Uuid::new_v4();
+    stranger.parent_id = None;
+    f.store.insert_session(&stranger).unwrap();
+    let version = source_work(&f, "outside", f.epic, stranger.id);
+    let mut request = review("outside", version, policy.row_version, "claude-sonnet-5");
+    request.fence.scope_version = config.row_version;
+    let error = reserve(&f, f.manager, &request).unwrap_err().to_string();
+    assert!(error.contains("manager_v2_session_out_of_scope"), "{error}");
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]

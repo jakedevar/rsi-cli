@@ -195,7 +195,7 @@ impl Store {
     /// absent (`None`) or anchored to a revoked scope (`revoked`) is for the
     /// caller to judge. Only an area node's config resolves through its live
     /// node grant, and a changed node authority refuses.
-    pub(crate) fn manager_policy_for_config(
+    pub fn manager_policy_for_config(
         &self,
         config: &HarnessManagerConfigV1,
     ) -> Result<Option<HarnessManagerPolicyConfigV2>> {
@@ -209,6 +209,11 @@ impl Store {
                 .is_some_and(|grant| grant.manager_session_id == config.manager_session_id)
         {
             return Ok(root);
+        }
+        // #1235: the global seat's synthetic project config governs by the
+        // grant's project policy, re-resolved here.
+        if let Some(global) = self.global_authority_for_config(config)? {
+            return Ok(Some(global.grant));
         }
         let caller = config
             .current_session_id
@@ -270,7 +275,7 @@ fn node_for_seat(store: &Store, tip: Uuid) -> Result<Option<(String, String, Nod
     Ok(matches.pop())
 }
 
-fn live_selected_epics(
+pub(crate) fn live_selected_epics(
     store: &Store,
     project: Uuid,
     selector: &ManagerNodeSelectorV1,

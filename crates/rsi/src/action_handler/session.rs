@@ -1,6 +1,6 @@
 //! Session lifecycle action handlers.
 //!
-//! Covers: launch (TaskRabbit, blank, standard), interrupt, continue,
+//! Covers: launch (blank, standard), interrupt, continue,
 //! approve/deny, archive/unarchive, pin, reassign, rotate, docregblock
 //! execution, commit-and-push, and yank.
 
@@ -10,15 +10,6 @@ use crate::types::{OverlayState, Pane};
 
 pub(super) async fn dispatch(app: &mut App, action: LcAction) {
     match action {
-        LcAction::TaskRabbitPrompt => {
-            // Always open a new TaskRabbit (input overlays stack)
-            crate::overlay::open_taskrabbit_popup(app);
-        }
-
-        LcAction::LaunchTaskRabbit(query) => {
-            app.launch_taskrabbit(&query, None, None, None, None).await;
-        }
-
         LcAction::BlankPrompt => {
             // Always open a new Blank prompt (input overlays stack)
             crate::overlay::open_blank_popup(app);
@@ -136,6 +127,10 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
 
         LcAction::RotateSession => {
             app.rotate_focused_session().await;
+        }
+
+        LcAction::AbandonRotation(target) => {
+            app.abandon_focused_rotation(target.clone()).await;
         }
 
         LcAction::CommitAndPush => {

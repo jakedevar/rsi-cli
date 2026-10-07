@@ -63,12 +63,7 @@ impl Default for HttpCredentialProbe {
 #[async_trait::async_trait]
 impl CredentialProbe for HttpCredentialProbe {
     async fn probe(&self, slot: Slot, secret: &SecretString) -> ProbeOutcome {
-        let Ok(http) = reqwest::Client::builder()
-            .connect_timeout(PROBE_TIMEOUT)
-            .timeout(PROBE_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-        else {
+        let Some(http) = probe_client() else {
             return ProbeOutcome::Failed;
         };
         let request = match slot {
@@ -101,27 +96,45 @@ impl CredentialProbe for HttpCredentialProbe {
             }
             _ => return ProbeOutcome::Unsupported,
         };
+        // Keep the send beside the bounded request: the model-control
+        // contract proves that this exact credential request is sent once.
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) if error.is_timeout() => return ProbeOutcome::Timeout,
             Err(error) if error.is_connect() => return ProbeOutcome::Connect,
             Err(_) => return ProbeOutcome::Failed,
         };
-        let status = response.status().as_u16();
-        let mut body = Vec::new();
-        let mut stream = futures::StreamExt::fuse(response.bytes_stream());
-        while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
-            let Ok(chunk) = chunk else {
-                return ProbeOutcome::Failed;
-            };
-            let room = MAX_PROBE_BODY_BYTES.saturating_sub(body.len());
-            body.extend_from_slice(&chunk[..chunk.len().min(room)]);
-            if body.len() >= MAX_PROBE_BODY_BYTES {
-                break;
-            }
-        }
-        ProbeOutcome::Http { status, body }
+        read_probe_response(response).await
     }
+}
+
+/// The HTTP client every probe uses: short timeouts, no redirects.
+pub(crate) fn probe_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(PROBE_TIMEOUT)
+        .timeout(PROBE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()
+}
+
+/// Capture a probe's status and (bounded) body for
+/// [`classify`]; the body is never surfaced to a caller.
+pub(crate) async fn read_probe_response(response: reqwest::Response) -> ProbeOutcome {
+    let status = response.status().as_u16();
+    let mut body = Vec::new();
+    let mut stream = futures::StreamExt::fuse(response.bytes_stream());
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        let Ok(chunk) = chunk else {
+            return ProbeOutcome::Failed;
+        };
+        let room = MAX_PROBE_BODY_BYTES.saturating_sub(body.len());
+        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if body.len() >= MAX_PROBE_BODY_BYTES {
+            break;
+        }
+    }
+    ProbeOutcome::Http { status, body }
 }
 
 fn body_says_exhausted(body: &str) -> bool {

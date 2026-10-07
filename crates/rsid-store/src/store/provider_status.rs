@@ -25,6 +25,8 @@ pub(crate) enum ProviderErrorKind {
     Credit,
     /// Rate limited (429-class).
     RateLimit,
+    /// The provider rejected the credential (401-class, #1610).
+    Auth,
 }
 
 /// Classify a `stop_reason` such as `provider_error:credit_exhausted`.
@@ -34,7 +36,9 @@ pub(crate) fn classify_stop_reason(reason: &str) -> Option<ProviderErrorKind> {
         return None;
     }
     let has = |terms: &[&str]| terms.iter().any(|term| lower.contains(term));
-    if has(&[
+    if crate::store_support::provider_defaults::is_provider_auth_failure_text(&lower) {
+        Some(ProviderErrorKind::Auth)
+    } else if has(&[
         "credit_exhausted",
         "402",
         "payment required",
@@ -57,7 +61,17 @@ pub struct ProviderLaunchStats {
     pub failed: u32,
     pub last_credit_error_at: Option<DateTime<Utc>>,
     pub last_rate_limit_at: Option<DateTime<Utc>>,
+    /// Last auth-rejected (401-class) startup inside the lookback.
+    pub last_auth_failure_at: Option<DateTime<Utc>>,
+    /// First auth failure after the latest launch that got past startup; the
+    /// start of the current auth-failure episode. `None` once a later launch
+    /// succeeded.
+    pub auth_episode_started_at: Option<DateTime<Utc>>,
 }
+
+/// A launch that is still running this long without a provider error got past
+/// startup, where an auth rejection surfaces.
+const AUTH_SUCCESS_MIN_AGE_SECS: i64 = 120;
 
 fn day_prefix(at: DateTime<Utc>) -> String {
     at.format("%Y-%m-%d").to_string()
@@ -84,7 +98,7 @@ impl Store {
         // The day prefix compares lexically regardless of the `Z` / `+00:00`
         // suffix; the exact window is applied after parsing.
         let mut launches = self.conn.prepare(
-            "SELECT provider, created_at, stop_reason LIKE 'provider_error:%'
+            "SELECT provider, created_at, stop_reason LIKE 'provider_error:%', status
              FROM sessions
              WHERE created_at >= ?1 AND COALESCE(session_kind,'') NOT IN ('Group','Epic')
              ORDER BY created_at DESC LIMIT ?2",
@@ -96,16 +110,31 @@ impl Store {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<bool>>(2)?.unwrap_or(false),
+                    row.get::<_, String>(3)?,
                 ))
             },
         )?;
+        let mut last_success: HashMap<String, DateTime<Utc>> = HashMap::new();
         for row in rows {
-            let (provider, created_at, failed) = row?;
+            let (provider, created_at, failed, status) = row?;
             let Some(created) = parse(&created_at) else {
                 continue;
             };
             if created < window_start || created > now {
                 continue;
+            }
+            let got_past_startup = !failed
+                && match status.as_str() {
+                    "Completed" | "Archived" => true,
+                    "Running" | "WaitingApproval" => {
+                        now.signed_duration_since(created)
+                            >= Duration::seconds(AUTH_SUCCESS_MIN_AGE_SECS)
+                    }
+                    _ => false,
+                };
+            if got_past_startup {
+                let slot = last_success.entry(provider.clone()).or_insert(created);
+                *slot = (*slot).max(created);
             }
             let entry = stats.entry(provider).or_default();
             entry.launches = entry.launches.saturating_add(1);
@@ -131,6 +160,7 @@ impl Store {
                 ))
             },
         )?;
+        let mut auth_failures: Vec<(String, DateTime<Utc>)> = Vec::new();
         for row in rows {
             let (provider, reason, created_at, duration_ms) = row?;
             let (Some(kind), Some(created)) = (classify_stop_reason(&reason), parse(&created_at))
@@ -141,13 +171,29 @@ impl Store {
             if at < lookback_start {
                 continue;
             }
+            if kind == ProviderErrorKind::Auth {
+                auth_failures.push((provider.clone(), at));
+            }
             let entry = stats.entry(provider).or_default();
             let slot = match kind {
                 ProviderErrorKind::Credit => &mut entry.last_credit_error_at,
                 ProviderErrorKind::RateLimit => &mut entry.last_rate_limit_at,
+                ProviderErrorKind::Auth => &mut entry.last_auth_failure_at,
             };
             if slot.is_none_or(|previous| at > previous) {
                 *slot = Some(at);
+            }
+        }
+        // The episode starts at the earliest auth failure after the latest
+        // launch that got past startup (the failed launch itself never counts).
+        for (provider, at) in auth_failures {
+            if last_success.get(&provider).is_some_and(|ok| *ok > at) {
+                continue;
+            }
+            if let Some(entry) = stats.get_mut(&provider)
+                && entry.auth_episode_started_at.is_none_or(|first| at < first)
+            {
+                entry.auth_episode_started_at = Some(at);
             }
         }
         Ok(stats)
@@ -193,6 +239,67 @@ mod tests {
                 rusqlite::params![id, provider, at, stop, kind],
             )
             .unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn auth_rejection_opens_an_episode_that_a_later_success_closes() {
+        assert_eq!(
+            classify_stop_reason(
+                "provider_error:codex:workspace routing discovery unauthorized (401)"
+            ),
+            Some(ProviderErrorKind::Auth)
+        );
+        assert_eq!(
+            classify_stop_reason(
+                crate::store_support::provider_defaults::PROVIDER_AUTH_INVALID_STOP_REASON
+            ),
+            Some(ProviderErrorKind::Auth)
+        );
+        let store = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        let ts = |mins: i64| (now - Duration::minutes(mins)).to_rfc3339();
+        let auth = "provider_error:provider_auth_invalid";
+        insert(
+            &store,
+            "00000000-0000-4000-8000-000000000011",
+            "Codex",
+            "Task",
+            Some(auth),
+            &ts(30),
+        );
+        insert(
+            &store,
+            "00000000-0000-4000-8000-000000000012",
+            "Codex",
+            "Task",
+            Some(auth),
+            &ts(20),
+        );
+        let stats = store.provider_launch_stats(now).unwrap();
+        let codex = &stats["Codex"];
+        assert!(codex.last_auth_failure_at.is_some());
+        assert!(
+            codex
+                .auth_episode_started_at
+                .is_some_and(|start| start < codex.last_auth_failure_at.unwrap()),
+            "the episode starts at the first failure"
+        );
+        // A later Completed Codex session proves the credential works again.
+        store
+            .conn
+            .execute(
+                "INSERT INTO sessions (id, provider, query, working_dir, status, created_at,
+                                       updated_at, session_kind, duration_ms)
+                 VALUES ('00000000-0000-4000-8000-000000000013','Codex','q','/tmp','Completed',
+                         ?1,?1,'Task',2000)",
+                [ts(5)],
+            )
+            .unwrap();
+        let stats = store.provider_launch_stats(now).unwrap();
+        let codex = &stats["Codex"];
+        assert!(codex.last_auth_failure_at.is_some());
+        assert_eq!(codex.auth_episode_started_at, None);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]

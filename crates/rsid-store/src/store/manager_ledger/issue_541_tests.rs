@@ -131,11 +131,15 @@ fn review_request_distinguishes_work_version_from_source_change() {
             &observed,
         )
         .unwrap_err();
-    assert!(
-        stale
-            .to_string()
-            .contains("manager_review_work_version_changed")
-    );
+    let stale = stale.to_string();
+    assert!(stale.contains("manager_review_work_version_changed"));
+    assert!(stale.contains(&format!("current_row_version={version}")));
+    // The same version is readable from the agent Inspect work row, so a
+    // manager never needs SQLite to build a request_review.
+    let rows = inspect(&f, ManagerInspectSectionV2::Work).rows;
+    let row = rows.iter().find(|r| r["key"] == "versioned").unwrap();
+    assert_eq!(row["row_version"], version);
+    assert!(row.get("review").is_some());
     let moved = f
         .store
         .manager_review_reserve_on(
@@ -587,6 +591,106 @@ fn finding_delta_can_reuse_its_reviewer_family_but_requires_its_exact_finding() 
     assert_eq!(request["finding_keys"], json!(["custody-check"]));
 }
 
+/// #1493: a delta round may name a revised commit. The Work's recorded source
+/// follows it (acceptance and admissions reset) and the events carry the old
+/// and new SHAs; a non-delta request for a moved commit stays refused.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn delta_review_rebinds_the_work_to_a_revised_source_commit() {
+    let f = fixture();
+    let first_sha = "a".repeat(40);
+    let revised = "b".repeat(40);
+    source_work(&f, "rebind", &first_sha);
+    let first = request_at(&f, f.manager, "rebind", &first_sha, SONNET).unwrap();
+    submit_review(&f, first);
+    let receipt_id: String = f
+        .store
+        .conn
+        .query_row(
+            "SELECT receipt_id FROM manager_review_receipts WHERE assignment_id=?1",
+            [first.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    f.store
+        .conn
+        .execute(
+            "INSERT INTO manager_review_findings
+         (receipt_id,finding_key,severity,summary,location,blocking)
+         VALUES(?1,'fix-me','error','Fix it',NULL,1)",
+            [receipt_id],
+        )
+        .unwrap();
+    let config = f.store.get_harness_manager(f.project).unwrap().unwrap();
+    let (row, record) = f.store.manager_v2_work(&config, "rebind").unwrap();
+    let observed = LedgerObservation {
+        source_commit: Some(revised.clone()),
+        ..Default::default()
+    };
+    let mut plain = review_request("rebind", row.row_version, &revised);
+    let moved = f
+        .store
+        .manager_review_reserve_on(
+            f.manager,
+            &config,
+            &plain,
+            &record,
+            row.row_version,
+            &observed,
+        )
+        .unwrap_err();
+    assert!(moved.to_string().contains("manager_review_source_changed"));
+    if let ManagerUpdateV2::RequestReview {
+        delta_of,
+        finding_keys,
+        ..
+    } = &mut plain.change
+    {
+        *delta_of = Some(first);
+        *finding_keys = vec!["fix-me".into()];
+    }
+    let tx = f.store.conn.unchecked_transaction().unwrap();
+    let receipt = f
+        .store
+        .manager_review_reserve_on(
+            f.manager,
+            &config,
+            &plain,
+            &record,
+            row.row_version,
+            &observed,
+        )
+        .unwrap();
+    tx.commit().unwrap();
+    let (rebound_row, rebound) = f.store.manager_v2_work(&config, "rebind").unwrap();
+    assert_eq!(rebound.source_commit.as_deref(), Some(revised.as_str()));
+    assert_eq!(rebound_row.row_version, row.row_version + 1);
+    assert!(rebound.acceptance.is_none() && rebound.integration.is_none());
+    let source: String = f
+        .store
+        .conn
+        .query_row(
+            "SELECT source_sha FROM manager_review_assignments WHERE assignment_id=?1",
+            [&receipt.key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(source, revised);
+    let payload: String = f
+        .store
+        .conn
+        .query_row(
+            "SELECT payload_json FROM harness_manager_v2_events
+              WHERE kind='review_assignment' AND record_key=?1",
+            [&receipt.key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["previous_source_commit"], first_sha);
+    assert_eq!(payload["source_commit"], revised);
+}
+
 /// #599 A1 test 1: S2's same-SHA exemption is withdrawn; a re-request of a
 /// launched review at capacity is a fourth attempt.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
@@ -782,6 +886,11 @@ fn pending_acceptance_allows_only_the_bound_reviewer_action_to_cross_decision_ga
                 status: "pending".into(),
                 answer: None,
                 delivery: None,
+                gate: None,
+                options: Vec::new(),
+                asked_by: None,
+                answered_by: None,
+                history: Vec::new(),
             }),
         )
         .unwrap();

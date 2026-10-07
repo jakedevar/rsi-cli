@@ -69,6 +69,7 @@ const KCMP_FS: i32 = 3;
 /// `Some(true)` when tasks `a` and `b` provably share the resource, `Some(false)`
 /// when they provably do not, `None` when the kernel cannot say (no `kcmp`, no
 /// permission, a task gone): then the task is scanned in full.
+#[cfg(target_os = "linux")]
 fn shares(a: u32, b: u32, kind: i32) -> Option<bool> {
     // SAFETY: kcmp takes plain integers and has no pointer arguments here.
     let rc = unsafe {
@@ -86,6 +87,11 @@ fn shares(a: u32, b: u32, kind: i32) -> Option<bool> {
         r if r > 0 => Some(false),
         _ => None,
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn shares(_a: u32, _b: u32, _kind: i32) -> Option<bool> {
+    None
 }
 
 /// Why a scan could not be completed.
@@ -400,7 +406,7 @@ fn parse_maps_line(line: &str) -> Option<(PathBuf, Option<Ident>)> {
         let major = u32::from_str_radix(major, 16).ok()?;
         let minor = u32::from_str_radix(minor, 16).ok()?;
         Some(Ident {
-            dev: nix::libc::makedev(major, minor),
+            dev: nix::libc::makedev(major as _, minor as _) as u64,
             ino: fields[4].parse().ok()?,
         })
     });

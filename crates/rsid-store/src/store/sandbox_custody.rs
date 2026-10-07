@@ -17,10 +17,11 @@ use rsi_common::types::{
     SandboxCustodyRecoveryV1, SandboxCustodyTransitionV1, Session, SessionStatus,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 #[cfg(any(test, feature = "test-seam"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{LazyLock, Mutex, MutexGuard, TryLockError};
+use std::sync::{Condvar, LazyLock, Mutex};
 use uuid::Uuid;
 
 const STARTUP_AGGREGATE_PAGE_SQL: &str = "SELECT custody_id,sandbox_root,custody_id FROM sandbox_custody_roots WHERE custody_id>?1 ORDER BY custody_id LIMIT ?2";
@@ -58,14 +59,13 @@ fn prepared_reclaim_for_owner_tuple_on(
 
 /// Root-local admission locks make filesystem validation and the associated
 /// generation-CAS one critical section without serializing unrelated roots.
-/// The registry lock is held only while locating a root lock; effect work is
-/// never performed while either it or SQLite is locked.
-/// A fixed number of stripes bounds synchronization storage for the daemon's
-/// entire lifetime.  Different custody IDs can deliberately collide, but all
-/// operations for one ID always select the same stripe.
+/// Each bucket records only held custody IDs. Its mutex is released before
+/// effect work or waiting, so a hash collision never makes another root busy.
+/// Entries disappear on guard drop; storage scales with concurrent holders,
+/// rather than every root the daemon has ever seen.
 pub(crate) const CUSTODY_ROOT_LOCK_SHARDS: usize = 64;
-static ROOT_LOCKS: LazyLock<[Mutex<()>; CUSTODY_ROOT_LOCK_SHARDS]> =
-    LazyLock::new(|| std::array::from_fn(|_| Mutex::new(())));
+static ROOT_LOCKS: LazyLock<[(Mutex<HashSet<Uuid>>, Condvar); CUSTODY_ROOT_LOCK_SHARDS]> =
+    LazyLock::new(|| std::array::from_fn(|_| (Mutex::new(HashSet::new()), Condvar::new())));
 
 const ADMISSION_PATH_MAX_BYTES: usize = 4096;
 const ADMISSION_PATH_MAX_COMPONENTS: usize = 256;
@@ -116,34 +116,43 @@ pub(crate) fn fail_next_effect_releases(count: usize) {
     FAIL_NEXT_EFFECT_RELEASES.store(count, Ordering::Release);
 }
 
-/// A held custody stripe. It also marks its thread as holding a stripe, so
+/// A held custody root. It also marks its thread as holding a root, so
 /// Store acquisition on that thread is bounded (see `custody_lock_order`).
-pub struct CustodyRootGuard(
-    MutexGuard<'static, ()>,
-    super::custody_lock_order::HeldScope,
-);
+pub struct CustodyRootGuard(Uuid, super::custody_lock_order::HeldScope);
 
 pub fn lock_custody_root(custody_id: Uuid) -> CustodyRootGuard {
-    let guard = ROOT_LOCKS[custody_root_lock_shard(custody_id)]
+    let (bucket, released) = &ROOT_LOCKS[custody_root_lock_shard(custody_id)];
+    let mut held = bucket
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    CustodyRootGuard(guard, super::custody_lock_order::HeldScope::stripe())
+    while !held.insert(custody_id) {
+        held = released
+            .wait(held)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    CustodyRootGuard(custody_id, super::custody_lock_order::HeldScope::stripe())
 }
 
-/// Acquire one custody stripe without waiting. Maintenance callers use this
+/// Acquire one custody root without waiting for its holder. Maintenance callers use this
 /// to preserve a hard pass-duration bound while ordinary custody effects keep
 /// the blocking guard and their existing serialization contract.
 pub fn try_lock_custody_root(custody_id: Uuid) -> Option<CustodyRootGuard> {
-    match ROOT_LOCKS[custody_root_lock_shard(custody_id)].try_lock() {
-        Ok(guard) => Some(CustodyRootGuard(
-            guard,
-            super::custody_lock_order::HeldScope::stripe(),
-        )),
-        Err(TryLockError::Poisoned(error)) => Some(CustodyRootGuard(
-            error.into_inner(),
-            super::custody_lock_order::HeldScope::stripe(),
-        )),
-        Err(TryLockError::WouldBlock) => None,
+    let (bucket, _) = &ROOT_LOCKS[custody_root_lock_shard(custody_id)];
+    let mut held = bucket
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    held.insert(custody_id)
+        .then(|| CustodyRootGuard(custody_id, super::custody_lock_order::HeldScope::stripe()))
+}
+
+impl Drop for CustodyRootGuard {
+    fn drop(&mut self) {
+        let (bucket, released) = &ROOT_LOCKS[custody_root_lock_shard(self.0)];
+        let mut held = bucket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.remove(&self.0);
+        released.notify_all();
     }
 }
 
@@ -242,6 +251,7 @@ pub(crate) struct RotationAuthorityFence {
     sandbox_custody_id: Option<Uuid>,
     model_invocation_id: Option<Uuid>,
     legacy_primary_tag: String,
+    require_never_started: bool,
 }
 
 pub(crate) enum RotationAuthorityCapture {
@@ -2225,6 +2235,43 @@ impl Store {
             sandbox_custody_id,
             model_invocation_id,
             legacy_primary_tag,
+            require_never_started: false,
+        }))
+    }
+
+    /// #1176: capture the `Failed` custody holder of a blocked rotation that
+    /// the operator abandoned, so it can be rotated forward to a fresh
+    /// replacement. Accepted only when the snapshot and durable row are both
+    /// `Failed` with unchanged authority and an open abandon request names it
+    /// as holder. The fence pins `Failed`, like the recovered path.
+    pub(crate) fn capture_blocked_holder_rotation_authority(
+        &self,
+        snapshot: &Session,
+    ) -> Result<RotationAuthorityCapture> {
+        if snapshot.status != SessionStatus::Failed {
+            return Ok(RotationAuthorityCapture::Changed);
+        }
+        let Some((durable, sandbox_custody_id, model_invocation_id, legacy_primary_tag)) =
+            load_rotation_authority_session_on(&self.conn, snapshot.id)?
+        else {
+            return Ok(RotationAuthorityCapture::Missing);
+        };
+        if durable.status != SessionStatus::Failed
+            || !self.holder_has_open_rotation_abandon(snapshot.id)?
+            || !super::rotation_abandon::rotation_holder_never_started_on(&self.conn, snapshot.id)?
+            || rotation_session_authority(snapshot)? != rotation_session_authority(&durable)?
+            || (ordinary_session_shape(snapshot) && sandbox_custody_id.is_some())
+        {
+            return Ok(RotationAuthorityCapture::Changed);
+        }
+        Ok(RotationAuthorityCapture::Captured(RotationAuthorityFence {
+            predecessor_id: snapshot.id,
+            predecessor_status: SessionStatus::Failed,
+            session_authority: rotation_session_authority(&durable)?,
+            sandbox_custody_id,
+            model_invocation_id,
+            legacy_primary_tag,
+            require_never_started: true,
         }))
     }
 
@@ -2274,6 +2321,7 @@ impl Store {
             sandbox_custody_id,
             model_invocation_id,
             legacy_primary_tag,
+            require_never_started: false,
         }))
     }
 
@@ -2425,6 +2473,16 @@ impl Store {
         )? {
             return Err(DaemonError::Store(
                 "rotation predecessor authority fence changed before bind".into(),
+            ));
+        }
+        if predecessor.require_never_started
+            && !super::rotation_abandon::rotation_holder_never_started_on(
+                &tx,
+                predecessor.predecessor_id,
+            )?
+        {
+            return Err(DaemonError::PolicyDenied(
+                "rotation_holder_execution_evidence_before_bind".into(),
             ));
         }
         bind_reserved_session_custody_on(&tx, session_id, binding)?;
@@ -3516,6 +3574,9 @@ impl Store {
         custody_id: Uuid,
         expected_generation: u64,
     ) -> Result<Option<ReclaimTarget>> {
+        if self.target_reclaim_has_live_consumer(custody_id, expected_generation)? {
+            return Ok(None);
+        }
         self.conn
             .query_row(
                 "SELECT r.canonical_repo_dir,r.sandbox_root,r.sandbox_branch,r.repository_identity,r.source_commit,r.allocation_id,r.owner_session_id,s.id,r.validated_generation
@@ -3550,6 +3611,110 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Terminal provider status does not end a continuation wake, restart
+    /// intent, manager seat or detached job. Protect each, including jobs
+    /// whose cwd names another owner's root.
+    pub(crate) fn target_reclaim_has_live_consumer(
+        &self,
+        custody_id: Uuid,
+        generation: u64,
+    ) -> Result<bool> {
+        Ok(self
+            .target_reclaim_live_consumer(custody_id, generation)?
+            .is_some())
+    }
+
+    /// The first live consumer that fences this custody's `target/`, named for
+    /// the reclaim report (#1575): `enabled_wake`, `restart_intent`,
+    /// `manager_seat`, `running_job` or `manager_current_session`.
+    pub(crate) fn target_reclaim_live_consumer(
+        &self,
+        custody_id: Uuid,
+        generation: u64,
+    ) -> Result<Option<&'static str>> {
+        // Predicate (`when`) wakes also use the durable `resume` mode.
+        // Terminal watches resume their owner, not the watched child.
+        let wake: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sandbox_custody_roots r
+             JOIN scheduled_jobs j ON j.wake_session_id=r.owner_session_id
+             WHERE r.custody_id=?1 AND r.generation=?2 AND j.enabled=1
+               AND (j.wake_mode='resume' OR j.wake_mode LIKE 'on_terminal:%'))",
+            params![custody_id.to_string(), generation as i64],
+            |row| row.get(0),
+        )?;
+        if wake {
+            return Ok(Some("enabled_wake"));
+        }
+        // Reclaim migration fixtures can precede the V134 restart journal.
+        // An existing catalog must remain readable: errors fail closed.
+        let schema_version: i32 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if schema_version >= 134 {
+            let restart: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sandbox_custody_roots r
+                 JOIN daemon_restart_intents i ON i.session_id=r.owner_session_id
+                 WHERE r.custody_id=?1 AND r.generation=?2
+                   AND i.state IN ('pending','claimed'))",
+                params![custody_id.to_string(), generation as i64],
+                |row| row.get(0),
+            )?;
+            if restart {
+                return Ok(Some("restart_intent"));
+            }
+        }
+        let seat: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sandbox_custody_roots r
+             JOIN harness_manager_scopes m ON m.manager_session_id=r.owner_session_id
+             WHERE r.custody_id=?1 AND r.generation=?2)",
+            params![custody_id.to_string(), generation as i64],
+            |row| row.get(0),
+        )?;
+        if seat {
+            return Ok(Some("manager_seat"));
+        }
+        // Migration fixtures can exercise the V141 reclaim API before V144
+        // introduced jobs. An absent catalog at that version has no jobs to
+        // protect; query errors on an existing catalog still fail closed.
+        if schema_version >= super::agent_jobs::AGENT_JOBS_SCHEMA_VERSION {
+            let job: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sandbox_custody_roots r
+                 JOIN agent_jobs j ON j.state IN ('queued','running')
+                 WHERE r.custody_id=?1 AND r.generation=?2
+                   AND (j.owner_session_id=r.owner_session_id OR j.cwd=r.sandbox_root
+                        OR substr(j.cwd,1,length(r.sandbox_root)+1)=r.sandbox_root || '/'))",
+                params![custody_id.to_string(), generation as i64],
+                |row| row.get(0),
+            )?;
+            if job {
+                return Ok(Some("running_job"));
+            }
+        }
+        // The seat's stable anchor can own a different sandbox from its
+        // rotated current session. Resolve that lineage using the same
+        // authoritative helper used by manager notices and authorization.
+        let owner: Option<(String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT r.owner_session_id,s.project_id FROM sandbox_custody_roots r
+             JOIN sessions s ON s.id=r.owner_session_id
+             WHERE r.custody_id=?1 AND r.generation=?2",
+                params![custody_id.to_string(), generation as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((owner, Some(project))) = owner else {
+            return Ok(None);
+        };
+        let project =
+            Uuid::parse_str(&project).map_err(|error| DaemonError::Store(error.to_string()))?;
+        Ok(self
+            .get_harness_manager_notice_config(project)?
+            .and_then(|config| config.current_session_id)
+            .is_some_and(|current| current.to_string() == owner)
+            .then_some("manager_current_session"))
     }
 
     /// Reconcile effects left by another process boot. Process death cannot
@@ -4190,7 +4355,7 @@ pub(super) fn bind_on(
 /// [`Store::restore_archived_session_with_fresh_custody`] for the async path:
 /// the Store first, then the fresh root's stripe acquired without ever waiting
 /// for it under the Store (a busy stripe drops the Store and retries), so a long
-/// maintenance proof on a colliding stripe delays only this unarchive (#1172).
+/// maintenance proof on this root delays only this unarchive (#1172).
 pub async fn restore_archived_session_with_fresh_custody_store_first(
     store: &tokio::sync::Mutex<Store>,
     session_id: Uuid,

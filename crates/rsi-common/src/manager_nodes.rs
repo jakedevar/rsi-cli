@@ -357,38 +357,6 @@ impl ManagerNodeAllowanceV1 {
         }
         Ok(())
     }
-
-    /// Every available finite dimension is carved down. A zero dimension
-    /// carries no capacity to delegate. Optional spend may remain uncapped
-    /// when the operator chose no spend cap (D4).
-    pub fn strictly_narrower_than(&self, parent: &Self) -> bool {
-        self.validate().is_ok()
-            && parent.validate().is_ok()
-            && narrower_u16(self.max_created_containers, parent.max_created_containers)
-            && narrower_u16(self.max_created_sessions, parent.max_created_sessions)
-            && narrower_u16(self.max_active_sessions, parent.max_active_sessions)
-            && narrower_u16(self.max_build_slots, parent.max_build_slots)
-            && narrower_u32(self.max_disk_gib, parent.max_disk_gib)
-            && parent.provider_limits.iter().all(|parent_limit| {
-                self.provider_limits.iter().any(|child_limit| {
-                    child_limit.provider == parent_limit.provider
-                        && child_limit.max_active < parent_limit.max_active
-                })
-            })
-            && match (self.max_spend_usd, parent.max_spend_usd) {
-                (Some(child), Some(parent)) => child < parent,
-                (Some(_), None) | (None, None) => true,
-                (None, Some(_)) => false,
-            }
-    }
-}
-
-fn narrower_u16(child: u16, parent: u16) -> bool {
-    (parent == 0 && child == 0) || (parent > 0 && child < parent)
-}
-
-fn narrower_u32(child: u32, parent: u32) -> bool {
-    (parent == 0 && child == 0) || (parent > 0 && child < parent)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -425,28 +393,16 @@ impl ManagerNodeGrantV1 {
         }
         Ok(())
     }
-
-    pub fn strictly_narrower_than(&self, parent: &Self) -> bool {
-        self.validate().is_ok()
-            && parent.validate().is_ok()
-            && self.capabilities.len() < parent.capabilities.len()
-            && self
-                .capabilities
-                .iter()
-                .all(|capability| parent.capabilities.contains(capability))
-            && self
-                .allowed_launches
-                .iter()
-                .all(|choice| parent.allowed_launches.contains(choice))
-            && self.allowance.strictly_narrower_than(&parent.allowance)
-            && self.max_direct_reports < parent.max_direct_reports
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::SessionProvider;
+
+    fn narrows(child: &ManagerNodeGrantV1, parent: &ManagerNodeGrantV1) -> bool {
+        crate::grant_narrowing::grant_narrows(&child.bounds(), &parent.bounds()).is_ok()
+    }
 
     fn grant() -> ManagerNodeGrantV1 {
         ManagerNodeGrantV1 {
@@ -525,8 +481,24 @@ mod tests {
             },
             max_direct_reports: 3,
         };
-        assert!(child.strictly_narrower_than(&parent));
-        assert!(!parent.strictly_narrower_than(&child));
+        assert!(narrows(&child, &parent));
+        assert!(!narrows(&parent, &child));
+    }
+
+    /// #1237: capabilities may stay equal across an edge; the allowance and
+    /// direct-report limit carry the narrowing.
+    #[test]
+    fn equal_capabilities_narrow_when_the_allowance_is_carved() {
+        let parent = grant();
+        let mut child = grant();
+        child.allowance.max_created_containers = 7;
+        child.allowance.max_created_sessions = 15;
+        child.allowance.max_active_sessions = 7;
+        child.allowance.max_build_slots = 2;
+        child.allowance.max_disk_gib = 89;
+        assert!(narrows(&child, &parent));
+        child.allowance.max_created_sessions = 16;
+        assert!(!narrows(&child, &parent));
     }
 
     #[test]
@@ -554,16 +526,16 @@ mod tests {
                 provider: SessionProvider::Codex,
                 max_active: 3,
             });
-        assert!(child.strictly_narrower_than(&parent));
+        assert!(narrows(&child, &parent));
         child.allowance.provider_limits[0].max_active = 4;
-        assert!(!child.strictly_narrower_than(&parent));
+        assert!(!narrows(&child, &parent));
         child.allowance.provider_limits[0].max_active = 3;
         child.allowed_launches.push(ManagerLaunchChoiceV2 {
             provider: SessionProvider::Codex,
             model: "gpt-6-sol".into(),
             effort: Some("high".into()),
         });
-        assert!(!child.strictly_narrower_than(&parent));
+        assert!(!narrows(&child, &parent));
     }
 
     #[test]

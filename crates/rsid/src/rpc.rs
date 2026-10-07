@@ -101,6 +101,7 @@ mod agent_issues;
 mod agent_verbs;
 mod codegraph;
 mod common;
+mod fleet;
 mod issues;
 mod manager;
 mod memory;
@@ -149,9 +150,11 @@ pub use self::topology::*;
 // confirmed side-effect-free from the calling session's perspective, or is
 // an `Agent*` verb that internally enforces its own self/lead scoping.
 mod failure_signatures; // #1016: AgentQueryFailureSignatures handler
+mod friction; // #1333: ListFrictionRollup and the agent-refusal andon point
 mod global_manager; // #872 Slice B: global manager v0
 mod manager_issue_worker; // #1100: AgentManagerLaunchIssueWorker handler
 mod operator_restart; // #1122: operator quiet-point restart
+mod portable; // #1406: operator-only portable install bundle
 mod scratch_adopt; // #1147: operator adoption of legacy scratch
 mod agent_gate {
     use std::collections::HashSet;
@@ -343,6 +346,7 @@ impl RpcServer {
             }
 
             let mut boundary_operator_ids: Vec<Uuid> = Vec::new();
+            let mut boundary_agent_ids: Vec<Uuid> = Vec::new();
             let handle_result = match serde_json::from_str::<RpcRequest>(&line) {
                 Ok(request) => {
                     // The six operator-local Remote reads retain their permit
@@ -371,6 +375,11 @@ impl RpcServer {
                         // the reply carrying them has been written (#1062).
                         boundary_operator_ids =
                             crate::session::boundary_mail::operator_message_ids(reply);
+                        // Agent mail waits for the hook's own confirmation
+                        // (#1183); a reply that cannot be written settles it
+                        // `uncertain` at once.
+                        boundary_agent_ids =
+                            crate::session::boundary_mail::agent_message_ids(reply);
                     }
                     result
                 }
@@ -402,6 +411,11 @@ impl RpcServer {
                                 .abandon_operator_boundary_delivery(&boundary_operator_ids)
                                 .await;
                         }
+                    }
+                    if !boundary_agent_ids.is_empty() && written.is_err() {
+                        self.session_manager
+                            .abandon_agent_boundary_delivery(&boundary_agent_ids)
+                            .await;
                     }
                     written?;
                 }
@@ -545,6 +559,7 @@ impl RpcServer {
             "AgentSendMessage" => self.handle_agent_send_message(request).await,
             "AgentGetAuthorityCatalog" => self.handle_agent_get_authority_catalog(request).await,
             "ClaimBoundaryMail" => self.handle_claim_boundary_mail(request).await,
+            "ConfirmBoundaryMail" => self.handle_confirm_boundary_mail(request).await,
             "AgentGetStatus" => self.handle_agent_get_status(request).await,
             "AgentHalt" => self.handle_agent_halt(request).await,
             "AgentContinueChild" => self.handle_agent_continue_child(request).await,
@@ -628,9 +643,14 @@ impl RpcServer {
             "AgentGetDaemonInfo" => self.handle_agent_get_daemon_info(request).await,
             "AgentRequestDeploy" => self.handle_agent_request_deploy(request).await,
             "AgentGlobalOverview" => self.handle_agent_global_overview(request).await,
+            "AgentManagerOverview" => self.handle_agent_manager_overview(request).await,
             "AgentGlobalSend" => self.handle_agent_global_send(request).await,
             "AgentGlobalAppointManager" => self.handle_agent_global_appoint_manager(request).await,
+            "AgentManagerAppointChild" => self.handle_agent_manager_appoint_child(request).await,
+            "AgentManagerRevokeChild" => self.handle_agent_manager_revoke_child(request).await,
             "AgentReportToGlobal" => self.handle_agent_report_to_global(request).await,
+            "AgentReportUp" => self.handle_agent_report_up(request).await,
+            "AgentSendDown" => self.handle_agent_send_down(request).await,
 
             // Appointment and scope replacement remain operator-only: neither
             // method belongs to AGENT_VERBS or READ_VERBS.
@@ -640,7 +660,17 @@ impl RpcServer {
             // #872 Slice B: the global manager grant is operator-only.
             "ConfigureGlobalManager" => self.handle_configure_global_manager(request).await,
             "GetGlobalManager" => self.handle_get_global_manager(request).await,
+            "GetGlobalManagerWorkspace" => self.handle_get_global_manager_workspace(request).await,
+            "GetManagerNodeWorkspace" => self.handle_get_manager_node_workspace(request).await,
             "RevokeGlobalManager" => self.handle_revoke_global_manager(request).await,
+            "ListPortfolioNodes" => self.handle_list_portfolio_nodes(request).await,
+            "GetPortfolioNode" => self.handle_get_portfolio_node(request).await,
+            "ConfigurePortfolioNode" => self.handle_configure_portfolio_node(request).await,
+            "RevokePortfolioNode" => self.handle_revoke_portfolio_node(request).await,
+            // #1238: the operator escalation queue and top-of-chain notices.
+            "ListOperatorEscalations" => self.handle_list_operator_escalations(request).await,
+            "RuleOperatorEscalation" => self.handle_rule_operator_escalation(request).await,
+            "AcknowledgeOperatorNotice" => self.handle_acknowledge_operator_notice(request).await,
             // #1122: the operator's quiet-point restart; operator-only.
             "RequestOperatorRestart" => self.handle_request_operator_restart(request).await,
             "GetOperatorRestart" => self.handle_get_operator_restart(request).await,
@@ -649,7 +679,14 @@ impl RpcServer {
             // #1147: operator-only (not in the verb registry): list and adopt
             // legacy scratch. Adopting records a directory; it deletes nothing.
             "ListLegacyScratch" => self.handle_list_legacy_scratch(request).await,
+            // #1333: the operator's friction rollup; operator-only (managers
+            // read it through AgentManagerInspect {section:"friction"}).
+            "ListFrictionRollup" => self.handle_list_friction_rollup(request).await,
             "AdoptLegacyScratch" => self.handle_adopt_legacy_scratch(request).await,
+            // #1406: operator-only (not in the verb registry): clean export of
+            // durable state and first-run import on a new machine.
+            "ExportPortableBundle" => self.handle_export_portable_bundle(request).await,
+            "ImportPortableBundle" => self.handle_import_portable_bundle(request).await,
             "GetHarnessManager" => self.handle_get_harness_manager(request).await,
             "ListHarnessManagerEpics" => self.handle_list_harness_manager_epics(request).await,
             "ListHarnessManagerScope" => self.handle_list_harness_manager_scope(request).await,
@@ -666,6 +703,13 @@ impl RpcServer {
             "GetHarnessManagerState" => self.handle_get_harness_manager_state(request).await,
             "AnswerHarnessManagerDecision" => {
                 self.handle_answer_harness_manager_decision(request).await
+            }
+            // #1415 operator-only: stale decision records are listed and
+            // archived (never deleted) by the operator; the TUI decisions
+            // board wires both (`X`, #1428).
+            "ListStaleManagerDecisions" => self.handle_list_stale_manager_decisions(request).await,
+            "ArchiveStaleManagerDecisions" => {
+                self.handle_archive_stale_manager_decisions(request).await
             }
 
             "GetSession" => self.handle_get_session(request).await,
@@ -838,6 +882,9 @@ impl RpcServer {
             "GetOperatorPause" => self.handle_get_operator_pause(request).await,
             "ContinueSession" => self.handle_continue_session(request).await,
             "RotateSession" => self.handle_rotate_session(request).await,
+            // #1176 operator-only: deliberately absent from AGENT_VERBS,
+            // READ_VERBS, native tools and the agent CLI catalog.
+            "AbandonBlockedRotation" => self.handle_abandon_blocked_rotation(request).await,
             "DeleteSession" => self.handle_delete_session(request).await,
             "ArchiveSession" => self.handle_archive_session(request).await,
             "GetArchiveCleanupStatus" => self.handle_get_archive_cleanup_status(request).await,
@@ -895,9 +942,13 @@ impl RpcServer {
                     .to_string(),
             )),
             "QueueSessionModelUpdate" => self.handle_queue_session_model_update(request).await,
+            "GetSessionModelSwitchOptions" => {
+                self.handle_get_session_model_switch_options(request).await
+            }
             "GetModelSegments" => self.handle_get_model_segments(request).await,
             // Read-only lifetime usage aggregate (T8) — operator/TUI-only,
             // deliberately NOT added to READ_VERBS (F-010).
+            "GetFleetOverview" => self.handle_get_fleet_overview(request).await,
             "GetUsageStats" => self.handle_get_usage_stats(request).await,
             "GetEfficiencyMetrics" => self.handle_get_efficiency_metrics(request).await,
             "GetRollingQueue" => self.handle_get_rolling_queue(request).await,
@@ -1073,6 +1124,19 @@ impl RpcServer {
                 )
                 .await
             }
+            // #1407 first-run AWS setup check. Operator-only like the vault
+            // methods; the handler refuses a tokened caller again and returns
+            // a secret-free result.
+            method if rsi_common::provider_profile::OPERATOR_METHODS.contains(&method) => {
+                crate::bedrock_setup::handle(
+                    &crate::vault::global(),
+                    method,
+                    request.session_token.is_some(),
+                    &request.params,
+                    &crate::bedrock_setup::HttpBedrockInvokeProbe::default(),
+                )
+                .await
+            }
             // #788 MCP operator configuration and credentials. Operator-only:
             // absent from AGENT_VERBS/READ_VERBS/native tools/agent CLI
             // catalog; the handler refuses tokened callers again.
@@ -1098,6 +1162,10 @@ impl RpcServer {
             }
         };
 
+        if let Err(error) = &result {
+            // #1333 andon: a refused `Agent*` verb is friction data.
+            Box::pin(self.note_agent_refusal(request, error)).await;
+        }
         HandleResult::Response(match result {
             Ok(value) => RpcResponse::success(request.id.clone(), value),
             Err(e) => {

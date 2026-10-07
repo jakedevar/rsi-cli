@@ -1186,6 +1186,50 @@ mod route_tests {
         process.kill().await.unwrap();
     }
 
+    /// Issue #1407: the provider-level backstop applies the operator provider
+    /// profile: under `aws_only` no provider process starts for a non-Bedrock
+    /// launch; `all` lets the same launch run.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn provider_spawn_refuses_a_non_bedrock_launch_under_the_aws_only_profile() {
+        let guard = super::super::spawn_single_flight::acquire_spawn_guard(Uuid::new_v4()).await;
+        let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+        runtime
+            .update_field("api_route.openrouter", &serde_json::json!("harness"))
+            .unwrap();
+        runtime
+            .update_field("provider_profile", &serde_json::json!("aws_only"))
+            .unwrap();
+        let launcher = RouteLauncher::new(Arc::clone(&runtime), true);
+        let config = route_config("vendor/some-model".to_string());
+        for provider in [SessionProvider::OpenRouter, SessionProvider::Claude] {
+            let refused = spawn_provider_process(
+                provider,
+                &config,
+                &launcher,
+                &AdmissionPermit::for_route_dispatch_test(),
+                &guard,
+            );
+            let Err(DaemonError::PolicyDenied(reason)) = refused else {
+                panic!("{provider:?}: a non-Bedrock launch must be refused");
+            };
+            assert!(reason.starts_with("provider_profile_refused"), "{reason}");
+        }
+
+        runtime
+            .update_field("provider_profile", &serde_json::json!("all"))
+            .unwrap();
+        let (mut process, _) = spawn_provider_process(
+            SessionProvider::OpenRouter,
+            &config,
+            &launcher,
+            &AdmissionPermit::for_route_dispatch_test(),
+            &guard,
+        )
+        .expect("`all` keeps today's behaviour");
+        process.kill().await.unwrap();
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn a_session_with_a_tool_policy_can_only_start_the_harness_loop() {

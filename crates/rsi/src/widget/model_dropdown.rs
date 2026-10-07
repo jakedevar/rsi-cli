@@ -55,8 +55,79 @@ pub fn handle_model_dropdown_key_with_providers(
     builtins: &[SessionProvider],
     custom_providers: &[CustomProviderEntry],
 ) -> ModelDropdownAction {
-    // j/k/g/G/Down/Up list navigation
-    if list::handle_list_nav_key(&mut state.selected_index, state.models.len(), key) {
+    state.reconcile_filter_selection();
+    // While the filter is being typed, printable keys are query text: they
+    // never reach vim navigation, numeric selection, `q` or a parent's leader.
+    // A query edit re-highlights the first match, so typing then Enter picks
+    // the best hit.
+    if state.filter_editing {
+        match key.code {
+            // Esc leaves the query and its filtered list in place for j/k and
+            // 1-9; the next Esc closes the picker.
+            KeyCode::Esc => {
+                state.filter_editing = false;
+                return ModelDropdownAction::Consumed;
+            }
+            KeyCode::Backspace => {
+                if state.filter_query.pop().is_none() {
+                    // Backspace on an empty query leaves search mode.
+                    state.filter_editing = false;
+                }
+                state.select_first_match();
+                return ModelDropdownAction::Consumed;
+            }
+            KeyCode::Char('u' | 'w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if key.code == KeyCode::Char('w') {
+                    let kept = state.filter_query.trim_end().len();
+                    state.filter_query.truncate(kept);
+                    let word_start = state
+                        .filter_query
+                        .rfind(char::is_whitespace)
+                        .map_or(0, |i| i + 1);
+                    state.filter_query.truncate(word_start);
+                } else {
+                    state.filter_query.clear();
+                }
+                state.select_first_match();
+                return ModelDropdownAction::Consumed;
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                state.filter_query.push(c);
+                state.select_first_match();
+                return ModelDropdownAction::Consumed;
+            }
+            _ => {}
+        }
+    } else if key.code == KeyCode::Char('/') {
+        state.filter_editing = true;
+        return ModelDropdownAction::Consumed;
+    }
+
+    let indices = state.filtered_indices();
+    let mut visible_index = indices
+        .iter()
+        .position(|i| *i == state.selected_index)
+        .unwrap_or(0);
+    let nav_key = match key.code {
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(KeyCode::Down),
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(KeyCode::Up),
+        KeyCode::Home => Some(KeyCode::Char('g')),
+        KeyCode::End => Some(KeyCode::Char('G')),
+        KeyCode::Up | KeyCode::Down => Some(key.code),
+        KeyCode::Char('j' | 'k' | 'g' | 'G') if !state.filter_editing => Some(key.code),
+        _ => None,
+    };
+    if let Some(code) = nav_key {
+        list::handle_list_nav_key(
+            &mut visible_index,
+            indices.len(),
+            &KeyEvent::new(code, KeyModifiers::NONE),
+        );
+        state.selected_index = indices.get(visible_index).copied().unwrap_or(0);
         return ModelDropdownAction::Consumed;
     }
 
@@ -74,23 +145,24 @@ pub fn handle_model_dropdown_key_with_providers(
             ModelDropdownAction::ProviderCycled
         }
         KeyCode::Enter => {
-            if state.selected_index < state.models.len() {
+            if indices.contains(&state.selected_index) {
                 let (model_id, _) = &state.models[state.selected_index];
                 ModelDropdownAction::Selected(model_id.clone())
             } else {
                 ModelDropdownAction::Consumed
             }
         }
-        KeyCode::Char(c @ '1'..='9') => {
+        KeyCode::Char(c @ '1'..='9') if !state.filter_editing => {
             let idx = (c as usize) - ('1' as usize);
-            if idx < state.models.len() {
-                let (model_id, _) = &state.models[idx];
+            if let Some(source_index) = indices.get(idx) {
+                let (model_id, _) = &state.models[*source_index];
                 ModelDropdownAction::Selected(model_id.clone())
             } else {
                 ModelDropdownAction::Consumed
             }
         }
         KeyCode::Esc | KeyCode::Char('q') => ModelDropdownAction::Dismissed,
+        _ if state.filter_editing => ModelDropdownAction::Consumed,
         _ => ModelDropdownAction::Ignored,
     }
 }
@@ -112,6 +184,18 @@ fn cycle_provider_with_providers(
     builtins: &[SessionProvider],
     custom_providers: &[CustomProviderEntry],
 ) {
+    // #1407: cycle only the providers the provider profile offers.
+    let builtins: Vec<SessionProvider> = builtins
+        .iter()
+        .copied()
+        .filter(|provider| crate::provider_profile_view::provider_offered(*provider))
+        .collect();
+    let builtins = builtins.as_slice();
+    let custom_providers = if crate::provider_profile_view::custom_providers_offered() {
+        custom_providers
+    } else {
+        &[]
+    };
     let custom_count = custom_providers.len();
     let base_slots = builtins.len();
 
@@ -162,6 +246,7 @@ fn cycle_provider_with_providers(
     };
 
     state.selected_index = 0;
+    state.reconcile_filter_selection();
 }
 
 #[cfg(test)]
@@ -183,6 +268,272 @@ mod tests {
             ("claude-opus-4-20250514".into(), "Claude Opus 4".into()),
             ("claude-haiku-3.5".into(), "Claude Haiku 3.5".into()),
         ]
+    }
+
+    fn type_query(state: &mut ModelDropdownState, query: &str) {
+        assert_eq!(
+            handle_model_dropdown_key(state, &make_key(KeyCode::Char('/')), &[]),
+            ModelDropdownAction::Consumed
+        );
+        for c in query.chars() {
+            assert_eq!(
+                handle_model_dropdown_key(state, &make_key(KeyCode::Char(c)), &[]),
+                ModelDropdownAction::Consumed
+            );
+        }
+    }
+
+    #[test]
+    fn model_dropdown_search_matches_name_and_id_with_all_terms() {
+        let mut state = ModelDropdownState::new(SessionProvider::Claude, sample_models(), None);
+        type_query(&mut state, "OPUS 20250514");
+        assert_eq!(state.filter_query, "OPUS 20250514");
+        assert_eq!(state.filtered_indices(), vec![1]);
+        assert_eq!(
+            handle_model_dropdown_key(&mut state, &make_key(KeyCode::Enter), &[]),
+            ModelDropdownAction::Selected("claude-opus-4-20250514".into())
+        );
+    }
+
+    #[test]
+    fn model_dropdown_search_captures_shortcut_letters_and_numbers() {
+        let mut state = ModelDropdownState::new(SessionProvider::Claude, sample_models(), None);
+        type_query(&mut state, "jkqgG19/ ");
+        assert_eq!(state.filter_query, "jkqgG19/ ");
+        assert!(state.filter_editing);
+        assert!(state.filtered_indices().is_empty());
+        assert_eq!(
+            handle_model_dropdown_key(&mut state, &make_key(KeyCode::Enter), &[]),
+            ModelDropdownAction::Consumed
+        );
+    }
+
+    #[test]
+    fn model_dropdown_filtered_navigation_and_numbers_use_visible_rows() {
+        let mut state = ModelDropdownState::new(SessionProvider::Claude, sample_models(), None);
+        type_query(&mut state, "claude 3");
+        assert_eq!(state.filtered_indices(), vec![2]);
+        handle_model_dropdown_key(&mut state, &make_key(KeyCode::Esc), &[]);
+        assert_eq!(
+            handle_model_dropdown_key(&mut state, &make_key(KeyCode::Char('1')), &[]),
+            ModelDropdownAction::Selected("claude-haiku-3.5".into())
+        );
+
+        state.filter_query = "claude".into();
+        state.filter_editing = true;
+        for code in [KeyCode::Home, KeyCode::Down, KeyCode::Down, KeyCode::Down] {
+            handle_model_dropdown_key(&mut state, &make_key(code), &[]);
+        }
+        assert_eq!(state.selected_index, 2);
+        handle_model_dropdown_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &[],
+        );
+        assert_eq!(state.selected_index, 1);
+        handle_model_dropdown_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            &[],
+        );
+        assert_eq!(state.selected_index, 2);
+        handle_model_dropdown_key(&mut state, &make_key(KeyCode::Esc), &[]);
+        handle_model_dropdown_key(&mut state, &make_key(KeyCode::Char('g')), &[]);
+        assert_eq!(state.selected_index, 0);
+        handle_model_dropdown_key(&mut state, &make_key(KeyCode::Char('G')), &[]);
+        assert_eq!(state.selected_index, 2);
+    }
+
+    #[test]
+    fn model_dropdown_empty_results_block_selection_and_recover() {
+        let mut state = ModelDropdownState::new(SessionProvider::Claude, sample_models(), None);
+        type_query(&mut state, "missing");
+        for code in [KeyCode::Down, KeyCode::End, KeyCode::Enter] {
+            assert_eq!(
+                handle_model_dropdown_key(&mut state, &make_key(code), &[]),
+                ModelDropdownAction::Consumed
+            );
+        }
+        handle_model_dropdown_key(&mut state, &make_key(KeyCode::Esc), &[]);
+        assert_eq!(
+            handle_model_dropdown_key(&mut state, &make_key(KeyCode::Char('1')), &[]),
+            ModelDropdownAction::Consumed
+        );
+        assert_eq!(
+            handle_model_dropdown_key(&mut state, &make_key(KeyCode::Enter), &[]),
+            ModelDropdownAction::Consumed
+        );
+        // Resume editing and clear the query: the full catalog returns.
+        handle_model_dropdown_key(&mut state, &make_key(KeyCode::Char('/')), &[]);
+        handle_model_dropdown_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            &[],
+        );
+        assert_eq!(state.filtered_indices(), vec![0, 1, 2]);
+        assert_eq!(
+            handle_model_dropdown_key(&mut state, &make_key(KeyCode::Enter), &[]),
+            ModelDropdownAction::Selected("claude-sonnet-5".into())
+        );
+    }
+
+    /// Esc steps out of the query first (keeping the filtered list), then a
+    /// second Esc closes; `q` types while editing and closes outside it.
+    #[test]
+    fn model_dropdown_esc_leaves_search_then_closes() {
+        let mut state = ModelDropdownState::new(SessionProvider::Claude, sample_models(), None);
+        type_query(&mut state, "haiku");
+        assert_eq!(
+            handle_model_dropdown_key(&mut state, &make_key(KeyCode::Esc), &[]),
+            ModelDropdownAction::Consumed
+        );
+        assert!(!state.filter_editing);
+        assert_eq!(state.filter_query, "haiku");
+        assert_eq!(state.filtered_indices(), vec![2]);
+        assert_eq!(
+            handle_model_dropdown_key(&mut state, &make_key(KeyCode::Esc), &[]),
+            ModelDropdownAction::Dismissed
+        );
+
+        let mut state = ModelDropdownState::new(SessionProvider::Claude, sample_models(), None);
+        type_query(&mut state, "q");
+        assert_eq!(state.filter_query, "q");
+        handle_model_dropdown_key(&mut state, &make_key(KeyCode::Esc), &[]);
+        assert_eq!(
+            handle_model_dropdown_key(&mut state, &make_key(KeyCode::Char('q')), &[]),
+            ModelDropdownAction::Dismissed
+        );
+    }
+
+    #[test]
+    fn model_dropdown_typing_highlights_the_first_match() {
+        // The current model (Haiku, index 2) starts highlighted.
+        let mut state = ModelDropdownState::new(
+            SessionProvider::Claude,
+            sample_models(),
+            Some("claude-haiku-3.5"),
+        );
+        assert_eq!(state.selected_index, 2);
+        type_query(&mut state, "claude");
+        assert_eq!(state.selected_index, 0, "a query edit restarts at the top");
+        assert_eq!(
+            handle_model_dropdown_key(&mut state, &make_key(KeyCode::Enter), &[]),
+            ModelDropdownAction::Selected("claude-sonnet-5".into())
+        );
+    }
+
+    #[test]
+    fn model_dropdown_search_ignores_punctuation_and_spacing() {
+        let mut models = sample_models();
+        models.push(("claude-opus-4-5".into(), "Opus 4.5".into()));
+        models.push(("gpt-5.5-codex".into(), "GPT 5.5 Codex".into()));
+        let mut state = ModelDropdownState::new(SessionProvider::Claude, models, None);
+        state.filter_query = "opus45".into();
+        assert_eq!(state.filtered_indices(), vec![3]);
+        state.filter_query = "GPT55".into();
+        assert_eq!(state.filtered_indices(), vec![4]);
+        state.filter_query = "haiku3.5".into();
+        assert_eq!(state.filtered_indices(), vec![2]);
+        state.filter_query = "-".into();
+        assert_eq!(state.filtered_indices(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn model_dropdown_backspace_on_empty_query_and_ctrl_w() {
+        let mut state = ModelDropdownState::new(SessionProvider::Claude, sample_models(), None);
+        type_query(&mut state, "claude opus ");
+        handle_model_dropdown_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            &[],
+        );
+        assert_eq!(state.filter_query, "claude ");
+        handle_model_dropdown_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            &[],
+        );
+        assert_eq!(state.filter_query, "");
+        assert!(state.filter_editing);
+        handle_model_dropdown_key(&mut state, &make_key(KeyCode::Backspace), &[]);
+        assert!(
+            !state.filter_editing,
+            "Backspace on an empty query ends search"
+        );
+        assert!(state.open);
+        handle_model_dropdown_key(&mut state, &make_key(KeyCode::Char('j')), &[]);
+        assert_eq!(state.selected_index, 1);
+    }
+
+    #[test]
+    fn model_dropdown_navigation_skips_hidden_models() {
+        let mut models = sample_models();
+        models.push(("vendor/future".into(), "Friendly Sonnet".into()));
+        let mut state = ModelDropdownState::new(SessionProvider::Claude, models, None);
+        type_query(&mut state, "sonnet");
+        assert_eq!(state.filtered_indices(), vec![0, 3]);
+        handle_model_dropdown_key(&mut state, &make_key(KeyCode::Down), &[]);
+        assert_eq!(state.selected_index, 3);
+        handle_model_dropdown_key(&mut state, &make_key(KeyCode::Up), &[]);
+        assert_eq!(state.selected_index, 0);
+        handle_model_dropdown_key(&mut state, &make_key(KeyCode::Esc), &[]);
+        handle_model_dropdown_key(&mut state, &make_key(KeyCode::Char('j')), &[]);
+        assert_eq!(state.selected_index, 3);
+        assert_eq!(
+            handle_model_dropdown_key(&mut state, &make_key(KeyCode::Char('2')), &[]),
+            ModelDropdownAction::Selected("vendor/future".into())
+        );
+        state.filter_query = "FRIENDLY vendor".into();
+        assert_eq!(state.filtered_indices(), vec![3]);
+    }
+
+    #[test]
+    fn model_dropdown_backspace_handles_unicode_and_control_u_clears() {
+        let mut state = ModelDropdownState::new(SessionProvider::Claude, sample_models(), None);
+        type_query(&mut state, "opusé");
+        handle_model_dropdown_key(&mut state, &make_key(KeyCode::Backspace), &[]);
+        assert_eq!(state.filter_query, "opus");
+        assert_eq!(state.filtered_indices(), vec![1]);
+        handle_model_dropdown_key(
+            &mut state,
+            &KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            &[],
+        );
+        assert_eq!(state.filter_query, "");
+        assert_eq!(state.filtered_indices(), vec![0, 1, 2]);
+        assert!(state.filter_editing);
+        state.close();
+        state.toggle();
+        assert!(state.open);
+        assert!(!state.filter_editing);
+        assert_eq!(state.filter_query, "");
+    }
+
+    #[test]
+    fn model_dropdown_query_survives_provider_cycle_and_discovery() {
+        let mut state = ModelDropdownState::new(SessionProvider::Claude, sample_models(), None);
+        type_query(&mut state, "gpt");
+        assert_eq!(
+            handle_model_dropdown_key(&mut state, &make_key(KeyCode::Tab), &[]),
+            ModelDropdownAction::ProviderCycled
+        );
+        assert_eq!(state.provider, SessionProvider::Codex);
+        assert_eq!(state.filter_query, "gpt");
+        assert!(state.filter_editing);
+        state.replace_models(vec![
+            ("other".into(), "Other".into()),
+            ("gpt-z".into(), "GPT Z".into()),
+        ]);
+        assert_eq!(state.selected_index, 1);
+        state.replace_models(vec![
+            ("gpt-z".into(), "GPT Z".into()),
+            ("gpt-new".into(), "GPT New".into()),
+        ]);
+        assert_eq!(state.selected_index, 0);
+        assert_eq!(
+            handle_model_dropdown_key(&mut state, &make_key(KeyCode::Enter), &[]),
+            ModelDropdownAction::Selected("gpt-z".into())
+        );
     }
 
     #[test]

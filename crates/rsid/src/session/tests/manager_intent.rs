@@ -98,6 +98,7 @@ async fn update(p: &Pilot, key: &str, change: ManagerUpdateV2) {
         .agent_manager_update(
             p.owner,
             AgentManagerUpdateRequestV2 {
+                project_id: None,
                 fence: ManagerFenceV2 {
                     scope_version: 1,
                     policy_version,
@@ -321,6 +322,67 @@ async fn manager_intent_empty_launch_list_is_a_stable_typed_hold() {
             assert_eq!(reconcile(&p).await.queued, 0);
             assert_eq!(intent(&p).await, before);
         }
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn manager_intent_recovers_with_the_live_ancestor_launch_set() {
+    use rsi_common::global_manager::ConfigureGlobalManagerRequestV1;
+    for copied in [false, true] {
+        let p = pilot().await;
+        let replacement = ManagerLaunchChoiceV2 {
+            provider: SessionProvider::Codex,
+            model: "gpt-6-luna".into(),
+            effort: Some("high".into()),
+        };
+        policy(&p, |policy| {
+            policy.allowed_launches = if copied {
+                vec![p.policy.allowed_launches[0].clone(), replacement.clone()]
+            } else {
+                vec![]
+            };
+        })
+        .await;
+        {
+            let store = p.manager.store.lock().await;
+            let seat = Uuid::new_v4();
+            let mut row = bare_session(seat);
+            row.project_id = Some(p.project);
+            row.status = SessionStatus::Running;
+            store.insert_session(&row).unwrap();
+            let mut ancestor = p.policy.clone();
+            ancestor.allowed_launches.clear();
+            store
+                .configure_global_manager(
+                    &ConfigureGlobalManagerRequestV1 {
+                        session_id: seat,
+                        project_ids: vec![p.project],
+                        allowed_launches: vec![replacement.clone()],
+                        project_policy: ancestor,
+                        expected_grant_version: 0,
+                        idempotency_key: "intent-ancestor".into(),
+                    },
+                    "operator:test",
+                )
+                .unwrap();
+            store
+                .update_session_status(p.lead, SessionStatus::Failed)
+                .unwrap();
+        }
+        work(&p, "product").await;
+        assert_eq!(reconcile(&p).await.queued, 1);
+        let id = operation(&p).await;
+        let action = p
+            .manager
+            .store
+            .lock()
+            .await
+            .manager_action_operation(id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(action.context.launch, Some(replacement));
+        assert_eq!(intent(&p).await["state"], "recovery_action");
     }
 }
 
@@ -604,6 +666,7 @@ async fn manager_intent_pause_carries_across_scope_and_manager_change_until_expl
         .agent_manager_control(
             new_manager_id,
             AgentManagerControlRequestV2 {
+                project_id: None,
                 fence: ManagerFenceV2 {
                     scope_version,
                     policy_version,
@@ -864,6 +927,8 @@ async fn decision(p: &Pilot) {
             question: "Choose the feature behavior".into(),
             request_id: None,
             work_key: Some("product".into()),
+            gate: None,
+            options: vec![],
         },
     )
     .await;
@@ -932,12 +997,22 @@ async fn manager_intent_race_scenario() {
     for gate in ["decision", "pause", "dependency"] {
         let p = pilot().await;
         work(&p, "product").await;
-        // A different explicitly granted model requires the normal replacement
-        // path, with a real allocated/authenticated sandbox before admission.
-        policy(&p, |policy| {
-            policy.allowed_launches[0].model = "fallback-scripted-provider".into()
-        })
-        .await;
+        // Keep the granted launch on the scripted model recognized by model
+        // preflight. A different previous model still forces the replacement
+        // path and its real allocated/authenticated sandbox; an unknown launch
+        // model would be refused before the custody pause (#1561).
+        let lead = {
+            let mut completed = p.manager.completed.write().await;
+            let lead = &mut completed.get_mut(&p.lead).unwrap().session;
+            lead.model = Some("previous-scripted-provider".into());
+            lead.clone()
+        };
+        p.manager
+            .store
+            .lock()
+            .await
+            .update_session_metadata(&lead)
+            .unwrap();
         assert_eq!(reconcile(&p).await.queued, 1);
         let id = operation(&p).await;
         let candidate = p.receipt(id).await.target_session_id.unwrap();
@@ -946,13 +1021,23 @@ async fn manager_intent_race_scenario() {
         wait_due(&p, id).await;
         let (reached, resume) =
             launch::install_direct_launch_custody_test_pause(&format!("manager.action:{id}"));
-        let change = async {
-            assert_eq!(reached.await.unwrap(), candidate);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let settle = settle_action(&p, id);
+            tokio::pin!(settle);
+            // A pre-custody refusal settles the action without ever sending
+            // `reached`. Report its receipt instead of waiting on that signal.
+            tokio::select! {
+                reached = reached => assert_eq!(reached.unwrap(), candidate),
+                () = &mut settle => panic!(
+                    "{gate}: action settled before custody pause: {:?}",
+                    p.receipt(id).await,
+                ),
+            }
             match gate {
                 "decision" => decision(&p).await,
                 "dependency" => block_dependencies(&p).await,
                 "pause" => {
-                    let mut request = p.request(
+                    let request = p.request(
                         "racing-manager-pause",
                         ManagerActionV2::PauseLead {
                             epic_id: p.epic,
@@ -960,7 +1045,6 @@ async fn manager_intent_race_scenario() {
                             reason: "pause before effect".into(),
                         },
                     );
-                    request.fence.policy_version = 2;
                     p.manager
                         .agent_control()
                         .agent_manager_control(p.owner, request)
@@ -971,9 +1055,7 @@ async fn manager_intent_race_scenario() {
             }
             // No intent reconciliation here: the effect must query live state.
             resume.send(()).unwrap();
-        };
-        tokio::time::timeout(Duration::from_secs(30), async {
-            let ((), ()) = tokio::join!(settle_action(&p, id), change);
+            settle.await;
         })
         .await
         .expect("bounded provider race settles");
@@ -1370,6 +1452,7 @@ async fn manager_intent_scoped_action_pages_include_unpublished_candidates_and_v
             .agent_manager_inspect(
                 p.lead,
                 AgentManagerInspectRequestV2 {
+                    project_id: None,
                     section: ManagerInspectSectionV2::Actions,
                     epic_id: Some(p.epic),
                     cursor,
@@ -1393,4 +1476,164 @@ async fn manager_intent_scoped_action_pages_include_unpublished_candidates_and_v
             unassign.operation_id.to_string()
         ])
     );
+}
+
+// #1443: a seat change never wakes stale leads by itself. Of three Epics, only
+// the lead active after the appointment is continued; the idle ones are listed
+// as `stale_lead` for the manager to resume explicitly.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_intent_seat_change_resumes_only_the_recently_active_lead() {
+    let mut p = pilot().await;
+    let new_manager_id = Uuid::new_v4();
+    let stale = [
+        (Uuid::new_v4(), Uuid::new_v4()),
+        (Uuid::new_v4(), Uuid::new_v4()),
+    ];
+    let long_ago = (chrono::Utc::now() - chrono::Duration::days(5))
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    {
+        let store = p.manager.store.lock().await;
+        let mut manager = bare_session(new_manager_id);
+        manager.project_id = Some(p.project);
+        manager.working_dir = p.repo.clone();
+        store.insert_session(&manager).unwrap();
+        for (epic, lead) in stale {
+            for (id, kind, parent) in [
+                (epic, SessionKind::Epic, p.group),
+                (lead, SessionKind::Feature, epic),
+            ] {
+                let mut row = bare_session(id);
+                row.project_id = Some(p.project);
+                row.working_dir = p.repo.clone();
+                row.session_kind = kind;
+                row.parent_id = Some(parent);
+                row.provider = SessionProvider::Claude;
+                row.model = Some("manager-scripted-provider".into());
+                row.claude_session_id = Some(format!("provider-{id}"));
+                store.insert_session(&row).unwrap();
+                p.manager
+                    .completed
+                    .write()
+                    .await
+                    .insert(id, CompletedSession::for_test(row));
+            }
+            store.set_lead_session(epic, Some(lead)).unwrap();
+        }
+        // The seat changes: a new appointment over all three Epics.
+        store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                project_id: p.project,
+                session_id: new_manager_id,
+                epic_ids: Some(vec![p.epic, stale[0].0, stale[1].0]),
+                group_ids: Vec::new(),
+                expected_row_version: 1,
+            })
+            .unwrap();
+        let grant = store
+            .get_harness_manager_policy(p.project)
+            .unwrap()
+            .unwrap();
+        store
+            .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                project_id: p.project,
+                expected_scope_version: 2,
+                expected_policy_version: grant.row_version,
+                idempotency_key: "policy-after-seat-change".into(),
+                policy: p.policy.clone(),
+            })
+            .unwrap();
+        // The stale leads were last active days before the appointment; the
+        // pilot's own lead acts after it.
+        for (_, lead) in stale {
+            store
+                .conn
+                .execute(
+                    "UPDATE sessions SET updated_at=?2 WHERE id=?1",
+                    rusqlite::params![lead.to_string(), long_ago],
+                )
+                .unwrap();
+        }
+        store
+            .update_session_status(p.lead, SessionStatus::Completed)
+            .unwrap();
+    }
+    p.owner = new_manager_id;
+    let policy_version = p
+        .manager
+        .store
+        .lock()
+        .await
+        .get_harness_manager_policy(p.project)
+        .unwrap()
+        .unwrap()
+        .row_version;
+    for epic in [p.epic, stale[0].0, stale[1].0] {
+        let key = format!("work-{epic}");
+        p.manager
+            .agent_control()
+            .agent_manager_update(
+                p.owner,
+                AgentManagerUpdateRequestV2 {
+                    project_id: None,
+                    fence: ManagerFenceV2 {
+                        scope_version: 2,
+                        policy_version,
+                    },
+                    idempotency_key: key.clone(),
+                    change: ManagerUpdateV2::Work {
+                        key,
+                        expected_row_version: 0,
+                        epic_id: epic,
+                        title: "deliverable".into(),
+                        kind: ManagerWorkKindV2::Product,
+                        priority: 1,
+                        weight: 1,
+                        required_gates: vec![
+                            ManagerWorkStageV2::Implementation,
+                            ManagerWorkStageV2::Review,
+                            ManagerWorkStageV2::Verification,
+                        ],
+                        risk_tier: Default::default(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // The second pass deduplicates: nothing new is queued for any Epic.
+    for expected in [1, 0] {
+        assert_eq!(reconcile(&p).await.queued, expected);
+        assert_eq!(count_actions(&p).await, 1);
+    }
+    let store = p.manager.store.lock().await;
+    let config = store.get_harness_manager(p.project).unwrap().unwrap();
+    let queued: Vec<(String, String)> = store
+        .conn
+        .prepare(
+            "SELECT json_extract(payload_json,'$.request.operation.action'),
+                    json_extract(payload_json,'$.request.operation.epic_id')
+             FROM harness_manager_v2_operations
+             WHERE project_id=?1 AND kind='lifecycle_action'
+               AND json_extract(payload_json,'$.origin.origin')='operating_intent'",
+        )
+        .unwrap()
+        .query_map([p.project.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<std::result::Result<_, rusqlite::Error>>()
+        .unwrap();
+    assert_eq!(
+        queued,
+        vec![("resume_lead".to_string(), p.epic.to_string())]
+    );
+    for (epic, _) in stale {
+        let state = store
+            .manager_v2_record(&config, "intent", &epic.to_string())
+            .unwrap()
+            .unwrap()
+            .payload;
+        assert_eq!(state["state"], "stale_lead");
+        assert_eq!(state["reason"], "lead_idle_since_before_seat_appointment");
+    }
 }
