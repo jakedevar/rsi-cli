@@ -23,6 +23,18 @@ use rsi_graph::format::*;
 use rsi_graph::generate::templates::starter_templates;
 use std::collections::{HashMap, HashSet};
 
+/// A `label: value` line for the field being edited: Standard mode draws the
+/// field cursor and selection, Vim mode the end-of-text block.
+fn edit_line<'a>(label: Span<'a>, edit_buffer: &str) -> Line<'a> {
+    let mut spans = vec![label];
+    spans.extend(crate::field_edit::draw_with_caret(
+        edit_buffer,
+        Style::default().fg(theme::text()).bg(theme::surface2()),
+        Style::default().fg(theme::blue()),
+    ));
+    Line::from(spans)
+}
+
 fn review_popup_rect(area: Rect) -> Rect {
     super::scoped_popup_rect(
         Rect::new(
@@ -172,6 +184,25 @@ pub fn render_graph_review(
                 }
                 frame.render_widget(Paragraph::new(lines), inner_dashboard_area);
             }
+        } else if let Some(run) =
+            execution.filter(|execution| is_topology_run(execution) && graph_area.width >= 90)
+        {
+            // #1746: a durable topology run shows its run view beside the canvas.
+            let chunks =
+                Layout::horizontal([Constraint::Fill(1), Constraint::Length(RUN_VIEW_WIDTH)])
+                    .split(graph_area);
+            render_graph_canvas(
+                frame,
+                chunks[0],
+                workflow,
+                mode,
+                viewport,
+                selected_node,
+                collapsed,
+                &validation,
+                execution,
+            );
+            render_run_view(frame, chunks[1], workflow, run);
         } else {
             render_graph_canvas(
                 frame,
@@ -960,6 +991,233 @@ fn write_char(buf: &mut Buffer, x: u16, y: u16, ch: char, style: Style) {
     cell.set_style(style);
 }
 
+/// Width of the topology run view beside the canvas.
+const RUN_VIEW_WIDTH: u16 = 46;
+
+/// Whether a snapshot is a durable topology run (a dry-run or in-memory
+/// workflow carries no row version).
+pub(crate) fn is_topology_run(execution: &WorkflowExecutionSnapshot) -> bool {
+    execution.row_version.is_some() && !execution.dry_run
+}
+
+/// One node row of the run view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunNodeRow {
+    pub(crate) id: String,
+    pub(crate) state: Option<WorkflowNodeExecutionState>,
+    /// Launches of the node since its last success (0 until it first runs).
+    pub(crate) attempt: u32,
+    /// Loop round: one more than the successes that came before this launch.
+    pub(crate) round: u32,
+    /// The node has an attempt reserved, launching, running or waiting.
+    pub(crate) current: bool,
+}
+
+/// Node rows in workflow order. `attempt` and `round` are derived from the
+/// node's update stream (each launch is a `Running` update, each success
+/// closes the round), so a retry raises the attempt and a loop revisit raises
+/// the round.
+pub(crate) fn run_node_rows(
+    workflow: &WorkflowDefinition,
+    execution: &WorkflowExecutionSnapshot,
+) -> Vec<RunNodeRow> {
+    workflow
+        .nodes
+        .iter()
+        .map(|node| {
+            let (mut state, mut attempt, mut successes) = (None, 0_u32, 0_u32);
+            for update in &execution.updates {
+                if update.node_id.as_deref() != Some(node.id.as_str()) {
+                    continue;
+                }
+                let Some(node_state) = update.node_state else {
+                    continue;
+                };
+                state = Some(node_state);
+                match node_state {
+                    WorkflowNodeExecutionState::Running => attempt += 1,
+                    WorkflowNodeExecutionState::Succeeded => {
+                        successes += 1;
+                        attempt = 0;
+                    }
+                    _ => {}
+                }
+            }
+            let started = state.is_some();
+            let settled_ok = matches!(state, Some(WorkflowNodeExecutionState::Succeeded));
+            RunNodeRow {
+                id: node.id.clone(),
+                state,
+                attempt,
+                round: if !started {
+                    0
+                } else if settled_ok {
+                    successes
+                } else {
+                    successes + 1
+                },
+                current: execution.current_nodes.iter().any(|id| id == &node.id),
+            }
+        })
+        .collect()
+}
+
+fn run_state_word(state: Option<WorkflowNodeExecutionState>) -> &'static str {
+    match state {
+        None => "pending",
+        Some(WorkflowNodeExecutionState::Running) => "running",
+        Some(WorkflowNodeExecutionState::Succeeded) => "succeeded",
+        Some(WorkflowNodeExecutionState::Failed) => "failed",
+        Some(WorkflowNodeExecutionState::Skipped) => "skipped",
+        Some(_) => "unknown",
+    }
+}
+
+fn on_call_seat_word(seat: &rsi_common::types::TopologyOnCallSeat) -> &'static str {
+    match seat {
+        rsi_common::types::TopologyOnCallSeat::ProjectManager => "project manager",
+        rsi_common::types::TopologyOnCallSeat::Portfolio { .. } => "portfolio seat",
+    }
+}
+
+/// Plain text of the run view: node rows (the current node first marked `>`),
+/// the on-call line, the rulings list and the waiting reason.
+pub(crate) fn run_view_text(
+    workflow: &WorkflowDefinition,
+    execution: &WorkflowExecutionSnapshot,
+) -> Vec<(String, RunLineKind)> {
+    let mut lines = vec![(
+        format!(
+            "{} {}",
+            execution.workflow_name,
+            execution_word(execution.status)
+        ),
+        RunLineKind::Title,
+    )];
+    for row in run_node_rows(workflow, execution) {
+        let detail = if row.attempt == 0 && row.round == 0 {
+            String::new()
+        } else {
+            format!("  attempt {} round {}", row.attempt.max(1), row.round)
+        };
+        lines.push((
+            format!(
+                "{} {}  {}{detail}",
+                if row.current { '>' } else { ' ' },
+                row.id,
+                run_state_word(row.state),
+            ),
+            if row.current {
+                RunLineKind::Current
+            } else {
+                RunLineKind::Node
+            },
+        ));
+    }
+    match &execution.on_call {
+        Some(on_call) => lines.push((
+            format!(
+                "on-call: {} ({})",
+                on_call_seat_word(&on_call.seat),
+                if on_call.live { "live" } else { "not live" }
+            ),
+            if on_call.live {
+                RunLineKind::Node
+            } else {
+                RunLineKind::Warn
+            },
+        )),
+        None => lines.push(("on-call: none".to_owned(), RunLineKind::Hint)),
+    }
+    if let Some(waiting) = &execution.waiting {
+        lines.push((
+            format!("waiting: {} - {}", waiting.node_id, waiting.reason),
+            RunLineKind::Warn,
+        ));
+    }
+    lines.push((
+        format!("rulings ({})", execution.rulings.len()),
+        RunLineKind::Title,
+    ));
+    if execution.rulings.is_empty() {
+        lines.push(("  none".to_owned(), RunLineKind::Hint));
+    }
+    for ruling in &execution.rulings {
+        let by = ruling
+            .answered_by
+            .as_deref()
+            .map(|by| format!(" by {by}"))
+            .unwrap_or_default();
+        lines.push((
+            format!(
+                "  {} [{}{by}] {}",
+                ruling.node_id, ruling.status, ruling.question
+            ),
+            RunLineKind::Node,
+        ));
+    }
+    lines
+}
+
+fn execution_word(status: WorkflowExecutionStatus) -> &'static str {
+    match status {
+        WorkflowExecutionStatus::Accepted => "accepted",
+        WorkflowExecutionStatus::Running => "running",
+        WorkflowExecutionStatus::Succeeded => "succeeded",
+        WorkflowExecutionStatus::Failed => "failed",
+        WorkflowExecutionStatus::Interrupted => "interrupted",
+        WorkflowExecutionStatus::Blocked => "blocked",
+        _ => "unknown",
+    }
+}
+
+/// Styling class of one run-view line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunLineKind {
+    Title,
+    Node,
+    Current,
+    Warn,
+    Hint,
+}
+
+fn render_run_view(
+    frame: &mut Frame,
+    area: Rect,
+    workflow: &WorkflowDefinition,
+    execution: &WorkflowExecutionSnapshot,
+) {
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme::overlay_border()))
+        .title(Span::styled(
+            " run ",
+            Style::default()
+                .fg(theme::overlay_hint())
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lines: Vec<Line<'static>> = run_view_text(workflow, execution)
+        .into_iter()
+        .map(|(text, kind)| {
+            let style = match kind {
+                RunLineKind::Title => Style::default()
+                    .fg(theme::overlay_hint())
+                    .add_modifier(Modifier::BOLD),
+                RunLineKind::Node => Style::default(),
+                RunLineKind::Current => Style::default()
+                    .fg(theme::yellow())
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+                RunLineKind::Warn => Style::default().fg(theme::yellow()),
+                RunLineKind::Hint => Style::default().fg(theme::overlay_hint()),
+            };
+            Line::from(Span::styled(text, style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
 fn execution_state_map(
     execution: Option<&WorkflowExecutionSnapshot>,
 ) -> HashMap<&str, WorkflowNodeExecutionState> {
@@ -1391,14 +1649,10 @@ fn render_detail_panel(
     ]));
 
     let name_line = if matches!(editing_field, Some(GraphEditField::Name)) {
-        Line::from(vec![
+        edit_line(
             Span::styled("Name: ", Style::default().fg(theme::overlay_hint())),
-            Span::styled(
-                edit_buffer,
-                Style::default().fg(theme::text()).bg(theme::surface2()),
-            ),
-            Span::styled("\u{2588}", Style::default().fg(theme::blue())),
-        ])
+            edit_buffer,
+        )
     } else {
         let suffix = if name_read_only {
             "  [read-only]"
@@ -1426,14 +1680,10 @@ fn render_detail_panel(
             .join(" ")
     };
     let instructions_line = if matches!(editing_field, Some(GraphEditField::Instructions)) {
-        Line::from(vec![
+        edit_line(
             Span::styled("Instructions: ", Style::default().fg(theme::overlay_hint())),
-            Span::styled(
-                edit_buffer,
-                Style::default().fg(theme::text()).bg(theme::surface2()),
-            ),
-            Span::styled("\u{2588}", Style::default().fg(theme::blue())),
-        ])
+            edit_buffer,
+        )
     } else {
         let suffix = if instructions_read_only {
             if let Some(reason) = &lock_reason {
@@ -1474,17 +1724,13 @@ fn render_detail_panel(
         // Integration strategy
         let integration_line = if matches!(editing_field, Some(GraphEditField::IntegrationStrategy))
         {
-            Line::from(vec![
+            edit_line(
                 Span::styled(
                     "Integration Strategy: ",
                     Style::default().fg(theme::overlay_hint()),
                 ),
-                Span::styled(
-                    edit_buffer,
-                    Style::default().fg(theme::text()).bg(theme::surface2()),
-                ),
-                Span::styled("\u{2588}", Style::default().fg(theme::blue())),
-            ])
+                edit_buffer,
+            )
         } else {
             let suffix = if instructions_read_only {
                 "  [locked]"
@@ -1506,17 +1752,13 @@ fn render_detail_panel(
         // Verification strategy
         let verification_line =
             if matches!(editing_field, Some(GraphEditField::VerificationStrategy)) {
-                Line::from(vec![
+                edit_line(
                     Span::styled(
                         "Verification Strategy: ",
                         Style::default().fg(theme::overlay_hint()),
                     ),
-                    Span::styled(
-                        edit_buffer,
-                        Style::default().fg(theme::text()).bg(theme::surface2()),
-                    ),
-                    Span::styled("\u{2588}", Style::default().fg(theme::blue())),
-                ])
+                    edit_buffer,
+                )
             } else {
                 let suffix = if instructions_read_only {
                     "  [locked]"
@@ -2219,5 +2461,139 @@ fn render_persistence_badge(persistence_state: GraphDraftPersistenceState) -> Sp
         GraphDraftPersistenceState::SaveFailed => {
             Span::styled("[save failed]", Style::default().fg(theme::red()))
         }
+    }
+}
+
+#[cfg(test)]
+mod run_view_tests {
+    use super::*;
+    use rsi_common::types::{
+        GraphExecutionUpdate, TopologyOnCallSeat, TopologyOnCallView, TopologyOnCallWait,
+        TopologyRulingView,
+    };
+    use uuid::Uuid;
+
+    fn update(
+        sequence: u64,
+        node: &str,
+        state: WorkflowNodeExecutionState,
+    ) -> GraphExecutionUpdate {
+        GraphExecutionUpdate {
+            execution_id: Uuid::nil(),
+            workflow_id: Uuid::nil(),
+            node_id: Some(node.to_owned()),
+            sequence,
+            status: WorkflowExecutionStatus::Running,
+            node_state: Some(state),
+            finished: false,
+            error: None,
+            output_preview: None,
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn workflow() -> WorkflowDefinition {
+        let mut workflow = WorkflowDefinition::new("flow");
+        for id in ["implement", "review", "land"] {
+            workflow.nodes.push(NodeDef::action(id, id));
+        }
+        workflow
+    }
+
+    fn run() -> WorkflowExecutionSnapshot {
+        use WorkflowNodeExecutionState::{Failed, Running, Succeeded};
+        WorkflowExecutionSnapshot {
+            execution_id: Uuid::nil(),
+            workflow_id: Uuid::nil(),
+            workflow_name: "issue-implement-review-land".into(),
+            status: WorkflowExecutionStatus::Running,
+            accepted_at: chrono::Utc::now(),
+            started_at: None,
+            finished_at: None,
+            dry_run: false,
+            input: None,
+            output: None,
+            error: None,
+            last_sequence: 6,
+            updates: vec![
+                update(1, "implement", Running),
+                update(2, "implement", Succeeded),
+                update(3, "review", Running),
+                update(4, "review", Failed),
+                update(5, "implement", Running),
+                update(6, "implement", Succeeded),
+                update(7, "review", Running),
+            ],
+            row_version: Some(7),
+            blocked_attempt_id: None,
+            blocked_reason: None,
+            waiting: Some(TopologyOnCallWait {
+                node_id: "review".into(),
+                reason: "no_live_project_manager".into(),
+                on_call: TopologyOnCallSeat::ProjectManager,
+                since: chrono::Utc::now(),
+            }),
+            current_nodes: vec!["review".into()],
+            on_call: Some(TopologyOnCallView {
+                seat: TopologyOnCallSeat::ProjectManager,
+                session_id: None,
+                live: false,
+            }),
+            rulings: vec![TopologyRulingView {
+                node_id: "review".into(),
+                decision_key: "k".into(),
+                question: "ship it?".into(),
+                status: "answered".into(),
+                answered_by: Some("manager".into()),
+                answer_digest: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn node_rows_carry_state_attempt_round_and_the_current_node() {
+        let rows = run_node_rows(&workflow(), &run());
+        let find = |id: &str| rows.iter().find(|row| row.id == id).unwrap().clone();
+        let implement = find("implement");
+        assert_eq!(implement.state, Some(WorkflowNodeExecutionState::Succeeded));
+        assert_eq!(
+            (implement.attempt, implement.round, implement.current),
+            (0, 2, false)
+        );
+        let review = find("review");
+        assert_eq!(review.state, Some(WorkflowNodeExecutionState::Running));
+        assert_eq!((review.attempt, review.round, review.current), (2, 1, true));
+        let land = find("land");
+        assert_eq!((land.state, land.attempt, land.round), (None, 0, 0));
+    }
+
+    #[test]
+    fn run_view_shows_rows_on_call_rulings_and_the_waiting_reason() {
+        let text: Vec<String> = run_view_text(&workflow(), &run())
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect();
+        assert!(
+            text.contains(&"> review  running  attempt 2 round 1".to_owned()),
+            "{text:?}"
+        );
+        assert!(text.contains(&"  land  pending".to_owned()), "{text:?}");
+        assert!(text.contains(&"on-call: project manager (not live)".to_owned()));
+        assert!(text.contains(&"waiting: review - no_live_project_manager".to_owned()));
+        assert!(text.contains(&"rulings (1)".to_owned()));
+        assert!(text.contains(&"  review [answered by manager] ship it?".to_owned()));
+        let kinds: Vec<RunLineKind> = run_view_text(&workflow(), &run())
+            .into_iter()
+            .map(|(_, kind)| kind)
+            .collect();
+        assert!(kinds.contains(&RunLineKind::Current));
+    }
+
+    #[test]
+    fn only_durable_runs_get_the_run_view() {
+        let mut execution = run();
+        assert!(is_topology_run(&execution));
+        execution.row_version = None;
+        assert!(!is_topology_run(&execution));
     }
 }

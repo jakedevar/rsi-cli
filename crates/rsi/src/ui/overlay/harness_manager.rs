@@ -60,13 +60,23 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &HarnessManagerScopeS
         .style(Style::default().fg(theme::overlay_hint())),
         regions[1],
     );
-    frame.render_widget(
-        Paragraph::new(format!(
+    let search_line = if state.searching && crate::field_edit::standard_frame() {
+        // Standard editing draws the query's cursor and selection in place.
+        let mut spans = vec![Span::raw("/ ")];
+        spans.extend(crate::field_edit::draw(
+            &state.query,
+            Style::default().fg(theme::text()),
+        ));
+        Line::from(spans)
+    } else {
+        Line::from(format!(
             "/ {}{}",
             state.query,
             if state.searching { "▏" } else { "" }
         ))
-        .style(Style::default().fg(theme::text())),
+    };
+    frame.render_widget(
+        Paragraph::new(search_line).style(Style::default().fg(theme::text())),
         regions[2],
     );
     if visible.is_empty() {

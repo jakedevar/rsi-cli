@@ -17,6 +17,32 @@ pub fn open_text_area_bg_editor(app: &mut App) {
 
 /// Handle a key event for the text-area-bg hex editor overlay.
 pub(super) fn handle_text_area_bg_editor_key(app: &mut App, key: KeyEvent) {
+    // Standard editing: a real cursor and selection in the hex field.
+    match app.edit_field_filtered(
+        key,
+        |overlay| match overlay {
+            OverlayState::TextAreaBgEditor { input, .. } => Some(input),
+            _ => None,
+        },
+        |c| c == '#' || c.is_ascii_hexdigit(),
+    ) {
+        crate::field_edit::FieldKey::Edited => {
+            let mut full = false;
+            if let OverlayState::TextAreaBgEditor { input, error } = &mut app.overlay {
+                *input = input.to_ascii_uppercase();
+                input.truncate(7);
+                *error = false;
+                full = input.len() == 7;
+            }
+            if full {
+                // Auto-commit when fully typed, as in Vim mode.
+                commit_input(app);
+            }
+            return;
+        }
+        crate::field_edit::FieldKey::Moved => return,
+        crate::field_edit::FieldKey::Ignored => {}
+    }
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.overlay = OverlayState::None;

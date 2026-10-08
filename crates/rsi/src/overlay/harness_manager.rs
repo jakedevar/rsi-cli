@@ -602,6 +602,22 @@ async fn open_manager(app: &mut App, config: HarnessManagerConfigV1) -> Result<(
 }
 
 pub(super) async fn handle_key(app: &mut App, key: KeyEvent) {
+    // Standard editing: a real cursor and selection in the search being typed.
+    if matches!(&app.overlay, OverlayState::HarnessManagerScope(s) if s.searching) {
+        match app.edit_field(key, |overlay| match overlay {
+            OverlayState::HarnessManagerScope(s) => Some(&mut s.query),
+            _ => None,
+        }) {
+            crate::field_edit::FieldKey::Edited => {
+                if let OverlayState::HarnessManagerScope(s) = &mut app.overlay {
+                    s.selected = 0;
+                }
+                return;
+            }
+            crate::field_edit::FieldKey::Moved => return,
+            crate::field_edit::FieldKey::Ignored => {}
+        }
+    }
     let OverlayState::HarnessManagerScope(state) = &mut app.overlay else {
         return;
     };

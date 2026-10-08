@@ -1074,25 +1074,30 @@ async fn land_with_gate(
                     &expected_tip,
                 ],
             )?;
-            unit["prior_units"] = Value::Array(
-                provisional
-                    .iter()
-                    .map(|prior| {
-                        serde_json::json!({
-                            "base": prior.base,
-                            "source": prior.source,
-                            "target": prior.proof["target"],
-                            "unit_candidate": prior.unit_candidate,
+            if unit["renumber_noop"].as_bool() == Some(true) {
+                // Already rolling head + 1 (#1655): land the source as is.
+                None
+            } else {
+                unit["prior_units"] = Value::Array(
+                    provisional
+                        .iter()
+                        .map(|prior| {
+                            serde_json::json!({
+                                "base": prior.base,
+                                "source": prior.source,
+                                "target": prior.proof["target"],
+                                "unit_candidate": prior.unit_candidate,
+                            })
                         })
-                    })
-                    .collect(),
-            );
-            let path = temp
-                .path()
-                .join(format!("provisional-unit-{}.json", provisional.len()));
-            std::fs::write(&path, unit.to_string())
-                .map_err(|error| format!("cannot record provisional unit: {error}"))?;
-            Some((path, unit))
+                        .collect(),
+                );
+                let path = temp
+                    .path()
+                    .join(format!("provisional-unit-{}.json", provisional.len()));
+                std::fs::write(&path, unit.to_string())
+                    .map_err(|error| format!("cannot record provisional unit: {error}"))?;
+                Some((path, unit))
+            }
         } else {
             None
         };
@@ -1906,7 +1911,11 @@ async fn remake_stale_provisional(
             let original = previous
                 .iter()
                 .find(|unit| unit.base == pair.base && unit.source == pair.source);
-            let built = if let Some(original) = original {
+            // A source that landed as is at rolling head + 1 (#1655) has no
+            // recorded proof, but a stale advance can move the head under it:
+            // re-inspect every declared source so it is renumbered when needed.
+            let declared = original.is_some() || has_provisional_declaration(repo, pair)?;
+            let built = if declared {
                 let mut unit = provisional_command(
                     repo,
                     &[
@@ -1919,47 +1928,58 @@ async fn remake_stale_provisional(
                         &tip,
                     ],
                 )?;
-                let version = provisional_version(&unit, "new_version")?;
-                if version != original.assigned_version {
-                    return Err(format!(
-                        "stale provisional migration version changed from {} to {version}",
-                        original.assigned_version
-                    ));
-                }
-                unit["prior_units"] = Value::Array(
-                    provisional
-                        .iter()
-                        .map(|prior| {
-                            serde_json::json!({
-                                "base": prior.base,
-                                "source": prior.source,
-                                "target": prior.proof["target"],
-                                "unit_candidate": prior.unit_candidate,
+                if original.is_none() && unit["renumber_noop"].as_bool() == Some(true) {
+                    None
+                } else {
+                    let version = provisional_version(&unit, "new_version")?;
+                    if let Some(original) = original
+                        && version != original.assigned_version
+                    {
+                        return Err(format!(
+                            "stale provisional migration version changed from {} to {version}",
+                            original.assigned_version
+                        ));
+                    }
+                    unit["prior_units"] = Value::Array(
+                        provisional
+                            .iter()
+                            .map(|prior| {
+                                serde_json::json!({
+                                    "base": prior.base,
+                                    "source": prior.source,
+                                    "target": prior.proof["target"],
+                                    "unit_candidate": prior.unit_candidate,
+                                })
                             })
-                        })
-                        .collect(),
-                );
-                let unit_path =
-                    scratch.join(format!("provisional-unit-{}.json", provisional.len()));
-                std::fs::write(&unit_path, unit.to_string())
-                    .map_err(|error| format!("cannot record stale provisional unit: {error}"))?;
-                let built = provisional_command(
-                    repo,
-                    &[
-                        "--build",
-                        "--unit-file",
-                        &unit_path.to_string_lossy(),
-                        "--scratch",
-                        &scratch.to_string_lossy(),
-                    ],
-                )?;
-                Some((unit_path, provisional_oid(&built, "candidate")?.to_owned()))
+                            .collect(),
+                    );
+                    let unit_path =
+                        scratch.join(format!("provisional-unit-{}.json", provisional.len()));
+                    std::fs::write(&unit_path, unit.to_string()).map_err(|error| {
+                        format!("cannot record stale provisional unit: {error}")
+                    })?;
+                    let built = provisional_command(
+                        repo,
+                        &[
+                            "--build",
+                            "--unit-file",
+                            &unit_path.to_string_lossy(),
+                            "--scratch",
+                            &scratch.to_string_lossy(),
+                        ],
+                    )?;
+                    Some((
+                        unit_path,
+                        provisional_oid(&built, "candidate")?.to_owned(),
+                        version,
+                    ))
+                }
             } else {
                 None
             };
             let source = built
                 .as_ref()
-                .map_or(pair.source.as_str(), |(_, oid)| oid.as_str());
+                .map_or(pair.source.as_str(), |(_, oid, _)| oid.as_str());
             let next = match prepare_candidate(config, repo, TARGET, &tip, source, scratch).await {
                 Ok(Prepared::Candidate(mut next)) => {
                     if built.is_some() {
@@ -1973,7 +1993,7 @@ async fn remake_stale_provisional(
                 Err(error) => return Err(format!("stale target could not merge cleanly: {error}")),
             };
             let checked = (|| -> Result<Option<ProvisionalLanding>, String> {
-                let landing = if let Some((unit_path, _)) = built {
+                let landing = if let Some((unit_path, _, assigned_version)) = built {
                     let proof_path =
                         scratch.join(format!("provisional-proof-{}.json", provisional.len()));
                     let proof = provisional_command(
@@ -1997,9 +2017,7 @@ async fn remake_stale_provisional(
                         unit_path,
                         unit_candidate: next.oid.clone(),
                         proof_path,
-                        assigned_version: original
-                            .expect("built provisional has prior proof")
-                            .assigned_version,
+                        assigned_version,
                         proof,
                     })
                 } else {
@@ -2104,9 +2122,17 @@ async fn retry_stale_candidate(
     }
     let candidate_paths = changed_paths(repo, fetched_tip, &candidate.oid).map_err(fail)?;
     let incoming_paths = changed_paths(repo, fetched_tip, &current).map_err(fail)?;
+    // A declared source that landed as is at head + 1 (#1655) has no recorded
+    // proof, yet an advance of the head can still force its renumbering.
+    let mut provisional_in_play = !provisional.is_empty();
+    for pair in &options.accepted {
+        if !provisional_in_play && has_provisional_declaration(repo, pair).map_err(fail)? {
+            provisional_in_play = true;
+        }
+    }
     let disjoint = !exact_gate_required()
         && candidate_paths.is_disjoint(&incoming_paths)
-        && (provisional.is_empty()
+        && (!provisional_in_play
             || !touches_provisional_gate(repo, options, fetched_tip, &current, &incoming_paths)
                 .map_err(fail)?);
     let regated = stale.iter().filter(|retry| !retry.reused_gate).count();
@@ -2138,7 +2164,7 @@ async fn retry_stale_candidate(
     std::fs::create_dir_all(&scratch)
         .map_err(|error| fail(format!("cannot create stale scratch: {error}")))?;
     let (remade, remade_provisional) =
-        if provisional.is_empty() {
+        if !provisional_in_play {
             let remade =
                 match prepare_candidate(&config, repo, TARGET, &current, &candidate.oid, &scratch)
                     .await
@@ -4790,15 +4816,41 @@ fn is_e2e_filter(filter: &str) -> bool {
         .is_some_and(|rest| rest.split(':').next() == Some(E2E_TARGET))
 }
 
+/// The single definition of the e2e prebuild (#1651, #1637): one
+/// `PACKAGE BINARY` pair per line. `scripts/scoped-test` reads the same file.
+const E2E_PREBUILD_LIST: &str = include_str!("../../../../scripts/e2e-prebuild-bins.txt");
+
+/// `(package, binary)` pairs parsed from [`E2E_PREBUILD_LIST`].
+fn e2e_prebuild_bins(list: &str) -> Vec<(&str, &str)> {
+    list.lines()
+        .filter_map(|line| {
+            let line = line.split('#').next().unwrap_or("").trim();
+            let mut words = line.split_whitespace();
+            Some((words.next()?, words.next()?))
+        })
+        .collect()
+}
+
 /// The prebuild an e2e run needs: the harness spawns `target/debug/rsid`,
-/// which `cargo test -p rsi --test e2e_tui` does not build (#1596).
+/// which `cargo test -p rsi --test e2e_tui` does not build (#1596), and the
+/// daemon looks its trusted siblings (`rsi-agent-mcp`, ...) up beside itself,
+/// so every binary in the shared list is built together.
 fn e2e_prebuild_command() -> GuardCommand {
+    let pairs = e2e_prebuild_bins(E2E_PREBUILD_LIST);
+    let mut args = vec!["build".to_owned()];
+    let mut packages: Vec<&str> = Vec::new();
+    for (package, _) in &pairs {
+        if !packages.contains(package) {
+            packages.push(package);
+            args.extend(["-p".to_owned(), (*package).to_owned()]);
+        }
+    }
+    for (_, binary) in &pairs {
+        args.extend(["--bin".to_owned(), (*binary).to_owned()]);
+    }
     GuardCommand {
         program: "cargo".into(),
-        args: ["build", "-p", "rsid", "--bin", "rsid"]
-            .into_iter()
-            .map(String::from)
-            .collect(),
+        args,
         timeout: guard_timeout(),
     }
 }
@@ -9946,7 +9998,7 @@ fi",
     fn provisional_stale_fixture(
         fixture: &Fixture,
         change: &str,
-    ) -> (PathBuf, PathBuf, String, String, String) {
+    ) -> (PathBuf, PathBuf, String, String, String, String) {
         let repo = fixture.root.path().join(format!("migration-{change}"));
         let bare = fixture.root.path().join(format!("migration-{change}.git"));
         let setup = r#"
@@ -9991,12 +10043,19 @@ case.git(repo, 'commit', '-q', '-m', 'landing support')
 case.base = case.git(repo, 'rev-parse', 'HEAD')
 source = case.source('alpha')
 case.git(repo, 'update-ref', 'refs/heads/source-for-landing', source)
-if change == 'version':
+# #1655: a source already at rolling head + 1 lands as is and has no proof to
+# go stale. Another provisional unit lands first, so alpha (declared V130) must
+# be renumbered to V131 and a stale retry has a proof to regenerate or refuse.
+# `advance` is the opposite: alpha starts at head + 1 (a no-op) and only a stale
+# advance of the head forces its renumbering.
+tip = case.base if change == 'advance' else case.candidate(case.source('zero'), case.base)[1]
+case.git(repo, 'update-ref', 'refs/heads/tip-for-landing', tip)
+if change in ('version', 'advance'):
     second = case.source('beta')
-    _, incoming = case.candidate(second, case.base)
+    _, incoming = case.candidate(second, tip)
 else:
     worktree = pathlib.Path(case.temp.name) / 'incoming'
-    case.git(repo, 'worktree', 'add', '-q', '--detach', str(worktree), case.base)
+    case.git(repo, 'worktree', 'add', '-q', '--detach', str(worktree), tip)
     if change == 'store':
         filename = 'crates/rsid-store/src/store/mod.rs'
         (worktree / filename).chmod(0o755)
@@ -10021,10 +10080,10 @@ else:
     incoming = case.git(worktree, 'rev-parse', 'HEAD')
 case.git(repo, 'update-ref', 'refs/heads/incoming-for-landing', incoming)
 subprocess.run(['git', 'init', '--bare', '-q', str(bare)], check=True)
-case.git(repo, 'push', '-q', str(bare), f'{case.base}:refs/heads/rolling')
+case.git(repo, 'push', '-q', str(bare), f'{tip}:refs/heads/rolling')
 subprocess.run(['git', 'clone', '-q', str(repo), str(destination)], check=True)
 case.git(destination, 'remote', 'set-url', 'origin', str(bare))
-print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
+print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': incoming}))
 "#;
         let output = Command::new("python3")
             .arg("-c")
@@ -10045,6 +10104,7 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
             repo,
             bare,
             details["base"].as_str().unwrap().into(),
+            details["tip"].as_str().unwrap().into(),
             details["source"].as_str().unwrap().into(),
             details["incoming"].as_str().unwrap().into(),
         )
@@ -10063,9 +10123,11 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
             "protected",
             "version",
             "proof",
+            "advance",
         ] {
             let fixture = Fixture::new();
-            let (repo, bare, base, source, incoming) = provisional_stale_fixture(&fixture, change);
+            let (repo, bare, base, tip, source, incoming) =
+                provisional_stale_fixture(&fixture, change);
             let work_rows = fixture.root.path().join("work-rows.json");
             fs::write(
                 &work_rows,
@@ -10102,7 +10164,7 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
             for (key, value) in [
                 ("LANDER924_LOG", log.to_string_lossy().into_owned()),
                 ("LANDER924_MARKER", marker.to_string_lossy().into_owned()),
-                ("LANDER924_BASE", base.clone()),
+                ("LANDER924_BASE", tip.clone()),
                 ("LANDER924_REPO", repo.to_string_lossy().into_owned()),
                 ("LANDER924_INCOMING", incoming.clone()),
                 ("LANDER924_CHANGE", change.to_owned()),
@@ -10157,6 +10219,9 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
                 assert_eq!(report.fetched_tip, incoming);
                 assert_eq!(report.provisional.len(), 1);
                 assert_eq!(report.provisional[0].proof["target"], incoming);
+                if change == "advance" {
+                    assert_eq!(report.provisional[0].assigned_version, 131);
+                }
                 assert_eq!(report.canary_reused_tree.is_some(), change != "disjoint");
                 assert_eq!(
                     git_value(&bare, &["rev-parse", "refs/heads/rolling"]),
@@ -11278,7 +11343,7 @@ print(json.dumps({'base': case.base, 'source': source, 'incoming': incoming}))
             rendered(&spec)[1..],
             [
                 "cargo check -p rsi --all-targets",
-                "cargo build -p rsid --bin rsid",
+                "cargo build -p rsid -p rsi-common -p rsi-turn-shim --bin rsid --bin rsi-agent-mcp --bin rsi-rpc --bin rsi-turn-shim",
                 "cargo test -p rsi --test e2e_tui -- --test-threads=1 settings_layout --exact",
             ]
         );

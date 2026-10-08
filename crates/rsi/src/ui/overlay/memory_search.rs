@@ -44,11 +44,13 @@ pub(super) fn render_memory_search(
     .split(inner);
 
     // Query line
-    let query_line = Line::from(vec![
-        Span::styled("/ ", Style::default().fg(theme::blue())),
-        Span::raw(query),
-        Span::styled("█", Style::default().fg(theme::blue())),
-    ]);
+    let mut query_spans = vec![Span::styled("/ ", Style::default().fg(theme::blue()))];
+    query_spans.extend(crate::field_edit::draw_with_caret(
+        query,
+        Style::default(),
+        Style::default().fg(theme::blue()),
+    ));
+    let query_line = Line::from(query_spans);
     frame.render_widget(Paragraph::new(query_line), chunks[0]);
 
     // Results

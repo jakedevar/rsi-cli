@@ -794,3 +794,35 @@ fn appserver_approval_resolution_queue_overflow_is_loss_sensitive_and_preserves_
     );
     assert_eq!(rx.try_recv().unwrap().data["request_id"], 281);
 }
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+#[tokio::test]
+async fn remote_native_answer_closure_while_queued_refuses_without_disturbing_other_gate() {
+    use rsi_common::remote_pending_decisions::RemoteAnswerStateV1;
+    let mut w = World::new().await;
+    w.inject(json!(1711), METHOD);
+    let a = w.publication(None, "published").await;
+    w.inject(json!(1712), METHOD);
+    let b = w.publication(Some(&a), "published").await;
+    let request = queue_remote(&w, &a).await;
+    w.resolve(json!(1711));
+    w.closure(&a, "closed").await;
+    w.manager.reconcile_harness_managers_once().await.unwrap();
+    assert_eq!(
+        w.manager
+            .store
+            .lock()
+            .await
+            .prepare_remote_answer(&request)
+            .unwrap()
+            .state,
+        RemoteAnswerStateV1::Refused
+    );
+    w.assert_actionable(&b).await;
+    w.assert_status(SessionStatus::WaitingApproval).await;
+    assert!(matches!(
+        w.writes.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    w.finish().await;
+}

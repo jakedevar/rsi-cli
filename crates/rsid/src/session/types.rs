@@ -577,8 +577,25 @@ impl TrackedSession {
     /// input tests can reach it without duplicating the field laundry.
     #[cfg(test)]
     pub(crate) fn new_for_test(session: Session) -> Self {
-        let session_id = session.id;
         let (stop_tx, _stop_rx) = tokio::sync::mpsc::channel(1);
+        Self::restored(session, stop_tx)
+    }
+
+    /// Rebuild runtime counters from durable session floors, without a launch.
+    pub(super) fn restored(session: Session, stop_tx: mpsc::Sender<()>) -> Self {
+        let session_id = session.id;
+        let work_time_base_ms = session.work_time_ms.unwrap_or(0);
+        let approval_wait_total_ms = session.approval_wait_ms.unwrap_or(0);
+        let retry_attempt = session.retry_attempt.unwrap_or(0);
+        let max_retries = session.max_retries.unwrap_or(0);
+        let pending_archive = session.pending_archive;
+        let pending_question = session.pending_question.clone();
+        let live_input_tokens = session.total_input_tokens.unwrap_or(0);
+        let live_output_tokens = session.total_output_tokens.unwrap_or(0);
+        let live_prompt_tokens = session.total_prompt_tokens.unwrap_or(0);
+        let daemon_input_tokens = session.daemon_input_tokens.unwrap_or(0);
+        let daemon_output_tokens = session.daemon_output_tokens.unwrap_or(0);
+        let live_usage_confidence = session.context_usage_confidence;
         TrackedSession {
             session,
             spawn_generation: 0,
@@ -590,27 +607,27 @@ impl TrackedSession {
             operator_inbox: Default::default(),
             interrupt_requested: false,
             interrupt_source: None,
-            pending_archive: false,
+            pending_archive,
             rotation: super::rotation_coordinator::RotationCoordinator::new(session_id, 0, false),
-            live_input_tokens: 0,
-            live_output_tokens: 0,
-            live_prompt_tokens: 0,
-            live_usage_confidence: ContextUsageConfidence::Missing,
-            daemon_input_tokens: 0,
-            daemon_output_tokens: 0,
+            live_input_tokens,
+            live_output_tokens,
+            live_prompt_tokens,
+            live_usage_confidence,
+            daemon_input_tokens,
+            daemon_output_tokens,
             daemon_tokens_at_last_api_update: 0,
             codex_context_tokens: 0,
             pipeline_artifact: None,
             memory_flush_compaction_count: None,
-            pending_question: None,
+            pending_question,
             approval_wait_start: None,
-            approval_wait_total_ms: 0,
+            approval_wait_total_ms,
             work_run_start: None,
-            work_time_base_ms: 0,
+            work_time_base_ms,
             received_meaningful_output: false,
             exit_code: None,
-            retry_attempt: 0,
-            max_retries: 0,
+            retry_attempt,
+            max_retries,
             last_event_at: chrono::Utc::now(),
             stall_interrupted: false,
             last_usage_update: None,
@@ -759,6 +776,13 @@ pub enum ProviderProcess {
 }
 
 impl ProviderProcess {
+    pub(crate) fn detached_turn(&self) -> Option<crate::claude::turn_spool::DetachedTurn> {
+        match self {
+            Self::Claude(p) | Self::Codex(p) | Self::Antigravity(p) => p.detached.clone(),
+            _ => None,
+        }
+    }
+
     /// Request graceful interruption of the process/task.
     /// `pub(crate)` for stall detector and reconciliation module access.
     pub(crate) fn interrupt(&self) -> Result<()> {

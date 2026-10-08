@@ -16,7 +16,39 @@ pub fn open_memory_search(app: &mut App) {
 
 /// Handle keys in the memory search overlay.
 pub(super) async fn handle_memory_search_key(app: &mut App, key: KeyEvent) {
+    // Standard editing: every printable key types, with a real cursor and
+    // selection in the query (Vim keeps `q`, `j` and `k` as commands).
+    match app.edit_field(key, |overlay| match overlay {
+        OverlayState::MemorySearch { query, .. } => Some(query),
+        _ => None,
+    }) {
+        crate::field_edit::FieldKey::Edited => {
+            let query = match &app.overlay {
+                OverlayState::MemorySearch { query, .. } => query.clone(),
+                _ => return,
+            };
+            let results = if query.is_empty() {
+                Vec::new()
+            } else {
+                app.client
+                    .memory_search(&query, Some(10), None)
+                    .await
+                    .unwrap_or_default()
+            };
+            app.overlay = OverlayState::MemorySearch {
+                query,
+                results,
+                selected_index: 0,
+                loading: false,
+            };
+            return;
+        }
+        crate::field_edit::FieldKey::Moved => return,
+        crate::field_edit::FieldKey::Ignored => {}
+    }
+    let standard = app.standard_editing();
     match key.code {
+        KeyCode::Char('q') | KeyCode::Char('j') | KeyCode::Char('k') if standard => {}
         KeyCode::Esc | KeyCode::Char('q') => {
             app.overlay = OverlayState::None;
         }

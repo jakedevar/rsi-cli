@@ -4,6 +4,7 @@
 
 mod cursor;
 mod cursor_pages;
+mod decision_targets;
 mod decisions_cursor;
 mod detail;
 mod history;

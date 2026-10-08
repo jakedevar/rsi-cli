@@ -16,6 +16,7 @@
 mod agent_jobs_verb;
 pub(crate) mod agent_message_arbiter;
 pub(crate) mod agent_message_delivery;
+mod agent_projects; // #1626
 mod effect_fence;
 pub(crate) mod tree_admission;
 pub(crate) use rsid_store::store::{agent_message_dispatcher, agent_message_reconciler};
@@ -58,6 +59,7 @@ mod manager_succession;
 mod monitor;
 mod outcome;
 mod pending_approvals;
+pub(crate) use pending_approvals::remote_selected_native_approval;
 mod persistence;
 pub(crate) mod post_handoff;
 pub mod preamble;
@@ -68,6 +70,7 @@ mod provider_status_verb;
 mod queries;
 pub(crate) mod question;
 mod reaper;
+mod remote_answers;
 pub mod retention;
 mod rolling_queue_verb;
 mod satellite_message_verb;

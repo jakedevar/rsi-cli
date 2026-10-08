@@ -9,8 +9,8 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rsi_common::types::{
-    GraphExecutionUpdate, WorkflowExecutionSnapshot, WorkflowExecutionStatus,
-    WorkflowNodeExecutionState,
+    GraphExecutionUpdate, TopologyOnCallSeat, TopologyOnCallWait, WorkflowExecutionSnapshot,
+    WorkflowExecutionStatus, WorkflowNodeExecutionState,
 };
 use rsi_graph::format::WorkflowDefinition;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -139,6 +139,9 @@ pub(crate) enum AttemptStatus {
     Reserved,
     Launching,
     Running,
+    /// A review node whose assignment is requested and whose verdict is
+    /// pending (#1641). No session of the topology's own runs.
+    Waiting,
     Succeeded,
     Failed,
     Blocked,
@@ -155,6 +158,7 @@ impl AttemptStatus {
             Self::Reserved => "reserved",
             Self::Launching => "launching",
             Self::Running => "running",
+            Self::Waiting => "waiting",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Blocked => "blocked",
@@ -169,7 +173,8 @@ impl AttemptStatus {
         Ok(match text {
             "reserved" => Self::Reserved,
             "launching" => Self::Launching,
-            "running" | "waiting" => Self::Running,
+            "running" => Self::Running,
+            "waiting" => Self::Waiting,
             "succeeded" => Self::Succeeded,
             "failed" => Self::Failed,
             "skipped" => Self::Skipped,
@@ -182,12 +187,17 @@ impl AttemptStatus {
     }
 
     pub(crate) const fn in_flight(self) -> bool {
-        matches!(self, Self::Reserved | Self::Launching | Self::Running)
+        matches!(
+            self,
+            Self::Reserved | Self::Launching | Self::Running | Self::Waiting
+        )
     }
 
     const fn node_state(self) -> WorkflowNodeExecutionState {
         match self {
-            Self::Reserved | Self::Launching | Self::Running => WorkflowNodeExecutionState::Running,
+            Self::Reserved | Self::Launching | Self::Running | Self::Waiting => {
+                WorkflowNodeExecutionState::Running
+            }
             Self::Succeeded => WorkflowNodeExecutionState::Succeeded,
             Self::Failed | Self::Blocked | Self::Cancelled | Self::Interrupted | Self::Lost => {
                 WorkflowNodeExecutionState::Failed
@@ -216,6 +226,28 @@ pub(crate) mod failure {
     pub(crate) const SANDBOX_MUTATED: &str = "sandbox_mutated";
     pub(crate) const EXIT_NONZERO: &str = "exit_nonzero";
     pub(crate) const GATE_ERROR: &str = "gate_error";
+    /// The review service could not give a usable verdict; one new
+    /// assignment is tried, then the node blocks.
+    pub(crate) const REVIEW_UNSETTLED: &str = "review_unsettled";
+    /// The review node reached `max_rounds` (or its loop bound) with changes
+    /// still requested.
+    pub(crate) const REVIEW_ROUNDS_EXHAUSTED: &str = "review_rounds_exhausted";
+    /// The on-call manager ruled "one more round" on an exhausted review: the
+    /// attempt ends and the instance earns one new review assignment (#1641
+    /// S3c). Bounded by `retry_due` to one per instance.
+    pub(crate) const REVIEW_REOPENED: &str = "review_reopened";
+    /// The project has no live manager ledger to own the review (#1641 S1b).
+    /// Retrying the same request cannot help, so it blocks at once.
+    pub(crate) const REVIEW_NO_MANAGER_LEDGER: &str = "review_no_manager_ledger";
+    /// The accepted review no longer admits the commit (the manager scope
+    /// moved, the receipt changed, the requester lost authority): nothing is
+    /// enqueued (#1641 S2).
+    pub(crate) const LAND_ADMISSION_LOST: &str = "land_admission_lost";
+    /// The merge queue refused or failed the entry, or the source could not be
+    /// enqueued. Never retried: a second landing attempt is a decision.
+    pub(crate) const LAND_REFUSED: &str = "land_refused";
+    /// The operator disabled the merge queue; visible, nothing was enqueued.
+    pub(crate) const QUEUE_DISABLED: &str = "queue_disabled";
     /// Every incoming edge of the node was untaken.
     pub(crate) const DEAD_PATH: &str = "dead_path";
 
@@ -300,12 +332,17 @@ pub(crate) struct AttemptRow {
     pub(crate) preserved_ref: Option<String>,
     pub(crate) preserved_commit: Option<String>,
     pub(crate) started_at: Option<DateTime<Utc>>,
-    /// `session`, `command` or `gate`.
+    /// `session`, `command`, `review`, `land` or `gate`.
     pub(crate) node_kind: String,
     /// Command nodes: sandbox HEAD recorded before the op ran.
     pub(crate) pre_head: Option<String>,
     /// Command nodes: live process group of the op.
     pub(crate) process_group_id: Option<i32>,
+    /// Review nodes: the requested review assignment.
+    pub(crate) review_assignment_id: Option<Uuid>,
+    /// Land nodes: the merge-queue entry this attempt enqueued (stored in
+    /// `integrate_action_id`); a restart mirrors it and never re-submits.
+    pub(crate) land_entry_id: Option<Uuid>,
 }
 
 impl AttemptRow {
@@ -331,6 +368,17 @@ pub(crate) struct NewExecution {
     pub(crate) input: Option<Value>,
     /// Scoped agent requester (#633); `None` is the operator.
     pub(crate) requester: Option<ExecutionRequester>,
+    /// An operator execution's owning project manager (#1746), resolved by the
+    /// daemon from the Epic's project. Always `None` with a `requester`.
+    pub(crate) owner: Option<OperatorOwner>,
+}
+
+/// The Epic and project manager that own an operator-started execution's
+/// review and land nodes. Never taken from a request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OperatorOwner {
+    pub(crate) epic_id: Uuid,
+    pub(crate) manager_session_id: Uuid,
 }
 
 /// The token-resolved agent that accepted an execution (#633, plan §5).
@@ -632,8 +680,14 @@ fn insert_in(tx: &Connection, new: &NewExecution) -> Result<GraphExecutionUpdate
             now,
             requester.and_then(|requester| requester.topology_revision),
             actor.kind,
-            requester.map(|requester| requester.epic_id.to_string()),
-            actor.session_id.map(|id| id.to_string()),
+            requester
+                .map(|requester| requester.epic_id)
+                .or(new.owner.map(|owner| owner.epic_id))
+                .map(|id| id.to_string()),
+            actor
+                .session_id
+                .or(new.owner.map(|owner| owner.manager_session_id))
+                .map(|id| id.to_string()),
             requester.and_then(|requester| requester.scope_version),
             requester.and_then(|requester| requester.policy_digest.clone()),
             requester.map(|requester| requester.idempotency_key.clone()),
@@ -724,7 +778,7 @@ pub(crate) fn load_execution(store: &Store, id: Uuid) -> Result<Option<Execution
     }))
 }
 
-const ATTEMPT_COLUMNS: &str = "id,node_id,iteration,attempt_no,status,dedup_key,session_id,boot_id,sandbox_root,base_commit,result_commit,pin_ref,input_json,output_json,failure_class,error,resolution,preserved_ref,preserved_commit,started_at,node_kind,pre_head,process_group_id";
+const ATTEMPT_COLUMNS: &str = "id,node_id,iteration,attempt_no,status,dedup_key,session_id,boot_id,sandbox_root,base_commit,result_commit,pin_ref,input_json,output_json,failure_class,error,resolution,preserved_ref,preserved_commit,started_at,node_kind,pre_head,process_group_id,review_assignment_id,integrate_action_id";
 
 fn attempt_from_row(row: &rusqlite::Row<'_>) -> Result<AttemptRow> {
     let text = |index: usize| row.get::<_, Option<String>>(index);
@@ -754,6 +808,8 @@ fn attempt_from_row(row: &rusqlite::Row<'_>) -> Result<AttemptRow> {
         node_kind: row.get(20)?,
         pre_head: text(21)?,
         process_group_id: row.get(22)?,
+        review_assignment_id: text(23)?.as_deref().map(parse_uuid).transpose()?,
+        land_entry_id: text(24)?.as_deref().map(parse_uuid).transpose()?,
     })
 }
 
@@ -778,7 +834,7 @@ pub(crate) fn load_attempt(store: &Store, attempt_id: Uuid) -> Result<Option<(Uu
     let Some(row) = rows.next()? else {
         return Ok(None);
     };
-    let execution_id = parse_uuid(&row.get::<_, String>(23)?)?;
+    let execution_id = parse_uuid(&row.get::<_, String>(25)?)?;
     Ok(Some((execution_id, attempt_from_row(row)?)))
 }
 
@@ -1023,6 +1079,69 @@ pub(crate) fn mark_launching(store: &Store, attempt_id: Uuid, boot_id: Uuid) -> 
     Ok(changed == 1)
 }
 
+/// #1641 S4b: `launching` → `reserved` for an attempt whose launch was held
+/// before any session, sandbox or invocation existed. Only a launching row
+/// with no recorded sandbox moves back, so a command that may have started is
+/// never made launchable twice.
+pub(crate) fn release_launching(store: &Store, attempt_id: Uuid) -> Result<bool> {
+    let changed = store.conn.execute(
+        "UPDATE topology_node_attempts SET status='reserved',boot_id=NULL,updated_at=?2 \
+         WHERE id=?1 AND status='launching' AND sandbox_root IS NULL",
+        params![attempt_id.to_string(), now_text()],
+    )?;
+    Ok(changed == 1)
+}
+
+/// The `kind` of the attempt's latest `admission_hold` event when no other
+/// event for the attempt followed it (the attempt is still held for it).
+fn standing_admission_hold(conn: &Connection, attempt_id: Uuid) -> Result<Option<String>> {
+    let latest: Option<(String, String)> = conn
+        .query_row(
+            "SELECT kind,payload_json FROM topology_events WHERE attempt_id=?1 \
+             ORDER BY execution_seq DESC LIMIT 1",
+            [attempt_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(latest.and_then(|(kind, payload)| {
+        (kind == "admission_hold")
+            .then(|| serde_json::from_str::<Value>(&payload).ok())
+            .flatten()
+            .and_then(|payload| payload["detail"]["kind"].as_str().map(str::to_owned))
+    }))
+}
+
+/// #1641 S4b: record that resource pressure holds the attempt `reserved`.
+/// One `admission_hold{kind}` event per transition: a tick that finds the
+/// attempt still held for the same kind writes nothing (`None`).
+pub(crate) fn note_admission_hold(
+    store: &Store,
+    execution_id: Uuid,
+    attempt: &AttemptRow,
+    kind: &str,
+) -> Result<Option<GraphExecutionUpdate>> {
+    let tx = immediate(store)?;
+    if standing_admission_hold(&tx, attempt.id)?.as_deref() == Some(kind) {
+        return Ok(None);
+    }
+    let update = append_event(
+        &tx,
+        execution_id,
+        EventSpec {
+            node_id: Some(&attempt.node_id),
+            attempt_id: Some(attempt.id),
+            detail: serde_json::json!({
+                "kind": kind,
+                "iteration": attempt.iteration,
+                "attempt_no": attempt.attempt_no,
+            }),
+            ..EventSpec::execution("admission_hold")
+        },
+    )?;
+    tx.commit()?;
+    Ok(Some(update))
+}
+
 pub(crate) fn mark_running(
     store: &Store,
     execution_id: Uuid,
@@ -1055,6 +1174,373 @@ pub(crate) fn mark_running(
                 "session_id": attempt.session_id,
             }),
             ..EventSpec::execution("node_running")
+        },
+    )?;
+    tx.commit()?;
+    Ok(update)
+}
+
+/// Review nodes: `reserved`/`launching` → `waiting`, recording the requested
+/// assignment. Idempotent for the same assignment.
+pub(crate) fn mark_waiting(
+    store: &Store,
+    execution_id: Uuid,
+    attempt: &AttemptRow,
+    assignment_id: Uuid,
+    boot_id: Uuid,
+) -> Result<GraphExecutionUpdate> {
+    let tx = immediate(store)?;
+    tx.execute(
+        "UPDATE topology_node_attempts SET status='waiting',review_assignment_id=?2,boot_id=?3,\
+            started_at=COALESCE(started_at,?4),updated_at=?4 \
+         WHERE id=?1 AND status IN ('reserved','launching')",
+        params![
+            attempt.id.to_string(),
+            assignment_id.to_string(),
+            boot_id.to_string(),
+            now_text(),
+        ],
+    )?;
+    bump(&tx, execution_id)?;
+    let update = append_event(
+        &tx,
+        execution_id,
+        EventSpec {
+            node_id: Some(&attempt.node_id),
+            attempt_id: Some(attempt.id),
+            node_state: Some(WorkflowNodeExecutionState::Running),
+            detail: serde_json::json!({
+                "iteration": attempt.iteration,
+                "attempt_no": attempt.attempt_no,
+                "review_assignment_id": assignment_id,
+            }),
+            ..EventSpec::execution("node_waiting")
+        },
+    )?;
+    tx.commit()?;
+    Ok(update)
+}
+
+/// Land nodes: `reserved`/`launching` → `waiting`, recording the merge-queue
+/// entry. Idempotent for the same entry.
+pub(crate) fn mark_land_waiting(
+    store: &Store,
+    execution_id: Uuid,
+    attempt: &AttemptRow,
+    entry_id: Uuid,
+    boot_id: Uuid,
+) -> Result<GraphExecutionUpdate> {
+    let tx = immediate(store)?;
+    tx.execute(
+        "UPDATE topology_node_attempts SET status='waiting',integrate_action_id=?2,boot_id=?3,\
+            started_at=COALESCE(started_at,?4),updated_at=?4 \
+         WHERE id=?1 AND status IN ('reserved','launching')",
+        params![
+            attempt.id.to_string(),
+            entry_id.to_string(),
+            boot_id.to_string(),
+            now_text(),
+        ],
+    )?;
+    bump(&tx, execution_id)?;
+    let update = append_event(
+        &tx,
+        execution_id,
+        EventSpec {
+            node_id: Some(&attempt.node_id),
+            attempt_id: Some(attempt.id),
+            node_state: Some(WorkflowNodeExecutionState::Running),
+            detail: serde_json::json!({
+                "iteration": attempt.iteration,
+                "attempt_no": attempt.attempt_no,
+                "land_entry_id": entry_id,
+            }),
+            ..EventSpec::execution("node_waiting")
+        },
+    )?;
+    tx.commit()?;
+    Ok(update)
+}
+
+/// #1641 S3c: park an attempt on a decision record. A session attempt goes
+/// `running` → `waiting` (its session has ended with a question); a review
+/// attempt is already `waiting` and only gains the decision marker. `output`
+/// carries `decision_key` and whatever the settlement needs later; it is
+/// replaced by the real output when the attempt settles. The node's wait on
+/// the ruling opens in the same transaction (`wait_floor`: the last moment the
+/// node is known not to have waited).
+pub(crate) fn mark_decision_waiting(
+    store: &Store,
+    execution_id: Uuid,
+    attempt: &AttemptRow,
+    output: &Value,
+    wait_floor: DateTime<Utc>,
+) -> Result<Vec<GraphExecutionUpdate>> {
+    let tx = immediate(store)?;
+    let changed = tx.execute(
+        "UPDATE topology_node_attempts SET status='waiting',output_json=?2,updated_at=?3 \
+         WHERE id=?1 AND status IN ('running','waiting')",
+        params![attempt.id.to_string(), output.to_string(), now_text()],
+    )?;
+    if changed != 1 {
+        return Err(DaemonError::Store(
+            "topology attempt cannot wait on a decision".into(),
+        ));
+    }
+    bump(&tx, execution_id)?;
+    let update = append_event(
+        &tx,
+        execution_id,
+        EventSpec {
+            node_id: Some(&attempt.node_id),
+            attempt_id: Some(attempt.id),
+            node_state: Some(WorkflowNodeExecutionState::Running),
+            detail: serde_json::json!({
+                "iteration": attempt.iteration,
+                "attempt_no": attempt.attempt_no,
+                "decision_key": output.get("decision_key"),
+                "decision_kind": output.get("decision_kind"),
+            }),
+            ..EventSpec::execution("node_waiting_on_decision")
+        },
+    )?;
+    // The ruling wait starts with the parking transition, so a daemon that
+    // stops right after it and returns hours later still charges that time to
+    // the wait, not to the node's productive clock (#1715).
+    let opened = open_wait_in(
+        &tx,
+        execution_id,
+        &attempt.node_id,
+        attempt.id,
+        Some(Utc::now()),
+        wait_floor,
+    )?;
+    tx.commit()?;
+    Ok(std::iter::once(update).chain(opened).collect())
+}
+
+/// Rewrite the marker of an attempt that is already parked on a decision (a
+/// delivery failure counter); no event.
+pub(crate) fn update_decision_marker(
+    store: &Store,
+    attempt_id: Uuid,
+    output: &Value,
+) -> Result<()> {
+    store.conn.execute(
+        "UPDATE topology_node_attempts SET output_json=?2,updated_at=?3 \
+         WHERE id=?1 AND status='waiting'",
+        params![attempt_id.to_string(), output.to_string(), now_text()],
+    )?;
+    Ok(())
+}
+
+/// Typed refusal: the attempt or execution an answer was bound to is no longer
+/// live (cancelled, past its deadline, settled or moved on) (#1715).
+pub(crate) const ANSWER_REVOKED: &str = "topology_answer_revoked";
+/// Typed refusal: an earlier delivery of this answer may have reached the
+/// provider. It is shown as uncertain and never replayed (#945).
+pub(crate) const ANSWER_UNCERTAIN: &str = "topology_answer_delivery_uncertain";
+
+/// The exact topology binding of one answer continuation: the execution, the
+/// attempt that waits for it and the decision it answers (#1715).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AnswerBinding {
+    pub(crate) execution_id: Uuid,
+    pub(crate) attempt_id: Uuid,
+    pub(crate) decision_key: String,
+}
+
+/// The marker of the bound attempt when the binding is still exactly live:
+/// the attempt waits on this decision in this session, and its execution is
+/// running (not cancelling or settled) and inside its absolute deadline.
+fn answer_target(conn: &Connection, binding: &AnswerBinding, session_id: Uuid) -> Result<Value> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    )> = conn
+        .query_row(
+            "SELECT a.status,a.session_id,a.node_kind,a.output_json,e.status,e.deadline_at \
+             FROM topology_node_attempts a JOIN topology_executions e ON e.id=a.execution_id \
+             WHERE a.id=?1 AND a.execution_id=?2",
+            params![
+                binding.attempt_id.to_string(),
+                binding.execution_id.to_string()
+            ],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let revoked = |why: &str| DaemonError::PolicyDenied(format!("{ANSWER_REVOKED}: {why}"));
+    let Some((status, session, kind, output, execution_status, deadline)) = row else {
+        return Err(revoked("the attempt is gone"));
+    };
+    if status != "waiting" || kind != "session" || session != session_id.to_string() {
+        return Err(revoked(
+            "the attempt no longer waits for this session's answer",
+        ));
+    }
+    if !matches!(
+        execution_status.as_str(),
+        "accepted" | "running" | "blocked"
+    ) {
+        return Err(revoked(&format!("the execution is {execution_status}")));
+    }
+    if let Some(deadline) = deadline
+        && parse_time(&deadline)? <= Utc::now()
+    {
+        return Err(revoked("the execution deadline passed"));
+    }
+    let marker: Value = match output {
+        Some(text) => serde_json::from_str(&text)?,
+        None => Value::Null,
+    };
+    if marker["decision_key"].as_str() != Some(binding.decision_key.as_str()) {
+        return Err(revoked("the attempt waits on another decision"));
+    }
+    Ok(marker)
+}
+
+/// Whether the answer binding is still exactly live; no write. Checked under
+/// the continuation's spawn guard before any effect (#1715).
+pub(crate) fn answer_delivery_live(
+    store: &Store,
+    binding: &AnswerBinding,
+    session_id: Uuid,
+) -> Result<()> {
+    answer_target(&store.conn, binding, session_id).map(|_| ())
+}
+
+/// Revalidate the binding and record, in one transaction, that the answer's
+/// provider effect is about to start (`delivery.state = "started"`). This is
+/// the durable at-most-once claim: a second claim, or a recovery that finds
+/// it, never sends the answer again (#1715).
+pub(crate) fn claim_answer_delivery(
+    store: &Store,
+    binding: &AnswerBinding,
+    session_id: Uuid,
+) -> Result<()> {
+    let tx = immediate(store)?;
+    let mut marker = answer_target(&tx, binding, session_id)?;
+    if marker["delivery"]["state"] == DELIVERY_STARTED {
+        return Err(DaemonError::PolicyDenied(format!(
+            "{ANSWER_UNCERTAIN}: an earlier delivery of this answer may have reached the provider"
+        )));
+    }
+    marker["delivery"] = serde_json::json!({ "state": DELIVERY_STARTED, "at": now_text() });
+    tx.execute(
+        "UPDATE topology_node_attempts SET output_json=?2,updated_at=?3 \
+         WHERE id=?1 AND status='waiting'",
+        params![
+            binding.attempt_id.to_string(),
+            marker.to_string(),
+            now_text()
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The provider process was never started (the spawn itself failed): take the
+/// claim back so the delivery can be retried. A claim whose effect may have
+/// started is never released.
+pub(crate) fn release_answer_delivery(store: &Store, binding: &AnswerBinding) -> Result<()> {
+    let tx = immediate(store)?;
+    let output: Option<Option<String>> = tx
+        .query_row(
+            "SELECT output_json FROM topology_node_attempts WHERE id=?1 AND status='waiting'",
+            [binding.attempt_id.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(Some(text)) = output {
+        let mut marker: Value = serde_json::from_str(&text)?;
+        if marker["delivery"]["state"] == DELIVERY_STARTED
+            && let Some(map) = marker.as_object_mut()
+        {
+            map.remove("delivery");
+            tx.execute(
+                "UPDATE topology_node_attempts SET output_json=?2,updated_at=?3 WHERE id=?1",
+                params![
+                    binding.attempt_id.to_string(),
+                    marker.to_string(),
+                    now_text()
+                ],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Whether the attempt's answer delivery was claimed (its provider effect may
+/// have started).
+pub(crate) fn answer_delivery_started(store: &Store, attempt_id: Uuid) -> Result<bool> {
+    let output: Option<Option<String>> = store
+        .conn
+        .query_row(
+            "SELECT output_json FROM topology_node_attempts WHERE id=?1",
+            [attempt_id.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(match output.flatten() {
+        Some(text) => {
+            serde_json::from_str::<Value>(&text)?["delivery"]["state"] == DELIVERY_STARTED
+        }
+        None => false,
+    })
+}
+
+/// `delivery.state` of a marker whose answer's provider effect may have started.
+pub(crate) const DELIVERY_STARTED: &str = "started";
+
+/// #1641 S3c: the ruling arrived and the same session was continued:
+/// `waiting` → `running`, the decision marker cleared.
+pub(crate) fn resume_after_decision(
+    store: &Store,
+    execution_id: Uuid,
+    attempt: &AttemptRow,
+    decision_key: &str,
+) -> Result<GraphExecutionUpdate> {
+    let tx = immediate(store)?;
+    let changed = tx.execute(
+        "UPDATE topology_node_attempts SET status='running',output_json=NULL,output_digest=NULL,\
+            updated_at=?2 WHERE id=?1 AND status='waiting'",
+        params![attempt.id.to_string(), now_text()],
+    )?;
+    if changed != 1 {
+        return Err(DaemonError::Store(
+            "topology attempt is not waiting on a decision".into(),
+        ));
+    }
+    bump(&tx, execution_id)?;
+    let update = append_event(
+        &tx,
+        execution_id,
+        EventSpec {
+            node_id: Some(&attempt.node_id),
+            attempt_id: Some(attempt.id),
+            node_state: Some(WorkflowNodeExecutionState::Running),
+            detail: serde_json::json!({
+                "iteration": attempt.iteration,
+                "attempt_no": attempt.attempt_no,
+                "session_id": attempt.session_id,
+                "decision_key": decision_key,
+            }),
+            ..EventSpec::execution("node_continued_after_decision")
         },
     )?;
     tx.commit()?;
@@ -1110,6 +1596,10 @@ pub(crate) fn settle_attempt(
         output.as_deref(),
     )?;
     tx.commit()?;
+    // A settled attempt owns no wait on an answer any more (#1715): the stall
+    // exemption of its session must not outlive it, whichever path settled it
+    // (timeout, cancel, block, success).
+    crate::topology::oncall::note_answer_wait(attempt.session_id, false);
     Ok(update)
 }
 
@@ -1225,6 +1715,8 @@ pub(crate) fn record_settled_attempts(
             node_kind: attempt.node_kind.to_owned(),
             pre_head: None,
             process_group_id: None,
+            review_assignment_id: None,
+            land_entry_id: None,
         };
         updates.push(settle_in(
             &tx,
@@ -1714,6 +2206,413 @@ pub(crate) fn current_row_version(store: &Store, execution_id: Uuid) -> Result<i
     )?)
 }
 
+/// Event kinds of the on-call wait (#1641 S3a): one `unavailable` per
+/// transition into the wait, one `restored` per transition out of it.
+const ON_CALL_UNAVAILABLE: &str = "on_call_unavailable";
+const ON_CALL_RESTORED: &str = "on_call_restored";
+
+/// The nodes whose latest on-call event is `on_call_unavailable`, oldest
+/// first. Re-derived from the event log, so it survives a restart.
+pub(crate) fn on_call_waits(store: &Store, execution_id: Uuid) -> Result<Vec<TopologyOnCallWait>> {
+    on_call_waits_on(&store.conn, execution_id)
+}
+
+fn on_call_waits_on(conn: &Connection, execution_id: Uuid) -> Result<Vec<TopologyOnCallWait>> {
+    let mut statement = conn.prepare(
+        "SELECT e.node_id,e.payload_json,e.created_at FROM topology_events e \
+         WHERE e.execution_id=?1 AND e.kind=?2 AND e.execution_seq=(\
+            SELECT MAX(x.execution_seq) FROM topology_events x \
+            WHERE x.execution_id=e.execution_id AND x.node_id=e.node_id AND x.kind IN (?2,?3)) \
+         ORDER BY e.execution_seq",
+    )?;
+    let rows = statement
+        .query_map(
+            params![
+                execution_id.to_string(),
+                ON_CALL_UNAVAILABLE,
+                ON_CALL_RESTORED
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .filter_map(|(node, payload, at)| node.map(|node| (node, payload, at)))
+        .map(|(node_id, payload, at)| {
+            let payload: Value = serde_json::from_str(&payload)?;
+            let detail = &payload["detail"];
+            Ok(TopologyOnCallWait {
+                node_id,
+                reason: detail["reason"].as_str().unwrap_or("unknown").to_owned(),
+                on_call: serde_json::from_value::<TopologyOnCallSeat>(detail["on_call"].clone())
+                    .unwrap_or_default(),
+                since: parse_time(&at)?,
+            })
+        })
+        .collect()
+}
+
+/// Record that `node_id` needs the on-call manager and none is live. Once per
+/// transition: `None` when the node is already waiting.
+pub(crate) fn record_on_call_unavailable(
+    store: &Store,
+    execution_id: Uuid,
+    node_id: &str,
+    attempt_id: Uuid,
+    reason: &str,
+    seat: &TopologyOnCallSeat,
+) -> Result<Option<GraphExecutionUpdate>> {
+    let tx = immediate(store)?;
+    if on_call_waits_on(&tx, execution_id)?
+        .iter()
+        .any(|wait| wait.node_id == node_id)
+    {
+        return Ok(None);
+    }
+    let update = append_event(
+        &tx,
+        execution_id,
+        EventSpec {
+            node_id: Some(node_id),
+            attempt_id: Some(attempt_id),
+            detail: serde_json::json!({ "reason": reason, "on_call": seat }),
+            ..EventSpec::execution(ON_CALL_UNAVAILABLE)
+        },
+    )?;
+    tx.commit()?;
+    Ok(Some(update))
+}
+
+/// Record that `node_id` no longer waits for the on-call manager (a seat is
+/// live again, or the node stopped needing one). `None` when it was not
+/// waiting.
+pub(crate) fn record_on_call_restored(
+    store: &Store,
+    execution_id: Uuid,
+    node_id: &str,
+    why: &str,
+) -> Result<Option<GraphExecutionUpdate>> {
+    let tx = immediate(store)?;
+    if !on_call_waits_on(&tx, execution_id)?
+        .iter()
+        .any(|wait| wait.node_id == node_id)
+    {
+        return Ok(None);
+    }
+    let update = append_event(
+        &tx,
+        execution_id,
+        EventSpec {
+            node_id: Some(node_id),
+            detail: serde_json::json!({ "why": why }),
+            ..EventSpec::execution(ON_CALL_RESTORED)
+        },
+    )?;
+    tx.commit()?;
+    Ok(Some(update))
+}
+
+/// #1641 S4a: a node session cut off by a restart was continued as the same
+/// session (`node_resumed_after_restart`), or its continuation was refused
+/// (`node_resume_refused`) and the attempt fell back to preserve/retry. At
+/// most one of the two is recorded per attempt per daemon boot, so a boot
+/// never resumes an attempt twice.
+const NODE_RESUMED_AFTER_RESTART: &str = "node_resumed_after_restart";
+const NODE_RESUME_REFUSED: &str = "node_resume_refused";
+
+/// Whether this boot already tried to resume `attempt_id`.
+pub(crate) fn node_resume_tried(store: &Store, attempt_id: Uuid, boot_id: Uuid) -> Result<bool> {
+    Ok(store.conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM topology_events WHERE attempt_id=?1 AND kind IN (?2,?3) \
+         AND json_extract(payload_json,'$.detail.boot_id')=?4)",
+        params![
+            attempt_id.to_string(),
+            NODE_RESUMED_AFTER_RESTART,
+            NODE_RESUME_REFUSED,
+            boot_id.to_string()
+        ],
+        |row| row.get(0),
+    )?)
+}
+
+/// Record the outcome of this boot's one resume of `attempt_id`: `Ok(())` was
+/// continued (the attempt stays `running`), `Err(reason)` was refused. The
+/// boot stamp moves to this boot in the same transaction, so a later failure
+/// of the continued session is an ordinary node failure, not a second
+/// restart cut.
+pub(crate) fn record_node_resume(
+    store: &Store,
+    execution_id: Uuid,
+    node_id: &str,
+    attempt_id: Uuid,
+    boot_id: Uuid,
+    outcome: std::result::Result<(), &str>,
+) -> Result<GraphExecutionUpdate> {
+    let tx = immediate(store)?;
+    let (kind, detail) = match outcome {
+        Ok(()) => (
+            NODE_RESUMED_AFTER_RESTART,
+            serde_json::json!({ "boot_id": boot_id.to_string() }),
+        ),
+        Err(reason) => (
+            NODE_RESUME_REFUSED,
+            serde_json::json!({ "boot_id": boot_id.to_string(), "reason": reason }),
+        ),
+    };
+    let update = append_event(
+        &tx,
+        execution_id,
+        EventSpec {
+            node_id: Some(node_id),
+            attempt_id: Some(attempt_id),
+            detail,
+            ..EventSpec::execution(kind)
+        },
+    )?;
+    if outcome.is_ok() {
+        tx.execute(
+            "UPDATE topology_node_attempts SET boot_id=?2,updated_at=?3 WHERE id=?1",
+            params![attempt_id.to_string(), boot_id.to_string(), now_text()],
+        )?;
+    }
+    tx.commit()?;
+    Ok(update)
+}
+
+/// Event kinds of a node session's wait on an answer (#1641 S3b). The executor
+/// opens one when it first sees the node session waiting and closes it when the
+/// session is running again, so the paused wall time survives a restart and a
+/// session resume (the session's own wait counter restarts with each resume).
+const NODE_WAIT_STARTED: &str = "node_wait_started";
+const NODE_WAIT_ENDED: &str = "node_wait_ended";
+
+/// Time one attempt's node session has spent waiting on an answer.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NodeWaited {
+    /// Total of the closed waits.
+    pub(crate) closed: chrono::TimeDelta,
+    /// When the still-open wait began, if there is one.
+    pub(crate) open_since: Option<DateTime<Utc>>,
+    /// When the latest closed wait ended: from then the node was running.
+    /// Waits recovered from the session's own total do not move it: they ended
+    /// at an unknown time before the observation that found them.
+    pub(crate) last_ended_at: Option<DateTime<Utc>>,
+    /// The session's cumulative total of ended waits (milliseconds) as of the
+    /// last wait recorded, so a wait the executor never saw open (it began and
+    /// ended between two observations) is the total's growth past this (#1704).
+    pub(crate) session_seen_ms: i64,
+}
+
+impl NodeWaited {
+    /// How much of the session's cumulative `total` the attempt has not yet
+    /// accounted for. A total below what was seen means the session's counter
+    /// restarted (a continue starts a new provider subprocess), so all of it
+    /// is new.
+    fn unseen_of(self, total: i64) -> i64 {
+        if total >= self.session_seen_ms {
+            total - self.session_seen_ms
+        } else {
+            total
+        }
+    }
+
+    pub(crate) fn total(self, now: DateTime<Utc>) -> chrono::TimeDelta {
+        self.closed
+            + self.open_since.map_or(chrono::TimeDelta::zero(), |since| {
+                (now - since).max(chrono::TimeDelta::zero())
+            })
+    }
+}
+
+fn node_waited_on(conn: &Connection, attempt_id: Uuid) -> Result<NodeWaited> {
+    let mut statement = conn.prepare(
+        "SELECT kind,payload_json,created_at FROM topology_events \
+         WHERE attempt_id=?1 AND kind IN (?2,?3) ORDER BY execution_seq",
+    )?;
+    let rows = statement
+        .query_map(
+            params![attempt_id.to_string(), NODE_WAIT_STARTED, NODE_WAIT_ENDED],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut waited = NodeWaited::default();
+    for (kind, payload, at) in rows {
+        if kind == NODE_WAIT_STARTED {
+            // The wait began at the transition the executor recorded, which
+            // may precede the event's own observation time (#1704).
+            let payload: Value = serde_json::from_str(&payload)?;
+            waited.open_since = Some(match payload["detail"]["since"].as_str() {
+                Some(since) => parse_time(since)?,
+                None => parse_time(&at)?,
+            });
+        } else {
+            let payload: Value = serde_json::from_str(&payload)?;
+            if payload["detail"]["reconciled"] != true {
+                waited.last_ended_at = Some(parse_time(&at)?);
+            }
+            let millis = payload["detail"]["waited_ms"].as_i64().unwrap_or(0);
+            waited.closed += chrono::TimeDelta::milliseconds(millis.max(0));
+            waited.open_since = None;
+            // A wait recorded before the session total was carried counts
+            // as already covered by it, never as unseen growth.
+            waited.session_seen_ms = payload["detail"]["session_waited_ms"]
+                .as_i64()
+                .unwrap_or_else(|| waited.session_seen_ms.max(waited.closed.num_milliseconds()));
+        }
+    }
+    Ok(waited)
+}
+
+/// The wait accounting of one attempt, re-derived from the event log.
+pub(crate) fn node_waited(store: &Store, attempt_id: Uuid) -> Result<NodeWaited> {
+    node_waited_on(&store.conn, attempt_id)
+}
+
+/// Open the attempt's wait when the node session starts waiting; `None` when
+/// one is already open. The wait began at `since`, the session's own wait
+/// transition time. The first observation can come long after it (a slow tick,
+/// a restart), so an unknown `since` falls back to the last moment the node was
+/// known not to be waiting (`floor`: the attempt start, or the end of its last
+/// wait). That pauses the node more, never less, than it really waited (#1704).
+pub(crate) fn record_node_wait_started(
+    store: &Store,
+    execution_id: Uuid,
+    node_id: &str,
+    attempt_id: Uuid,
+    since: Option<DateTime<Utc>>,
+    floor: DateTime<Utc>,
+) -> Result<Option<GraphExecutionUpdate>> {
+    let tx = immediate(store)?;
+    let update = open_wait_in(&tx, execution_id, node_id, attempt_id, since, floor)?;
+    tx.commit()?;
+    Ok(update)
+}
+
+/// `record_node_wait_started` inside the caller's transaction, so a transition
+/// that parks a node can open its wait atomically (#1715).
+fn open_wait_in(
+    tx: &Connection,
+    execution_id: Uuid,
+    node_id: &str,
+    attempt_id: Uuid,
+    since: Option<DateTime<Utc>>,
+    floor: DateTime<Utc>,
+) -> Result<Option<GraphExecutionUpdate>> {
+    let waited = node_waited_on(tx, attempt_id)?;
+    if waited.open_since.is_some() {
+        return Ok(None);
+    }
+    let floor = waited.last_ended_at.map_or(floor, |ended| ended.max(floor));
+    let began = since.unwrap_or(floor).clamp(floor, Utc::now().max(floor));
+    append_event(
+        tx,
+        execution_id,
+        EventSpec {
+            node_id: Some(node_id),
+            attempt_id: Some(attempt_id),
+            detail: serde_json::json!({ "since": began.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true) }),
+            ..EventSpec::execution(NODE_WAIT_STARTED)
+        },
+    )
+    .map(Some)
+}
+
+/// Close the attempt's open wait, recording its length; `None` when none is
+/// open. `session_waited_ms` is the session's own cumulative total of ended
+/// waits: it also holds any wait that began and ended unseen before this one,
+/// so the recorded length is the larger of what the executor measured and what
+/// the total grew by. That can over-pause, never under-pause (#1704).
+pub(crate) fn record_node_wait_ended(
+    store: &Store,
+    execution_id: Uuid,
+    node_id: &str,
+    attempt_id: Uuid,
+    session_waited_ms: Option<u64>,
+) -> Result<Option<GraphExecutionUpdate>> {
+    let tx = immediate(store)?;
+    let waited = node_waited_on(&tx, attempt_id)?;
+    let Some(since) = waited.open_since else {
+        return Ok(None);
+    };
+    let mut length = (Utc::now() - since).max(chrono::TimeDelta::zero());
+    let mut detail = serde_json::Map::new();
+    if let Some(total) = session_waited_ms.map(clamp_ms) {
+        length = length.max(chrono::TimeDelta::milliseconds(waited.unseen_of(total)));
+        detail.insert("session_waited_ms".into(), total.into());
+    }
+    detail.insert("waited_ms".into(), length.num_milliseconds().into());
+    let update = append_event(
+        &tx,
+        execution_id,
+        EventSpec {
+            node_id: Some(node_id),
+            attempt_id: Some(attempt_id),
+            detail: Value::Object(detail),
+            ..EventSpec::execution(NODE_WAIT_ENDED)
+        },
+    )?;
+    tx.commit()?;
+    Ok(Some(update))
+}
+
+/// Record waits the session finished without the executor seeing them open:
+/// the growth of its own cumulative total past what the attempt already
+/// accounts for. `None` when the total is unknown, an open wait will account
+/// for it when it closes, or nothing grew. Nothing here backdates a wait's
+/// start: the wait is recorded as a length, marked `reconciled` (#1704).
+pub(crate) fn record_node_waits_between_observations(
+    store: &Store,
+    execution_id: Uuid,
+    node_id: &str,
+    attempt_id: Uuid,
+    session_waited_ms: Option<u64>,
+) -> Result<Option<GraphExecutionUpdate>> {
+    let Some(total) = session_waited_ms.map(clamp_ms) else {
+        return Ok(None);
+    };
+    let tx = immediate(store)?;
+    let waited = node_waited_on(&tx, attempt_id)?;
+    let unseen = waited.unseen_of(total);
+    // A counter that restarted (a resumed subprocess) below the baseline is
+    // recorded even when it restarted at zero: the baseline must follow it,
+    // or the next wait is measured against the old total and under-credited.
+    let restarted = total < waited.session_seen_ms;
+    if waited.open_since.is_some() || (unseen <= 0 && !restarted) {
+        return Ok(None);
+    }
+    let update = append_event(
+        &tx,
+        execution_id,
+        EventSpec {
+            node_id: Some(node_id),
+            attempt_id: Some(attempt_id),
+            detail: serde_json::json!({
+                "waited_ms": unseen,
+                "session_waited_ms": total,
+                "reconciled": true,
+            }),
+            ..EventSpec::execution(NODE_WAIT_ENDED)
+        },
+    )?;
+    tx.commit()?;
+    Ok(Some(update))
+}
+
+fn clamp_ms(ms: u64) -> i64 {
+    i64::try_from(ms).unwrap_or(i64::MAX)
+}
+
 /// Durable TUI projection (plan §6): the snapshot replays `topology_events`.
 pub(crate) fn execution_snapshot(
     store: &Store,
@@ -1768,6 +2667,14 @@ pub(crate) fn execution_snapshot(
         row_version: Some(execution.row_version),
         blocked_attempt_id,
         blocked_reason,
+        waiting: if execution.status.is_final() {
+            None
+        } else {
+            on_call_waits(store, execution_id)?.into_iter().next()
+        },
+        current_nodes: Vec::new(),
+        on_call: None,
+        rulings: Vec::new(),
     }))
 }
 
@@ -1831,7 +2738,8 @@ pub(crate) fn cleanup_due(
 pub(crate) fn releasable_sessions(store: &Store, execution_id: Uuid) -> Result<Vec<Uuid>> {
     let mut statement = store.conn.prepare(
         "SELECT session_id FROM topology_node_attempts WHERE execution_id=?1 \
-         AND started_at IS NOT NULL AND preserved_ref IS NULL AND session_id IS NOT NULL",
+         AND started_at IS NOT NULL AND preserved_ref IS NULL AND session_id IS NOT NULL \
+         AND node_kind NOT IN ('review','land')",
     )?;
     let ids = statement
         .query_map([execution_id.to_string()], |row| row.get::<_, String>(0))?

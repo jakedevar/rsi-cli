@@ -118,6 +118,40 @@ impl RpcServer {
         Ok(serde_json::json!({ "success": true }))
     }
 
+    /// `AgentCreateProject` (#1626): the caller is the token-resolved session.
+    pub(super) async fn handle_agent_create_project(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let caller = self.resolve_caller_session_id(request).await?;
+        let params = serde_json::from_value(request.params.clone()).map_err(|_| {
+            DaemonError::InvalidParam(rsi_common::agent_projects::PROJECT_INVALID_REQUEST.into())
+        })?;
+        let result = self
+            .session_manager
+            .agent_control()
+            .agent_create_project(caller, params)
+            .await?;
+        Ok(serde_json::to_value(result)?)
+    }
+
+    /// `AgentUpdateProject` (#1626).
+    pub(super) async fn handle_agent_update_project(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let caller = self.resolve_caller_session_id(request).await?;
+        let params = serde_json::from_value(request.params.clone()).map_err(|_| {
+            DaemonError::InvalidParam(rsi_common::agent_projects::PROJECT_INVALID_REQUEST.into())
+        })?;
+        let result = self
+            .session_manager
+            .agent_control()
+            .agent_update_project(caller, params)
+            .await?;
+        Ok(serde_json::to_value(result)?)
+    }
+
     pub(super) async fn handle_get_project(
         &self,
         request: &RpcRequest,

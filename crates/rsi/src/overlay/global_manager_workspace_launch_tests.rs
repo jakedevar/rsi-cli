@@ -155,3 +155,41 @@ fn form_keys_move_fields_and_report_submit_and_cancel() {
     assert_eq!(form.role, LaunchRole::Global);
     assert!(form.error.as_deref().unwrap().contains("already launched"));
 }
+
+#[test]
+fn the_host_defaults_to_the_active_project_and_cycles_through_the_scope() {
+    let f = fixture();
+    let projects = [f.a.clone(), f.b.clone()];
+    let mut form = LaunchForm::new(LaunchRole::Global, &projects, None, Some(f.b.id));
+    assert!(form.fields().contains(&LaunchField::Host));
+    assert_eq!(form.value(LaunchField::Host), "dictate-agent (default)");
+    assert_eq!(form.validate(&projects).unwrap().home_project, f.b.id);
+
+    form.field = LaunchField::Host;
+    handle_form_key(&mut form, key(KeyCode::Right));
+    assert_eq!(form.value(LaunchField::Host), "rsi");
+    let request = form.validate(&projects).unwrap();
+    assert_eq!(request.home_project, f.a.id, "the override is the host");
+    assert_eq!(request.scope, vec![f.a.id, f.b.id], "scope is unchanged");
+}
+
+#[test]
+fn the_host_falls_back_when_its_project_leaves_the_scope() {
+    let f = fixture();
+    let projects = [f.a.clone(), f.b.clone()];
+    // No active tab project: the first project in scope hosts.
+    let mut form = LaunchForm::new(LaunchRole::Global, &projects, None, None);
+    assert_eq!(form.value(LaunchField::Host), "rsi (default)");
+    form.field = LaunchField::Host;
+    form.cycle(1);
+    assert_eq!(form.host, Some(f.b.id));
+    // Unchecking the chosen host drops the override.
+    form.field = LaunchField::Scope;
+    form.scope_cursor = 1;
+    handle_form_key(&mut form, key(KeyCode::Char(' ')));
+    assert_eq!(form.host, None);
+    assert_eq!(form.validate(&projects).unwrap().home_project, f.a.id);
+    // A PM seat has no host field: its project is the host.
+    let pm = LaunchForm::new(LaunchRole::Project(f.b.id), &projects, None, None);
+    assert!(!pm.fields().contains(&LaunchField::Host));
+}

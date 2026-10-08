@@ -176,6 +176,29 @@ fn commit_candidate(app: &mut App) {
 }
 
 pub fn handle_theme_role_editor_key(app: &mut App, key: KeyEvent) {
+    // Standard editing: a real cursor and selection in the color field.
+    match app.edit_field(key, |overlay| match overlay {
+        OverlayState::ThemeRoleEditor { input, .. } => Some(input),
+        _ => None,
+    }) {
+        crate::field_edit::FieldKey::Edited => {
+            if let OverlayState::ThemeRoleEditor {
+                assessment,
+                pending_acknowledgement,
+                committed,
+                ..
+            } = &mut app.overlay
+            {
+                *assessment = None;
+                *pending_acknowledgement = None;
+                *committed = false;
+            }
+            update_preview(app);
+            return;
+        }
+        crate::field_edit::FieldKey::Moved => return,
+        crate::field_edit::FieldKey::Ignored => {}
+    }
     match key.code {
         KeyCode::Esc => {
             let opening = match &app.overlay {

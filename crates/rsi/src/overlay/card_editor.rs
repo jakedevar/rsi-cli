@@ -167,8 +167,8 @@ async fn handle_nav_mode(app: &mut App, key: KeyEvent) {
             *editing = Some(String::new());
         }
 
-        // Edit selected fact
-        KeyCode::Char('e') | KeyCode::Char('i') if key.modifiers.is_empty() => {
+        // Edit selected fact (Enter is the Standard-mode way in)
+        KeyCode::Char('e') | KeyCode::Char('i') | KeyCode::Enter if key.modifiers.is_empty() => {
             let Some((facts, selected_index, _, editing, _)) = card_fields(&mut app.overlay) else {
                 return;
             };
@@ -233,6 +233,13 @@ async fn handle_nav_mode(app: &mut App, key: KeyEvent) {
 
 /// Handle keys in edit mode (editing a single fact inline).
 async fn handle_edit_mode(app: &mut App, key: KeyEvent) {
+    // Standard editing: a real cursor and selection in the fact being edited.
+    if app.edit_field(key, |overlay| {
+        card_fields(overlay).and_then(|(_, _, _, editing, _)| editing.as_mut())
+    }) != crate::field_edit::FieldKey::Ignored
+    {
+        return;
+    }
     match key.code {
         // Confirm edit
         KeyCode::Enter => {

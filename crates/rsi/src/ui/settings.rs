@@ -567,14 +567,21 @@ fn search_spans(app: &App) -> Vec<Span<'static>> {
     if !state.query_active && state.query.is_empty() {
         return vec![key_cap("/"), Span::styled(" search  ", dim_style())];
     }
-    let mut spans = vec![Span::styled(
-        format!(
-            "/{}{}",
-            state.query,
-            if state.query_active { "▏" } else { "" }
-        ),
-        search_hit_style(),
-    )];
+    let mut spans = if state.query_active && crate::field_edit::standard_frame() {
+        // Standard editing draws the query's cursor and selection in place.
+        let mut spans = vec![Span::styled("/", search_hit_style())];
+        spans.extend(crate::field_edit::draw(&state.query, search_hit_style()));
+        spans
+    } else {
+        vec![Span::styled(
+            format!(
+                "/{}{}",
+                state.query,
+                if state.query_active { "▏" } else { "" }
+            ),
+            search_hit_style(),
+        )]
+    };
     if !state.query.trim().is_empty() {
         let matches: usize = SettingsSection::ALL
             .iter()
@@ -2558,7 +2565,8 @@ fn local_settings_row(app: &App, section: SettingsSection, idx: usize) -> Settin
                 ),
             }
         }
-        SettingsSection::ModelControl
+        SettingsSection::EditingMode
+        | SettingsSection::ModelControl
         | SettingsSection::RetriesRecovery
         | SettingsSection::StallDetection
         | SettingsSection::MemoryDreaming

@@ -82,6 +82,19 @@ impl SessionManager {
                 + store.manager_v2_recover_decision_deliveries(self.program_run_boot_id)?
                 + store.recover_manager_actions_startup(self.program_run_boot_id)?
         };
+        match self
+            .store
+            .lock()
+            .await
+            .recover_remote_answers(self.program_run_boot_id)
+        {
+            Ok(recovered) => changed += recovered,
+            Err(error) => tracing::warn!(%error, "remote answer recovery deferred"),
+        }
+        match self.reconcile_remote_answers_once().await {
+            Ok(delivered) => changed += delivered,
+            Err(error) => tracing::warn!(%error, "remote answer delivery deferred"),
+        }
         let auth_episodes: Vec<(
             String,
             chrono::DateTime<chrono::Utc>,
@@ -395,7 +408,20 @@ impl SessionManager {
         &self,
         delivery: &ManagerDecisionDeliveryV2,
     ) -> Result<()> {
-        let target = decision_session(delivery)?;
+        self.check_question_runtime(decision_session(delivery)?, &delivery.target)
+            .await?;
+        self.store
+            .lock()
+            .await
+            .manager_v2_check_decision_target(delivery)?;
+        Ok(())
+    }
+
+    pub(super) async fn check_question_runtime(
+        &self,
+        target: Uuid,
+        expected: &Value,
+    ) -> Result<()> {
         // Match the actual latest question event, including an unpersisted
         // event whose id is still zero. Hold runtime read guards through the
         // durable check so detection+append cannot interleave between them.
@@ -408,11 +434,11 @@ impl SessionManager {
             });
             let exact = event.is_some_and(|event| {
                 event.id > 0
-                    && delivery.target["event_id"].as_i64() == Some(event.id)
-                    && delivery.target["event_sequence"].as_i64() == Some(i64::from(event.sequence))
-                    && delivery.target["tool_use_id"].as_str() == event.tool_use_id.as_deref()
+                    && expected["event_id"].as_i64() == Some(event.id)
+                    && expected["event_sequence"].as_i64() == Some(i64::from(event.sequence))
+                    && expected["tool_use_id"].as_str() == event.tool_use_id.as_deref()
             });
-            if !exact || serde_json::to_value(pending)? != delivery.target["question"] {
+            if !exact || serde_json::to_value(pending)? != expected["question"] {
                 return Err(refused("manager_v2_decision_runtime_changed"));
             }
             Ok(())
@@ -428,10 +454,6 @@ impl SessionManager {
                 matches_runtime(&cached.session.pending_question, &cached.events)?;
             }
         }
-        self.store
-            .lock()
-            .await
-            .manager_v2_check_decision_target(delivery)?;
         Ok(())
     }
 

@@ -192,7 +192,7 @@ test-benchmark:
 
 .PHONY: e2e-tui
 e2e-tui:
-	RSI_E2E=1 cargo test -p rsi --test e2e_tui -- --nocapture
+	./scripts/e2e.sh
 
 dev-rsid-live-dogfood:
 	./scripts/recursive-dag-live-dogfood.sh daemon-fresh

@@ -371,10 +371,12 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
     // --- Global model dropdown intercept (widget, not overlay) ---
     if app.model_dropdown.open {
         use crate::widget::model_dropdown::ModelDropdownAction;
+        let standard_editing = app.standard_editing();
         let action = crate::widget::model_dropdown::handle_model_dropdown_key(
             &mut app.model_dropdown,
             &key,
             &app.settings.custom_providers,
+            standard_editing,
         );
         let consumed = !matches!(action, ModelDropdownAction::Ignored);
         match action {
@@ -688,6 +690,7 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
 
 /// Handle Prompt-specific keys when the overlay is a ContinueSession prompt in `app.overlay`.
 async fn handle_overlay_prompt_keys(app: &mut App, key: KeyEvent) -> bool {
+    let standard_editing = app.standard_editing();
     let mut selected_override_model = None;
     // Model dropdown intercept: when the prompt's dropdown is open, route keys to it
     if let OverlayState::Prompt {
@@ -703,6 +706,7 @@ async fn handle_overlay_prompt_keys(app: &mut App, key: KeyEvent) -> bool {
                 model_dropdown,
                 &key,
                 &app.settings.custom_providers,
+                standard_editing,
             );
             let consumed = !matches!(action, ModelDropdownAction::Ignored);
             match action {
@@ -778,7 +782,10 @@ async fn handle_overlay_prompt_keys(app: &mut App, key: KeyEvent) -> bool {
     }
 
     // Ctrl+A — open AI command
-    if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL) {
+    if key.code == KeyCode::Char('a')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && (!app.standard_editing() || key.modifiers.contains(KeyModifiers::ALT))
+    {
         if app.prompt_processor.is_none() {
             app.notify("AI assistant requires prompt processor");
             return true;
@@ -1041,6 +1048,7 @@ async fn handle_overlay_prompt_keys(app: &mut App, key: KeyEvent) -> bool {
         available_commands: &available_commands,
         working_dir: working_dir.as_deref(),
         submit_on_enter: false,
+        standard_editing: app.standard_editing(),
     };
 
     let action = if let OverlayState::Prompt { surface, .. } = &mut app.overlay {
@@ -1125,6 +1133,7 @@ async fn handle_input_overlay_key(app: &mut App, key: KeyEvent) -> bool {
 /// Handle Prompt-specific keys for the focused input overlay.
 async fn handle_focused_input_prompt_keys(app: &mut App, key: KeyEvent) -> bool {
     let idx = app.focused_input_idx;
+    let standard_editing = app.standard_editing();
     let mut selected_override_model = None;
 
     // Model dropdown intercept: when the prompt's dropdown is open, route keys to it
@@ -1141,6 +1150,7 @@ async fn handle_focused_input_prompt_keys(app: &mut App, key: KeyEvent) -> bool 
                 model_dropdown,
                 &key,
                 &app.settings.custom_providers,
+                standard_editing,
             );
             let consumed = !matches!(action, ModelDropdownAction::Ignored);
             match action {
@@ -1216,7 +1226,10 @@ async fn handle_focused_input_prompt_keys(app: &mut App, key: KeyEvent) -> bool 
     }
 
     // Ctrl+A — open AI command (opens in app.overlay, input overlays stay visible)
-    if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL) {
+    if key.code == KeyCode::Char('a')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && (!app.standard_editing() || key.modifiers.contains(KeyModifiers::ALT))
+    {
         if app.prompt_processor.is_none() {
             app.notify("AI assistant requires prompt processor");
             return true;
@@ -1470,6 +1483,7 @@ async fn handle_focused_input_prompt_keys(app: &mut App, key: KeyEvent) -> bool 
         available_commands: &available_commands,
         working_dir: working_dir.as_deref(),
         submit_on_enter: false,
+        standard_editing: app.standard_editing(),
     };
 
     let action = match app.input_overlays.get_mut(idx) {
@@ -1557,7 +1571,10 @@ async fn handle_input_modal_key(app: &mut App, key: KeyEvent) {
     }
 
     // Ctrl+A — open AI command input for text transformation
-    if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL) {
+    if key.code == KeyCode::Char('a')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && (!app.standard_editing() || key.modifiers.contains(KeyModifiers::ALT))
+    {
         if app.prompt_processor.is_none() {
             app.notify("AI assistant requires prompt processor");
             return;
@@ -1695,6 +1712,7 @@ async fn handle_input_modal_key(app: &mut App, key: KeyEvent) {
         available_commands: &[], // No command suggestions in the input modal
         working_dir: None,       // No file suggestions in the input modal
         submit_on_enter: app.settings.submit_on_enter,
+        standard_editing: app.standard_editing(),
     };
 
     let action = if let OverlayState::InputModal { surface, .. } = &mut app.overlay {

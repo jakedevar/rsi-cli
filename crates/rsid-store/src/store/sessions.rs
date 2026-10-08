@@ -1691,6 +1691,28 @@ impl Store {
     pub fn purge_session(&self, id: Uuid) -> Result<()> {
         let id_str = id.to_string();
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let retained_answer: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM remote_answer_deliveries WHERE session_id=?1)",
+            [&id_str],
+            |row| row.get(0),
+        )?;
+        if retained_answer {
+            return Err(DaemonError::InvalidParam(
+                "session_remote_answer_retained: remote answer history prevents permanent purge"
+                    .into(),
+            ));
+        }
+        let retained_turn: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM provider_turn_custody WHERE session_id=?1)",
+            [&id_str],
+            |row| row.get(0),
+        )?;
+        if retained_turn {
+            return Err(DaemonError::InvalidParam(
+                "session_turn_custody_retained: provider turn history prevents permanent purge"
+                    .into(),
+            ));
+        }
         if !super::sandbox_custody::prepare_session_execution_projection_for_purge(&tx, id)? {
             return Ok(());
         }

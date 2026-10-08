@@ -799,6 +799,7 @@ Registry keys of the Issues workspace; some apply only in the tab or mode the ac
 | `Enter` | Inspect or open linked session | Inspects the selected issue, or opens its linked session when one exists. |
 | `r` | Refresh active Issue view | Refreshes the active Issues tab from the daemon. |
 | `P` | Run poll now | Runs the issue sync poll now instead of waiting for its schedule. |
+| `T` | Run topology on issue | Starts the issue-implement-review-land topology on the selected issue under its project's Epic and opens the run view. |
 | `Enter` | Select highlighted form value | Selects the highlighted value in the open issue form field. |
 | `Ctrl-Enter` | Retry identical Issue write | Retries the last failed issue write with the identical request and idempotency key. |
 | `Tab` | Select next inspector history section | Moves the issue inspector to its next history section. |
@@ -949,6 +950,7 @@ arguments open that editor on Enter.
 | `:diagnostics` | `:diag` | Open diagnostics | Opens the diagnostics overlay. |
 | `:graph` |  | Open graph review | Opens the visual workflow graph review editor. |
 | `:topology-resolve [arg]` |  | Resolve preserved topology work | Inspects, accepts, retries or discards preserved work on a blocked durable topology execution: `:topology-resolve [<execution_id>] inspect\|accept\|retry\|discard [<commit>]` (the id may be omitted when exactly one is blocked; discard needs the full preserved commit). |
+| `:topology [arg]` |  | Run a topology on the focused Issue | Starts a stored topology on the focused Issue in the Issues workspace: `:topology run <name> [<epic>]`. The Epic defaults to the focused or only live Epic of the Issue's project; the run view opens on the started execution. |
 | `:dag` |  | Open recursive DAG | Opens the recursive DAG browser. |
 | `:context [arg]` | `:ctx [arg]` | Set active task context | Sets or clears the active task context for new launches. |
 | `:card [arg]` |  | Edit entity card | Opens the entity card editor for the current project or the named entity. |
@@ -961,7 +963,7 @@ arguments open that editor on Enter.
 | `:manager clear` |  | Clear manager scope | Clears the harness manager's scope. |
 | `:fleet` |  | Open fleet workspace | Shows active agents and usage rates across all projects. |
 | `:global-manager` | `:gm` `:manager workspace` | Open global manager workspace | Opens the global manager workspace above all projects: the grant, the global seat and each granted project's PM health; Enter opens the seat or a PM session. |
-| `:manager global [arg]` |  | Show global manager grant | Shows the active global manager grant; `:manager global set <active\|sessions\|containers\|spend\|groups> <value>` changes one per-project cap; `:manager global configure <JSON>` sends a full typed grant request. |
+| `:manager global [arg]` |  | Show global manager grant | Shows the active global manager grant; `:manager global set <active\|sessions\|containers\|spend\|groups> <value>` changes one per-project cap; `:manager global add-project <names...>` adds projects to the grant; `:manager global configure <JSON>` sends a full typed grant request. |
 | `:manager global appoint [arg]` |  | Appoint global manager | Appoints the focused session as the global manager over the named projects (comma-separated; default: every project). |
 | `:manager global revoke` |  | Revoke global manager | Revokes the active global manager grant; the seat keeps its session but loses its authority. |
 | `:manager portfolio [arg]` |  | Manager portfolio nodes | Lists managers above project level (portfolio nodes of any tier); `:manager portfolio show <node>`, `appoint <label> [projects...]` (focused session as seat; `--adopt <node,...>` appoints it above existing nodes), `configure <JSON>` and `revoke <node>` inspect or change one. |
@@ -2022,7 +2024,7 @@ The focused session is the one selected in the session list behind the tree; it 
 
 ### Global Manager Workspace (`gm`, `:global-manager`)
 
-`gm` (the `g` leader, then `m`) or `:global-manager` (also `:gm`, `:manager workspace`) opens the global manager workspace: one full-screen view above every project. It is not part of any project tab, so it shows the same content from every tab. It reads one bounded operator-only snapshot (`GetGlobalManagerWorkspace`): the active global grant (or the most recent revoked one), the global seat's session, and for each granted project its PM seat health plus portfolio signals (open / in-progress / operator-request Issues, running and waiting sessions, pending questions and approvals). Each seat shows `ACTIVE`, `IDLE`, `WAITING`, `PAUSED`, `STOPPED`, `MISSING` or `REVOKED`. The view is a console (#1231): the manager seats (the global seat, then each project's PM, indented by level) sit on the left, and the selected seat's live conversation sits on the right with its input bar. It uses the same renderer as the session detail pane and updates from the same event stream. `i` types to the selected seat in place (`t` selects the global seat first). Enter or Ctrl-Enter sends, and Esc leaves typing; drafts stay with each seat's session. `Tab` focuses the transcript for scrolling. Below 96 columns the list and the conversation take turns. `n` instantiates a manager in one flow. Pick the seat (global, or a project's PM), a provider/model/effort from the allowed launch catalog (the grant's launches plus the operator default) and, for the global seat, its projects. It then launches a fresh session and appoints it through `ConfigureGlobalManager` or `ConfigureHarnessManager` plus the Execute policy. Validation and refusals show inline. When the launch succeeded but the appointment was refused, Enter retries only the appointment. With no grant the view says how to launch one (or appoint an existing session with `:manager global appoint [project names...]`). Missing, stopped and revoked seats say what to do. The view reloads every 15 seconds while open, after any `:manager global`, `:manager node` or `:manager restart` command, and on `r`; a failed reload keeps the last snapshot and says so. Enter opens the selected seat's session in a tab showing its project (opening one when needed). `?` lists the keys.
+`gm` (the `g` leader, then `m`) or `:global-manager` (also `:gm`, `:manager workspace`) opens the global manager workspace: one full-screen view above every project. It is not part of any project tab, so it shows the same content from every tab. It reads one bounded operator-only snapshot (`GetGlobalManagerWorkspace`): the active global grant (or the most recent revoked one), the global seat's session, and for each granted project its PM seat health plus portfolio signals (open / in-progress / operator-request Issues, running and waiting sessions, pending questions and approvals). Each seat shows `ACTIVE`, `IDLE`, `WAITING`, `PAUSED`, `STOPPED`, `MISSING` or `REVOKED`. The view is a console (#1231): the manager seats (the global seat, then each project's PM, indented by level) sit on the left, and the selected seat's live conversation sits on the right with its input bar. It uses the same renderer as the session detail pane and updates from the same event stream. `i` types to the selected seat in place (`t` selects the global seat first). `s` shows the selected seat session's status, `x` halts it softly and `X` halts it now (press twice), through the same path as the session list's `x` / `X`; `a` archives an earlier seat session (the current seat is refused: revoke or replace it first). Enter or Ctrl-Enter sends, and Esc leaves typing; drafts stay with each seat's session. `Tab` focuses the transcript for scrolling. Below 96 columns the list and the conversation take turns. `n` instantiates a manager in one flow. Pick the seat (global, or a project's PM), a provider/model/effort from the allowed launch catalog (the grant's launches plus the operator default) and, for the global seat, its projects (Scope, every project by default) and its Host project (the session's home: the tab's project when in scope, else the first project in scope; `h`/`l` on Host picks another project in scope). The global seat's header names its host project. It then launches a fresh session and appoints it through `ConfigureGlobalManager` or `ConfigureHarnessManager` plus the Execute policy. Validation and refusals show inline. When the launch succeeded but the appointment was refused, Enter retries only the appointment. With no grant the view says how to launch one (or appoint an existing session with `:manager global appoint [project names...]`). Missing, stopped and revoked seats say what to do. The view reloads every 15 seconds while open, after any `:manager global`, `:manager node` or `:manager restart` command, and on `r`; a failed reload keeps the last snapshot and says so. Enter opens the selected seat's session in a tab showing its project (opening one when needed). `?` lists the keys.
 
 The same console renders any manager node (#1240). Enter on a Portfolio, Project or Area row of the manager tree opens that node's console from the operator-only `GetManagerNodeWorkspace` snapshot. The header names the node it reports to, its grant, a fleet rollup of its coverage (active agents and 5-minute and 1-hour token and cost rates, 24-hour invocations) and the escalations waiting on it. The seats are the node's own seat, each child portfolio node (as a digest with its summed counts) with the projects it covers beneath it, then the projects the node manages directly and its child areas. Enter on a child row opens that child's console, and Backspace opens the parent's. In a node console, `n` launches project managers only; appoint portfolio and area seats from the manager tree. `gm` still opens the global through `GetGlobalManagerWorkspace`.
 
@@ -2430,6 +2432,10 @@ Keys of the theme role editor.
 | `g / G` | Jump to first / last |
 | `i` | Type to the selected seat's manager here |
 | `t` | Select the console's own seat and type to it |
+| `s` | Show the selected seat session's status |
+| `x` | Halt the selected seat session (soft stop) |
+| `X` | Halt the selected seat session now (press twice) |
+| `a` | Archive the selected earlier seat session |
 | `n` | Launch and appoint a manager (seat, launch, scope) |
 | `Tab` | Focus the conversation: j/k, Ctrl-D/U scroll, g/G ends |
 | `Enter / l` | Open the seat's session in its project tab, or a child node's console |
@@ -3104,6 +3110,37 @@ The input bar appears at the bottom of the session detail view for continuing se
 - **Normal mode + content**: vim editing commands (`w`/`b`/`e`, `x`, `d`/`c`/`y`, `f`/`t`, etc.) go to the input bar; unrecognized keys pass through to session detail
 - **Normal mode + empty**: all keys pass through to session detail
 - Clipboard paste works from either mode and automatically enters insert mode if needed.
+
+### Standard Editing Mode
+
+When the `editing_mode` setting is `standard` (Settings > Editing Mode, or the first-start prompt), the input bar has no modes: it is always typing, and the vim sections below do not apply. A change in Settings takes effect on the next key. Click inside the draft to place the cursor.
+
+| Key | Action |
+|-----|--------|
+| Text keys | Type (including `j`, `k`, `Space`, `:`) |
+| `Left` / `Right`, `Home` / `End` | Move; `Ctrl+Home` / `Ctrl+End` jump to the start / end of the draft |
+| `Ctrl+Left` / `Ctrl+Right`, `Alt+Left` / `Alt+Right` | Move by word |
+| `Up` / `Down` | Move between rows of a multi-line draft; at the first/last row (or on an empty draft) they scroll the transcript |
+| `Shift` + any of the above | Extend the selection (with a draft; on an empty draft `Shift+Up` / `Shift+Down` still step transcript events) |
+| `Backspace` / `Delete`, `Ctrl+Backspace` / `Ctrl+Delete` | Delete a character / a word (or the selection) |
+| `Ctrl+A` | Select all (the AI command moves to `Ctrl+Alt+A`) |
+| `Ctrl+C` | Copy the selection; with no selection it keeps its global meaning (quit) |
+| `Ctrl+X` / `Ctrl+V` / `Ctrl+Z` | Cut / paste / undo (`Ctrl+Shift+Z` redo) |
+| `Enter` / `Shift+Enter` | Send / newline |
+| `Esc` | Clear the selection or dismiss suggestions; with neither, return to the session list (works on any terminal) |
+| `Ctrl+H` / `Ctrl+L`, `Ctrl+O` / `Ctrl+I` | Still move pane focus / the session jumplist while the draft has focus; with no pane to the left, `Ctrl+H` returns to the session list (needs a terminal that reports Ctrl+H apart from Backspace, as the kitty keyboard protocol does) |
+
+Collisions with global chords in Standard mode: `Ctrl+Left` / `Ctrl+Right` move by word instead of focusing a pane or nudging the transcript column (use `Ctrl+H` / `Ctrl+L`); `Ctrl+Shift+Left` / `Ctrl+Shift+Right` select words instead of resizing the sidebar while the draft has text; `Ctrl+A` selects all instead of opening the AI command. Because every printable key types, `Space` leader sequences and `j` / `k` are not available while the draft pane has focus: press `Esc` (or `Ctrl+H` on a kitty-protocol terminal) to move to the session list, where the global bindings are unchanged.
+
+#### Standard Editing in Overlays, Palettes, Editors and Search
+
+The same `editing_mode = standard` setting applies to every other text input. The multi-line surfaces (new-session and continue prompts, the `Ctrl+G` input modal, the provider form, the create-entity body, the file viewer and the prompt-file editor) use the table above. `Esc` closes an overlay surface when there is no selection to clear, `Ctrl+Q` still closes it, and `Ctrl+Alt+A` replaces `Ctrl+A` for the AI command. The help overlay (`Ctrl+Alt+G`) lists the keys of the active mode.
+
+Single-line fields (command palette, finders and pickers, `/` search, `:` and quick-input lines, settings search, rename, forms, the card and background editors, AI command and chat, the dialectic and question inputs) get a real cursor and selection: `Left` / `Right`, `Home` / `End`, `Alt+Left` / `Alt+Right` by word (inside an overlay `Ctrl+Left` / `Ctrl+Right` still move the overlay window; the multi-line surfaces and the Issues editor also take them for words), `Shift` to select, `Ctrl+A` select all, `Ctrl+C` / `Ctrl+X` copy / cut (paste is `Ctrl+V`), `Backspace` / `Delete` and `Ctrl` + them for words. Every printable key types into the focused field, so list shortcuts such as `j` / `k` / `q` do not apply there (use the arrow keys); `Enter`, `Esc` and `Tab` keep their form meaning. Numeric fields still accept only their digits. Secret fields (credential and MCP secret forms) stay append-only so no plaintext copy is kept or placed on the clipboard.
+
+In Standard mode the file viewer is always an editor: `Ctrl+S` saves, `Ctrl+F` finds (`F3` / `Shift+F3` step through matches), `Alt+M` toggles the Markdown preview, `PageUp` / `PageDown` scroll and `Esc` or `Ctrl+Q` close it. Folds and `:` commands are Vim-mode features. The question modal types a free answer directly; while the box is empty `Up` / `Down` move the option cursor and `Space` or `1`-`9` pick an option, `Enter` sends (or moves to the next question), `Ctrl+D` declines and `Esc` dismisses. Creating an entity: Name and Tag are typed into as soon as they are focused, `Tab` / `Shift+Tab` move between fields and `Esc` saves the draft and closes.
+
+The remaining inputs follow the same rules (#1628 slice 3b): the Issues pane editor (title, body, priority, assignee, labels, dependency query and filter fields; `Ctrl+Enter` saves, `Tab` / `Shift+Tab` move between fields, `Esc` discards), the satellite registry form, the source-worktree settlement authorization phrase, the global-manager launch prompt, the manager policy value and decision-answer boxes, the graph node edit buffer, the recursive-DAG reason / recovery-budget / max-steps inputs, the create-entity topology filter (`Space` still toggles the preview) and the model-dropdown filter (opened with `/`). Numeric and id-alphabet fields keep their character filters and length limits. The file viewer draws its selection, and the help overlay's filter shows its cursor in place. Secret fields stay append-only.
 
 ### Insert Mode
 

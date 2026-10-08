@@ -21,7 +21,7 @@ use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 pub const UNIT_NAME: &str = "rsi-remote.service";
@@ -51,6 +51,27 @@ pub trait RemoteSystem: Send + Sync {
     fn unit_stop_and_disable(&self) -> Result<(), String>;
     /// Delete our unit file (only if it carries the rsid marker).
     fn unit_remove_file(&self) -> Result<(), String>;
+    /// When the unit's main process started; `None` when unknown or inactive.
+    fn unit_started_at(&self) -> Option<SystemTime>;
+    /// Modification time of the gateway binary (symlinks followed).
+    fn binary_modified(&self, binary: &Path) -> Option<SystemTime>;
+    fn unit_restart(&self) -> Result<(), String>;
+}
+
+/// The running gateway predates its binary: a deploy or install replaced the
+/// file after the process started. Whole seconds on both sides (systemd
+/// reports seconds), so a start in the same second as the write never counts
+/// and a restart cannot repeat. Unknown times never count.
+fn gateway_outdated(started: Option<SystemTime>, modified: Option<SystemTime>) -> bool {
+    let secs = |time: SystemTime| {
+        time.duration_since(SystemTime::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .ok()
+    };
+    matches!(
+        (started.and_then(secs), modified.and_then(secs)),
+        (Some(started), Some(modified)) if modified > started
+    )
 }
 
 struct TsPeer {
@@ -266,6 +287,13 @@ const UNIT_MARKER: &str = "# Managed by rsid: RSI Remote gateway (#1096). Edits 
 
 /// The unit text. Relative, non-UTF-8, whitespace, quote, backslash and
 /// control characters are refused; `%` and `$` are escaped for systemd.
+///
+/// No `PrivateTmp=`/`PrivateUsers=` (#1639): in a systemd *user* manager they
+/// put the gateway in a private user namespace that maps only this user, so
+/// root `tailscaled` shows up as the overflow uid and fails the gateway's
+/// uid-0 peer check on every request. `Restart=always` because a clean
+/// SIGTERM (an operator killing processes by name) is not a failure, yet it
+/// left the gateway down.
 fn unit_text(binary: &Path, policy: &Path) -> Result<String, String> {
     let clean = |path: &Path| {
         let text = path
@@ -293,10 +321,9 @@ ExecStartPre=-/usr/bin/rm -f %t/rsi-remote/ingress.sock\n\
 ExecStart={binary} run {policy} %t/rsi-remote/ingress.sock\n\
 RuntimeDirectory=rsi-remote\n\
 RuntimeDirectoryMode=0700\n\
-Restart=on-failure\n\
+Restart=always\n\
 RestartSec=3\n\
 NoNewPrivileges=yes\n\
-PrivateTmp=yes\n\
 \n\
 [Install]\n\
 WantedBy=default.target\n"
@@ -690,6 +717,64 @@ fn disable(
     Ok(out)
 }
 
+/// What [`converge`] found and did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Converged {
+    /// Remote is off or has no policy file: nothing was touched.
+    Disabled,
+    /// The gateway was already active (its unit file was refreshed, and the
+    /// unit restarted, only if the text had drifted).
+    AlreadyActive,
+    /// The gateway was not active and has been started.
+    Started,
+    /// The gateway was active on a binary older than the installed one and
+    /// has been restarted onto it.
+    Restarted,
+}
+
+/// Bring the gateway unit back in line with the policy after an rsid start,
+/// which also follows every deploy restart and `make release-install` (#1639).
+/// When Remote is enabled the managed unit is rewritten if its text drifted,
+/// started if it is not active, and restarted if its process is older than
+/// the installed binary (a deploy replaced the file under it). It never
+/// enables Remote, never stops or disables the unit and never touches the
+/// `tailscale serve` route.
+pub fn converge(system: &dyn RemoteSystem) -> Result<Converged, String> {
+    let path = system.policy_path();
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Ok(Converged::Disabled);
+    }
+    let policy =
+        config::read(&path).map_err(|e| format!("policy file {} unusable: {e}", path.display()))?;
+    if !policy.enabled {
+        return Ok(Converged::Disabled);
+    }
+    let binary = system
+        .gateway_binary()
+        .ok_or_else(|| "rsi-remote binary not found".to_string())?;
+    let unit = unit_text(&binary, &path)?;
+    let was_active = system.unit_state().active;
+    system
+        .unit_install_and_start(&unit)
+        .map_err(|e| format!("gateway unit: {e}"))?;
+    // Checked after the install: a drifted unit was already restarted there.
+    let restarted =
+        was_active && gateway_outdated(system.unit_started_at(), system.binary_modified(&binary));
+    if restarted {
+        system
+            .unit_restart()
+            .map_err(|e| format!("gateway restart: {e}"))?;
+    }
+    if !system.unit_state().active {
+        return Err("gateway unit did not become active".into());
+    }
+    Ok(match (was_active, restarted) {
+        (_, true) => Converged::Restarted,
+        (true, false) => Converged::AlreadyActive,
+        (false, false) => Converged::Started,
+    })
+}
+
 /// Serializes every status read and policy+lifecycle mutation: one operation
 /// runs to completion before the next starts, so a stale read can never undo
 /// a later disable or revocation. The lock is owned by the blocking task, so a
@@ -716,6 +801,19 @@ impl RemoteController {
         })
         .await
         .map_err(|e| format!("remote status task failed: {e}"))
+    }
+
+    /// [`converge`] under the same lock as every operator edit, so a
+    /// concurrent disable cannot be undone by a stale startup read.
+    pub async fn converge(&self) -> Result<Converged, String> {
+        let guard = std::sync::Arc::clone(&self.lock).lock_owned().await;
+        let system = std::sync::Arc::clone(&self.system);
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            converge(system.as_ref())
+        })
+        .await
+        .map_err(|e| format!("remote converge task failed: {e}"))?
     }
 
     pub async fn set_config(
@@ -1100,6 +1198,40 @@ impl RemoteSystem for HostSystem {
         )
         .map(|_| ())
     }
+
+    fn unit_started_at(&self) -> Option<SystemTime> {
+        // `@<unix seconds>`; empty when the unit never ran. An older systemd
+        // without `--timestamp=unix` fails here and yields `None`.
+        let out = run(
+            "systemctl",
+            &[
+                "--user",
+                "show",
+                UNIT_NAME,
+                "--timestamp=unix",
+                "-p",
+                "ExecMainStartTimestamp",
+                "--value",
+            ],
+            Duration::from_secs(5),
+        )
+        .ok()?;
+        let secs: u64 = out.trim().strip_prefix('@')?.parse().ok()?;
+        (secs > 0).then(|| SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+    }
+
+    fn binary_modified(&self, binary: &Path) -> Option<SystemTime> {
+        std::fs::metadata(binary).and_then(|m| m.modified()).ok()
+    }
+
+    fn unit_restart(&self) -> Result<(), String> {
+        run(
+            "systemctl",
+            &["--user", "restart", UNIT_NAME],
+            Duration::from_secs(20),
+        )
+        .map(|_| ())
+    }
 }
 
 /// Convenience for the RPC layer: projects as `(id, name)` rows.
@@ -1140,6 +1272,8 @@ mod tests {
         version: String,
         /// The first `tailscale status` call parks until released.
         park_status: bool,
+        unit_started_at: Option<SystemTime>,
+        binary_modified: Option<SystemTime>,
     }
 
     struct Fake {
@@ -1289,6 +1423,19 @@ mod tests {
             state.unit = UnitState::default();
             Ok(())
         }
+        fn unit_started_at(&self) -> Option<SystemTime> {
+            self.state.lock().unwrap().unit_started_at
+        }
+        fn binary_modified(&self, _binary: &Path) -> Option<SystemTime> {
+            self.state.lock().unwrap().binary_modified
+        }
+        fn unit_restart(&self) -> Result<(), String> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push("unit_restart");
+            state.unit.active = !state.unit_never_active;
+            state.unit_started_at = state.binary_modified.map(|t| t + Duration::from_secs(1));
+            Ok(())
+        }
     }
 
     fn projects() -> Vec<(String, String)> {
@@ -1344,7 +1491,7 @@ mod tests {
             .clone()
             .unwrap();
         for needle in [
-            "Restart=on-failure",
+            "Restart=always",
             "WantedBy=default.target",
             "RuntimeDirectoryMode=0700",
             "ExecStart=/opt/rsi/bin/rsi-remote run ",
@@ -1360,6 +1507,114 @@ mod tests {
         let alpha = out.projects.iter().find(|p| p.id == PROJECT_A).unwrap();
         assert!(alpha.exposed);
         assert_eq!(fake.calls(), ["unit_start", "serve_apply"]);
+    }
+
+    /// #1639: the unit must share the host user namespace so tailscaled is
+    /// seen as uid 0, and must come back after a clean SIGTERM.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn gateway_unit_keeps_the_host_user_namespace_and_always_restarts() {
+        let text = unit_text(Path::new("/opt/rsi/bin/rsi-remote"), Path::new("/p")).unwrap();
+        let directives: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(key, _)| key))
+            .collect();
+        assert_eq!(
+            directives,
+            [
+                "Description",
+                "After",
+                "Type",
+                "ExecStartPre",
+                "ExecStart",
+                "RuntimeDirectory",
+                "RuntimeDirectoryMode",
+                "Restart",
+                "RestartSec",
+                "NoNewPrivileges",
+                "WantedBy",
+            ]
+        );
+        assert!(text.contains("\nRestart=always\n"));
+    }
+
+    /// #1639: a daemon start re-starts an enabled gateway that is down, and
+    /// touches nothing when Remote is off.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn converge_starts_an_enabled_gateway_that_is_down() {
+        let fake = Fake::new();
+        assert_eq!(converge(&fake), Ok(Converged::Disabled));
+        assert!(fake.calls().is_empty());
+
+        set_config(&fake, &projects(), &enable_request()).unwrap();
+        fake.state.lock().unwrap().calls.clear();
+        // The gateway died (a kill by name, a reboot, a deploy).
+        fake.state.lock().unwrap().unit.active = false;
+        assert_eq!(converge(&fake), Ok(Converged::Started));
+        assert!(fake.state.lock().unwrap().unit.active);
+        assert_eq!(fake.calls(), ["unit_start"]);
+        let unit = fake.state.lock().unwrap().installed_unit_text.clone();
+        assert_eq!(
+            unit,
+            Some(unit_text(Path::new("/opt/rsi/bin/rsi-remote"), &fake.policy_path()).unwrap())
+        );
+
+        assert_eq!(converge(&fake), Ok(Converged::AlreadyActive));
+
+        fake.state.lock().unwrap().unit.active = false;
+        fake.state.lock().unwrap().unit_never_active = true;
+        assert_eq!(
+            converge(&fake),
+            Err("gateway unit did not become active".into())
+        );
+
+        set_config(&fake, &projects(), &disable_request()).unwrap();
+        fake.state.lock().unwrap().calls.clear();
+        assert_eq!(converge(&fake), Ok(Converged::Disabled));
+        assert!(fake.calls().is_empty());
+    }
+
+    /// Review #1645: a deploy that replaces the binary under an unchanged
+    /// unit restarts the running gateway onto it, once; a disabled policy
+    /// is never touched however stale the binary looks.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn converge_restarts_a_gateway_older_than_its_binary() {
+        let at = |secs: u64| Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+        let fake = Fake::new();
+        set_config(&fake, &projects(), &enable_request()).unwrap();
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.calls.clear();
+            state.unit_started_at = at(1_000);
+            state.binary_modified = at(2_000);
+        }
+        assert_eq!(converge(&fake), Ok(Converged::Restarted));
+        assert_eq!(fake.calls(), ["unit_start", "unit_restart"]);
+        // The restarted process is now newer than the binary: no second restart.
+        assert_eq!(converge(&fake), Ok(Converged::AlreadyActive));
+        assert_eq!(fake.calls(), ["unit_start", "unit_restart", "unit_start"]);
+
+        set_config(&fake, &projects(), &disable_request()).unwrap();
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.calls.clear();
+            state.binary_modified = at(9_000);
+        }
+        assert_eq!(converge(&fake), Ok(Converged::Disabled));
+        assert!(fake.calls().is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn gateway_is_outdated_only_when_the_binary_is_newer_by_whole_seconds() {
+        let at = |secs: u64, nanos: u32| Some(SystemTime::UNIX_EPOCH + Duration::new(secs, nanos));
+        assert!(gateway_outdated(at(100, 0), at(101, 0)));
+        assert!(!gateway_outdated(at(100, 0), at(100, 900_000_000)));
+        assert!(!gateway_outdated(at(101, 0), at(100, 0)));
+        assert!(!gateway_outdated(None, at(101, 0)));
+        assert!(!gateway_outdated(at(100, 0), None));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]

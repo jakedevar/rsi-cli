@@ -1468,6 +1468,52 @@ pub enum TopologyStep {
     Command { op: CatalogOp },
     /// A pure boolean over upstream typed outputs.
     Gate { condition: GateCondition },
+    /// An independent review of the commit another node produced (#1641).
+    /// The daemon asks the review service for an assignment, waits for its
+    /// verdict, and routes `verdict_accepted` / `verdict_changes_requested`
+    /// edges. It runs no agent turn of the topology's own.
+    Review {
+        /// Node whose result commit is reviewed.
+        of: String,
+        /// Explicit reviewer launch; its vendor family must differ from the
+        /// author's.
+        reviewer: ReviewerLaunch,
+        /// Review rounds before the node blocks with
+        /// `review_rounds_exhausted`.
+        #[serde(default = "default_review_rounds")]
+        max_rounds: u8,
+    },
+    /// Publish the accepted commit through the daemon merge queue (#1641 S2).
+    /// The daemon enqueues on behalf of the execution's owning manager or
+    /// Epic lead, waits on the queue entry without any agent turn, and
+    /// branches on published versus refused. It is never an author command:
+    /// the only inputs are the accepted review node and optional
+    /// `PACKAGE=FILTER` gate filters.
+    Land {
+        /// The review node whose accepted commit is landed. The land node's
+        /// only forward input is its `verdict_accepted` edge.
+        accepted: String,
+        /// `PACKAGE=FILTER` test filters for the queue entry; empty lets the
+        /// lander derive the observing tests.
+        #[serde(default)]
+        test_filters: Vec<String>,
+    },
+}
+
+/// Most review rounds one review node may allow (the store's per-revision cap).
+pub const TOPOLOGY_MAX_REVIEW_ROUNDS: u8 = 3;
+
+const fn default_review_rounds() -> u8 {
+    2
+}
+
+/// The explicit provider, model and effort of a review node's reviewer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewerLaunch {
+    pub provider: SessionProvider,
+    pub model: String,
+    pub effort: String,
 }
 
 impl TopologyStep {
@@ -1478,6 +1524,8 @@ impl TopologyStep {
             Self::Session { .. } => "session",
             Self::Command { .. } => "command",
             Self::Gate { .. } => "gate",
+            Self::Review { .. } => "review",
+            Self::Land { .. } => "land",
         }
     }
 }
@@ -2083,6 +2131,77 @@ pub struct WorkflowExecutionSnapshot {
     /// Typed blocked reason (for example `preserved_work`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
+    /// #1641 S3a: a node that needs the on-call manager and has none live.
+    /// Present only while the wait lasts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<TopologyOnCallWait>,
+    /// #1641 S6a: node ids with an attempt reserved, launching, running or
+    /// waiting (sorted). Empty once the execution is final.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub current_nodes: Vec<String>,
+    /// #1641 S6a: the on-call manager seat the execution names and whether it
+    /// can answer now. Absent once the execution is final.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_call: Option<TopologyOnCallView>,
+    /// #1641 S6a: questions nodes put to the on-call manager, oldest first,
+    /// at most [`MAX_SNAPSHOT_RULINGS`] (the newest). Digests only, never the
+    /// answer text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rulings: Vec<TopologyRulingView>,
+}
+
+/// Rulings a snapshot lists (the newest are kept).
+pub const MAX_SNAPSHOT_RULINGS: usize = 32;
+
+/// The on-call seat of a run, as the run view shows it (#1641 S6a).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyOnCallView {
+    /// The seat the execution names, or the covering portfolio seat that
+    /// stands in for a project manager that is not live.
+    pub seat: TopologyOnCallSeat,
+    /// The live seat's session; `None` while nobody can answer.
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+    pub live: bool,
+}
+
+/// One question a node put to the on-call manager (#1641 S6a).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyRulingView {
+    pub node_id: String,
+    pub decision_key: String,
+    pub question: String,
+    /// The ledger status: `pending`, `answered`, `withdrawn`, ...
+    pub status: String,
+    /// The kind of actor that ruled (`manager`, `operator`, ...).
+    #[serde(default)]
+    pub answered_by: Option<String>,
+    /// `sha256:<hex>` of the answer text; the text itself is never listed.
+    #[serde(default)]
+    pub answer_digest: Option<String>,
+}
+
+/// The on-call manager seat an execution names (#1641 S3a). A seat
+/// reference, never a session id: seats rotate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TopologyOnCallSeat {
+    /// The project's manager, else the nearest live covering portfolio seat.
+    #[default]
+    ProjectManager,
+    /// This portfolio node's current seat, nothing else.
+    Portfolio { node_id: Uuid },
+}
+
+/// Why a node that needs the on-call manager is waiting (#1641 S3a).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyOnCallWait {
+    pub node_id: String,
+    /// `no_project`, `no_live_project_manager` or `portfolio_seat_not_live`.
+    pub reason: String,
+    /// The seat the execution names.
+    pub on_call: TopologyOnCallSeat,
+    pub since: DateTime<Utc>,
 }
 
 /// One iteration of a `master_improve` convergence loop.
@@ -6102,6 +6221,43 @@ mod tests {
         assert_eq!(deserialized.definition["name"], "graph-editor");
     }
 
+    /// #1641 S3a: a snapshot written before `waiting` existed still decodes,
+    /// and a wait round-trips with its typed reason and seat.
+    #[test]
+    fn workflow_execution_snapshot_waiting_is_additive_and_typed() {
+        let execution_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let old = serde_json::json!({
+            "execution_id": execution_id,
+            "workflow_id": Uuid::new_v4(),
+            "workflow_name": "run",
+            "status": "running",
+            "accepted_at": now,
+        });
+        let snapshot: WorkflowExecutionSnapshot = serde_json::from_value(old).unwrap();
+        assert!(snapshot.waiting.is_none());
+        assert!(
+            !serde_json::to_value(&snapshot)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("waiting")
+        );
+        let node_id = Uuid::new_v4();
+        let mut waiting = snapshot;
+        waiting.waiting = Some(TopologyOnCallWait {
+            node_id: "fix".into(),
+            reason: "no_live_project_manager".into(),
+            on_call: TopologyOnCallSeat::Portfolio { node_id },
+            since: now,
+        });
+        let json = serde_json::to_value(&waiting).unwrap();
+        assert_eq!(json["waiting"]["reason"], "no_live_project_manager");
+        assert_eq!(json["waiting"]["on_call"]["kind"], "portfolio");
+        let back: WorkflowExecutionSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(back.waiting, waiting.waiting);
+    }
+
     #[test]
     fn test_workflow_execution_snapshot_round_trip() {
         let execution_id = Uuid::new_v4();
@@ -6123,6 +6279,10 @@ mod tests {
             row_version: None,
             blocked_attempt_id: None,
             blocked_reason: None,
+            waiting: None,
+            current_nodes: Vec::new(),
+            on_call: None,
+            rulings: Vec::new(),
             updates: vec![GraphExecutionUpdate {
                 execution_id,
                 workflow_id,
@@ -6197,6 +6357,10 @@ mod tests {
                 row_version: None,
                 blocked_attempt_id: None,
                 blocked_reason: None,
+                waiting: None,
+                current_nodes: Vec::new(),
+                on_call: None,
+                rulings: Vec::new(),
                 updates: Vec::new(),
             },
         };

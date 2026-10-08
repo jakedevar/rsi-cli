@@ -3860,6 +3860,7 @@ impl CustodyService {
             expected_generation,
             sandbox_base,
             remove,
+            false,
         )
         .map(|attempt| attempt.outcome)
     }
@@ -3874,6 +3875,7 @@ impl CustodyService {
         expected_generation: u64,
         sandbox_base: &Path,
         remove: bool,
+        require_landed: bool,
     ) -> Result<TerminalTargetAttempt> {
         Self::terminal_target_attempt_with_store(
             &mut PhasedReclaimStore { store, pass },
@@ -3882,6 +3884,7 @@ impl CustodyService {
             expected_generation,
             sandbox_base,
             remove,
+            require_landed,
         )
     }
 
@@ -3917,6 +3920,7 @@ impl CustodyService {
             expected_generation,
             sandbox_base,
             remove,
+            false,
         )
         .map(|attempt| attempt.outcome)
     }
@@ -3924,6 +3928,11 @@ impl CustodyService {
     /// Authenticate one terminal candidate and, when it is clean, reclaim (or
     /// inspect) its `target/`. A refusal names the exact check that failed
     /// (#1575): the report keeps it so no refusal is anonymous.
+    ///
+    /// `require_landed` is set when the owner row is still inside the idle TTL
+    /// and no disk pressure is active (#1684): the target is then reclaimed
+    /// only when the worktree's HEAD is already an ancestor of
+    /// `origin/rolling`, so nothing unlanded depends on that build cache.
     fn terminal_target_attempt_with_store(
         access: &mut impl ReclaimStoreAccess,
         active_owner: Option<&dyn Fn() -> std::result::Result<bool, ReclaimSkipReason>>,
@@ -3931,6 +3940,7 @@ impl CustodyService {
         expected_generation: u64,
         sandbox_base: &Path,
         remove: bool,
+        require_landed: bool,
     ) -> Result<TerminalTargetAttempt> {
         use ReclaimSkipReason as Skip;
         let refuse = |reason: Skip, name: &'static str| {
@@ -4020,6 +4030,9 @@ impl CustodyService {
         };
         if !has_matching_worktree_stanza(&registered, &root, &target.sandbox_branch) {
             return refuse(Skip::GitOrRootIdentityRefusal, "worktree_not_registered");
+        }
+        if require_landed && !git_head_landed_on_rolling(&root) {
+            return refuse(Skip::FreshOrInvalidTimestamp, "idle_below_ttl");
         }
         if let Err((reason, check)) = pinned.ensure_idle_cargo_target_checked() {
             return Ok(TerminalTargetAttempt::refused(reason, check));
@@ -4907,6 +4920,23 @@ fn git_is_ancestor(root: &Path, source_commit: &str) -> bool {
     std::process::Command::new("git")
         .args(["merge-base", "--is-ancestor", source_commit, "HEAD"])
         .current_dir(root)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Whether the worktree's HEAD is already an ancestor of `origin/rolling`
+/// (#1684). The worktree shares the canonical repository's remote-tracking
+/// refs. An absent ref or any git failure is "not landed" (fail closed).
+fn git_head_landed_on_rolling(root: &Path) -> bool {
+    std::process::Command::new("git")
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            "HEAD",
+            "refs/remotes/origin/rolling",
+        ])
+        .current_dir(root)
+        .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
 }

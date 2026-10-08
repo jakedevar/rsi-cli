@@ -2004,7 +2004,11 @@ fn manager_v2_resources_rejects_more_than_budget_live_members() {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
 #[test]
 fn manager_v2_answer_reopen_preserves_only_exact_invocation_measurements() {
-    for bind_answer in [false, true] {
+    for (bind_answer, prefix) in [false, true].into_iter().flat_map(|bind| {
+        ["manager.answer:", "remote.answer:"]
+            .into_iter()
+            .map(move |prefix| (bind, prefix))
+    }) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("answer.db");
         let store = Store::open(&path).unwrap();
@@ -2015,7 +2019,7 @@ fn manager_v2_answer_reopen_preserves_only_exact_invocation_measurements() {
         let mut request = admission_request(&lead);
         request.purpose = ModelInvocationPurpose::SessionContinueResume;
         request.trigger = "continue_session".into();
-        request.dedup_key = Some(format!("manager.answer:{}", Uuid::new_v4()));
+        request.dedup_key = Some(format!("{prefix}{}", Uuid::new_v4()));
         let StoreAdmissionOutcome::Admitted(invocation) = store
             .admit_model_invocation(
                 Uuid::new_v4(),

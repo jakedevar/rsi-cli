@@ -114,12 +114,41 @@ impl WorkflowSteps {
         )
     }
 
+    /// The node a review node reviews; `None` for any other node.
+    pub(crate) fn review_of(&self, node: &str) -> Option<&str> {
+        match self.step(node) {
+            Some(TopologyStep::Review { of, .. }) => Some(of.as_str()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_review(&self, node: &str) -> bool {
+        self.review_of(node).is_some()
+    }
+
     /// Whether any node is not a session node (the legacy runner cannot run
     /// command or gate nodes).
     pub(crate) fn has_typed_effects(&self) -> bool {
         self.steps
             .values()
             .any(|step| !matches!(step, TopologyStep::Session { .. }))
+    }
+
+    /// Whether any node is a review node (#1641 S1b): its Work lives on an
+    /// Epic's manager ledger, so the execution must have an Epic.
+    pub(crate) fn has_review_nodes(&self) -> bool {
+        self.steps
+            .values()
+            .any(|step| matches!(step, TopologyStep::Review { .. }))
+    }
+
+    /// Whether any node is a land node (#1641 S2): it enqueues on behalf of
+    /// the execution's owner: its manager or Epic lead, or for an operator
+    /// start the Epic's project manager (#1746).
+    pub(crate) fn has_land_nodes(&self) -> bool {
+        self.steps
+            .values()
+            .any(|step| matches!(step, TopologyStep::Land { .. }))
     }
 
     pub(crate) fn command_crates(&self) -> Vec<(&str, &str)> {

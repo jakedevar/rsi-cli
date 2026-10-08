@@ -479,6 +479,9 @@ pub(crate) enum CommandPoll {
 pub(crate) struct CommandRunner {
     program: OsString,
     runs: std::sync::Mutex<HashMap<Uuid, Arc<RunSlot>>>,
+    /// #1641 S4b: attempt id → its governor build-slot ticket and whether the
+    /// slot was granted.
+    slots: std::sync::Mutex<HashMap<Uuid, (Uuid, bool)>>,
 }
 
 impl Default for CommandRunner {
@@ -492,6 +495,81 @@ impl CommandRunner {
         Self {
             program,
             runs: std::sync::Mutex::new(HashMap::new()),
+            slots: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// #1641 S4b: ask the resource governor for a build slot for this attempt
+    /// (the same gates a `cargo-slot` client faces: slots, load, memory and
+    /// the `min_free_disk_gb` disk floor). `None`: the slot is held. `Some(kind)`:
+    /// still waiting, `disk_floor` when the floor is the blocking gate and
+    /// `build_slot` otherwise. The ticket is kept so each tick polls the same
+    /// queue position; a platform where the governor cannot see this process
+    /// admits (there is nothing to gate on).
+    pub(crate) fn build_slot(
+        &self,
+        governor: &crate::governor::Governor,
+        policy: &crate::governor::GovernorPolicy,
+        attempt_id: Uuid,
+    ) -> Option<&'static str> {
+        use crate::governor::{AcquireOutcome, AcquireParams, AdmissionClass, BlockReason};
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ticket = match slots.get(&attempt_id) {
+            Some((_, true)) => return None,
+            Some((ticket, false)) => Some(*ticket),
+            None => None,
+        };
+        let params = AcquireParams {
+            class: AdmissionClass::Build,
+            pid: std::process::id(),
+            label: Some(format!("topology command {attempt_id}")),
+            ticket_id: ticket,
+        };
+        match governor.acquire(policy, &params) {
+            Ok(AcquireOutcome::Granted { lease_id, .. }) => {
+                slots.insert(attempt_id, (lease_id, true));
+                None
+            }
+            Ok(AcquireOutcome::Queued {
+                ticket_id, reason, ..
+            }) => {
+                slots.insert(attempt_id, (ticket_id, false));
+                Some(if matches!(reason, BlockReason::Disk { .. }) {
+                    "disk_floor"
+                } else {
+                    "build_slot"
+                })
+            }
+            Err(error) => {
+                if ticket.is_some() {
+                    // The queued ticket expired: ask again from the back.
+                    slots.remove(&attempt_id);
+                    Some("build_slot")
+                } else {
+                    tracing::warn!(%error, "topology command build slot not gated");
+                    None
+                }
+            }
+        }
+    }
+
+    /// Give the attempt's build slot (or queued ticket) back; idempotent.
+    pub(crate) fn release_build_slot(
+        &self,
+        governor: &crate::governor::Governor,
+        policy: &crate::governor::GovernorPolicy,
+        attempt_id: Uuid,
+    ) {
+        let ticket = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&attempt_id);
+        if let Some((ticket, _)) = ticket {
+            governor.release(policy, ticket);
         }
     }
 
@@ -585,6 +663,61 @@ impl CommandRunner {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// #1641 S4b: a cargo command takes a governor build slot; the disk floor
+    /// holds it (`disk_floor`), the same ticket is granted once space returns,
+    /// and releasing gives the slot back.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn build_slot_is_held_by_the_disk_floor_then_granted_and_released() {
+        use crate::governor::{Governor, GovernorPolicy, Holder, ResourceSample};
+        use std::sync::Mutex;
+        let free = Arc::new(Mutex::new(1.0_f64));
+        let sample = Arc::clone(&free);
+        let governor = Governor::new(
+            Box::new(move || ResourceSample {
+                load1: 0.0,
+                cores: 8,
+                disk_free_gb: *sample.lock().unwrap(),
+                mem_available_gb: 1000.0,
+                workers_slice_anon_gb: None,
+            }),
+            Box::new(|pid| {
+                Some(Holder {
+                    pid,
+                    start_ticks: 1,
+                })
+            }),
+        );
+        let policy = GovernorPolicy {
+            build_slots: 1,
+            min_free_disk_gb: 30,
+            ..GovernorPolicy::default()
+        };
+        let runner = CommandRunner::default();
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+
+        assert_eq!(
+            runner.build_slot(&governor, &policy, first),
+            Some("disk_floor")
+        );
+        assert_eq!(
+            runner.build_slot(&governor, &policy, first),
+            Some("disk_floor")
+        );
+        *free.lock().unwrap() = 500.0;
+        assert_eq!(runner.build_slot(&governor, &policy, first), None);
+        assert_eq!(runner.build_slot(&governor, &policy, first), None, "kept");
+        // The single slot is taken: another command waits for a slot.
+        assert_eq!(
+            runner.build_slot(&governor, &policy, second),
+            Some("build_slot")
+        );
+        runner.release_build_slot(&governor, &policy, first);
+        runner.release_build_slot(&governor, &policy, first);
+        assert_eq!(runner.build_slot(&governor, &policy, second), None);
+        runner.release_build_slot(&governor, &policy, second);
+    }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]

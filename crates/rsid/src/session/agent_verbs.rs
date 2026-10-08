@@ -231,6 +231,9 @@ pub struct AgentControlHandle {
     /// Operator runtime settings read at use (#1337 job timeout default);
     /// `None` for handles built without a manager (the built-in default).
     pub(super) runtime_config: Option<Arc<crate::config::RuntimeConfig>>,
+    /// Project index and RSI.md cache the project verbs refresh (#1626);
+    /// `None` for handles built without a manager.
+    pub(super) project_admin: Option<super::agent_projects::ProjectAdminContext>,
 }
 
 impl AgentControlHandle {
@@ -256,7 +259,16 @@ impl AgentControlHandle {
             deploy_drain: None,
             host_load: None,
             runtime_config: None,
+            project_admin: None,
         }
+    }
+
+    pub(super) fn with_project_admin(
+        mut self,
+        context: super::agent_projects::ProjectAdminContext,
+    ) -> Self {
+        self.project_admin = Some(context);
+        self
     }
 
     pub(super) fn with_runtime_config(mut self, config: Arc<crate::config::RuntimeConfig>) -> Self {
@@ -508,12 +520,16 @@ impl AgentControlHandle {
             #[cfg(all(test, target_os = "linux"))]
             let test_reap =
                 super::reaper::prepare_runtime_reap_proc_root_operation(target_session_id)?;
+            let orphan_store = Arc::clone(&self.store);
             let reaped = tokio::task::spawn_blocking(move || {
                 #[cfg(all(test, target_os = "linux"))]
                 if let Some(reap) = test_reap {
                     return reap();
                 }
-                super::reaper::reap_orphans_for_session(target_session_id)
+                let turns = orphan_store
+                    .blocking_lock()
+                    .list_active_provider_turn_custody()?;
+                super::reaper::reap_orphans_for_session(target_session_id, turns)
             })
             .await
             .map_err(|error| {
@@ -3332,6 +3348,11 @@ impl SessionManager {
         .with_deploy_drain(Arc::clone(&self.deploy_drain))
         .with_host_load(Arc::clone(&self.host_load))
         .with_runtime_config(Arc::clone(&self.runtime_config))
+        .with_project_admin(super::agent_projects::ProjectAdminContext::for_daemon(
+            self.workspace_roots.clone(),
+            Arc::clone(&self.project_index),
+            Arc::clone(&self.workflow_config_cache),
+        ))
     }
 
     /// `AgentCreateIssue` RPC delegator — creator identity is passed only from
@@ -8124,6 +8145,85 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(own.issue.project_id, koplik.id);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn agent_create_issue_harness_files_from_session_outside_the_rsi_repo() {
+        // #1613: the harness project comes from the daemon's own root, never
+        // from the caller's working directory or its project's path.
+        let (control, store) = control_handle_with_store();
+        let mut rsi = harness_test_project("Rsi", None);
+        rsi.path = Some(
+            super::super::preamble::harness_root()
+                .unwrap()
+                .to_path_buf(),
+        );
+        let outside = tempfile::tempdir().expect("non-rsi project tree");
+        let koplik = harness_test_project("Koplik", outside.path().to_str());
+        let caller = Uuid::new_v4();
+        {
+            let store = store.lock().await;
+            store.insert_project(&rsi).unwrap();
+            store.insert_project(&koplik).unwrap();
+            let mut session = test_session(caller, outside.path().to_path_buf());
+            assert_ne!(session.working_dir, *rsi.path.as_ref().unwrap());
+            session.project_id = Some(koplik.id);
+            store.insert_session(&session).unwrap();
+        }
+        let filed = control
+            .agent_create_issue(
+                caller,
+                AgentCreateIssueParams {
+                    project_id: None,
+                    title: "rsi defect found from koplik".into(),
+                    body: "evidence".into(),
+                    priority: None,
+                    labels: vec!["kaizen".into()],
+                    assignee: None,
+                    idempotency_key: "outside-harness".into(),
+                    harness: true,
+                    source_issue: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(filed.issue.project_id, rsi.id);
+        assert_eq!(filed.issue.created_by_session_id, Some(caller));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[test]
+    fn harness_project_resolves_from_a_sandbox_built_daemon_via_its_main_worktree() {
+        // #1613: a daemon built in a linked worktree (a manager sandbox) must
+        // match the project registered at the MAIN worktree path.
+        let tmp = tempfile::tempdir().expect("fixture root");
+        let (main, build_dir) = super::super::preamble::linked_worktree_fixture(tmp.path());
+        let cwd = std::path::Path::new("/rsi-test-no-such-daemon-cwd");
+        let discovered = super::super::preamble::discover_harness_root_from(
+            None,
+            Some(cwd),
+            None,
+            &build_dir,
+            None,
+        );
+        let mut rsi = harness_test_project("Rsi", None);
+        rsi.path = Some(main.clone());
+        let koplik = harness_test_project("Koplik", tmp.path().to_str());
+        let projects = [koplik, rsi.clone()];
+        assert_eq!(
+            resolve_harness_project(&projects, discovered.as_deref()),
+            Some(rsi.id)
+        );
+        // A non-repo build dir stays unresolved (typed refusal downstream).
+        let no_repo = super::super::preamble::discover_harness_root_from(
+            None,
+            Some(cwd),
+            None,
+            std::path::Path::new("/rsi-test-no-such-build-dir"),
+            None,
+        );
+        assert_eq!(resolve_harness_project(&projects, no_repo.as_deref()), None);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]

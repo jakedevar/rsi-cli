@@ -80,9 +80,12 @@ stranded on a branch.
     RPC/TUI surface in the same change (no SQL-only knobs). Operator-only
     methods stay out of `AGENT_VERBS`, `READ_VERBS`, native tools and the agent
     CLI catalog.
-11. **Long cargo runs.** Scope them (`cargo test -p rsid --lib <filter>`), run in
+11. **Long cargo runs.** Scope them with `scripts/scoped-test`, or name exact
+    tests (`cargo test -p rsid --lib -- --exact <full::test::path>`; the shell
+    hook refuses bare-word or module-prefix filters, #1656), run in
     the foreground, and `tee` long runs to a log. Never report a run you did not
-    see finish as green.
+    see finish as green. Exception: `scripts/scoped-test` is a job (below), not a
+    foreground shell call (#1638).
 12. **Detach with systemd.** Any process that must outlive this turn (a lander,
     a long test run, anything you check on a later wake) MUST be launched via
     `systemd-run --user --collect`; `setsid`, `nohup`, `disown` and bare `&`
@@ -120,6 +123,11 @@ make test-fast            # quick lanes; make test-full for everything
 ```
 
 `scripts/scoped-test --base origin/rolling` verifies the committed diff to HEAD.
+Workers run it as a job: `AgentSubmitJob {"kind":"test","wake":"none","params":
+{"scoped_test":{"base":"origin/rolling"}}}`, then ONE `AgentScheduleWake`
+`mode:"when"` (`when.jobs_terminal`), then end the turn; you are resumed once with
+`exit_code`, the log path and the typed receipt (#1638). A foreground call outlives
+the provider's 10-minute tool cap on a busy host.
 Use `--dry-run` to inspect the plan without building; add `--head <rev>` to
 inspect another candidate. Execution requires the candidate to be this HEAD. It builds each selected package once and runs its matching tests under
 a per-package budget (build included): `--runtime-max-sec 1800 --cpu-quota 200`.

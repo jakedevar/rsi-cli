@@ -6,6 +6,14 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 /// Handle keys in the session rename overlay.
 pub(super) async fn handle_rename_session_key(app: &mut App, key: KeyEvent) {
+    // Standard editing: a real cursor and selection in the title.
+    if app.edit_field(key, |overlay| match overlay {
+        OverlayState::RenameSession { title, .. } => Some(title),
+        _ => None,
+    }) != crate::field_edit::FieldKey::Ignored
+    {
+        return;
+    }
     match key.code {
         KeyCode::Enter => {
             if let OverlayState::RenameSession { session_id, title } = &app.overlay {

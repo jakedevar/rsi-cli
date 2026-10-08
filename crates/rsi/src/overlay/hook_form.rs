@@ -98,6 +98,34 @@ pub(super) fn handle_hook_form_key(app: &mut App, key: KeyEvent) {
         _ => return,
     };
 
+    // Standard editing: a real cursor and selection in the focused text field.
+    let accept: fn(char) -> bool = if focused_field == FIELD_TIMEOUT {
+        |c| c.is_ascii_digit()
+    } else {
+        |_| true
+    };
+    if app.edit_field_filtered(
+        key,
+        |overlay| match overlay {
+            OverlayState::HookForm {
+                matcher,
+                command,
+                timeout,
+                ..
+            } => match focused_field {
+                FIELD_MATCHER => Some(matcher),
+                FIELD_COMMAND => Some(command),
+                FIELD_TIMEOUT => Some(timeout),
+                _ => None,
+            },
+            _ => None,
+        },
+        accept,
+    ) != crate::field_edit::FieldKey::Ignored
+    {
+        return;
+    }
+
     match key.code {
         KeyCode::BackTab => cycle_field(app, false),
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => cycle_field(app, false),

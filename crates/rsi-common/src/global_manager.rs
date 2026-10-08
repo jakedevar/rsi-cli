@@ -245,6 +245,30 @@ pub struct GlobalSeatSessionV1 {
     pub cost_usd: Option<f64>,
     pub updated_at: DateTime<Utc>,
     pub pending_question: bool,
+    /// #1627: earlier sessions of this seat, newest first, found by walking
+    /// `continued_from` (context-cap rotations and successions). Bounded by
+    /// [`SEAT_PREDECESSOR_LIMIT`]; read-only history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub predecessors: Vec<SeatPredecessorV1>,
+    /// More predecessors exist than `predecessors` lists.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub predecessors_truncated: bool,
+}
+
+/// How many predecessors one seat snapshot lists.
+pub const SEAT_PREDECESSOR_LIMIT: usize = 8;
+
+/// One earlier session of a manager seat (#1627).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeatPredecessorV1 {
+    pub session_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub status: SessionStatus,
+    pub provider: SessionProvider,
+    pub model: Option<String>,
+    pub context_fill_pct: Option<f64>,
+    pub cost_usd: Option<f64>,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// One project of the workspace grant.

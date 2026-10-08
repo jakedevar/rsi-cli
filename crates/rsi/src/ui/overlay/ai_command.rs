@@ -28,14 +28,16 @@ pub(super) fn render_ai_command(frame: &mut Frame, area: Rect, command: &str, in
     frame.render_widget(block, popup_area);
 
     // Command text with cursor
-    let display = Line::from(vec![
-        Span::styled("› ", Style::default().fg(theme::accent())),
-        Span::raw(command),
-        if !in_flight {
-            Span::styled("█", Style::default().fg(theme::accent()))
-        } else {
-            Span::raw("")
-        },
-    ]);
+    let mut display_spans = vec![Span::styled("› ", Style::default().fg(theme::accent()))];
+    if in_flight {
+        display_spans.push(Span::raw(command));
+    } else {
+        display_spans.extend(crate::field_edit::draw_with_caret(
+            command,
+            Style::default(),
+            Style::default().fg(theme::accent()),
+        ));
+    }
+    let display = Line::from(display_spans);
     frame.render_widget(Paragraph::new(display), inner);
 }

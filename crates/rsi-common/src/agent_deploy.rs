@@ -13,7 +13,7 @@ use uuid::Uuid;
 /// Artifacts the daemon may replace, by file name. `rsid` is mandatory; every
 /// other member is deployed (and sha-verified) when present in the binaries
 /// directory and reported in the receipt's `skipped` list when absent (#1110).
-pub const DEPLOY_BINARIES: [&str; 9] = [
+pub const DEPLOY_BINARIES: [&str; 11] = [
     "rsid",
     "rsi",
     "rsi-rpc",
@@ -22,6 +22,8 @@ pub const DEPLOY_BINARIES: [&str; 9] = [
     "rsi-contract-validate",
     "rsi-rolling-land",
     "rsi-remote",
+    "rsi-turn-shim",
+    "rsi-socket-hold",
     "rsid-supervisor.sh",
 ];
 

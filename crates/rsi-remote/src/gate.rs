@@ -242,6 +242,7 @@ mod tests {
             owner_user_id: OWNER,
             allowed_node_ids: vec![CLIENT_NODE.into()],
             project_ids: vec![],
+            ..Config::default()
         }
     }
 

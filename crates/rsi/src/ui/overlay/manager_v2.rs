@@ -606,18 +606,32 @@ fn decision_hints(state: &board::BoardState) -> String {
     )
 }
 
+/// An edit buffer with its caret: the Standard cursor and selection, or the
+/// thin bar after the text that Vim mode has always drawn.
+fn caret_or_bar(text: &str) -> Vec<Span<'static>> {
+    if crate::field_edit::standard_frame() {
+        crate::field_edit::draw(text, Style::default())
+    } else {
+        vec![Span::raw(format!("{text}▏"))]
+    }
+}
+
 fn render_answer_and_message(frame: &mut Frame, area: Rect, state: &board::BoardState) {
     let bottom = Layout::vertical([Constraint::Length(2), Constraint::Length(2)]).split(area);
     if let Some(draft) = &state.answer {
         // The full question is in the scrollable details. Keep the target and
         // answer separate from errors even when the question is very long.
+        let mut answer = vec![Span::raw("Answer: ")];
+        answer.extend(caret_or_bar(&draft.target.answer));
         frame.render_widget(
-            Paragraph::new(format!(
-                "Answering {} · {}\nAnswer: {}▏",
-                draft.target.decision_key,
-                decisions::parse_question(&draft.question).headline,
-                draft.target.answer,
-            )),
+            Paragraph::new(vec![
+                Line::from(format!(
+                    "Answering {} · {}",
+                    draft.target.decision_key,
+                    decisions::parse_question(&draft.question).headline,
+                )),
+                Line::from(answer),
+            ]),
             bottom[0],
         );
     }
@@ -682,7 +696,9 @@ fn render_policy(frame: &mut Frame, area: Rect, state: &policy::PolicyState) {
     // One line: the edit buffer while editing, else the selected row's
     // description, range and how Enter acts on it.
     let detail = if let Some((_, text)) = &state.edit {
-        Line::from(format!("Edit: {text}▏"))
+        let mut spans = vec![Span::raw("Edit: ")];
+        spans.extend(caret_or_bar(text));
+        Line::from(spans)
     } else {
         rows.get(state.selected)
             .map(|row| Line::from(policy_row_help(row)).style(hints()))

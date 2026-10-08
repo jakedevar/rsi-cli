@@ -1,10 +1,11 @@
 [Unit]
 Description=RSI daemon
-Requires=rsi-workers.slice
-After=rsi-workers.slice
+Requires=rsi-workers.slice rsid.socket
+After=rsi-workers.slice rsid.socket
 
 [Service]
 Type=simple
+Sockets=rsid.socket
 WorkingDirectory=%h
 Environment="PATH=%h/.local/bin:%h/.bun/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 EnvironmentFile=%h/.config/rsi/rsid.env

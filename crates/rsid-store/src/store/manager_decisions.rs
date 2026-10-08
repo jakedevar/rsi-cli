@@ -3,13 +3,53 @@
 use rsi_common::harness_manager::HarnessManagerConfigV1;
 use rsi_common::harness_manager_v2::*;
 use rusqlite::{Transaction, TransactionBehavior};
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::Store;
 use super::harness_manager_v2::{fingerprint, refused};
-use super::manager_coordinator::ManagerDecisionDeliveryV2;
+use super::manager_coordinator::{ManagerDecisionDeliveryV2, ManagerDeliveryTopologyV2};
 use crate::error::Result;
+
+/// Key prefix of the decision records the daemon files for topology nodes
+/// (#1641 S3c). Deliberately not one of the reserved gate prefixes.
+pub const TOPOLOGY_DECISION_PREFIX: &str = "topology:";
+
+/// One daemon-filed topology decision (see
+/// [`Store::manager_v2_put_topology_decision`]).
+#[derive(Debug, Clone)]
+pub struct TopologyDecisionRequest {
+    /// `topology:<execution>:<node>:<iteration>:<attempt>[:q<n>]`.
+    pub key: String,
+    pub epic: Uuid,
+    pub question: String,
+    /// Where the question came from (execution, node, blocker evidence),
+    /// recorded as the note of the "asked" audit entry. Kept apart from
+    /// `question` so the daemon phrase scan reads only the asker's own words.
+    pub context: Option<String>,
+    /// The gate class the node declared, if any; absent sends the record
+    /// through the daemon phrase scan only.
+    pub gate: Option<String>,
+    /// Digest of the thing being asked about (the handoff text, the review
+    /// output). It is folded into the record's `target_digest`, so a restart
+    /// recognises its own record (see [`topology_decision_digest`]).
+    pub source_digest: String,
+    /// Audit identity of the asker (`kind: topology_executor`, ids).
+    pub actor: Value,
+}
+
+/// The `target_digest` of a topology decision: a function of its key and of
+/// what it asks about, so the executor can tell its own pending record from an
+/// earlier question of the same attempt.
+///
+/// # Errors
+/// A payload over the ledger's size limit.
+pub fn topology_decision_digest(key: &str, source_digest: &str) -> Result<String> {
+    super::harness_manager_v2::fingerprint(&json!({
+        "topology_decision": key,
+        "source_digest": source_digest,
+    }))
+}
 
 impl Store {
     /// The RPC is operator-only. The callback is the ledger's exact work-gate
@@ -92,48 +132,18 @@ impl Store {
         } else if let Some(target) =
             self.manager_v2_record(&config, "decision_target", &request.decision_key)?
         {
-            if fingerprint(&target.payload)? != request.target_digest {
-                return Err(refused("manager_v2_decision_target_changed"));
-            }
-            let delivery_id = Uuid::new_v5(
-                &Uuid::NAMESPACE_OID,
-                format!(
-                    "manager-answer:{}:{}:{}:{}",
-                    config.project_id,
-                    config.manager_session_id,
-                    config.row_version,
-                    request.idempotency_key
-                )
-                .as_bytes(),
-            );
-            let delivery = ManagerDecisionDeliveryV2 {
-                project_id: config.project_id,
-                manager_session_id: config.manager_session_id,
-                scope_version: config.row_version,
-                policy_version: grant.row_version,
-                key: delivery_id.to_string(),
-                decision_key: request.decision_key.clone(),
-                epic_id: Some(epic),
-                target_digest: request.target_digest.clone(),
-                target: target.payload,
-                answer: request.answer.clone(),
-                state: "queued".into(),
-                effect_started: false,
-                boot_id: None,
-                outcome: None,
-            };
-            self.manager_v2_put_record(
+            queued_delivery = Some(self.manager_v2_queue_decision_delivery(
                 &config,
-                "decision_delivery",
-                &delivery.key,
-                Some(epic),
-                0,
-                &serde_json::to_value(&delivery)?,
-            )?;
-            decision["status"] = json!("answer_queued");
-            decision["answer"] = json!(request.answer);
-            decision["delivery"] = json!({"state":"queued","delivery_id":delivery_id});
-            queued_delivery = Some(delivery);
+                grant.row_version,
+                epic,
+                &request.decision_key,
+                &request.target_digest,
+                &request.answer,
+                &request.idempotency_key,
+                target.payload,
+                None,
+                &mut decision,
+            )?);
         } else {
             // Manager questions are delivered as attributed OPERATOR answers
             // in the scoped decision inbox. No v1 agent sender is fabricated.
@@ -186,10 +196,134 @@ impl Store {
         Ok(receipt)
     }
 
+    /// Record the answer's durable delivery obligation for an exact session
+    /// target and mark `decision` `answer_queued`. Shared by the operator's
+    /// answer and a manager's ruling (#1641 S3b), so both reach the session
+    /// through the coordinator's one delivery path.
+    #[allow(clippy::too_many_arguments)] // one exact answer: scope, target, answer, idempotency
+    pub(super) fn manager_v2_queue_decision_delivery(
+        &self,
+        config: &HarnessManagerConfigV1,
+        policy_version: i64,
+        epic: Uuid,
+        decision_key: &str,
+        target_digest: &str,
+        answer: &str,
+        idempotency_key: &str,
+        target: serde_json::Value,
+        topology: Option<ManagerDeliveryTopologyV2>,
+        decision: &mut serde_json::Value,
+    ) -> Result<ManagerDecisionDeliveryV2> {
+        if fingerprint(&target)? != target_digest {
+            return Err(refused("manager_v2_decision_target_changed"));
+        }
+        let delivery_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!(
+                "manager-answer:{}:{}:{}:{}",
+                config.project_id, config.manager_session_id, config.row_version, idempotency_key
+            )
+            .as_bytes(),
+        );
+        let delivery = ManagerDecisionDeliveryV2 {
+            project_id: config.project_id,
+            manager_session_id: config.manager_session_id,
+            scope_version: config.row_version,
+            policy_version,
+            key: delivery_id.to_string(),
+            decision_key: decision_key.to_owned(),
+            epic_id: Some(epic),
+            target_digest: target_digest.to_owned(),
+            target,
+            answer: answer.to_owned(),
+            state: "queued".into(),
+            effect_started: false,
+            boot_id: None,
+            outcome: None,
+            topology,
+        };
+        self.manager_v2_put_record(
+            config,
+            "decision_delivery",
+            &delivery.key,
+            Some(epic),
+            0,
+            &serde_json::to_value(&delivery)?,
+        )?;
+        decision["status"] = json!("answer_queued");
+        decision["answer"] = json!(answer);
+        decision["delivery"] = json!({"state":"queued","delivery_id":delivery_id});
+        Ok(delivery)
+    }
+
+    /// The live topology node attempt whose own question `session` is
+    /// holding, as an exact binding for a manager ruling (#1704). `None` when
+    /// the session is not a live node of a non-cancelling execution.
+    pub(crate) fn manager_v2_topology_binding(
+        &self,
+        session: Uuid,
+    ) -> Result<Option<ManagerDeliveryTopologyV2>> {
+        use rusqlite::OptionalExtension;
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT a.execution_id,a.id FROM topology_node_attempts a
+                 JOIN topology_executions e ON e.id=a.execution_id
+                 WHERE a.session_id=?1 AND a.node_kind='session'
+                   AND a.status IN ('reserved','launching','running','waiting')
+                   AND e.status IN ('accepted','running','blocked')
+                 ORDER BY a.created_at DESC LIMIT 1",
+                [session.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(execution, attempt)| {
+            Ok(ManagerDeliveryTopologyV2 {
+                execution_id: Uuid::parse_str(&execution)
+                    .map_err(|_| refused("manager_v2_invalid_stored_identity"))?,
+                attempt_id: Uuid::parse_str(&attempt)
+                    .map_err(|_| refused("manager_v2_invalid_stored_identity"))?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Whether the exact attempt and execution a manager ruling was bound to
+    /// are still live. A delivery without a binding is live only when the
+    /// decision's audit identity says the operator answered it. A manager
+    /// ruling queued before the binding existed (a row from the e81fef92a
+    /// producer, or a pre-effect claim recovered after restart) has no binding
+    /// to verify, so it fails closed instead of inheriting the operator's
+    /// exemption (#1704). Origin is read from the decision's `answered_by`
+    /// audit actor, never inferred from the missing binding alone.
+    fn manager_v2_delivery_topology_live(&self, delivery: &ManagerDecisionDeliveryV2) -> bool {
+        let Some(bound) = &delivery.topology else {
+            return self
+                .manager_v2_record(
+                    &delivery_journal_scope(delivery),
+                    "decision",
+                    &delivery.decision_key,
+                )
+                .ok()
+                .flatten()
+                .is_some_and(|decision| decision.payload["answered_by"]["kind"] == "operator");
+        };
+        self.manager_v2_topology_binding(
+            delivery.target["session_id"]
+                .as_str()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .unwrap_or_default(),
+        )
+        .is_ok_and(|live| live.as_ref() == Some(bound))
+    }
+
     pub fn manager_v2_check_decision_target(
         &self,
         delivery: &ManagerDecisionDeliveryV2,
     ) -> Result<HarnessManagerConfigV1> {
+        if !self.manager_v2_delivery_topology_live(delivery) {
+            return Err(refused("manager_v2_decision_topology_revoked"));
+        }
         let config = self
             .get_harness_manager(delivery.project_id)?
             .ok_or_else(|| refused("manager_v2_decision_scope_changed"))?;
@@ -324,6 +458,12 @@ impl Store {
                     json!(match delivery.state.as_str() {
                         "delivered" => "answered",
                         "enqueued" => "answer_sent",
+                        // #1704: the node's execution ended or is being
+                        // cancelled, so nothing is left to answer or block.
+                        "blocked" | "revoked"
+                            if !delivery.effect_started
+                                && !self.manager_v2_delivery_topology_live(delivery) =>
+                            "target_unavailable",
                         "blocked" | "revoked" if approval_unavailable => "blocked",
                         "blocked" | "revoked" if !delivery.effect_started => "pending",
                         _ => "answer_queued",

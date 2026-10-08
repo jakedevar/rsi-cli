@@ -25,6 +25,22 @@ pub(super) async fn handle_label_picker_key(app: &mut App, key: KeyEvent) {
         _ => return,
     };
 
+    // Standard editing: every printable key types into the filter, with a
+    // real cursor and selection.
+    match app.edit_field(key, |overlay| match overlay {
+        OverlayState::LabelPicker { filter, .. } => Some(filter),
+        _ => None,
+    }) {
+        crate::field_edit::FieldKey::Edited => {
+            if let OverlayState::LabelPicker { selected_index, .. } = &mut app.overlay {
+                *selected_index = 0;
+            }
+            return;
+        }
+        crate::field_edit::FieldKey::Moved => return,
+        crate::field_edit::FieldKey::Ignored => {}
+    }
+
     let filtered_count = get_label_picker_filtered_count(app, &filter);
 
     // Ctrl+n = create new label

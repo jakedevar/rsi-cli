@@ -92,15 +92,17 @@ pub(super) fn render_ai_chat(
     frame.render_widget(sep, chunks[1]);
 
     // Input line
-    let input_line = Line::from(vec![
-        Span::styled("› ", Style::default().fg(theme::accent())),
-        Span::raw(input),
-        if !in_flight {
-            Span::styled("█", Style::default().fg(theme::accent()))
-        } else {
-            Span::raw("")
-        },
-    ]);
+    let mut input_spans = vec![Span::styled("› ", Style::default().fg(theme::accent()))];
+    if in_flight {
+        input_spans.push(Span::raw(input));
+    } else {
+        input_spans.extend(crate::field_edit::draw_with_caret(
+            input,
+            Style::default(),
+            Style::default().fg(theme::accent()),
+        ));
+    }
+    let input_line = Line::from(input_spans);
     frame.render_widget(Paragraph::new(input_line), chunks[2]);
 
     // Hint line

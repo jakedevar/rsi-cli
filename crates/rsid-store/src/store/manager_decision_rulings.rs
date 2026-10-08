@@ -15,7 +15,10 @@ use uuid::Uuid;
 
 use super::Store;
 use super::harness_manager_v2::{ManagerAuthorityV2, ManagerRecordV2, now, refused};
-use super::manager_ledger::record_row;
+use super::manager_decisions::{
+    TOPOLOGY_DECISION_PREFIX, TopologyDecisionRequest, topology_decision_digest,
+};
+use super::manager_ledger::{DecisionRecord, record_row};
 use super::portfolio_nodes::node_row_on;
 use crate::error::Result;
 
@@ -192,16 +195,25 @@ fn scan_decision_gate(question: &str) -> Option<&'static str> {
 }
 
 /// Classify one decision record. `has_target` is true when the daemon created
-/// the record for an exact session question or approval.
+/// the record for an exact session question or approval. `topology_node` is
+/// true when the key names the pending question of a live topology node
+/// session (#1641 S3b): that one question is then classified by its declared
+/// gate and the phrase scan like a plain record, so the on-call manager may
+/// rule on it. Every other daemon-created key stays a reserved gate.
 pub(crate) fn classify_decision(
     key: &str,
     payload: &Value,
     has_target: bool,
+    topology_node: bool,
 ) -> Option<DecisionGate> {
-    if has_target
-        || key.starts_with("accept:")
-        || key.starts_with("question:")
-        || key.starts_with("approval:")
+    // A node question is rulable only with its exact answer target: without
+    // one the answer could not be delivered to the same session.
+    let node_question = topology_node && has_target && key.starts_with("question:");
+    if !node_question
+        && (has_target
+            || key.starts_with("accept:")
+            || key.starts_with("question:")
+            || key.starts_with("approval:"))
     {
         return Some(DecisionGate {
             class: "human_approval",
@@ -214,10 +226,23 @@ pub(crate) fn classify_decision(
             source: "declared",
         });
     }
-    scan_decision_gate(payload["question"].as_str()?).map(|class| DecisionGate {
-        class,
-        source: "daemon_scan",
-    })
+    let question = payload["question"].as_str()?;
+    // The producer-published text (headers, option labels and descriptions)
+    // is part of the question. A node question without it was projected before
+    // the full scan existed, so it cannot be proven free of a real gate.
+    let gate_text = payload["gate_text"].as_str();
+    if node_question && gate_text.is_none() {
+        return Some(DecisionGate {
+            class: "human_approval",
+            source: "reserved_key",
+        });
+    }
+    scan_decision_gate(question)
+        .or_else(|| gate_text.and_then(scan_decision_gate))
+        .map(|class| DecisionGate {
+            class,
+            source: "daemon_scan",
+        })
 }
 
 /// Append one audit entry, keeping the first (the question) and the newest.
@@ -365,6 +390,40 @@ impl Store {
         )?)
     }
 
+    /// True when `key` is `question:<session>` and that session is the node of
+    /// a live topology execution attempt (#1641 S3b). Read from rows each time.
+    pub(crate) fn manager_v2_topology_node_question(&self, key: &str) -> Result<bool> {
+        let Some(session) = key.strip_prefix("question:") else {
+            return Ok(false);
+        };
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM topology_node_attempts a
+             JOIN topology_executions e ON e.id=a.execution_id
+             WHERE a.session_id=?1 AND a.node_kind='session'
+               AND a.status IN ('reserved','launching','running','waiting')
+               AND e.status IN ('accepted','running','blocked'))",
+            params![session],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// `classify_decision` with the topology-node fact read from the store.
+    pub(crate) fn manager_v2_classify_decision(
+        &self,
+        key: &str,
+        payload: &Value,
+        has_target: bool,
+    ) -> Result<Option<DecisionGate>> {
+        let node = has_target && self.manager_v2_topology_node_question(key)?;
+        Ok(classify_decision(key, payload, has_target, node))
+    }
+
+    /// Whether a plain decision record (no exact session target) is the
+    /// operator's alone: it declares a gate or names one in its question.
+    pub fn manager_v2_decision_is_operator_gate(&self, key: &str, payload: &Value) -> bool {
+        classify_decision(key, payload, false, false).is_some()
+    }
+
     /// `manager_gone` or `older_than_days` for an open record, else `None`.
     fn manager_v2_decision_stale_reason(
         &self,
@@ -390,7 +449,7 @@ impl Store {
     ) -> Result<()> {
         let key = row["key"].as_str().unwrap_or_default().to_owned();
         let status = row["status"].as_str().unwrap_or_default().to_owned();
-        let gate = classify_decision(&key, row, has_target);
+        let gate = self.manager_v2_classify_decision(&key, row, has_target)?;
         let pending = status == "pending" && !archived;
         let blocking = matches!(status.as_str(), "pending" | "answer_queued") && !archived;
         row["gate"] = json!(gate.map(|g| g.class));
@@ -556,7 +615,14 @@ impl Store {
         let has_target = self
             .manager_v2_record(&owner_config, "decision_target", key)?
             .is_some();
-        let gate = classify_decision(key, &record.payload, has_target);
+        let ruling = matches!(change, ManagerUpdateV2::DecisionRuling { .. });
+        // Only a ruling may treat a live topology node's question as a plain
+        // record; withdrawing it would strand the node, so it stays reserved.
+        let gate = if ruling {
+            self.manager_v2_classify_decision(key, &record.payload, has_target)?
+        } else {
+            classify_decision(key, &record.payload, has_target, false)
+        };
         if let ManagerUpdateV2::DecisionRuling { target_digest, .. } = change {
             if record.payload["target_digest"] != *target_digest {
                 return Err(refused("manager_v2_decision_changed"));
@@ -642,15 +708,60 @@ impl Store {
         let settlement = self.manager_v2_resolve_settlement(a, &request.change, false)?;
         let actor = self.manager_v2_decision_actor(a)?;
         let mut decision = settlement.record.payload.clone();
+        let mut queued_delivery = None;
         let (event, key) = match &request.change {
-            ManagerUpdateV2::DecisionRuling { key, answer, .. } => {
-                decision["status"] = json!("answered");
-                decision["answer"] = json!(answer);
-                decision["delivery"] = json!({
-                    "state":"available_in_scoped_inbox","actor":"manager",
-                    "actor_kind":actor["kind"],"request_id":decision["request_id"],
-                    "work_key":decision["work_key"],"target_digest":decision["target_digest"]
-                });
+            ManagerUpdateV2::DecisionRuling {
+                key,
+                answer,
+                target_digest,
+                ..
+            } => {
+                // #1641 S3b: a ruling on a record with an exact session target
+                // (a topology node's question) carries the same durable
+                // delivery obligation as the operator's answer, so the
+                // coordinator resumes that session with the manager's answer.
+                if let Some(target) =
+                    self.manager_v2_record(&settlement.owner, "decision_target", key)?
+                {
+                    let grant = self
+                        .get_harness_manager_policy(settlement.owner.project_id)?
+                        .filter(|grant| !grant.revoked)
+                        .ok_or_else(|| refused("manager_v2_explicit_grant_required"))?;
+                    queued_delivery = Some(
+                        self.manager_v2_queue_decision_delivery(
+                            &settlement.owner,
+                            grant.row_version,
+                            settlement.epic,
+                            key,
+                            target_digest,
+                            answer,
+                            &request.idempotency_key,
+                            target.payload,
+                            // The classifier admits a ruling on an exact session
+                            // target only for a live topology node's question;
+                            // bind to that exact attempt, or refuse.
+                            Some(
+                                key.strip_prefix("question:")
+                                    .and_then(|id| Uuid::parse_str(id).ok())
+                                    .map(|session| self.manager_v2_topology_binding(session))
+                                    .transpose()?
+                                    .flatten()
+                                    .ok_or_else(|| {
+                                        refused("manager_v2_decision_topology_revoked")
+                                    })?,
+                            ),
+                            &mut decision,
+                        )?,
+                    );
+                } else {
+                    decision["status"] = json!("answered");
+                    decision["answer"] = json!(answer);
+                    decision["delivery"] = json!({
+                        "state":"available_in_scoped_inbox","actor":"manager",
+                        "actor_kind":actor["kind"],"request_id":decision["request_id"],
+                        "work_key":decision["work_key"],"target_digest":decision["target_digest"]
+                    });
+                }
                 decision["answered_by"] = actor.clone();
                 push_history(&mut decision, "ruled", &actor, Some(settlement.relation));
                 ("decision_ruling", key)
@@ -670,6 +781,9 @@ impl Store {
             settlement.record.row_version,
             &decision,
         )?;
+        if let Some(delivery) = &queued_delivery {
+            self.manager_v2_check_decision_target(delivery)?;
+        }
         let sequence = self.manager_v2_event(
             &settlement.owner,
             Some(caller),
@@ -751,7 +865,9 @@ impl Store {
                 let has_target = self
                     .manager_v2_record(&owner, "decision_target", &key)?
                     .is_some();
-                if classify_decision(&key, &record.payload, has_target).is_some()
+                if self
+                    .manager_v2_classify_decision(&key, &record.payload, has_target)?
+                    .is_some()
                     || record.epic_id.is_some_and(|e| !owner.epic_ids.contains(&e))
                 {
                     continue;
@@ -835,7 +951,7 @@ impl Store {
             let has_target = self
                 .manager_v2_record(&config, "decision_target", &key)?
                 .is_some();
-            let gate = classify_decision(&key, &payload, has_target);
+            let gate = self.manager_v2_classify_decision(&key, &payload, has_target)?;
             rows.push(StaleManagerDecisionV2 {
                 decision: ManagerDecisionRefV2 {
                     project_id: project,
@@ -961,6 +1077,119 @@ impl Store {
             });
         }
         Ok(ArchiveStaleManagerDecisionsResponseV2 { archived, skipped })
+    }
+
+    /// File one decision record for a topology node (#1641 S3c): a node's
+    /// BLOCKED handoff that names a question, or a review that ran out of
+    /// rounds. The daemon authors it on the project manager's ledger under a
+    /// `topology:` key. That prefix is not a reserved gate key, so the record
+    /// is classified like any manager question: its declared `gate` (or the
+    /// daemon phrase scan of the question) sends it to the operator, anything
+    /// else is the on-call manager's to rule on. Idempotent per key: an
+    /// existing record is returned unchanged.
+    pub fn manager_v2_put_topology_decision(
+        &self,
+        config: &HarnessManagerConfigV1,
+        request: &TopologyDecisionRequest,
+    ) -> Result<ManagerRecordV2> {
+        if !request.key.starts_with(TOPOLOGY_DECISION_PREFIX) {
+            return Err(refused("manager_v2_reserved_decision_key"));
+        }
+        if request.question.trim().is_empty() {
+            return Err(refused("manager_v2_decision_question_required"));
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if let Some(existing) = self.manager_v2_record(config, "decision", &request.key)? {
+            tx.commit()?;
+            return Ok(existing);
+        }
+        if !config.epic_ids.contains(&request.epic) {
+            return Err(refused("manager_v2_scope_denied"));
+        }
+        self.manager_epic(config.project_id, request.epic)?;
+        let mut decision = serde_json::to_value(DecisionRecord {
+            key: request.key.clone(),
+            epic_id: request.epic,
+            question: request.question.clone(),
+            request_id: None,
+            work_key: None,
+            target_digest: topology_decision_digest(&request.key, &request.source_digest)?,
+            target_row_version: None,
+            request_row_version: None,
+            status: "pending".into(),
+            answer: None,
+            delivery: None,
+            gate: request.gate.clone(),
+            options: Vec::new(),
+            asked_by: Some(request.actor.clone()),
+            answered_by: None,
+            history: Vec::new(),
+        })?;
+        let mut actor = request.actor.clone();
+        actor["at"] = json!(now());
+        push_history(&mut decision, "asked", &actor, request.context.as_deref());
+        let record = self.manager_v2_put_record(
+            config,
+            "decision",
+            &request.key,
+            Some(request.epic),
+            0,
+            &decision,
+        )?;
+        self.manager_v2_event(
+            config,
+            None,
+            "decision_asked",
+            &request.key,
+            record.row_version,
+            &decision,
+        )?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    /// Withdraw a still-pending topology decision whose node no longer waits
+    /// (the execution was cancelled): a pending record would otherwise keep
+    /// holding the Epic's manager launches. Returns whether it withdrew one.
+    pub fn manager_v2_withdraw_topology_decision(
+        &self,
+        config: &HarnessManagerConfigV1,
+        key: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        if !key.starts_with(TOPOLOGY_DECISION_PREFIX) {
+            return Err(refused("manager_v2_reserved_decision_key"));
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let Some(record) = self.manager_v2_record(config, "decision", key)? else {
+            return Ok(false);
+        };
+        if record.archived || record.payload["status"] != "pending" {
+            return Ok(false);
+        }
+        let mut decision = record.payload.clone();
+        decision["status"] = json!("withdrawn");
+        let actor =
+            json!({"kind":"topology_executor","session_id":null,"node_label":null,"at":now()});
+        push_history(&mut decision, "withdrawn", &actor, Some(reason));
+        let updated = self.manager_v2_put_record(
+            config,
+            "decision",
+            key,
+            record.epic_id,
+            record.row_version,
+            &decision,
+        )?;
+        self.manager_v2_event(
+            config,
+            None,
+            "decision_withdrawn",
+            key,
+            updated.row_version,
+            &decision,
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// A pending-record lookup the tests and the TUI share: the exact record.

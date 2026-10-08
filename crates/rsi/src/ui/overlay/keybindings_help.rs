@@ -56,7 +56,7 @@ pub(crate) fn contextual_lines(app: &App, filter: &str) -> Vec<Line<'static>> {
     // Overlay-owned keys come from the shared discovery catalog. They are
     // rendered and searchable here but never dispatched through the registry.
     if let Some(route) = overlay_help_for(&context) {
-        for entry in route.entries() {
+        for entry in &route.entries_for(app.standard_editing()) {
             if matches(format!(
                 "{} {} {} {:?}",
                 route.title, entry.keys, entry.label, entry.role
@@ -208,7 +208,8 @@ fn symbols_lines(filter: &str) -> Vec<Line<'static>> {
 
 fn help_footer(filter: &str, search_active: bool) -> String {
     let navigation = if search_active {
-        format!("/{filter}█")
+        // Standard editing marks the cursor and selection inside the filter.
+        format!("/{}", crate::field_edit::mark(filter, "█"))
     } else if filter.is_empty() {
         "/ filter · j/k · Esc/q/? return".to_string()
     } else {
@@ -257,7 +258,11 @@ pub fn render_keybindings_help(
     if content_width == 0 || inner.height == 0 {
         return;
     }
-    let footer = Paragraph::new(help_footer(filter, search_active))
+    let footer_text = help_footer(filter, search_active);
+    let mut in_selection = false;
+    let footer_spans =
+        crate::field_edit::marked_row(&footer_text, &mut in_selection, Style::default());
+    let footer = Paragraph::new(Line::from(footer_spans))
         .style(Style::default().fg(theme::subtext1()))
         .wrap(Wrap { trim: false });
     let footer_height = footer
@@ -592,5 +597,28 @@ mod tests {
             .find(|action| action.request.id == crate::action_registry::ActionId::ContextHelp)
             .expect("help remains available in Prompt Creator");
         assert!(binding_text(&prompt_help, &prompt_context).contains('?'));
+    }
+
+    #[test]
+    fn standard_footer_draws_the_filter_cursor_where_it_sits() {
+        let mut edit = crate::field_edit::FieldEdit::default();
+        let mut text = String::from("abc");
+        let key =
+            |code| crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        edit.handle_key(&mut text, key(crossterm::event::KeyCode::Home));
+        let _frame = crate::field_edit::begin_frame(Some(edit));
+        let footer = help_footer("abc", true);
+        let mut in_selection = false;
+        let spans = crate::field_edit::marked_row(&footer, &mut in_selection, Style::default());
+        let drawn: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            drawn.starts_with("/\u{258f}abc"),
+            "caret before the first character: {drawn}"
+        );
+    }
+
+    #[test]
+    fn vim_footer_keeps_the_trailing_block() {
+        assert!(help_footer("abc", true).starts_with("/abc█"));
     }
 }

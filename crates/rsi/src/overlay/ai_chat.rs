@@ -8,6 +8,21 @@ use crate::types::OverlayState;
 use crossterm::event::{KeyCode, KeyEvent};
 
 pub(super) async fn handle_ai_chat_key(app: &mut App, key: KeyEvent) -> bool {
+    // Standard editing: a real cursor and selection in the question (not
+    // while the request is in flight, when only Esc is live).
+    if matches!(
+        app.overlay,
+        OverlayState::AiChat {
+            in_flight: false,
+            ..
+        }
+    ) && app.edit_field(key, |overlay| match overlay {
+        OverlayState::AiChat { input, .. } => Some(input),
+        _ => None,
+    }) != crate::field_edit::FieldKey::Ignored
+    {
+        return true;
+    }
     let (messages, input, source_text, in_flight, scroll_offset) = match &mut app.overlay {
         OverlayState::AiChat {
             messages,

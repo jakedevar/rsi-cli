@@ -6,6 +6,8 @@ members = [
     "crates/rsid-store",
     "crates/rsi",
     "crates/rsi-common",
+    "crates/rsi-turn-shim",
+    "crates/rsi-socket-hold",
     "crates/rsi-signal",
     "crates/rsi-graph",
     "crates/rsi-eval",

@@ -1,0 +1,13 @@
+[Unit]
+Description=RSI daemon front door
+
+[Socket]
+ListenStream=%h/.rsi/daemon.sock
+SocketMode=0600
+DirectoryMode=0700
+Accept=no
+Service=rsid.service
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

@@ -54,6 +54,7 @@ pub enum ActionId {
     IssueOpenSession,
     IssueRefresh,
     IssueRunPoll,
+    IssueRunTopology,
     IssueSelectFormValue,
     IssueRetryMutation,
     IssueInspectorNextSection,
@@ -129,6 +130,7 @@ pub enum ActionId {
     Diagnostics,
     Graph,
     TopologyResolve,
+    TopologyRun,
     Dag,
     Context,
     Card,
@@ -708,7 +710,8 @@ fn settings_row_facts(app: &App) -> SettingsRowFacts {
             facts.editable = facts.exists || (index == 0 && count == 0);
             facts.enableable = facts.exists;
         }
-        SettingsSection::ModelControl
+        SettingsSection::EditingMode
+        | SettingsSection::ModelControl
         | SettingsSection::RetriesRecovery
         | SettingsSection::StallDetection
         | SettingsSection::Orchestration
@@ -1305,6 +1308,7 @@ const SETTINGS_RESET: &[ActionBinding] = &[binding("Delete", ActionRoute::Settin
 const ISSUE_OPEN: &[ActionBinding] = &[binding("Enter", ActionRoute::IssueTracker)];
 const ISSUE_REFRESH: &[ActionBinding] = &[binding("r", ActionRoute::IssueTracker)];
 const ISSUE_RUN_POLL: &[ActionBinding] = &[binding("P", ActionRoute::IssueTracker)];
+const ISSUE_RUN_TOPOLOGY: &[ActionBinding] = &[binding("T", ActionRoute::IssueTracker)];
 const ISSUE_SELECT_FORM_VALUE: &[ActionBinding] = &[binding("Enter", ActionRoute::IssueTracker)];
 const ISSUE_RETRY_MUTATION: &[ActionBinding] = &[binding("Ctrl-Enter", ActionRoute::IssueTracker)];
 const ISSUE_INSPECTOR_NEXT_SECTION: &[ActionBinding] = &[binding("Tab", ActionRoute::IssueTracker)];
@@ -1997,6 +2001,17 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         command_aliases: &[],
         command_argument: CommandArgument::None,
         availability: AvailabilitySelector::IssueSyncPoll,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::IssueRunTopology,
+        label: "Run topology on issue",
+        summary: "Starts the issue-implement-review-land topology on the selected issue under its project's Epic and opens the run view.",
+        category: "ISSUES",
+        bindings: ISSUE_RUN_TOPOLOGY,
+        command_aliases: &[],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::IssueLocalActiveSelection,
         show_in_help: true,
     },
     ActionDescriptor {
@@ -2717,6 +2732,17 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         show_in_help: false,
     },
     ActionDescriptor {
+        id: ActionId::TopologyRun,
+        label: "Run a topology on the focused Issue",
+        summary: "Starts a stored topology on the focused Issue in the Issues workspace: `:topology run <name> [<epic>]`. The Epic defaults to the focused or only live Epic of the Issue's project; the run view opens on the started execution.",
+        category: "OPERATOR VIEWS",
+        bindings: &[],
+        command_aliases: &["topology"],
+        command_argument: CommandArgument::Optional,
+        availability: AvailabilitySelector::Always,
+        show_in_help: false,
+    },
+    ActionDescriptor {
         id: ActionId::Dag,
         label: "Open recursive DAG",
         summary: "Opens the recursive DAG browser.",
@@ -2851,7 +2877,7 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
     ActionDescriptor {
         id: ActionId::ManagerGlobal,
         label: "Show global manager grant",
-        summary: "Shows the active global manager grant; `:manager global set <active|sessions|containers|spend|groups> <value>` changes one per-project cap; `:manager global configure <JSON>` sends a full typed grant request.",
+        summary: "Shows the active global manager grant; `:manager global set <active|sessions|containers|spend|groups> <value>` changes one per-project cap; `:manager global add-project <names...>` adds projects to the grant; `:manager global configure <JSON>` sends a full typed grant request.",
         category: "MANAGER",
         bindings: &[],
         command_aliases: &["manager global"],
@@ -4729,6 +4755,70 @@ impl OverlayHelpRoute {
     pub fn entries(&self) -> impl Iterator<Item = &'static OverlayHelpEntry> + '_ {
         self.groups.iter().flat_map(|group| group.iter())
     }
+
+    /// The rows this route shows under the operator's editing mode (#1628).
+    /// Vim shows `entries()` unchanged. Standard swaps the shared Vim text
+    /// groups for their Standard counterparts and rewrites or drops the rows
+    /// that only exist in Vim's Normal mode.
+    #[must_use]
+    pub fn entries_for(&self, standard: bool) -> Vec<OverlayHelpEntry> {
+        if !standard {
+            return self.entries().copied().collect();
+        }
+        if self.class == OverlayHelpClass::FileViewer {
+            return FILE_VIEWER_STANDARD.to_vec();
+        }
+        let mut rows = Vec::new();
+        for group in self.groups {
+            if std::ptr::eq(*group, TEXT_SURFACE) {
+                rows.extend_from_slice(TEXT_SURFACE_STANDARD);
+            } else if std::ptr::eq(*group, PROMPT_TEXT_TOOLS) {
+                rows.extend_from_slice(PROMPT_TEXT_TOOLS_STANDARD);
+            } else {
+                for entry in *group {
+                    match standard_rewrite(entry) {
+                        StandardRow::Keep => rows.push(*entry),
+                        StandardRow::Replace(row) => rows.push(row),
+                        StandardRow::Drop => {}
+                    }
+                }
+            }
+        }
+        rows
+    }
+}
+
+/// What a Vim-mode help row becomes under Standard editing.
+enum StandardRow {
+    Keep,
+    Replace(OverlayHelpEntry),
+    Drop,
+}
+
+/// Rows that name Vim's Normal mode have no Standard counterpart as written:
+/// there is no Normal mode, so they are reworded or removed.
+fn standard_rewrite(entry: &OverlayHelpEntry) -> StandardRow {
+    match (entry.keys, entry.label) {
+        ("Esc (normal mode), Ctrl-Q", _) => StandardRow::Replace(close("Esc, Ctrl-Q", "Close")),
+        ("Esc", "Save draft and close (normal mode)") => {
+            StandardRow::Replace(close("Esc", "Save draft and close"))
+        }
+        ("Esc", "Return to normal mode") => {
+            StandardRow::Replace(close("Esc", "Save draft and close"))
+        }
+        ("Enter", "Insert newline (insert mode)") => {
+            StandardRow::Replace(edit("Enter", "Insert newline"))
+        }
+        ("Ctrl-O, Tab (normal)", label) => StandardRow::Replace(nav("Ctrl-O", label)),
+        ("Type, Backspace" | "Type / Backspace", label) => {
+            StandardRow::Replace(edit("Type, arrows, Backspace / Delete, Ctrl-A", label))
+        }
+        ("? (normal)", _) => StandardRow::Replace(act("Ctrl-Alt-G", "Show this help")),
+        ("Space N (normal)", _) | ("Space e", "Close explorer (viewer normal mode)") => {
+            StandardRow::Drop
+        }
+        _ => StandardRow::Keep,
+    }
 }
 
 /// `overlay::list::handle_list_nav_key`.
@@ -4751,6 +4841,31 @@ const TEXT_SURFACE: &[OverlayHelpEntry] = &[
     nav("Esc", "Return to normal mode (insert mode)"),
     nav("h j k l, w b", "Move cursor (normal mode)"),
 ];
+/// `input_surface::standard`: the non-modal text surface (#1628).
+const TEXT_SURFACE_STANDARD: &[OverlayHelpEntry] = &[
+    edit("Type, Left / Right, Home / End", "Edit and move the cursor"),
+    nav("Ctrl-Left / Ctrl-Right", "Move by word"),
+    edit("Shift + movement, Ctrl-A", "Select; Ctrl-A selects all"),
+    edit("Ctrl-C / Ctrl-X / Ctrl-V", "Copy / cut / paste"),
+    edit("Ctrl-Z / Ctrl-Shift-Z", "Undo / redo"),
+    edit("Backspace / Delete", "Delete a character (Ctrl: a word)"),
+    nav("Esc", "Clear the selection, then close"),
+];
+/// The file viewer under Standard editing: always an editor, no Vim modes.
+const FILE_VIEWER_STANDARD: &[OverlayHelpEntry] = &[
+    close("Esc, Ctrl-Q", "Close viewer"),
+    act("Ctrl-S", "Save file"),
+    act("Ctrl-F", "Find"),
+    nav("F3 / Shift-F3", "Next / previous match"),
+    act("Alt-M", "Toggle markdown preview"),
+    nav("PageDown / PageUp", "Scroll one page"),
+    edit("Type, Left / Right, Home / End", "Edit and move the cursor"),
+    nav("Ctrl-Left / Ctrl-Right", "Move by word"),
+    edit("Shift + movement, Ctrl-A", "Select; Ctrl-A selects all"),
+    edit("Ctrl-C / Ctrl-X / Ctrl-V", "Copy / cut / paste"),
+    edit("Ctrl-Z / Ctrl-Shift-Z", "Undo / redo"),
+    nav("Ctrl-H", "Back to the session list"),
+];
 const FORM_FIELDS: &[OverlayHelpEntry] = &[
     nav("Tab / Shift-Tab", "Next / previous field"),
     edit("Type, Backspace", "Edit focused field"),
@@ -4763,6 +4878,18 @@ const PROMPT_TEXT_TOOLS: &[OverlayHelpEntry] = &[
     act("a / d", "Accept / discard the compiled preview"),
     act("Ctrl-Shift-G", "Grammar and spelling correction"),
     act("Ctrl-A", "AI command on text"),
+    act("Ctrl-Shift-A", "Ask AI about text"),
+    act(
+        "Ctrl-V",
+        "Paste from clipboard (images become @path references)",
+    ),
+];
+/// `PROMPT_TEXT_TOOLS` with the AI command on its Standard chord.
+const PROMPT_TEXT_TOOLS_STANDARD: &[OverlayHelpEntry] = &[
+    act("Ctrl-Y", "Compile prompt"),
+    act("a / d", "Accept / discard the compiled preview"),
+    act("Ctrl-Shift-G", "Grammar and spelling correction"),
+    act("Ctrl-Alt-A", "AI command on text"),
     act("Ctrl-Shift-A", "Ask AI about text"),
     act(
         "Ctrl-V",
@@ -5358,6 +5485,10 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
             &[
                 act("i", "Type to the selected seat's manager here"),
                 act("t", "Select the console's own seat and type to it"),
+                act("s", "Show the selected seat session's status"),
+                act("x", "Halt the selected seat session (soft stop)"),
+                act("X", "Halt the selected seat session now (press twice)"),
+                act("a", "Archive the selected earlier seat session"),
                 act("n", "Launch and appoint a manager (seat, launch, scope)"),
                 act(
                     "Tab",
@@ -6614,6 +6745,7 @@ mod tests {
         };
         let guarded = [
             ActionId::IssueEdit,
+            ActionId::IssueRunTopology,
             ActionId::IssueStatus,
             ActionId::IssueReopen,
             ActionId::IssuePriority,
@@ -6636,6 +6768,7 @@ mod tests {
                 },
                 &[
                     ActionId::IssueEdit,
+                    ActionId::IssueRunTopology,
                     ActionId::IssueStatus,
                     ActionId::IssuePriority,
                     ActionId::IssueAssignee,

@@ -181,7 +181,7 @@ impl AgentEnqueueLandingSourceRequestV1 {
             return Err(QUEUE_SOURCE_INVALID);
         }
         if self.test_filters.len() > ROLLING_QUEUE_MAX_TEST_FILTERS
-            || self.test_filters.iter().any(|f| !valid_filter(f))
+            || self.test_filters.iter().any(|f| !valid_test_filter(f))
         {
             return Err(QUEUE_FILTER_INVALID);
         }
@@ -202,7 +202,8 @@ fn is_full_lower_hex_oid(value: &str) -> bool {
 
 /// `PACKAGE=FILTER`, both non-empty, neither starting with `-` (the lander
 /// refuses the same shapes; refusing here gives the owner an immediate answer).
-fn valid_filter(value: &str) -> bool {
+#[must_use]
+pub fn valid_test_filter(value: &str) -> bool {
     let Some((package, filter)) = value.split_once('=') else {
         return false;
     };

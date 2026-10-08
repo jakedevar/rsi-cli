@@ -71,10 +71,14 @@ pub(super) fn render_text_area_bg_editor(frame: &mut Frame, area: Rect, input: &
             format!("{}█", input)
         };
 
-        let input_line = Line::from(vec![
-            preview_span,
-            Span::styled(display, Style::default().fg(input_fg).bg(input_bg)),
-        ]);
+        let input_style = Style::default().fg(input_fg).bg(input_bg);
+        let input_line = if crate::field_edit::standard_frame() {
+            let mut spans = vec![preview_span];
+            spans.extend(crate::field_edit::draw(input, input_style));
+            Line::from(spans)
+        } else {
+            Line::from(vec![preview_span, Span::styled(display, input_style)])
+        };
         let input_area = Rect::new(inner.x, y, inner.width, 1);
         frame.render_widget(
             Paragraph::new(input_line).style(Style::default().bg(theme::overlay_bg())),

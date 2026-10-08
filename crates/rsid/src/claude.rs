@@ -20,6 +20,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 mod model_discovery;
+pub(crate) mod turn_spool;
 
 /// Configuration for launching a Claude session.
 /// This is daemon-internal and has more fields than LaunchSessionParams.
@@ -374,14 +375,44 @@ pub struct StreamEvent {
 
 /// Wraps a running Claude CLI process (without the event receiver).
 /// The receiver is returned separately to avoid lock contention.
-pub struct ClaudeProcess {
-    child: Child,
+pub struct CliTurnProcess {
+    child: Option<Child>,
+    pub(crate) detached: Option<turn_spool::DetachedTurn>,
 }
 
-impl ClaudeProcess {
+pub type ClaudeProcess = CliTurnProcess;
+
+impl CliTurnProcess {
+    pub(crate) fn direct(child: Child) -> Self {
+        Self {
+            child: Some(child),
+            detached: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_child_for_route_test(child: Child) -> Self {
+        Self::direct(child)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn detached_for_test(child: Child, turn: turn_spool::DetachedTurn) -> Self {
+        Self::detached_child(child, turn)
+    }
+
+    pub(crate) fn detached_child(child: Child, turn: turn_spool::DetachedTurn) -> Self {
+        Self {
+            child: Some(child),
+            detached: Some(turn),
+        }
+    }
+
     /// Send SIGINT to gracefully interrupt the session.
     pub fn interrupt(&self) -> Result<()> {
-        if let Some(pid) = self.child.id() {
+        if let Some(turn) = &self.detached {
+            return turn.signal(nix::sys::signal::Signal::SIGINT);
+        }
+        if let Some(pid) = self.child.as_ref().and_then(Child::id) {
             nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid as i32),
                 nix::sys::signal::Signal::SIGINT,
@@ -393,22 +424,77 @@ impl ClaudeProcess {
 
     /// Force kill the process.
     pub async fn kill(&mut self) -> Result<()> {
-        crate::process_scope::kill_worker_child(&mut self.child).await
+        if let Some(turn) = self.detached.clone() {
+            if turn.is_handed_off() {
+                return Ok(());
+            }
+            let stop = async {
+                turn.custody(uuid::Uuid::nil(), uuid::Uuid::nil()).await?;
+                turn.signal(nix::sys::signal::Signal::SIGQUIT)?;
+                tokio::time::timeout(std::time::Duration::from_secs(5), self.wait())
+                    .await
+                    .map_err(|_| DaemonError::Process("turn shim force stop timed out".into()))??;
+                Ok::<_, DaemonError>(())
+            }
+            .await;
+            match stop {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    // Shutdown may hand custody off while this bounded stop
+                    // awaits identity or exit. Its new owner must not be killed.
+                    if turn.is_handed_off() {
+                        return Ok(());
+                    }
+                    tracing::warn!(%error, "Turn shim stop failed; killing the owned child process group")
+                }
+            }
+        }
+        if let Some(child) = self.child.as_mut() {
+            crate::process_scope::kill_worker_child(child).await
+        } else {
+            Err(DaemonError::Process(
+                "adopted turn could not be stopped safely".into(),
+            ))
+        }
     }
 
     /// Wait for the process to exit.
     pub async fn wait(&mut self) -> Result<std::process::ExitStatus> {
-        Ok(self.child.wait().await?)
+        if let Some(child) = self.child.as_mut() {
+            return Ok(child.wait().await?);
+        }
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     /// OS pid of the provider child, `None` once it was reaped.
     pub fn pid(&self) -> Option<u32> {
-        self.child.id()
+        self.child
+            .as_ref()
+            .and_then(Child::id)
+            .or_else(|| self.detached.as_ref().and_then(|t| t.pid()))
     }
 
     /// Check if the process is still running.
     pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
-        Ok(self.child.try_wait()?)
+        if let Some(child) = self.child.as_mut() {
+            return Ok(child.try_wait()?);
+        }
+        self.detached
+            .as_ref()
+            .expect("adopted handle has custody")
+            .exit_status()
+    }
+
+    pub(crate) fn adopt(turn: turn_spool::DetachedTurn) -> Self {
+        Self {
+            child: None,
+            detached: Some(turn),
+        }
     }
 }
 
@@ -621,12 +707,21 @@ impl ClaudeClient {
     }
 
     /// Launch a new Claude session.
-    /// Returns the process handle, the event receiver, and the stdin handle (for flush injection).
+    /// Returns the process handle and event receiver.
     /// This design prevents lock contention in the session manager.
     pub(crate) fn launch(
         &self,
         config: &LaunchConfig,
         execution: CliExecutionCapability,
+    ) -> Result<(ClaudeProcess, mpsc::Receiver<StreamEvent>)> {
+        self.launch_inner(config, execution, None)
+    }
+
+    fn launch_inner(
+        &self,
+        config: &LaunchConfig,
+        execution: CliExecutionCapability,
+        shim_override: Option<&Path>,
     ) -> Result<(ClaudeProcess, mpsc::Receiver<StreamEvent>)> {
         let invocation_id = execution.invocation_id();
         let mut cmd = Command::new(&self.binary_path);
@@ -722,6 +817,20 @@ impl ClaudeClient {
         stamp_execution_environment(&mut cmd, config, invocation_id)?;
 
         cmd.arg("--").arg(&config.query);
+
+        if let Some(shim) =
+            turn_spool::available_shim(config, self.runtime_config.as_deref(), shim_override)
+        {
+            return turn_spool::launch(
+                &cmd,
+                config,
+                execution,
+                RuntimeExecutionRoute::ClaudeCli,
+                &shim,
+                turn_spool::TurnOutput::Claude,
+                None,
+            );
+        }
 
         cmd = crate::process_scope::ScopedWorkerCommand::wrap_unspawned(&cmd, invocation_id)?;
 
@@ -889,7 +998,13 @@ impl ClaudeClient {
             });
         }
 
-        Ok((ClaudeProcess { child }, event_rx))
+        Ok((
+            ClaudeProcess {
+                child: Some(child),
+                detached: None,
+            },
+            event_rx,
+        ))
     }
 }
 
@@ -1167,9 +1282,13 @@ mod tests {
     fn test_client_with_isolation(binary_path: PathBuf, policy: &str) -> ClaudeClient {
         let mut config = Config::default();
         config.claude_config_isolation = policy.to_string();
+        let runtime = RuntimeConfig::from_config(&config);
+        runtime
+            .turn_detach_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         ClaudeClient {
             binary_path,
-            runtime_config: Some(RuntimeConfig::from_config(&config)),
+            runtime_config: Some(runtime),
             agent_mcp_path: None,
             boundary_mail_hook_path: None,
         }
@@ -1926,6 +2045,180 @@ worker prompt body\n\
 
         let args = read_nul_args(&args_path);
         assert!(args.contains(&"--model=claude-sonnet-5-5[1m]".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn managed_turn_detach_toggle_keeps_direct_pipe_argv_and_events() {
+        let dir = TempDir::new().unwrap();
+        let (binary, args) = install_fake_claude(dir.path());
+        let mut client = test_client(binary);
+        let runtime = RuntimeConfig::from_config(&Config::default());
+        runtime
+            .update_field("turn_detach_enabled", &serde_json::json!(false))
+            .unwrap();
+        client.runtime_config = Some(runtime);
+        let mut config = launch_config_for_provider_test("literal prompt");
+        config.rsi_session_id = Some(uuid::Uuid::new_v4());
+        let (mut process, mut rx) = client
+            .launch(
+                &config,
+                CliExecutionCapability::for_test(RuntimeExecutionRoute::ClaudeCli),
+            )
+            .unwrap();
+        assert!(process.detached.is_none());
+        assert_eq!(rx.recv().await.unwrap().event_type, "result");
+        assert!(process.wait().await.unwrap().success());
+        let expected = read_nul_args(&args);
+        client.runtime_config = None;
+        let (mut process, mut rx) = client
+            .launch(
+                &config,
+                CliExecutionCapability::for_test(RuntimeExecutionRoute::ClaudeCli),
+            )
+            .unwrap();
+        assert_eq!(rx.recv().await.unwrap().event_type, "result");
+        assert!(process.wait().await.unwrap().success());
+        assert_eq!(read_nul_args(&args), expected);
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn managed_turn_missing_or_non_executable_shim_falls_back_to_direct_pipes() {
+        #[derive(Clone, Default)]
+        struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for LogBuffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let (binary, args) = install_fake_claude(dir.path());
+        let mut client = test_client(binary);
+        let mut config = launch_config_for_provider_test("literal $HOME and `prompt`");
+        config.rsi_session_id = Some(uuid::Uuid::new_v4());
+        config.rsi_socket = Some(dir.path().join("daemon.sock"));
+        let (mut direct, mut direct_rx) = client
+            .launch(
+                &config,
+                CliExecutionCapability::for_test(RuntimeExecutionRoute::ClaudeCli),
+            )
+            .unwrap();
+        let expected_event = direct_rx.recv().await.unwrap();
+        assert!(direct.wait().await.unwrap().success());
+        let expected_args = read_nul_args(&args);
+
+        let runtime = RuntimeConfig::from_config(&Config::default());
+        runtime
+            .update_field("turn_detach_enabled", &serde_json::json!(true))
+            .unwrap();
+        client.runtime_config = Some(runtime);
+        let missing = dir.path().join("missing-shim");
+        let non_executable = dir.path().join("non-executable-shim");
+        fs::write(&non_executable, "#!/bin/sh\nexit 99\n").unwrap();
+        fs::set_permissions(&non_executable, fs::Permissions::from_mode(0o644)).unwrap();
+
+        for shim in [&missing, &non_executable] {
+            let logs = LogBuffer::default();
+            let writer = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let (mut process, mut rx) = tracing::subscriber::with_default(subscriber, || {
+                client.launch_inner(
+                    &config,
+                    CliExecutionCapability::for_test(RuntimeExecutionRoute::ClaudeCli),
+                    Some(shim),
+                )
+            })
+            .unwrap();
+            assert!(process.detached.is_none());
+            let event = rx.recv().await.unwrap();
+            assert_eq!(event.event_type, expected_event.event_type);
+            assert_eq!(event.data, expected_event.data);
+            assert!(process.wait().await.unwrap().success());
+            assert_eq!(read_nul_args(&args), expected_args);
+            let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+            assert!(captured.contains("rsi-turn-shim is missing or not executable; falling back to direct Claude pipes"), "{captured}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn managed_turn_detach_launches_shim_with_literal_provider_argv_and_spools() {
+        let dir = TempDir::new().unwrap();
+        let (binary, args) = install_fake_claude(dir.path());
+        let shim = dir.path().join("shim-fixture");
+        fs::write(&shim, r#"#!/usr/bin/env python3
+import fcntl, json, os, subprocess, sys
+folder = sys.argv[2]
+with open(folder + '/alive.lock', 'w') as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    with open(folder + '/.shim.json.tmp', 'w') as identity:
+        json.dump({'pid': os.getpid()}, identity)
+    os.replace(folder + '/.shim.json.tmp', folder + '/shim.json')
+    with open(folder + '/stdout', 'ab') as out, open(folder + '/stderr', 'ab') as err:
+        status = subprocess.run(sys.argv[4:], stdin=subprocess.DEVNULL, stdout=out, stderr=err).returncode
+    with open(folder + '/.exit.json.tmp', 'w') as record:
+        json.dump({'exit_code': status, 'error': None, 'signal': None}, record)
+    os.replace(folder + '/.exit.json.tmp', folder + '/exit.json')
+"#).unwrap();
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut client = test_client(binary);
+        let runtime = RuntimeConfig::from_config(&Config::default());
+        runtime
+            .update_field("turn_detach_enabled", &serde_json::json!(true))
+            .unwrap();
+        client.runtime_config = Some(runtime);
+        let mut config = launch_config_for_provider_test("literal $HOME and `prompt`");
+        config.rsi_session_id = Some(uuid::Uuid::new_v4());
+        config.rsi_socket = Some(dir.path().join("daemon.sock"));
+        let (mut process, mut rx) = client
+            .launch_inner(
+                &config,
+                CliExecutionCapability::for_test(RuntimeExecutionRoute::ClaudeCli),
+                Some(&shim),
+            )
+            .unwrap();
+        let turn = process.detached.clone().unwrap();
+        let boot = uuid::Uuid::new_v4();
+        let row = turn
+            .custody(config.rsi_session_id.unwrap(), boot)
+            .await
+            .unwrap();
+        assert_eq!(
+            row.spool_dir,
+            dir.path().join("turns").join(uuid::Uuid::nil().to_string())
+        );
+        turn.start(Ok(boot));
+        let event = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.event_type, "result");
+        let receipt = turn.next_receipt().unwrap();
+        assert_eq!(receipt.expected_offset, 0);
+        assert_eq!(
+            receipt.next_offset,
+            fs::metadata(row.spool_dir.join("stdout")).unwrap().len()
+        );
+        assert!(process.wait().await.unwrap().success());
+        assert_eq!(
+            read_nul_args(&args).last().map(String::as_str),
+            Some(config.query.as_str())
+        );
+        assert!(rx.recv().await.is_none());
+        assert!(turn.complete.load(std::sync::atomic::Ordering::Acquire));
     }
 
     /// V-006: a supported effort reaches the CLI verbatim.

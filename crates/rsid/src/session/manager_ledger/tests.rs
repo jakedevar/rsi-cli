@@ -240,6 +240,13 @@ async fn fixture_with_merged_source(merge_rolling: bool) -> Fixture {
                     ManagerCapabilityV2::SessionCreate,
                 ],
                 max_created_sessions: 8,
+                // #1582: an empty allowlist never grants a launch, so the
+                // fixture grants the reviewer launch the tests request.
+                allowed_launches: vec![ManagerLaunchChoiceV2 {
+                    provider: SessionProvider::Claude,
+                    model: "claude-sonnet-5".into(),
+                    effort: None,
+                }],
                 ..Default::default()
             },
         })

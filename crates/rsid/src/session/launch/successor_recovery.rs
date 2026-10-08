@@ -120,12 +120,18 @@ impl SessionManager {
         // Missing Session is not a process-absence proof. The durable claim
         // retains capacity on inventory/signal failure, task cancellation, or
         // restart. Reuse the checked, bounded exact-session cohort reaper.
+        let orphan_store = std::sync::Arc::clone(&self.store);
         #[cfg(target_os = "linux")]
-        tokio::task::spawn_blocking(move || super::super::reaper::reap_orphans_for_session(id))
-            .await
-            .map_err(|error| {
-                DaemonError::Process(format!("successor cleanup reaper join failed: {error}"))
-            })??;
+        tokio::task::spawn_blocking(move || {
+            let turns = orphan_store
+                .blocking_lock()
+                .list_active_provider_turn_custody()?;
+            super::super::reaper::reap_orphans_for_session(id, turns)
+        })
+        .await
+        .map_err(|error| {
+            DaemonError::Process(format!("successor cleanup reaper join failed: {error}"))
+        })??;
         #[cfg(not(target_os = "linux"))]
         return Err(DaemonError::Process(
             "successor cleanup requires exact process-cohort proof".into(),

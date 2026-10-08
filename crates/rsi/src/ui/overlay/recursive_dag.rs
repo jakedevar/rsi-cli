@@ -399,6 +399,7 @@ fn push_fake_scheduler_control(
                 &format!("{value}  Enter submit  Esc cancel"),
                 width,
             ));
+            lines.extend(standard_input_line("max_steps", input));
             if let Some(error) = error {
                 lines.push(dim_kv("input error", error, width));
             }
@@ -474,6 +475,7 @@ fn push_live_scheduler_control(
                 &format!("{value}  Enter submit  Esc cancel"),
                 width,
             ));
+            lines.extend(standard_input_line("max_steps", input));
             if let Some(error) = error {
                 lines.push(dim_kv("input error", error, width));
             }
@@ -535,6 +537,7 @@ fn push_recursive_control_rail(
                 ),
                 width,
             ));
+            lines.extend(standard_input_line("reason", input));
             if let Some(error) = error {
                 lines.push(dim_kv("input error", error, width));
             }
@@ -553,6 +556,7 @@ fn push_recursive_control_rail(
                 ),
                 width,
             ));
+            lines.extend(standard_input_line("reason", input));
             if let Some(error) = error {
                 lines.push(dim_kv("input error", error, width));
             }
@@ -577,6 +581,13 @@ fn push_recursive_control_rail(
                     recovery_field_label(*field)
                 ),
                 width,
+            ));
+            lines.extend(standard_input_line(
+                recovery_field_label(*field),
+                match field {
+                    RecursiveDagRecoveryInputField::MaxGraphs => max_graphs_input,
+                    RecursiveDagRecoveryInputField::TimeBudgetMs => time_budget_ms_input,
+                },
             ));
             lines.push(dim_kv(
                 "manual",
@@ -3200,6 +3211,23 @@ fn deferred_recovery_work_visible(detail: &RecursiveDagSelectedGraphData) -> boo
         .as_ref()
         .is_some_and(|status| status.deferred_graph_count > 0)
         || !detail.deferred_recovery_rows().is_empty()
+}
+
+/// In a Standard frame, the field being typed into on its own line with the
+/// cursor and selection drawn (Vim mode keeps the summary line only).
+fn standard_input_line(label: &str, input: &str) -> Option<Line<'static>> {
+    if !crate::field_edit::standard_frame() {
+        return None;
+    }
+    let mut spans = vec![Span::styled(
+        format!("{label}> "),
+        Style::default().fg(theme::overlay_hint()),
+    )];
+    spans.extend(crate::field_edit::draw(
+        input,
+        Style::default().fg(theme::text()),
+    ));
+    Some(Line::from(spans))
 }
 
 fn reason_display(input: &str) -> String {

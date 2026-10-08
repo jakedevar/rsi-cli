@@ -398,11 +398,15 @@ impl RpcServer {
         };
 
         let workflow_id = Uuid::new_v4();
-        let input = if params.inputs.is_null() {
-            None
-        } else {
-            Some(params.inputs)
-        };
+        {
+            let store = self.session_manager.store().lock().await;
+            crate::topology::oncall::require_covering(
+                &store,
+                params.project_id,
+                params.on_call.as_ref(),
+            )?;
+        }
+        let input = crate::topology::oncall::embed(params.inputs, params.on_call.as_ref())?;
 
         let response = SessionManager::execute_workflow_live(
             Arc::clone(&self.session_manager),

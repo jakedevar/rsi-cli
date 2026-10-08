@@ -74,6 +74,7 @@ fn manager_decision_history_preserves_all_pages_and_routes_new_answers_after_reo
             effect_started: true,
             boot_id: None,
             outcome: Some("Consumption unconfirmed".into()),
+            topology: None,
         };
         store
             .manager_v2_put_record(

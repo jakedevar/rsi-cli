@@ -27,9 +27,10 @@ For the diff merge-base(base, head)..head it:
     receipt's `dropped_filters` with the reason (#1260, #1253). Migration rewind
     helper-only edits select their callers and fixture guards, not all of
     store::tests (#1341); when every added migration only adds columns or
-    indexes, only the migration-chain pins (#1618). No test is run.
+    indexes or isolated new tables, only the migration-chain pins (#1618,
+    #1654). No test is run.
     The list is bounded and precise (#1440, #1418, #1438, #1263), so a worker can
-    run it inside its 10-minute test budget:
+    run it inside its bounded test budget:
       - a test module that mounts test submodules (`session::tests::manager_actions`
         with `#[path] mod issue_worker;`) gets `test(/^<module>::[A-Za-z0-9_]+$/)`:
         its own tests, not the `test(<module>)` prefix that spills into every
@@ -64,7 +65,7 @@ For the diff merge-base(base, head)..head it:
         functions, or an identifier is too common, the module filter is kept and
         the receipt says so: `broad: true`, `broad_filters` (filter, test count,
         reason), a `BROAD` token in the summary line and a stderr warning. A broad
-        filter may not finish in 10 minutes: run it in parts or ask for more time.
+        filter may exceed the budget: split it into bounded runs.
         Uncertain coverage can retain more than 12 filters; none are truncated.
       - `#[path]` and `include!` mounts (a `../` mount, a mount from a mounted
         file) resolve to the module path the compiler gives their tests.
@@ -96,6 +97,7 @@ import posixpath
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -527,10 +529,88 @@ MIGRATION_CHAIN_PINS = re.compile(
     r"every_recovered_migration_step_actually_executes|_fixture_rewinds|previous_schema_upgrades_")
 
 
+def isolated_table_migration(code):
+    """Prove literal DDL owns only new tables; ambiguity retains all rewind callers.
+
+    SQLite parses object targets in a private in-memory DB. Triggers may only
+    reject writes to their new table, never mutate another relation. Rust helper
+    calls and nonliteral SQL are deliberately outside this small proof.
+    """
+    batch = re.compile(r'\btx\.execute_batch\(\s*"((?:\\.|[^"\\])*)"\s*,?\s*\)', re.S)
+    matches = list(batch.finditer(code))
+    if not matches:
+        return False
+    remainder = batch.sub("", code)
+    remainder = re.sub(r'\btx\.pragma_update\(None,\s*"user_version",\s*\d+\)', "", remainder)
+    words = set(re.findall(r'\b[A-Za-z_]\w*\b', remainder))
+    skeleton = set("impl Store fn self version i32 Result if let tx Transaction new_unchecked conn TransactionBehavior Immediate commit Ok".split())
+    if any(word not in skeleton and not re.fullmatch(r'migrate_v\d+', word) for word in words) \
+            or re.search(r'\b\w+!\s*[({\[]', remainder):
+        return False
+    calls = re.findall(r'\b([A-Za-z_]\w*(?:(?:\.|::)[A-Za-z_]\w*)*)\s*\(', remainder)
+    if any(not re.fullmatch(r'migrate_v\d+|Transaction::new_unchecked|tx\.commit|Ok', call)
+           for call in calls):
+        return False
+    try:
+        sql = "\n".join(json.loads('"' + match.group(1) + '"', strict=False) for match in matches)
+    except ValueError:
+        return False
+    # Split complete SQLite statements, retaining a trigger's BEGIN/END body.
+    statements, pending = [], ""
+    for char in sql:
+        pending += char
+        if char == ";" and sqlite3.complete_statement(pending):
+            statements.append(pending.strip())
+            pending = ""
+    if pending.strip() or not statements:
+        return False
+    for statement in statements:
+        if not re.match(r'CREATE\s+(?:TABLE|(?:UNIQUE\s+)?INDEX|TRIGGER)\b', statement, re.I):
+            return False
+        # A pre-existing table must fail CREATE, never silently acquire new
+        # indexes/triggers via IF NOT EXISTS on an existing relation.
+        uncommented = re.sub(r'/\*.*?\*/|--[^\n]*', " ", statement, flags=re.S)
+        if re.match(r'CREATE\s+TABLE\s+IF\b', uncommented, re.I):
+            return False
+        if re.match(r'CREATE\s+TRIGGER\b', statement, re.I) and not re.search(
+                r"\bBEGIN\s+SELECT\s+RAISE\s*\(\s*ABORT\s*,\s*'(?:[^']|'')*'\s*\)\s*;\s*END\s*;$",
+                statement, re.I):
+            return False
+    tables = set()
+
+    def authorize(action, first, second, database, source):
+        allowed = False
+        if action == sqlite3.SQLITE_CREATE_TABLE:
+            tables.add(first)
+            allowed = database == "main"
+        elif action in (sqlite3.SQLITE_CREATE_INDEX, sqlite3.SQLITE_CREATE_TRIGGER):
+            allowed = second in tables and database == "main"
+        elif action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE):
+            allowed = first == "sqlite_master"
+        elif action == sqlite3.SQLITE_READ:
+            allowed = first == "sqlite_master" or first in tables
+        elif action in (sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_REINDEX):
+            allowed = True
+        return sqlite3.SQLITE_OK if allowed else sqlite3.SQLITE_DENY
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        for function in ("rsi_uuid_is_canonical", "rsi_rfc3339_nanos_is_canonical"):
+            connection.create_function(function, 1, lambda value: 1, deterministic=True)
+        connection.set_authorizer(authorize)
+        connection.executescript(sql)
+        return bool(tables)
+    except sqlite3.Error:
+        return False
+    finally:
+        connection.close()
+
+
 def additive_migration(text):
-    """True when a migration unit only adds columns and indexes (no data or table rewrite)."""
+    """True for column/index additions or provably isolated new-table DDL."""
     code = "\n".join(line.split("//", 1)[0] for line in text.splitlines())
-    return bool(ADDITIVE_SQL.search(code)) and not DESTRUCTIVE_SQL.search(code)
+    return ((bool(ADDITIVE_SQL.search(code)) and not DESTRUCTIVE_SQL.search(code))
+            or isolated_table_migration(code))
 
 
 def rewind_test_filters(sources, pins_only=False):

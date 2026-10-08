@@ -117,10 +117,11 @@ pub(super) fn render_provider_form(
 
     let hint_y = inner.y + inner.height - 1;
     let hint_area = Rect::new(inner.x, hint_y, inner.width, 1);
+    let standard = name.standard_editing;
     let hint_line = if focused_mode == PopupMode::Insert {
         Line::from(vec![
             Span::styled(
-                " INSERT ",
+                if standard { " EDIT " } else { " INSERT " },
                 Style::default()
                     .fg(theme::overlay_mode_insert_fg())
                     .bg(theme::overlay_mode_insert_bg())
@@ -154,7 +155,10 @@ pub(super) fn render_provider_form(
                     .fg(theme::overlay_hint())
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(": normal", Style::default().fg(theme::overlay_hint())),
+            Span::styled(
+                if standard { ": close" } else { ": normal" },
+                Style::default().fg(theme::overlay_hint()),
+            ),
         ])
     } else {
         Line::from(vec![
@@ -244,8 +248,8 @@ fn render_field_row(
     } else {
         session::CursorStyle::Hidden
     };
-    let visual_sel = if focused && surface.vim_state.visual.is_some() {
-        surface.textarea.selection_range()
+    let visual_sel = if focused {
+        session::surface_selection_for_render(surface)
     } else {
         None
     };

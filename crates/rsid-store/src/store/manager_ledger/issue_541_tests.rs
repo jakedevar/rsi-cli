@@ -50,7 +50,19 @@ fn review_request(key: &str, version: i64, sha: &str) -> AgentManagerUpdateReque
     )
 }
 
-fn enable_review_policy(f: &Fixture) {
+pub(super) fn enable_review_policy(f: &Fixture) {
+    enable_review_policy_launches(
+        f,
+        vec![ManagerLaunchChoiceV2 {
+            provider: SessionProvider::Claude,
+            model: "claude-sonnet-5".into(),
+            effort: None,
+        }],
+    );
+}
+
+/// `enable_review_policy` with the given allowed launches.
+pub(super) fn enable_review_policy_launches(f: &Fixture, launches: Vec<ManagerLaunchChoiceV2>) {
     f.store
         .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
             project_id: f.project,
@@ -64,11 +76,7 @@ fn enable_review_policy(f: &Fixture) {
                     ManagerCapabilityV2::SessionCreate,
                 ],
                 max_created_sessions: 2,
-                allowed_launches: vec![ManagerLaunchChoiceV2 {
-                    provider: SessionProvider::Claude,
-                    model: "claude-sonnet-5".into(),
-                    effort: None,
-                }],
+                allowed_launches: launches,
                 ..Default::default()
             },
         })
@@ -383,7 +391,7 @@ fn allow_anthropic_rounds(f: &Fixture, work_key: &str) {
 /// accounting, not allocation or custody, so foreign keys are relaxed for the
 /// write only. Reviewer sessions are real because contributor provenance reads
 /// their recorded provider family.
-fn synthetic(f: &Fixture, sql: &str, values: &[&dyn rusqlite::ToSql]) {
+pub(super) fn synthetic(f: &Fixture, sql: &str, values: &[&dyn rusqlite::ToSql]) {
     f.store
         .conn
         .execute_batch("PRAGMA foreign_keys=OFF")
@@ -396,12 +404,12 @@ fn synthetic(f: &Fixture, sql: &str, values: &[&dyn rusqlite::ToSql]) {
     result.unwrap();
 }
 
-fn stamp() -> String {
+pub(super) fn stamp() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
 }
 
 /// reserved -> allocating -> active with a launched reviewer.
-fn launch_review(f: &Fixture, assignment: Uuid) {
+pub(super) fn launch_review(f: &Fixture, assignment: Uuid) {
     let model: String = f.store.conn.query_row(
         "SELECT json_extract(request_json,'$.launch.model') FROM manager_review_assignments WHERE assignment_id=?1",
         [assignment.to_string()], |row| row.get(0),
@@ -440,7 +448,7 @@ fn launch_review(f: &Fixture, assignment: Uuid) {
 }
 
 /// Launch, record an immutable receipt, and settle the row as submitted.
-fn submit_review(f: &Fixture, assignment: Uuid) {
+pub(super) fn submit_review(f: &Fixture, assignment: Uuid) {
     launch_review(f, assignment);
     synthetic(
         f,
@@ -468,7 +476,7 @@ fn submit_review(f: &Fixture, assignment: Uuid) {
     );
 }
 
-fn fail_review(f: &Fixture, assignment: Uuid) {
+pub(super) fn fail_review(f: &Fixture, assignment: Uuid) {
     let at = stamp();
     f.store
         .conn

@@ -177,6 +177,9 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("claude_config_isolation", NextSpawn),
     // The TUI updates its cache after save and includes the preset in launches.
     page("system_prompt_preset", NextSpawn),
+    // #1626: the TUI reads it from GetDaemonConfig when a `project_created`
+    // event arrives; the daemon only stores it.
+    page("follow_agent_created_projects", LIVE),
     // Classifier wiring stays alive; detector and receiver both gate on runtime.
     page("stall_classifier_enabled", LIVE),
     // The classifier snapshots the live model before admission and execution.
@@ -213,6 +216,9 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("topology_bulk_fanout_min_openrouter", LIVE),
     // rsid store/model_control.rs:4678 reads the ceiling per admission.
     page("orchestration_max_child_effort", LIVE),
+    // Issue #1628: operator text-editing mode. Operator-view setting read by
+    // the TUI on every config refresh; no daemon behavior depends on it.
+    page("editing_mode", LIVE),
     // Issue #692: read per launch by rsid session/launch.rs (the single launch
     // chokepoint; the effective model, defaults applied, is checked before any
     // side effect), the continuation/rotation preflights and the AgentSpawnChild
@@ -250,6 +256,7 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("cpu_andon_cpu_minutes", LIVE),
     page("cpu_andon_host_load", LIVE),
     // Issue #1073: the deploy loop reads the toggle at every 5 s poll.
+    page("turn_detach_enabled", LIVE),
     page("deploy_drain_enabled", LIVE),
     // Issue #1320/#1311: the deploy loop reads the hold cap at every 5 s poll.
     page("deploy_drain_hold_secs", LIVE),

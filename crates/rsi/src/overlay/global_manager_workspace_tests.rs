@@ -8,6 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rsi_common::global_manager::{
     GlobalIssueCountsV1, GlobalManagerGrantV1, GlobalManagerWorkspaceV1, GlobalPmPolicyV1,
     GlobalPmSeatV1, GlobalProjectOverviewV1, GlobalSeatSessionV1, GlobalWorkspaceProjectV1,
+    SeatPredecessorV1,
 };
 use rsi_common::harness_manager_v2::{
     ManagerLaunchChoiceV2, ManagerOperatingModeV2, ManagerPolicyV2,
@@ -76,6 +77,8 @@ pub(crate) fn seat(
         cost_usd: Some(4.2),
         updated_at: Utc::now(),
         pending_question: false,
+        predecessors: Vec::new(),
+        predecessors_truncated: false,
     }
 }
 
@@ -1349,5 +1352,223 @@ fn project_console_shows_effective_caps_from_overview() {
             .selected_cap_line()
             .unwrap()
             .contains("Effective caps · active 4 · created sessions 50")
+    );
+}
+
+fn prior(id: Uuid, project_id: Uuid, status: SessionStatus) -> SeatPredecessorV1 {
+    SeatPredecessorV1 {
+        session_id: id,
+        project_id: Some(project_id),
+        status,
+        provider: SessionProvider::Claude,
+        model: Some("claude-opus-5-5".into()),
+        context_fill_pct: Some(91.0),
+        cost_usd: Some(7.5),
+        updated_at: Utc::now(),
+    }
+}
+
+/// The fixture's seat after two rotations: newest predecessor first.
+fn rotated(f: &Fixture) -> (GlobalManagerWorkspaceV1, Uuid, Uuid) {
+    let (older, oldest) = (Uuid::new_v4(), Uuid::new_v4());
+    let mut snapshot = f.snapshot.clone();
+    let seat = snapshot.seat.as_mut().unwrap();
+    seat.predecessors = vec![
+        prior(older, f.b.id, SessionStatus::Completed),
+        prior(oldest, f.b.id, SessionStatus::Archived),
+    ];
+    (snapshot, older, oldest)
+}
+
+#[test]
+fn predecessors_are_indented_selectable_rows_under_their_seat() {
+    let f = fixture();
+    let (snapshot, older, oldest) = rotated(&f);
+    let mut state = GlobalManagerWorkspaceState::default();
+    state.install(snapshot, Utc::now());
+    assert_eq!(
+        state.rows(),
+        vec![
+            WorkspaceRow::Seat,
+            WorkspaceRow::Predecessor {
+                child: None,
+                index: 0
+            },
+            WorkspaceRow::Predecessor {
+                child: None,
+                index: 1
+            },
+            WorkspaceRow::Project(0),
+            WorkspaceRow::Project(1),
+        ]
+    );
+    let seats = state.seats();
+    assert_eq!(
+        seats
+            .iter()
+            .map(|seat| (seat.depth, seat.session_id))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, Some(f.seat_id)),
+            (1, Some(older)),
+            (1, Some(oldest)),
+            (1, Some(f.pm_id)),
+            (1, None),
+        ]
+    );
+    assert_eq!(seats[1].level, SeatLevel::Global);
+    assert_eq!(seats[1].health, SeatHealth::Idle);
+    assert_eq!(
+        seats[2].health,
+        SeatHealth::Idle,
+        "an archived prior is history, not missing"
+    );
+    assert!(seat_row_text(&seats[1], 60).contains("prior"));
+    state.selected = 1;
+    assert_eq!(state.conversation_session_id(), Some(older));
+}
+
+#[test]
+fn a_seat_without_rotations_adds_no_history_rows() {
+    let f = fixture();
+    let mut state = GlobalManagerWorkspaceState::default();
+    state.install(f.snapshot.clone(), Utc::now());
+    assert!(
+        !state
+            .rows()
+            .iter()
+            .any(|row| matches!(row, WorkspaceRow::Predecessor { .. }))
+    );
+}
+
+#[tokio::test]
+async fn enter_on_a_predecessor_opens_that_session_and_typing_is_refused() {
+    let f = fixture();
+    let (snapshot, older, _) = rotated(&f);
+    let mut app = app_on_a(&f);
+    let mut session = baseline_session(older, SessionKind::Standard);
+    session.project_id = Some(f.b.id);
+    app.sessions.insert(older, SessionState::new(session));
+    open_with(&mut app, snapshot);
+    handle_key(&mut app, key(KeyCode::Char('j'))).await;
+    handle_key(&mut app, key(KeyCode::Char('i'))).await;
+    let state = workspace(&app);
+    assert_eq!(state.focus, WorkspaceFocus::Seats, "history is read only");
+    assert!(
+        state
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("read-only history"))
+    );
+    handle_key(&mut app, key(KeyCode::Enter)).await;
+    assert!(matches!(app.overlay, OverlayState::None));
+    assert_eq!(app.active_project_id(), Some(f.b.id));
+    assert!(matches!(
+        app.focused_pane(),
+        Some(Pane::SessionDetail { session_id }) if *session_id == older
+    ));
+}
+
+#[tokio::test]
+async fn s_reports_the_selected_seat_sessions_status_read_only() {
+    let f = fixture();
+    let (snapshot, older, _) = rotated(&f);
+    let mut app = app_on_a(&f);
+    let mut session = baseline_session(older, SessionKind::Standard);
+    session.status = SessionStatus::Completed;
+    app.sessions.insert(older, SessionState::new(session));
+    open_with(&mut app, snapshot);
+    handle_key(&mut app, key(KeyCode::Char('j'))).await;
+    handle_key(&mut app, key(KeyCode::Char('s'))).await;
+    let notice = workspace(&app).notice.clone().unwrap();
+    assert!(notice.contains("status Completed"), "{notice}");
+    assert!(notice.contains("earlier session, read only"), "{notice}");
+    assert!(notice.contains(&older.to_string()[..8]), "{notice}");
+}
+
+#[tokio::test]
+async fn x_halts_a_running_seat_through_the_session_list_interrupt() {
+    let f = fixture();
+    let mut app = app_on_a(&f);
+    let daemon = fake_daemon(&mut app).await;
+    daemon.serve("InterruptSession", serde_json::json!({}));
+    daemon.serve(
+        "GetGlobalManagerWorkspace",
+        serde_json::to_value(&f.snapshot).unwrap(),
+    );
+    app.sessions.get_mut(&f.seat_id).unwrap().session.status = SessionStatus::Running;
+    open_with(&mut app, f.snapshot.clone());
+    handle_key(&mut app, key(KeyCode::Char('x'))).await;
+    assert_eq!(daemon.calls("InterruptSession"), 1);
+    let params = daemon.last_params("InterruptSession").unwrap();
+    assert_eq!(params["session_id"], f.seat_id.to_string());
+    assert_eq!(params["pause_level"], "soft");
+    assert!(
+        workspace(&app)
+            .notice
+            .as_deref()
+            .is_some_and(|n| n.contains("Halt requested"))
+    );
+}
+
+#[tokio::test]
+async fn x_refuses_a_seat_session_that_is_not_running() {
+    let f = fixture();
+    let mut app = app_on_a(&f);
+    let daemon = fake_daemon(&mut app).await;
+    app.sessions.get_mut(&f.seat_id).unwrap().session.status = SessionStatus::Completed;
+    open_with(&mut app, f.snapshot.clone());
+    handle_key(&mut app, key(KeyCode::Char('x'))).await;
+    assert_eq!(daemon.calls("InterruptSession"), 0);
+    assert!(
+        workspace(&app)
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("can be halted"))
+    );
+}
+
+#[tokio::test]
+async fn a_refuses_the_current_seat_and_archives_an_earlier_session() {
+    let f = fixture();
+    let (snapshot, older, _) = rotated(&f);
+    let mut app = app_on_a(&f);
+    let daemon = fake_daemon(&mut app).await;
+    daemon.serve(
+        "ArchiveSession",
+        serde_json::to_value(
+            rsi_common::archive_cleanup::ArchiveSessionResultV1::no_cleanup_required(),
+        )
+        .unwrap(),
+    );
+    daemon.serve(
+        "GetGlobalManagerWorkspace",
+        serde_json::to_value(&snapshot).unwrap(),
+    );
+    let mut session = baseline_session(older, SessionKind::Standard);
+    session.status = SessionStatus::Completed;
+    app.sessions.insert(older, SessionState::new(session));
+    open_with(&mut app, snapshot);
+
+    // The current seat keeps its authority: no archive call.
+    handle_key(&mut app, key(KeyCode::Char('a'))).await;
+    assert_eq!(daemon.calls("ArchiveSession"), 0);
+    assert!(
+        workspace(&app)
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("current seat"))
+    );
+
+    handle_key(&mut app, key(KeyCode::Char('j'))).await;
+    handle_key(&mut app, key(KeyCode::Char('a'))).await;
+    assert_eq!(daemon.calls("ArchiveSession"), 1);
+    assert_eq!(
+        daemon.last_params("ArchiveSession").unwrap()["session_id"],
+        older.to_string()
+    );
+    assert!(
+        !app.sessions.contains_key(&older),
+        "archived session leaves the live set"
     );
 }

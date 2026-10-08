@@ -448,6 +448,62 @@ pub(super) async fn handle_create_entity_form_key(app: &mut App, key: KeyEvent) 
         return;
     }
 
+    // Standard editing has no insert/normal split: Name and Tag are always
+    // being typed into when focused (`sync_standard_surfaces` keeps
+    // `insert_mode` on for them), and Esc saves the draft and closes.
+    if app.standard_editing()
+        && matches!(
+            focused_field,
+            CreateEntityField::Name | CreateEntityField::Tag
+        )
+    {
+        if key.code == KeyCode::Esc {
+            if focused_field == CreateEntityField::Tag {
+                commit_pending_chip(app);
+            }
+            auto_save_draft(app);
+            app.overlay = OverlayState::None;
+            app.mark_dirty();
+            return;
+        }
+        // Tab / Shift-Tab leave the field (a pending tag chip is committed
+        // first); Vim needs Esc, Tab for this.
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            let forward = key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT);
+            if focused_field == CreateEntityField::Tag {
+                commit_pending_chip(app);
+            }
+            cycle_field(app, forward);
+            auto_save_draft(app);
+            app.mark_dirty();
+            return;
+        }
+        // A real cursor and selection in the name or the pending tag chip.
+        let commits_chip =
+            focused_field == CreateEntityField::Tag && matches!(key.code, KeyCode::Char(' ' | ','));
+        if !commits_chip
+            && app.edit_field(key, |overlay| match overlay {
+                OverlayState::CreateEntityForm {
+                    name,
+                    tags,
+                    focused_field,
+                    ..
+                } => match focused_field {
+                    CreateEntityField::Name => Some(name),
+                    CreateEntityField::Tag => tags
+                        .last_mut()
+                        .filter(|chip| chip.status == ChipStatus::Pending && !chip.value.is_empty())
+                        .map(|chip| &mut chip.value),
+                    _ => None,
+                },
+                _ => None,
+            }) != crate::field_edit::FieldKey::Ignored
+        {
+            auto_save_draft(app);
+            return;
+        }
+    }
+
     // Insert-mode branches first (text/tag editing); normal-mode branches
     // afterwards (Tab cycle, field hotkeys, segment motions). Only Name and
     // Tag have insert mode — every other focus falls through to normal mode.
@@ -475,12 +531,13 @@ fn handle_model_dropdown_intercept(app: &mut App, key: KeyEvent) {
     // Snapshot custom_providers because handle_model_dropdown_key takes a
     // separate slice argument; clone keeps the borrow checker happy.
     let custom_providers = app.settings.custom_providers.clone();
+    let standard_editing = app.standard_editing();
     let action: ModelDropdownAction = if let OverlayState::CreateEntityForm {
         model_dropdown: Some(state),
         ..
     } = &mut app.overlay
     {
-        handle_model_dropdown_key(state, &key, &custom_providers)
+        handle_model_dropdown_key(state, &key, &custom_providers, standard_editing)
     } else {
         return;
     };
@@ -574,6 +631,7 @@ async fn handle_body_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    let standard_editing = app.standard_editing();
     let action = {
         let OverlayState::CreateEntityForm { body, .. } = &mut app.overlay else {
             return;
@@ -586,6 +644,7 @@ async fn handle_body_key(app: &mut App, key: KeyEvent) {
                 available_commands: &[],
                 working_dir: None,
                 submit_on_enter: false,
+                standard_editing,
             },
         )
     };
@@ -596,6 +655,12 @@ async fn handle_body_key(app: &mut App, key: KeyEvent) {
         // Ctrl+Enter, which the form intercept already swallowed.
         crate::input_surface::InputAction::Submit(_) => {
             submit_create_entity_form(app).await;
+        }
+        // Standard editing has no Normal mode, so Esc (nothing to dismiss)
+        // saves the draft and closes, as Normal-mode Esc does in Vim.
+        crate::input_surface::InputAction::Close if standard_editing => {
+            auto_save_draft(app);
+            app.overlay = OverlayState::None;
         }
         // `q` in surface-normal mode maps to Close for overlay configs;
         // the body is a field, not a closable overlay — ignore.
@@ -1014,6 +1079,29 @@ fn handle_topology_key(app: &mut App, key: KeyEvent) -> bool {
             .map(|t| t.id);
         (count, chosen)
     };
+
+    // Standard editing: every printable key types into the filter with a real
+    // cursor and selection (Space stays the preview toggle); Up/Down navigate.
+    if app.standard_editing() && key.code != KeyCode::Char(' ') {
+        let result = app.edit_field(key, |overlay| match overlay {
+            OverlayState::CreateEntityForm {
+                topology_filter, ..
+            } => Some(topology_filter),
+            _ => None,
+        });
+        if result != crate::field_edit::FieldKey::Ignored {
+            if result == crate::field_edit::FieldKey::Edited
+                && let OverlayState::CreateEntityForm {
+                    topology_selected_index,
+                    ..
+                } = &mut app.overlay
+            {
+                *topology_selected_index = 0;
+            }
+            app.mark_dirty();
+            return true;
+        }
+    }
 
     // j/k/G/Down/Up nav (but NOT `g` — Phase 5 reserves `g` for the form's
     // `gp` leader chord; here `g` falls through to be inserted into the

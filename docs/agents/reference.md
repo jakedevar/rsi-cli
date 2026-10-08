@@ -265,9 +265,14 @@ harness — waiting idle on a background build/lint/test task can strand the
 session until the operator nudges it. This occurs often (operator-confirmed
 2026-07-27).
 
-**Prefer the foreground.** The simplest correct answer is to run long local work
-in the FOREGROUND with an explicit generous timeout rather than backgrounding it
-and waiting. A foreground run needs no wake, no polling, and no notification.
+**Prefer the foreground, except for `scripts/scoped-test`.** The simplest
+correct answer for most long local work is the FOREGROUND with an explicit
+generous timeout rather than backgrounding it and waiting. A foreground run needs
+no wake, no polling, and no notification. A scoped-test run on a busy host
+outlives the 10-minute tool cap (#1638): submit it as
+`AgentSubmitJob {kind:"test", wake:"none", params:{scoped_test:{base}}}`, arm ONE
+`AgentScheduleWake mode:"when"` and end the turn; never detach it with a bare
+`systemd-run` and end the turn without a wake.
 
 **Do not size that timeout from this file — measure it.** A full
 `cargo test -p rsid --lib -- --test-threads=1` was once ~4 minutes, and this
@@ -281,8 +286,11 @@ mid-verification.
 
 Practical consequences, in order of preference:
 
-1. **Scope the run.** Prefer `cargo test -p rsid --lib <filter>` for the modules
-   your change touches. A targeted run finishes in seconds and is what you
+1. **Scope the run.** Prefer `scripts/scoped-test`, or exact test paths
+   (`cargo test -p rsid --lib -- --exact <full::test::path>`) for the modules
+   your change touches. The shell hook refuses bare-word and module-prefix
+   filters (`topology::`, `review`) because they are substring matches that can
+   select hundreds of tests (#1656). A targeted run finishes in seconds and is what you
    actually need for an edit-verify loop.
 2. **Drop `--test-threads=1` unless you need it.** It exists for tests that
    contend on shared state; it is not required for the whole suite.

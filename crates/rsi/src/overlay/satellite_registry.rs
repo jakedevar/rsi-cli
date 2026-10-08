@@ -419,7 +419,78 @@ async fn probe_selected(app: &mut App) {
     }
 }
 
+/// The active text field's character limit and whether it only takes the
+/// hex/dash/comma id alphabet (`None` on toggle and numeric fields).
+fn active_text_limit(form: &SatelliteRegistryForm) -> Option<(usize, bool)> {
+    match form {
+        SatelliteRegistryForm::Peer { field, .. } => match *field {
+            0 => Some((120, false)),
+            1 => Some((36, false)),
+            5 => Some((37 * 64, true)),
+            _ => None,
+        },
+        SatelliteRegistryForm::Inbound { .. } => Some((37 * 64, true)),
+        SatelliteRegistryForm::Link { field, .. } => match *field {
+            0 => Some((512, false)),
+            1 | 2 => Some((256, false)),
+            _ => None,
+        },
+    }
+}
+
+/// The active text field of the form (see [`active_text_limit`]).
+fn active_text_mut(form: &mut SatelliteRegistryForm) -> Option<&mut String> {
+    match form {
+        SatelliteRegistryForm::Peer {
+            label,
+            expected_installation_id,
+            dispatch_scope,
+            field,
+            ..
+        } => match *field {
+            0 => Some(label),
+            1 => Some(expected_installation_id),
+            5 => Some(dispatch_scope),
+            _ => None,
+        },
+        SatelliteRegistryForm::Inbound { hubs, roots, field } => {
+            Some(if *field == 0 { hubs } else { roots })
+        }
+        SatelliteRegistryForm::Link {
+            socket_path,
+            ssh_target,
+            trust_reference,
+            field,
+            ..
+        } => match *field {
+            0 => Some(socket_path),
+            1 => Some(ssh_target),
+            2 => Some(trust_reference),
+            _ => None,
+        },
+    }
+}
+
 async fn handle_form_key(app: &mut App, key: KeyEvent) {
+    // Standard editing: a real cursor and selection in the active text field
+    // (Enter, Esc, Tab, toggles and the numeric priority keep their handling).
+    if let Some((cap, hex)) = state(app)
+        .and_then(|state| state.form.as_ref())
+        .and_then(active_text_limit)
+        && app.edit_field_capped(
+            key,
+            |overlay| match overlay {
+                OverlayState::SatelliteRegistry(state) => {
+                    state.form.as_mut().and_then(active_text_mut)
+                }
+                _ => None,
+            },
+            move |c| !c.is_control() && (!hex || c.is_ascii_hexdigit() || c == '-' || c == ','),
+            cap,
+        ) != crate::field_edit::FieldKey::Ignored
+    {
+        return;
+    }
     match key.code {
         KeyCode::Esc => {
             if let Some(state) = state(app) {

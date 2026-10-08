@@ -2677,3 +2677,85 @@ async fn stale_bulk_archive_cancel_sends_nothing_and_empty_list_says_so() {
     finish(task).await;
     assert!(screen(&mut app).contains("No stale decisions"));
 }
+
+fn set_editing_mode(app: &mut App, mode: &str) {
+    crate::settings::DaemonFeatureEntry::update_from_json(
+        &mut app.daemon_features,
+        &json!({ "editing_mode": mode }),
+    );
+}
+
+/// #1628 slice 3b: the policy editor's value gets a cursor and selection in
+/// Standard editing; Vim mode keeps appending.
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn policy_value_is_edited_in_place_in_standard_mode_only() {
+    for (mode, expected) in [("standard", "712"), ("vim", "127")] {
+        let (mut app, config) = fixture();
+        set_editing_mode(&mut app, mode);
+        let (_dir, task) = connect(
+            &mut app,
+            vec![(
+                "GetHarnessManagerPolicy",
+                json!({"result":policy_config(&config)}),
+            )],
+        )
+        .await;
+        policy::open(&mut app, config, "Coordination desk".into())
+            .await
+            .unwrap();
+        finish(task).await;
+        policy_mut(&mut app).activate(policy::Field::Containers);
+        policy_mut(&mut app).edit.as_mut().unwrap().1 = "12".to_string();
+        key(&mut app, KeyCode::Home).await;
+        key(&mut app, KeyCode::Char('7')).await;
+        assert_eq!(
+            policy_mut(&mut app).edit.as_ref().unwrap().1,
+            expected,
+            "{mode}"
+        );
+    }
+}
+
+/// #1628 slice 3b: the decision answer box gets a cursor in Standard editing
+/// and typing refreshes the exact-target idempotency key.
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn decision_answer_is_edited_in_place_in_standard_mode() {
+    let (mut app, config) = fixture();
+    set_editing_mode(&mut app, "standard");
+    let mut cases = board_cases(&config, board_overview_rows(&config), vec![], vec![]);
+    cases[1].1 = json!({"result":page(
+        &config,
+        ManagerInspectSectionV2::Decisions,
+        vec![
+            pending_decision("first-gate", "Approve first gate?", 4),
+            pending_decision("release-target", "Choose release target", 7),
+        ],
+        None,
+    )});
+    let (_dir, task) = connect(&mut app, cases).await;
+    board::open(&mut app, config, "Coordination desk".into(), false)
+        .await
+        .unwrap();
+    finish(task).await;
+    key(&mut app, KeyCode::Char('j')).await;
+    key(&mut app, KeyCode::Char('a')).await;
+    for c in "lling".chars() {
+        key(&mut app, KeyCode::Char(c)).await;
+    }
+    let before = board_state(&app)
+        .answer
+        .as_ref()
+        .unwrap()
+        .target
+        .idempotency_key
+        .clone();
+    key(&mut app, KeyCode::Home).await;
+    for c in "ro".chars() {
+        key(&mut app, KeyCode::Char(c)).await;
+    }
+    let target = &board_state(&app).answer.as_ref().unwrap().target;
+    assert_eq!(target.answer, "rolling");
+    assert_ne!(target.idempotency_key, before, "editing refreshes the key");
+}

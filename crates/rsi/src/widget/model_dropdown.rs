@@ -44,8 +44,9 @@ pub fn handle_model_dropdown_key(
     state: &mut ModelDropdownState,
     key: &KeyEvent,
     custom_providers: &[CustomProviderEntry],
+    standard: bool,
 ) -> ModelDropdownAction {
-    handle_model_dropdown_key_with_providers(state, key, &BUILTIN, custom_providers)
+    handle_model_dropdown_key_with_providers(state, key, &BUILTIN, custom_providers, standard)
 }
 
 /// Reuse dropdown input with a caller-owned provider list; model IDs still come from the catalog.
@@ -54,6 +55,7 @@ pub fn handle_model_dropdown_key_with_providers(
     key: &KeyEvent,
     builtins: &[SessionProvider],
     custom_providers: &[CustomProviderEntry],
+    standard: bool,
 ) -> ModelDropdownAction {
     state.reconcile_filter_selection();
     // While the filter is being typed, printable keys are query text: they
@@ -61,6 +63,29 @@ pub fn handle_model_dropdown_key_with_providers(
     // A query edit re-highlights the first match, so typing then Enter picks
     // the best hit.
     if state.filter_editing {
+        // Standard editing: a real cursor and selection in the query. Esc,
+        // Backspace on an empty query and Ctrl-U/W keep their meaning.
+        if standard {
+            let leaves = key.code == KeyCode::Esc
+                || (key.code == KeyCode::Backspace && state.filter_query.is_empty())
+                || (matches!(key.code, KeyCode::Char('u' | 'w'))
+                    && key.modifiers.contains(KeyModifiers::CONTROL));
+            if !leaves {
+                let ModelDropdownState {
+                    filter_cursor,
+                    filter_query,
+                    ..
+                } = &mut *state;
+                match filter_cursor.handle_key(filter_query, *key) {
+                    crate::field_edit::FieldKey::Ignored => {}
+                    crate::field_edit::FieldKey::Moved => return ModelDropdownAction::Consumed,
+                    crate::field_edit::FieldKey::Edited => {
+                        state.select_first_match();
+                        return ModelDropdownAction::Consumed;
+                    }
+                }
+            }
+        }
         match key.code {
             // Esc leaves the query and its filtered list in place for j/k and
             // 1-9; the next Esc closes the picker.
@@ -253,6 +278,15 @@ fn cycle_provider_with_providers(
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// Vim-mode (append-only filter) entry point for the existing tests.
+    fn handle_model_dropdown_key(
+        state: &mut ModelDropdownState,
+        key: &KeyEvent,
+        custom_providers: &[CustomProviderEntry],
+    ) -> ModelDropdownAction {
+        super::handle_model_dropdown_key(state, key, custom_providers, false)
+    }
 
     fn make_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

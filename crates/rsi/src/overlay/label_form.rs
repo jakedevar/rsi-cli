@@ -40,6 +40,21 @@ pub(super) async fn handle_label_form_key(app: &mut App, key: KeyEvent) {
         _ => return,
     };
 
+    // Standard editing: a real cursor and selection in the focused text field.
+    if app.edit_field(key, |overlay| match overlay {
+        OverlayState::LabelForm {
+            name, description, ..
+        } => match focused_field {
+            0 => Some(name),
+            1 => Some(description),
+            _ => None,
+        },
+        _ => None,
+    }) != crate::field_edit::FieldKey::Ignored
+    {
+        return;
+    }
+
     match key.code {
         KeyCode::BackTab => {
             if let OverlayState::LabelForm { focused_field, .. } = &mut app.overlay {

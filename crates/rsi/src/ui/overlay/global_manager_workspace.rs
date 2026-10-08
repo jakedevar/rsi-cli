@@ -8,7 +8,7 @@
 use crate::app::App;
 use crate::overlay::global_manager_workspace::{
     APPOINT_HINT, GlobalManagerWorkspaceState, LAUNCH_HINT, SPLIT_MIN_WIDTH, SeatEntry, SeatHealth,
-    WorkspaceFocus, seat_header, seat_health, seat_row_text, seat_summary,
+    SeatLevel, WorkspaceFocus, seat_header, seat_health, seat_row_text, seat_summary,
 };
 use crate::overlay::global_manager_workspace_launch::{LaunchField, LaunchForm, LaunchRole};
 use crate::types::OverlayState;
@@ -269,7 +269,7 @@ pub(crate) fn form_lines(form: &LaunchForm, width: usize) -> Vec<Line<'static>> 
             if form.cap_confirm {
                 "y confirm lower project caps · n back to the form · Esc cancel"
             } else {
-                "j/k field · h/l change · Space/a scope · Enter launch · Esc cancel"
+                "j/k field · h/l change (seat, host) · Space/a scope · Enter launch · Esc cancel"
             },
             dim,
         )),
@@ -296,10 +296,17 @@ pub(crate) fn form_lines(form: &LaunchForm, width: usize) -> Vec<Line<'static>> 
                     format!("{marker}{:<9}", field.label()),
                     style,
                 )));
-                let cursor = if focused { "▏" } else { "" };
-                let body = format!("{}{cursor}", safe(&form.prompt));
+                let body = if focused && crate::field_edit::standard_frame() {
+                    crate::field_edit::mark(&form.prompt, "")
+                } else {
+                    let cursor = if focused { "▏" } else { "" };
+                    format!("{}{cursor}", safe(&form.prompt))
+                };
+                let mut in_selection = false;
                 for row in wrap_words(&body, width.saturating_sub(4).max(10)) {
-                    lines.push(Line::from(Span::styled(format!("    {row}"), text)));
+                    let mut spans = vec![Span::styled("    ", text)];
+                    spans.extend(crate::field_edit::marked_row(&row, &mut in_selection, text));
+                    lines.push(Line::from(spans));
                 }
             }
             LaunchField::Scope => {
@@ -442,6 +449,18 @@ fn detail(app: &App, state: &GlobalManagerWorkspaceState) -> Detail {
         });
     };
     let mut header = seat_header_lines(&seat);
+    // #1627: the global seat lives in one host project; name it.
+    if seat.level == SeatLevel::Global {
+        if let Some(host) = seat
+            .project_id
+            .and_then(|id| app.projects.iter().find(|p| p.id == id))
+        {
+            header.push(Line::from(Span::styled(
+                safe(&format!("Host project {}", host.name)),
+                Style::default().fg(theme::text()),
+            )));
+        }
+    }
     if let Some(caps) = state.selected_cap_line() {
         header.push(Line::from(Span::styled(
             safe(&caps),
@@ -947,6 +966,7 @@ mod tests {
                 "deleted 00000000",
                 // The conversation pane: the seat header and the transcript.
                 "GLOBAL SEAT · IDLE",
+                "Host project dictate-agent",
                 "Give me a portfolio digest.",
                 "rsi: PM active",
             ] {

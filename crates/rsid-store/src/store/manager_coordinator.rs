@@ -39,6 +39,19 @@ pub struct ManagerDecisionDeliveryV2 {
     pub effect_started: bool,
     pub boot_id: Option<Uuid>,
     pub outcome: Option<String>,
+    /// #1704: a manager ruling on a topology node's question is bound to the
+    /// exact node attempt and execution it was ruled under. Every claim and
+    /// the effect-start admission re-check that the attempt is still live, so
+    /// a cancelled execution revokes the queued answer. The operator's own
+    /// answer carries no binding and keeps its authority unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology: Option<ManagerDeliveryTopologyV2>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagerDeliveryTopologyV2 {
+    pub execution_id: Uuid,
+    pub attempt_id: Uuid,
 }
 
 /// Live keys of one kind in a scope, read from the live-row index so archived
@@ -262,6 +275,26 @@ impl Store {
                                 .join("\n")
                         })
                         .unwrap_or_else(|| "Pending provider question".into());
+                    // The complete published question: every item's question,
+                    // header, option label and option description. The gate
+                    // scan reads this, never only the flattened question.
+                    let gate_text = session
+                        .pending_question
+                        .as_ref()
+                        .map(|q| {
+                            q.questions
+                                .iter()
+                                .flat_map(|item| {
+                                    [item.question.as_str(), item.header.as_str()]
+                                        .into_iter()
+                                        .chain(item.options.iter().flat_map(|option| {
+                                            [option.label.as_str(), option.description.as_str()]
+                                        }))
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default();
                     self.manager_v2_record_changed(
                         config,
                         "decision_target",
@@ -270,7 +303,7 @@ impl Store {
                         &target,
                     )?;
                     changed += usize::from(self.manager_v2_record_changed(config,"decision",&key,live_epic,&json!({
-                        "key":key,"epic_id":live_epic,"question":question,"request_id":null,"work_key":null,
+                        "key":key,"epic_id":live_epic,"question":question,"gate_text":gate_text,"request_id":null,"work_key":null,
                         "target_digest":digest,"target_row_version":null,"status":"pending","answer":null,"delivery":null
                     }))?);
                 }

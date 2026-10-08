@@ -2277,6 +2277,10 @@ pub struct ExecuteTopologyParams {
     /// behavior; preserves backward compat with pre-P1.12 callers).
     #[serde(default)]
     pub parent_id: Option<Uuid>,
+    /// #1641 S3a: the on-call manager seat for this execution. Omitted means
+    /// the project's manager (else the covering portfolio seat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_call: Option<crate::types::TopologyOnCallSeat>,
 }
 
 // ─── Tag RPC params (P1.5) ──────────────────────────────────────────
@@ -3348,6 +3352,42 @@ mod tests {
         assert!(params.parent_id.is_none());
         assert!(params.project_id.is_none());
         assert!(params.inputs.is_null());
+    }
+
+    /// #1641 S3a: the on-call seat is optional, a reference, and strict.
+    #[test]
+    fn execute_topology_params_on_call_is_an_optional_seat_reference() {
+        use crate::types::TopologyOnCallSeat;
+        let topology_id = Uuid::new_v4();
+        let params: ExecuteTopologyParams =
+            serde_json::from_value(serde_json::json!({ "topology_id": topology_id })).unwrap();
+        assert_eq!(params.on_call, None);
+        let node_id = Uuid::new_v4();
+        let params: ExecuteTopologyParams = serde_json::from_value(serde_json::json!({
+            "topology_id": topology_id,
+            "on_call": {"kind": "portfolio", "node_id": node_id},
+        }))
+        .unwrap();
+        assert_eq!(
+            params.on_call,
+            Some(TopologyOnCallSeat::Portfolio { node_id })
+        );
+        let params: ExecuteTopologyParams = serde_json::from_value(serde_json::json!({
+            "topology_id": topology_id,
+            "on_call": {"kind": "project_manager"},
+        }))
+        .unwrap();
+        assert_eq!(params.on_call, Some(TopologyOnCallSeat::ProjectManager));
+        // A session id is not a seat: seats rotate, so none is ever kept.
+        let params: ExecuteTopologyParams = serde_json::from_value(serde_json::json!({
+            "topology_id": topology_id,
+            "on_call": {"kind": "project_manager", "session_id": Uuid::new_v4()},
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&params.on_call).unwrap(),
+            serde_json::json!({"kind": "project_manager"})
+        );
     }
 
     /// P1.12: explicit `parent_id: null` deserializes to None.

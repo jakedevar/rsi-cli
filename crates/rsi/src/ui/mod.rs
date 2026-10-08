@@ -75,6 +75,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         return;
     }
 
+    // Text surfaces follow the operator's live editing mode every frame (#1628).
+    app.sync_standard_surfaces();
+    let _field_edit_frame =
+        crate::field_edit::begin_frame(app.standard_editing().then(|| app.field_edit.clone()));
+
     let overlay_was_visible = app.overlay_visible_last_frame;
     let overlay_is_visible =
         !matches!(app.overlay, OverlayState::None) || !app.input_overlays.is_empty();
@@ -129,6 +134,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     // Overlay rendered last — drawn on top of everything (painter's algorithm)
     overlay::render_overlay(frame, frame.area(), app);
+    crate::editing_mode_prompt::render(frame, frame.area(), app);
     app.overlay_visible_last_frame = overlay_is_visible;
 
     // Model dropdown widget (rendered after overlays for painter's algorithm)
@@ -1161,27 +1167,29 @@ fn render_command_bar(frame: &mut Frame, area: Rect, app: &App) {
 
     let bg = theme::status_line_bg();
 
-    let content = match app.input_mode {
-        InputMode::Command => format!(":{}", app.command_buffer),
-        InputMode::Input => format!("> {}", app.input_buffer),
+    // (prefix, editable text, suffix): the text is the one field the
+    // Standard cursor edits.
+    let (prefix, field, suffix) = match app.input_mode {
+        InputMode::Command => (":".to_string(), app.command_buffer.as_str(), String::new()),
+        InputMode::Input => ("> ".to_string(), app.input_buffer.as_str(), String::new()),
         InputMode::Search => {
-            if app.search_matches.is_empty()
+            let suffix = if app.search_matches.is_empty()
                 && !app.search_query.is_empty()
                 && app.search_target == SearchTarget::SessionDetail
             {
-                format!("/{} [no matches]", app.search_query)
+                " [no matches]".to_string()
             } else if !app.search_matches.is_empty() {
                 format!(
-                    "/{} [{}/{}]",
-                    app.search_query,
+                    " [{}/{}]",
                     app.search_match_cursor + 1,
                     app.search_matches.len()
                 )
             } else {
-                format!("/{}", app.search_query)
-            }
+                String::new()
+            };
+            ("/".to_string(), app.search_query.as_str(), suffix)
         }
-        InputMode::Normal => String::new(),
+        InputMode::Normal => (String::new(), "", String::new()),
     };
 
     let style = match app.input_mode {
@@ -1190,7 +1198,10 @@ fn render_command_bar(frame: &mut Frame, area: Rect, app: &App) {
         InputMode::Search => Style::default().fg(theme::green()),
     };
 
-    let bar = Paragraph::new(content).style(style.bg(bg));
+    let mut spans = vec![Span::raw(prefix)];
+    spans.extend(crate::field_edit::draw_inline(field, Style::default()));
+    spans.push(Span::raw(suffix));
+    let bar = Paragraph::new(Line::from(spans)).style(style.bg(bg));
     frame.render_widget(bar, area);
 }
 

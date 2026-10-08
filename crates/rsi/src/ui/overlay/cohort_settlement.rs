@@ -143,10 +143,10 @@ pub(super) fn render_source_worktree_settlement(
     if state.authorization_active {
         lines.push(Line::default());
         lines.push(section("Authorization input (not prefilled)"));
-        lines.push(Line::from(Span::styled(
-            format!("> {}█", state.authorization_input),
-            Style::default().fg(theme::warning_status()),
-        )));
+        let style = Style::default().fg(theme::warning_status());
+        let mut spans = vec![Span::styled("> ", style)];
+        spans.extend(crate::field_edit::draw(&state.authorization_input, style));
+        lines.push(Line::from(spans));
         lines.push(Line::from(Span::styled(
             "Enter submit · Esc cancel",
             Style::default().fg(theme::subtext0()),

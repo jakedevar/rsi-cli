@@ -101,6 +101,7 @@ pub enum SettingsSection {
     SessionList,
     TranscriptDefaults,
     InputPrompts,
+    EditingMode,
     ModelRoles,
     ApiProviders,
     SystemPrompt,
@@ -130,6 +131,7 @@ impl SettingsSection {
         Self::SessionList,
         Self::TranscriptDefaults,
         Self::InputPrompts,
+        Self::EditingMode,
         Self::ModelRoles,
         Self::ApiProviders,
         Self::SystemPrompt,
@@ -156,9 +158,10 @@ impl SettingsSection {
     pub const fn group(self) -> SettingsGroup {
         match self {
             Self::ThemeColors | Self::Screen => SettingsGroup::Appearance,
-            Self::SessionList | Self::TranscriptDefaults | Self::InputPrompts => {
-                SettingsGroup::Workspace
-            }
+            Self::SessionList
+            | Self::TranscriptDefaults
+            | Self::InputPrompts
+            | Self::EditingMode => SettingsGroup::Workspace,
             Self::ModelRoles | Self::ApiProviders | Self::SystemPrompt => SettingsGroup::Models,
             Self::ModelControl | Self::Budgets | Self::Usage | Self::ProviderKeys => {
                 SettingsGroup::SafetyAndSpend
@@ -186,6 +189,7 @@ impl SettingsSection {
             Self::SessionList => "Session List",
             Self::TranscriptDefaults => "Transcript Defaults",
             Self::InputPrompts => "Input & Prompts",
+            Self::EditingMode => "Editing Mode",
             Self::ModelRoles => "Model Roles",
             Self::ApiProviders => "API Providers",
             Self::SystemPrompt => "System Prompt",
@@ -217,6 +221,7 @@ impl SettingsSection {
             Self::SessionList => "What the session navigator and cards show.",
             Self::TranscriptDefaults => "What a newly opened transcript shows.",
             Self::InputPrompts => "How typing and submitting behave.",
+            Self::EditingMode => "Standard or Vim text editing in every input.",
             Self::ModelRoles => "Which model does which job.",
             Self::ApiProviders => "OpenAI-compatible endpoints for model selection.",
             Self::SystemPrompt => "The system-prompt preset applied to launches.",
@@ -283,6 +288,7 @@ setting_ids! {
     SubmitOnEnter,
     AutoOpenQuestionPanel,
     PromptCompiler,
+    EditingMode,
     DefaultModel,
     TitleModel,
     PromptCompilerModel,
@@ -331,6 +337,7 @@ setting_ids! {
     DagMaxConcurrentGraphs,
     GvRenderRecursiveOrigin,
     GvInfoDashboard,
+    FollowAgentCreatedProjects,
     TopologyExecutor,
     TopologyBuildNodes,
     TopologyBulkFanout,
@@ -343,6 +350,7 @@ setting_ids! {
     WorkerScopeMemorySwapMax,
     WorkerScopeCpuWeight,
     RollingQueueEnabled,
+    TurnDetachEnabled,
     DeployDrainEnabled,
     DeployDrainHold,
     HostLoadAdmissionThreshold,
@@ -772,6 +780,18 @@ pub static SETTINGS: &[SettingSpec] = &[
         kind: SettingKind::Bool,
         owner: SettingOwner::Tui,
         apply: SettingApply::Immediate,
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::EditingMode,
+        section: SettingsSection::EditingMode,
+        label: "Editing mode",
+        summary: "Standard edits like a normal text field (typing inserts, arrows move); Vim is the modal editing RSI was built around. Applies live; `unset` asks again at the next start.",
+        detail: None,
+        keywords: &["editing", "vim", "standard", "modal", "keys"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("editing_mode"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },
     SettingSpec {
@@ -1392,6 +1412,20 @@ pub static SETTINGS: &[SettingSpec] = &[
         destructive: false,
     },
     SettingSpec {
+        id: SettingId::FollowAgentCreatedProjects,
+        section: SettingsSection::Orchestration,
+        label: "Follow agent-created projects",
+        summary: "Switches to the new project's tab when an agent creates a project (AgentCreateProject).",
+        detail: Some(
+            "On (default): the TUI jumps to the tab of a project an agent just created and offers, in one key, to add it to the creating global manager's grant. Off: the project still appears in the tab bar and the grant offer still shows, but the view stays where it is.",
+        ),
+        keywords: &["project", "agent", "created", "follow", "tab", "grant"],
+        kind: SettingKind::Bool,
+        owner: SettingOwner::Daemon("follow_agent_created_projects"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
         id: SettingId::TopologyExecutor,
         section: SettingsSection::Orchestration,
         label: "Durable topology executor",
@@ -1546,6 +1580,20 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["merge", "queue", "landing", "rolling", "lander"],
         kind: SettingKind::Bool,
         owner: SettingOwner::Daemon("rolling_queue_enabled"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::TurnDetachEnabled,
+        section: SettingsSection::Orchestration,
+        label: "Detach Claude turns",
+        summary: "Run new Claude CLI turns through the durable turn shim (default off).",
+        detail: Some(
+            "Applies to the next Claude turn. Turning it off reads provider output directly from a pipe. Experimental: enabling is unsafe until transport authority across daemon boots (#1711) lands. Sessions that ran a detached turn are kept in the trash and cannot be purged.",
+        ),
+        keywords: &["claude", "turn", "detach", "spool", "deploy"],
+        kind: SettingKind::Bool,
+        owner: SettingOwner::Daemon("turn_detach_enabled"),
         apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },

@@ -103,6 +103,10 @@ enum ContinuationIntent {
     },
     ManagerAction(Box<crate::store::manager_actions::ManagerActionClaimV2>),
     ManagerDecision(Box<crate::store::manager_coordinator::ManagerDecisionDeliveryV2>),
+    RemoteAnswer(Box<crate::store::pending_questions::remote_answers::RemoteAnswerDelivery>),
+    /// Exact published terminal question, rechecked under the spawn guard and
+    /// cleared only after provider establishment. Runtime-only slots refuse.
+    OperatorAnswer(Box<serde_json::Value>),
     /// Scheduled Resume wake or ordinary child-watch delivery. The exact job
     /// rows are revalidated under the target spawn guard (K2 review (a)).
     ScheduledWake {
@@ -110,6 +114,11 @@ enum ContinuationIntent {
     },
     /// #669: daemon-owned in-place resume of a Failed appointed manager seat.
     ManagerSeat(Box<crate::store::manager_intent::manager_seat::ManagerSeatClaimV1>),
+    /// #1715: the on-call ruling's answer to a parked topology node. Behaves
+    /// like `ExistingAuthority` plus the exact execution/attempt/decision
+    /// binding, rechecked under the spawn guard and durably claimed before
+    /// the provider effect (the S3b delivery safeguards).
+    TopologyAnswer(Box<crate::topology::store::AnswerBinding>),
 }
 
 struct FreshRelaunchIntent {
@@ -1818,74 +1827,73 @@ impl SessionManager {
 
     /// Answer a pending question from the session, resuming it.
     pub async fn answer_question(&self, session_id: Uuid, response_text: String) -> Result<()> {
-        let is_waiting = {
-            let active = self.active.read().await;
-            if let Some(tracked) = active.get(&session_id) {
-                tracked.session.status == SessionStatus::WaitingApproval
-            } else {
-                false
-            }
-        };
-
-        if !is_waiting {
-            // Check if it's in completed as a fallback, although WaitingApproval sessions
-            // are moved to completed map in finalize_session, they still keep their status.
-            let in_completed = {
-                let completed = self.completed.read().await;
-                completed.get(&session_id).map(|s| s.session.status)
-                    == Some(SessionStatus::WaitingApproval)
-            };
-            if !in_completed {
-                return Err(DaemonError::SessionNotFound(session_id));
-            }
-        }
-
-        // Clear the pending question in the DB and memory immediately (best effort for UI responsiveness)
-        {
-            if let Some(tracked) = self.active.write().await.get_mut(&session_id) {
-                tracked.pending_question = None;
-                tracked.session.pending_question = None;
-                // Close the open WaitingApproval interval and fold its duration
-                // into the running total. `saturating_add` defends against an
-                // improbable u64 overflow (would require a session wait
-                // measured in hundreds of millions of years).
-                if let Some(started) = tracked.approval_wait_start.take() {
-                    let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                    tracked.approval_wait_total_ms =
-                        tracked.approval_wait_total_ms.saturating_add(elapsed_ms);
+        // A producer publication is the gate. Runtime maps may temporarily
+        // lack this session while a competing answer owns its spawn guard;
+        // status-only checks would turn that race into SessionNotFound.
+        let (provider, published_target) = {
+            let store = self.store.lock().await;
+            let target =
+                store
+                    .manager_v2_question_target(session_id)
+                    .map_err(|error| match error {
+                        DaemonError::InvalidParam(code)
+                            if matches!(
+                                code.as_str(),
+                                "manager_v2_question_identity_unavailable"
+                                    | "manager_v2_question_identity_stale"
+                                    | "manager_v2_question_malformed"
+                            ) =>
+                        {
+                            DaemonError::PolicyDenied("question_not_published".into())
+                        }
+                        other => other,
+                    })?;
+            let target = match target {
+                Some(target) => target,
+                None => {
+                    return Err(DaemonError::PolicyDenied(
+                        if store.pending_question_was_cleared(session_id)? {
+                            "question_already_answered"
+                        } else {
+                            "question_not_published"
+                        }
+                        .into(),
+                    ));
                 }
-            }
-        }
-        {
-            if let Some(completed) = self.completed.write().await.get_mut(&session_id) {
-                completed.session.pending_question = None;
-            }
-        }
-        if let Err(e) = self
-            .persistence
-            .update_pending_question_json(session_id, None)
-            .await
-        {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %e,
-                "Failed to clear pending question"
-            );
-        }
-
-        let provider = {
-            let active = self.active.read().await;
-            if let Some(tracked) = active.get(&session_id) {
-                Some(tracked.session.provider)
-            } else {
-                let completed = self.completed.read().await;
-                completed.get(&session_id).map(|s| s.session.provider)
-            }
+            };
+            let provider = store
+                .get_session(session_id)?
+                .ok_or_else(|| DaemonError::SessionNotFound(session_id))?
+                .provider;
+            (provider, target)
         };
-
-        let provider = provider.ok_or_else(|| DaemonError::SessionNotFound(session_id))?;
         let answer = super::question::encode_answer(provider, &response_text);
-        self.continue_session(session_id, answer).await
+        self.continue_session_with_delivery(
+            session_id,
+            answer,
+            ContinuationIntent::OperatorAnswer(Box::new(published_target)),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Exact published target check under the spawn guard, before any effect.
+    async fn check_operator_answer_target(
+        &self,
+        session_id: Uuid,
+        expected: &serde_json::Value,
+    ) -> Result<()> {
+        match self
+            .store
+            .lock()
+            .await
+            .manager_v2_question_target(session_id)
+        {
+            Ok(Some(current)) if &current == expected => Ok(()),
+            _ => Err(DaemonError::PolicyDenied(
+                "question_already_answered".into(),
+            )),
+        }
     }
 
     /// How long [`Self::continue_session`] waits for an already-active session
@@ -1900,6 +1908,25 @@ impl SessionManager {
     /// this value is a compile error, not a silent regression.
     pub(super) const CONTINUE_INTERRUPT_WAIT: std::time::Duration =
         std::time::Duration::from_secs(20);
+
+    /// #1715: deliver an on-call ruling's answer to a parked topology node
+    /// session. Same continue path as `continue_session`, bound to the exact
+    /// execution, attempt and decision and durably claimed before the
+    /// provider effect.
+    pub(crate) async fn continue_topology_answer(
+        &self,
+        session_id: Uuid,
+        query: String,
+        binding: crate::topology::store::AnswerBinding,
+    ) -> Result<()> {
+        self.continue_session_with_delivery(
+            session_id,
+            query,
+            ContinuationIntent::TopologyAnswer(Box::new(binding)),
+        )
+        .await
+        .map(|_| ())
+    }
 
     /// Continue a completed/interrupted/failed session with a new query.
     pub async fn continue_session(&self, session_id: Uuid, query: String) -> Result<()> {
@@ -1948,11 +1975,17 @@ impl SessionManager {
         let runtime_active = self.active.read().await.contains_key(&row.tip_session_id);
         if !runtime_active {
             let tip = row.tip_session_id;
-            tokio::task::spawn_blocking(move || super::reaper::reap_orphans_for_session(tip))
-                .await
-                .map_err(|error| {
-                    DaemonError::Process(format!("child relaunch orphan reap join failed: {error}"))
-                })??;
+            let orphan_store = std::sync::Arc::clone(&self.store);
+            tokio::task::spawn_blocking(move || {
+                let turns = orphan_store
+                    .blocking_lock()
+                    .list_active_provider_turn_custody()?;
+                super::reaper::reap_orphans_for_session(tip, turns)
+            })
+            .await
+            .map_err(|error| {
+                DaemonError::Process(format!("child relaunch orphan reap join failed: {error}"))
+            })??;
         }
         let store = self.store.lock().await;
         let task_source = super::rotation::resolve_rotation_task_query(
@@ -2320,6 +2353,23 @@ impl SessionManager {
         .map(|_| ())
     }
 
+    pub(super) async fn continue_remote_answer(
+        &self,
+        delivery: crate::store::pending_questions::remote_answers::RemoteAnswerDelivery,
+    ) -> Result<()> {
+        let query = super::question::encode_answer(
+            SessionProvider::Claude,
+            delivery.request.answer.as_str(),
+        );
+        self.continue_session_with_delivery(
+            delivery.session_id(),
+            query,
+            ContinuationIntent::RemoteAnswer(Box::new(delivery)),
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub(super) async fn continue_manager_decision(
         &self,
         delivery: crate::store::manager_coordinator::ManagerDecisionDeliveryV2,
@@ -2651,6 +2701,7 @@ impl SessionManager {
                 "daemon restart drain is in progress".into(),
             ));
         }
+        self.fence_prior_detached_turn(session_id).await?;
         // #1073: an automated continuation of a child session starts a worker
         // turn, so it is refused (typed, retryable) behind a draining deploy;
         // every such caller keeps a durable retry obligation (a due wake or
@@ -2660,6 +2711,7 @@ impl SessionManager {
         if matches!(
             intent,
             ContinuationIntent::ExistingAuthority
+                | ContinuationIntent::TopologyAnswer(_)
                 | ContinuationIntent::AgentChild(_)
                 | ContinuationIntent::ScheduledWake { .. }
                 | ContinuationIntent::ManagerAction(_)
@@ -2684,6 +2736,7 @@ impl SessionManager {
         if matches!(
             intent,
             ContinuationIntent::ExistingAuthority
+                | ContinuationIntent::TopologyAnswer(_)
                 | ContinuationIntent::HubDelivery
                 | ContinuationIntent::ManagerSeat(_)
         ) && let Some(hold) = self.usage_limit_hold_for(session_id).await?
@@ -2707,12 +2760,18 @@ impl SessionManager {
             ContinuationIntent::ManagerSeat(claim) => Some(claim.as_ref().clone()),
             _ => None,
         };
+        let topology_answer = match &intent {
+            ContinuationIntent::TopologyAnswer(binding) => Some(binding.as_ref().clone()),
+            _ => None,
+        };
+        let mut remote_answer = None;
         let mut scheduled_wake_jobs = None;
         let (
             capacity_delivery,
             manager_notice_jobs,
             manager_action,
             mut manager_decision,
+            operator_answer,
             agent_child,
         ) = match intent {
             ContinuationIntent::Operator
@@ -2720,19 +2779,29 @@ impl SessionManager {
             | ContinuationIntent::ExistingAuthority
             | ContinuationIntent::HubDelivery
             | ContinuationIntent::Restart(_)
-            | ContinuationIntent::ManagerSeat(_) => (None, None, None, None, None),
-            ContinuationIntent::AgentChild(child) => (None, None, None, None, Some(child)),
+            | ContinuationIntent::TopologyAnswer(_)
+            | ContinuationIntent::ManagerSeat(_) => (None, None, None, None, None, None),
+            ContinuationIntent::OperatorAnswer(target) => {
+                (None, None, None, None, Some(target), None)
+            }
+            ContinuationIntent::AgentChild(child) => (None, None, None, None, None, Some(child)),
             ContinuationIntent::ScheduledWake { job_ids } => {
                 scheduled_wake_jobs = Some(job_ids);
-                (None, None, None, None, None)
+                (None, None, None, None, None, None)
             }
-            ContinuationIntent::Capacity(delivery) => (Some(delivery), None, None, None, None),
+            ContinuationIntent::Capacity(delivery) => {
+                (Some(delivery), None, None, None, None, None)
+            }
             ContinuationIntent::ManagerNotice { job_ids } => {
-                (None, Some(job_ids), None, None, None)
+                (None, Some(job_ids), None, None, None, None)
             }
-            ContinuationIntent::ManagerAction(claim) => (None, None, Some(claim), None, None),
+            ContinuationIntent::ManagerAction(claim) => (None, None, Some(claim), None, None, None),
+            ContinuationIntent::RemoteAnswer(delivery) => {
+                remote_answer = Some(delivery);
+                (None, None, None, None, None, None)
+            }
             ContinuationIntent::ManagerDecision(delivery) => {
-                (None, None, None, Some(delivery), None)
+                (None, None, None, Some(delivery), None, None)
             }
         };
         // Single-flight spawn guard: held across this fn's check -> launch ->
@@ -2847,6 +2916,22 @@ impl SessionManager {
         }
         if let Some(delivery) = manager_decision.as_ref() {
             self.check_manager_decision_runtime(delivery).await?;
+        }
+        if let Some(binding) = topology_answer.as_ref() {
+            // #1715: the exact execution/attempt must still be live under the
+            // spawn guard before anything else is done for this answer.
+            crate::topology::store::answer_delivery_live(
+                &*self.store.lock().await,
+                binding,
+                session_id,
+            )?;
+        }
+        if let Some(delivery) = remote_answer.as_ref() {
+            self.check_remote_answer_runtime(delivery).await?;
+        }
+        if let Some(answer) = operator_answer.as_ref() {
+            self.check_operator_answer_target(session_id, answer)
+                .await?;
         }
         if operator_intent {
             self.store
@@ -3314,7 +3399,10 @@ impl SessionManager {
         // A continuation that is not the answer (answer_question clears the
         // pending question first; a manager decision carries the answer) must
         // tell the agent that no human answered, in the typed documented form.
-        if manager_decision.is_none() {
+        // A terminal operator answer is itself the answer to the pending
+        // question; its published snapshot lingers until the deferred exact
+        // clear, so the "no human has answered" notice must not be prepended.
+        if manager_decision.is_none() && remote_answer.is_none() && operator_answer.is_none() {
             query = super::question::with_unanswered_notice(
                 completed_session.session.pending_question.as_ref(),
                 query,
@@ -3821,8 +3909,12 @@ impl SessionManager {
                     | SessionProvider::Harness
             )
         {
+            let orphan_store = std::sync::Arc::clone(&self.store);
             let reaped = tokio::task::spawn_blocking(move || {
-                super::reaper::reap_orphans_for_session(session_id)
+                let turns = orphan_store
+                    .blocking_lock()
+                    .list_active_provider_turn_custody()?;
+                super::reaper::reap_orphans_for_session(session_id, turns)
             })
             .await
             .map_err(|error| {
@@ -3894,6 +3986,11 @@ impl SessionManager {
                 None => manager_decision
                     .as_ref()
                     .map(|delivery| format!("manager.answer:{}", delivery.key))
+                    .or_else(|| {
+                        remote_answer
+                            .as_ref()
+                            .map(|delivery| format!("remote.answer:{}", delivery.key()))
+                    })
                     .or_else(|| restart_intent_id.map(|id| format!("daemon.restart:{id}")))
                     .or_else(|| {
                         manager_action
@@ -4274,6 +4371,91 @@ impl SessionManager {
                 }
             }
         }
+        if let Some(binding) = topology_answer.as_ref() {
+            // #1715: the last check before the provider effect, and the
+            // durable at-most-once claim in the same transaction. A
+            // cancellation, deadline or supersession that committed since the
+            // executor read the answer stops the delivery here.
+            let claimed = crate::topology::store::claim_answer_delivery(
+                &*self.store.lock().await,
+                binding,
+                session_id,
+            );
+            if let Err(error) = claimed {
+                let _ = complete_invocation(
+                    &self.store,
+                    &admission_permit,
+                    InvocationCompletion {
+                        error_class: Some("topology_answer_fence_rejected".into()),
+                        confidence: Some(ModelUsageConfidence::Unavailable),
+                        ..InvocationCompletion::default()
+                    },
+                    self.event_bus(),
+                )
+                .await;
+                self.revoke_agent_token_for_session(session_id).await;
+                self.completed
+                    .write()
+                    .await
+                    .insert(session_id, completed_session);
+                return Err(error);
+            }
+        }
+        if let Some(answer) = operator_answer.as_ref() {
+            if let Err(error) = self.check_operator_answer_target(session_id, answer).await {
+                let _ = complete_invocation(
+                    &self.store,
+                    &admission_permit,
+                    InvocationCompletion {
+                        error_class: Some("operator_answer_fence_rejected".into()),
+                        confidence: Some(ModelUsageConfidence::Unavailable),
+                        ..Default::default()
+                    },
+                    self.event_bus(),
+                )
+                .await;
+                self.revoke_agent_token_for_session(session_id).await;
+                self.completed
+                    .write()
+                    .await
+                    .insert(session_id, completed_session);
+                return Err(error);
+            }
+        }
+        if let Some(delivery) = remote_answer.as_mut() {
+            let marked = async {
+                self.check_remote_answer_runtime(delivery).await?;
+                self.store.lock().await.set_remote_answer_delivery(
+                    delivery,
+                    rsi_common::remote_pending_decisions::RemoteAnswerStateV1::Running,
+                    true,
+                    None,
+                )
+            }
+            .await;
+            match marked {
+                Ok(marked) => **delivery = marked,
+                Err(error) => {
+                    let _ = complete_invocation(
+                        &self.store,
+                        &admission_permit,
+                        InvocationCompletion {
+                            error_class: Some("remote_answer_fence_rejected".into()),
+                            confidence: Some(ModelUsageConfidence::Unavailable),
+                            ..InvocationCompletion::default()
+                        },
+                        self.event_bus(),
+                    )
+                    .await;
+                    self.revoke_agent_token_for_session(session_id).await;
+                    self.completed
+                        .write()
+                        .await
+                        .insert(session_id, completed_session);
+                    return Err(error);
+                }
+            }
+        }
         #[cfg(test)]
         if manager_seat.is_some() {
             super::launch::pause_controller_candidate_test(
@@ -4357,6 +4539,16 @@ impl SessionManager {
         let (mut process, event_rx) = match launch_result {
             Ok(launch) => launch,
             Err(e) => {
+                if let Some(binding) = topology_answer.as_ref() {
+                    // The provider process never started: the claim's effect
+                    // did not happen, so the delivery may be retried.
+                    if let Err(release) = crate::topology::store::release_answer_delivery(
+                        &*self.store.lock().await,
+                        binding,
+                    ) {
+                        tracing::warn!(error = %release, "topology answer claim not released");
+                    }
+                }
                 let safe_error_class = if matches!(&e, DaemonError::CodexResumeTornTail) {
                     "codex_resume_rollout_torn_tail"
                 } else if matches!(&e, DaemonError::CodexResumeToolHistory(_)) {
@@ -4424,6 +4616,66 @@ impl SessionManager {
                 )
                 .await;
                 return Err(error);
+            }
+            completed_session.session.pending_question = None;
+        }
+        if let Some(delivery) = remote_answer.as_ref() {
+            #[cfg(test)]
+            super::launch::pause_controller_candidate_test(
+                session_id,
+                super::launch::ControllerCandidateTestPhase::ManagerQuestionBeforeClear,
+            )
+            .await;
+            if let Err(error) = self.clear_delivered_remote_question(delivery).await {
+                self.revoke_agent_token_for_session(session_id).await;
+                self.retain_failed_manager_question_process(
+                    manager_question_cleanup::FailedQuestionProcess {
+                        process,
+                        completed: completed_session,
+                        permit: admission_permit,
+                        spawn_guard,
+                        cwd_guard: cwd_admission_guard,
+                        settlements: model_call_settlements,
+                    },
+                )
+                .await;
+                return Err(error);
+            }
+            completed_session.session.pending_question = None;
+        }
+        if let Some(operator_target) = operator_answer.as_ref() {
+            // T1 (#990): the terminal answer clears the exact published
+            // question only here, after the provider is established under the
+            // spawn guard. A racing manager/remote delivery that already
+            // cleared it makes this compare-and-clear refuse before any
+            // provider effect.
+            #[cfg(test)]
+            super::launch::pause_controller_candidate_test(
+                session_id,
+                super::launch::ControllerCandidateTestPhase::ManagerQuestionBeforeClear,
+            )
+            .await;
+            let cleared = self
+                .store
+                .lock()
+                .await
+                .clear_pending_question_exact(session_id, operator_target.as_ref());
+            if cleared.is_err() {
+                self.revoke_agent_token_for_session(session_id).await;
+                self.retain_failed_manager_question_process(
+                    manager_question_cleanup::FailedQuestionProcess {
+                        process,
+                        completed: completed_session,
+                        permit: admission_permit,
+                        spawn_guard,
+                        cwd_guard: cwd_admission_guard,
+                        settlements: model_call_settlements,
+                    },
+                )
+                .await;
+                return Err(DaemonError::PolicyDenied(
+                    "question_already_answered".into(),
+                ));
             }
             completed_session.session.pending_question = None;
         }
@@ -4776,6 +5028,12 @@ impl SessionManager {
             .await;
         });
 
+        #[cfg(test)]
+        super::launch::pause_controller_candidate_test(
+            session_id,
+            super::launch::ControllerCandidateTestPhase::ContinuationAfterMonitorSpawn,
+        )
+        .await;
         Ok(match (capacity_delivery, fresh_receipt) {
             (_, Some(receipt)) => ContinueSessionOutcome::AgentFresh(receipt),
             (Some(_), None) => ContinueSessionOutcome::CapacityLaunchConfirmed {
@@ -4856,8 +5114,12 @@ impl SessionManager {
     /// a blocking thread. Inventory or proof failure refuses the destructive
     /// transition so ownership evidence is never erased prematurely.
     async fn reap_orphaned_subprocesses(&self, session_id: Uuid, context: &str) -> Result<()> {
+        let orphan_store = std::sync::Arc::clone(&self.store);
         let reaped = tokio::task::spawn_blocking(move || {
-            super::reaper::reap_orphans_for_session(session_id)
+            let turns = orphan_store
+                .blocking_lock()
+                .list_active_provider_turn_custody()?;
+            super::reaper::reap_orphans_for_session(session_id, turns)
         })
         .await
         .map_err(|error| {
@@ -5845,22 +6107,74 @@ impl SessionManager {
             .await
     }
 
+    async fn deploy_detached_sessions(&self) -> Result<std::collections::HashSet<Uuid>> {
+        let mut preserved = std::collections::HashSet::new();
+        if !self.drain_restart_requested() {
+            return Ok(preserved);
+        }
+        let ids = self.active.read().await.keys().copied().collect::<Vec<_>>();
+        let store = self.store.lock().await;
+        for id in ids {
+            if let Some(turn) = store.adoptable_provider_turn_for_session(id)?
+                && turn.boot_id == self.program_run_boot_id
+            {
+                preserved.insert(id);
+            }
+        }
+        Ok(preserved)
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         self.begin_restart_drain();
-        let session_ids: Vec<Uuid> = self.active.read().await.keys().copied().collect();
+        let preserved = self.deploy_detached_sessions().await?;
+        // Quiesce local readers without turning a deploy into turn completion.
+        // Custody, invocation and session state stay durable for startup adoption.
+        {
+            let active = self.active.read().await;
+            for id in &preserved {
+                if let Some(turn) = active
+                    .get(id)
+                    .and_then(|tracked| tracked.process.as_ref())
+                    .and_then(super::types::ProviderProcess::detached_turn)
+                {
+                    turn.leave_running();
+                }
+            }
+        }
+        let session_ids: Vec<Uuid> = self
+            .active
+            .read()
+            .await
+            .keys()
+            .copied()
+            .filter(|id| !preserved.contains(id))
+            .collect();
         self.interrupt_restart_sessions(session_ids).await?;
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(5);
-        while !self.active.read().await.is_empty() && start.elapsed() < timeout {
+        while self
+            .active
+            .read()
+            .await
+            .keys()
+            .any(|id| !preserved.contains(id))
+            && start.elapsed() < timeout
+        {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         let mut active = self.active.write().await;
-        for tracked in active.values_mut() {
+        for (id, tracked) in active.iter_mut() {
+            if preserved.contains(id) {
+                continue;
+            }
             if let Some(ref mut process) = tracked.process {
                 let _ = process.kill().await;
             }
         }
-        active.clear();
+        // Retain handed-off handles until runtime teardown. A monitor already
+        // inside a persistence await can finish its current line without
+        // seeing an artificial generation change while it observes handoff.
+        active.retain(|id, _| preserved.contains(id));
         drop(active);
         self.harness_process_manager.shutdown_all().await;
         let mut custody_attempt = 0_u64;
@@ -5905,7 +6219,11 @@ impl SessionManager {
     }
 
     pub(super) async fn interrupt_restart_sessions(&self, session_ids: Vec<Uuid>) -> Result<()> {
+        let preserved = self.deploy_detached_sessions().await?;
         for session_id in session_ids {
+            if preserved.contains(&session_id) {
+                continue;
+            }
             // Persist the exact invocation owner before signaling its process.
             // A turn completed during the grace window has no eligible row.
             let recorded = self
@@ -5999,7 +6317,17 @@ impl SessionManager {
     pub async fn shutdown_drain(&self, max_wait: std::time::Duration) -> Result<()> {
         self.begin_restart_drain();
         let deadline = tokio::time::Instant::now() + max_wait;
-        while !self.active.read().await.is_empty() && tokio::time::Instant::now() < deadline {
+        while tokio::time::Instant::now() < deadline {
+            let preserved = self.deploy_detached_sessions().await?;
+            if self
+                .active
+                .read()
+                .await
+                .keys()
+                .all(|id| preserved.contains(id))
+            {
+                break;
+            }
             let snapshot = self.drain_restart_status().await;
             tracing::info!(state=%snapshot, "DRAIN waiting for current turns to settle");
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;

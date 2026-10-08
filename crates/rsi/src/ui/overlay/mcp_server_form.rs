@@ -45,19 +45,23 @@ pub(super) fn render_mcp_server_form(
         ("Enabled", if enabled { "on" } else { "off" }),
     ];
     for (index, (label, value)) in fields.iter().enumerate() {
-        let row = Line::from(vec![
-            Span::styled(
-                format!("{label}: "),
-                Style::default()
-                    .fg(theme::mauve())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(value.to_string(), Style::default().fg(theme::text())),
-            Span::styled(
+        let value_style = Style::default().fg(theme::text());
+        let mut spans = vec![Span::styled(
+            format!("{label}: "),
+            Style::default()
+                .fg(theme::mauve())
+                .add_modifier(Modifier::BOLD),
+        )];
+        if focused_field == index && index < 5 {
+            spans.extend(crate::field_edit::draw(value, value_style));
+        } else {
+            spans.push(Span::styled(value.to_string(), value_style));
+            spans.push(Span::styled(
                 if focused_field == index { "█" } else { "" },
-                Style::default().fg(theme::text()),
-            ),
-        ]);
+                value_style,
+            ));
+        }
+        let row = Line::from(spans);
         frame.render_widget(
             Paragraph::new(row),
             Rect::new(inner.x, inner.y + index as u16, inner.width, 1),

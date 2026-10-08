@@ -232,6 +232,19 @@ fn begin_authorization(app: &mut App) {
 }
 
 async fn handle_authorization_key(app: &mut App, key: KeyEvent) {
+    // Standard editing: a real cursor and selection in the typed phrase.
+    if app.edit_field_capped(
+        key,
+        |overlay| match overlay {
+            OverlayState::SourceWorktreeSettlement(state) => Some(&mut state.authorization_input),
+            _ => None,
+        },
+        |_| true,
+        8192,
+    ) != crate::field_edit::FieldKey::Ignored
+    {
+        return;
+    }
     match key.code {
         KeyCode::Esc => {
             if let OverlayState::SourceWorktreeSettlement(state) = &mut app.overlay {

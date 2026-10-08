@@ -43,11 +43,12 @@ pub(super) fn render_parent_picker(
     }
 
     // Row 0: query
-    let q_line = Line::from(vec![
-        Span::styled("> ", Style::default().fg(theme::mauve())),
-        Span::styled(query.to_string(), Style::default().fg(theme::text())),
-        Span::styled("\u{2588}", Style::default().fg(theme::text())),
-    ]);
+    let mut q_spans = vec![Span::styled("> ", Style::default().fg(theme::mauve()))];
+    q_spans.extend(crate::field_edit::draw(
+        query,
+        Style::default().fg(theme::text()),
+    ));
+    let q_line = Line::from(q_spans);
     frame.render_widget(
         Paragraph::new(q_line),
         Rect::new(inner.x, inner.y, inner.width, 1),

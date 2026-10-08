@@ -16,9 +16,9 @@ use crate::store::agent_jobs::{AgentJobRow, NewAgentJob};
 use chrono::{DateTime, Utc};
 use rsi_common::agent_jobs::{
     AgentJobResultV1, AgentJobV1, BuildJobParams, CloudSweepResultV1, JOB_ADMISSION_TIMED_OUT,
-    JOB_CANCELLED, JOB_DIR_NOT_ALLOWED, JOB_LAUNCH_FAILED, JOB_NOT_FOUND, JOB_TIMED_OUT, JobKind,
-    JobParams, JobState, JobWake, LandingJobParams, SWEEP_MAX_FAILURES, SweepVerdict,
-    TestJobParams,
+    JOB_CANCELLED, JOB_DIR_NOT_ALLOWED, JOB_LAUNCH_FAILED, JOB_NOT_FOUND,
+    JOB_TEST_TIMEOUT_DEFAULT_MINS, JOB_TIMED_OUT, JobKind, JobParams, JobState, JobWake,
+    LandingJobParams, SWEEP_MAX_FAILURES, SweepVerdict, TestJobParams,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -165,6 +165,47 @@ fn slot_cargo(tools: &JobTools, cargo_args: Vec<String>) -> Vec<String> {
 
 /// The line `scripts/candidate-receipt.sh` ends with: the compact JSON receipt.
 const RECEIPT_LINE_PREFIX: &str = "RECEIPT_JSON ";
+/// The line `scripts/scoped-test` ends with (#1638): its compact JSON receipt.
+const SCOPED_RECEIPT_LINE_PREFIX: &str = "SCOPED_TEST_RECEIPT ";
+
+/// #1638: `scripts/scoped-test` for the sandbox, with only the two validated
+/// refs and fixed budgets derived from the job's timeout (the same 120 s and
+/// 60 s margins `make scoped-test` uses at the 20-minute default).
+fn scoped_test_command(
+    tools: &JobTools,
+    p: &rsi_common::agent_jobs::ScopedTestParams,
+    timeout_minutes: Option<u32>,
+) -> JobCommand {
+    let timeout_secs = u64::from(timeout_minutes.unwrap_or(JOB_TEST_TIMEOUT_DEFAULT_MINS)) * 60;
+    let mut argv = vec![
+        tools.cargo_slot.display().to_string(),
+        s("env"),
+        s("-u"),
+        s(STRIP_NAMESPACE_ENV),
+        s("scripts/scoped-test"),
+        s("--base"),
+        p.base.clone(),
+    ];
+    if let Some(head) = &p.head {
+        argv.extend([s("--head"), head.clone()]);
+    }
+    argv.extend([
+        s("--runtime-max-sec"),
+        timeout_secs.saturating_sub(120).max(1).to_string(),
+        s("--total-max-sec"),
+        timeout_secs.saturating_sub(60).max(1).to_string(),
+        s("--cpu-quota"),
+        s("200"),
+    ]);
+    JobCommand {
+        argv,
+        runtime_max_secs: timeout_secs + JOB_TIMEOUT_UNIT_GRACE_SECS,
+        stop_timeout_secs: 60,
+        log_max_bytes: 64 * MIB,
+        memory_max_gib: 24,
+        cpu_quota_percent: 200,
+    }
+}
 
 fn test_command(tools: &JobTools, p: &TestJobParams) -> Vec<String> {
     // #1099: the wrapper makes its own temporary worktree and shares the build
@@ -248,6 +289,11 @@ pub(crate) fn job_command(
         && test.recipe.is_some()
     {
         return recipe::command(tools, test, cwd);
+    }
+    if let JobParams::Test(test) = params
+        && let Some(scoped) = &test.scoped_test
+    {
+        return Ok(scoped_test_command(tools, scoped, test.timeout_minutes));
     }
     let (argv, runtime_max_secs, stop_timeout_secs) = match params {
         JobParams::Test(p) => (
@@ -1619,6 +1665,44 @@ pub(crate) fn parse_receipt_line(log: &str) -> Option<serde_json::Value> {
         .filter(serde_json::Value::is_object)
 }
 
+/// The receipt a `scoped_test` job printed (#1638): the last
+/// `SCOPED_TEST_RECEIPT ` line of the log, when it is a JSON object.
+pub(crate) fn parse_scoped_receipt_line(log: &str) -> Option<serde_json::Value> {
+    log.lines()
+        .rev()
+        .find_map(|line| line.trim_end().strip_prefix(SCOPED_RECEIPT_LINE_PREFIX))
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .filter(serde_json::Value::is_object)
+}
+
+/// A `scoped_test` job succeeds only with a clean exit and a receipt whose
+/// `ok` is true. The receipt rides in the result either way; a run that ended
+/// before the script could print one is the typed refusal
+/// `scoped_test_receipt_missing`. `exit_code` and the log path are already on
+/// the result and the job.
+fn classify_scoped_test(
+    exit_code: Option<i32>,
+    log: &str,
+    mut result: AgentJobResultV1,
+) -> (JobState, AgentJobResultV1) {
+    let receipt = parse_scoped_receipt_line(log);
+    let ok = receipt
+        .as_ref()
+        .and_then(|r| r.get("ok"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if receipt.is_none() {
+        result.refusal = Some("scoped_test_receipt_missing".into());
+    }
+    result.receipt = receipt;
+    let state = if exit_code == Some(0) && ok {
+        JobState::Succeeded
+    } else {
+        JobState::Failed
+    };
+    (state, result)
+}
+
 /// A `candidate_receipt` job succeeds only with a clean exit and a receipt
 /// whose `ok` is true. The typed receipt rides in the result either way, and
 /// `detail` is the one summary line (not the log tail).
@@ -1678,6 +1762,11 @@ pub(crate) fn classify(
         && p.is_candidate_receipt()
     {
         return classify_candidate_receipt(exit_code, log, result);
+    }
+    if let JobParams::Test(p) = &job.params
+        && p.is_scoped_test()
+    {
+        return classify_scoped_test(exit_code, log, result);
     }
     let landing_source = match &job.params {
         JobParams::Landing(p) | JobParams::CloudGate(p) => Some(p.accepted.clone()),
@@ -5868,6 +5957,97 @@ mod tests {
         let (state, result) = classify(&job, Some(0), "no receipt\n");
         assert_eq!(state, JobState::Failed);
         assert_eq!(result.refusal.as_deref(), Some("candidate_receipt_missing"));
+        assert!(result.receipt.is_none());
+    }
+
+    /// #1638: the scoped-test form runs the fixed script with the two refs and
+    /// budgets derived from the timeout, and settles with its typed receipt.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_scoped_test_job_runs_the_fixed_script_and_records_its_receipt() {
+        let mut p = params(
+            JobKind::Test,
+            serde_json::json!({"scoped_test":{"base":"origin/rolling","head":"HEAD"}}),
+        );
+        let JobParams::Test(test) = &mut p else {
+            panic!("test");
+        };
+        test.timeout_minutes = Some(20);
+        let command = job_command(&tools(), &p, Path::new("/tmp"), None).unwrap();
+        let tail: Vec<&str> = command.argv.iter().skip(4).map(String::as_str).collect();
+        assert_eq!(
+            tail,
+            [
+                "scripts/scoped-test",
+                "--base",
+                "origin/rolling",
+                "--head",
+                "HEAD",
+                "--runtime-max-sec",
+                "1080",
+                "--total-max-sec",
+                "1140",
+                "--cpu-quota",
+                "200",
+            ]
+        );
+        assert_eq!(command.cpu_quota_percent, 200);
+        assert_eq!(
+            command.runtime_max_secs,
+            20 * 60 + JOB_TIMEOUT_UNIT_GRACE_SECS
+        );
+
+        let receipt = serde_json::json!({
+            "schema": 1, "base": "origin/rolling", "head": "h", "filters": ["rsid=x"],
+            "log_dir": "/tmp/rsi-scoped-test-abc", "dry_run": false,
+            "packages": [{"package": "rsid", "status": "passed", "completed": 3}],
+            "exit_code": 0, "ok": true,
+        });
+        let log = format!(
+            "noise\nscoped-test: rsid: passed (3 completed tests)\nSCOPED_TEST_RECEIPT {receipt}\n"
+        );
+        let job = AgentJobV1 {
+            id: Uuid::new_v4(),
+            kind: JobKind::Test,
+            name: None,
+            state: JobState::Running,
+            owner_session_id: Uuid::new_v4(),
+            unit_name: "u".into(),
+            cwd: "/tmp".into(),
+            log_path: "/tmp/job.log".into(),
+            params: p,
+            exit_code: None,
+            result: None,
+            created_at: Utc::now().to_rfc3339(),
+            started_at: None,
+            finished_at: None,
+            held: None,
+            wake: JobWake::Owner,
+        };
+        let (state, result) = classify(&job, Some(0), &log);
+        assert_eq!(state, JobState::Succeeded);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.receipt.as_ref(), Some(&receipt));
+        let wake = crate::store::agent_jobs::wake_message(&job, state, &result);
+        assert!(wake.contains("exit_code=0"), "{wake}");
+        assert!(
+            wake.contains("\"log_dir\":\"/tmp/rsi-scoped-test-abc\""),
+            "{wake}"
+        );
+        assert!(wake.contains("log=/tmp/job.log"), "{wake}");
+
+        // A red receipt settles failed with its receipt; a clean exit with a
+        // red receipt is still failed; no receipt is a typed refusal.
+        let red = log.replace("\"ok\":true", "\"ok\":false");
+        let (state, result) = classify(&job, Some(0), &red);
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(result.receipt.unwrap()["ok"], false);
+        let (state, result) = classify(&job, Some(1), "no receipt\n");
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(
+            result.refusal.as_deref(),
+            Some("scoped_test_receipt_missing")
+        );
         assert!(result.receipt.is_none());
     }
 

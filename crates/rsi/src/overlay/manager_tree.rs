@@ -27,11 +27,11 @@ use uuid::Uuid;
 use crate::app::App;
 use crate::types::OverlayState;
 
-pub(crate) use actions::offer_cap_confirmation;
 pub use actions::{
     ActionAvailability, Candidate, GlobalEditor, NodeEditor, PendingAction, PreparedRequest,
     TreeAction, TreeModal,
 };
+pub(crate) use actions::{offer_cap_confirmation, offer_grant_addition};
 
 /// Rows requested per RPC page.
 pub const PAGE_LIMIT: u16 = 200;

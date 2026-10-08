@@ -34,6 +34,7 @@ use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rsi_common::global_manager::{
     GlobalManagerGrantV1, GlobalManagerWorkspaceV1, GlobalSeatSessionV1, GlobalWorkspaceProjectV1,
+    SeatPredecessorV1,
 };
 use rsi_common::manager_node_workspace::{ManagerNodeChildV1, ManagerNodeWorkspaceV1};
 use rsi_common::manager_tier_routing::ManagerNodeRefV1;
@@ -168,6 +169,10 @@ pub enum WorkspaceRow {
     MissingProject(usize),
     /// #1240: `node.children[index]`: a child portfolio node or area.
     Child(usize),
+    /// #1627: an earlier session of a seat (a rotation or succession), read
+    /// only. `child` is `None` for the console's own seat, else the child
+    /// whose seat it belonged to; `index` is into that seat's `predecessors`.
+    Predecessor { child: Option<usize>, index: usize },
 }
 
 /// The manager level a seat sits at.
@@ -273,6 +278,7 @@ impl GlobalManagerWorkspaceState {
             return Vec::new();
         }
         std::iter::once(WorkspaceRow::Seat)
+            .chain(predecessor_rows(snapshot.seat.as_ref(), None))
             .chain((0..snapshot.projects.len()).map(WorkspaceRow::Project))
             .chain((0..snapshot.missing_project_ids.len()).map(WorkspaceRow::MissingProject))
             .collect()
@@ -326,11 +332,20 @@ impl GlobalManagerWorkspaceState {
                     entry.depth = node_project_depth(node, entry.project_id);
                     return Some(entry);
                 }
+                WorkspaceRow::Predecessor { child, index } => {
+                    return predecessor_seat(self, node, child, index);
+                }
                 WorkspaceRow::MissingProject(_) => {}
             }
         }
         match row {
             WorkspaceRow::Child(_) => None,
+            WorkspaceRow::Predecessor { child: None, index } => {
+                let owner = self.seat(WorkspaceRow::Seat)?;
+                let prior = snapshot.seat.as_ref()?.predecessors.get(index)?;
+                Some(predecessor_entry(&owner, row, prior))
+            }
+            WorkspaceRow::Predecessor { .. } => None,
             WorkspaceRow::Seat => {
                 let grant = snapshot.grant.as_ref()?;
                 let seat = snapshot.seat.as_ref();
@@ -700,6 +715,62 @@ impl GlobalManagerWorkspaceState {
     }
 }
 
+/// The predecessor rows listed under a seat.
+fn predecessor_rows(
+    seat: Option<&GlobalSeatSessionV1>,
+    child: Option<usize>,
+) -> impl Iterator<Item = WorkspaceRow> {
+    (0..seat.map_or(0, |seat| seat.predecessors.len()))
+        .map(move |index| WorkspaceRow::Predecessor { child, index })
+}
+
+/// #1627: a predecessor row: the owner's level one step deeper, bound to the
+/// earlier session so the conversation pane shows it read only.
+fn predecessor_entry(owner: &SeatEntry, row: WorkspaceRow, prior: &SeatPredecessorV1) -> SeatEntry {
+    let health = match SeatHealth::from_status(prior.status, false) {
+        SeatHealth::Missing => SeatHealth::Idle,
+        health => health,
+    };
+    SeatEntry {
+        row,
+        level: owner.level,
+        tier: owner.tier.clone(),
+        depth: owner.depth + 1,
+        label: format!("↳ prior {}", short(prior.session_id)),
+        health,
+        session_id: Some(prior.session_id),
+        project_id: prior.project_id,
+        model: prior.model.clone(),
+        effort: None,
+        context_fill_pct: prior.context_fill_pct,
+        cost_usd: prior.cost_usd,
+        updated_at: Some(prior.updated_at),
+        issues: None,
+        activity: None,
+    }
+}
+
+fn predecessor_seat(
+    state: &GlobalManagerWorkspaceState,
+    node: &ManagerNodeWorkspaceV1,
+    child: Option<usize>,
+    index: usize,
+) -> Option<SeatEntry> {
+    let row = WorkspaceRow::Predecessor { child, index };
+    let (owner, seat) = match child {
+        None => (state.seat(WorkspaceRow::Seat)?, node.seat.as_ref()?),
+        Some(child) => (
+            state.seat(WorkspaceRow::Child(child))?,
+            node.children.get(child)?.seat.as_ref()?,
+        ),
+    };
+    Some(predecessor_entry(
+        &owner,
+        row,
+        seat.predecessors.get(index)?,
+    ))
+}
+
 fn short(id: Uuid) -> String {
     id.to_string()[..8].to_string()
 }
@@ -749,16 +820,19 @@ fn covering_child(node: &ManagerNodeWorkspaceV1, project: Uuid) -> Option<usize>
 /// child areas; granted projects that are gone.
 fn node_rows(node: &ManagerNodeWorkspaceV1) -> Vec<WorkspaceRow> {
     let mut rows = vec![WorkspaceRow::Seat];
+    rows.extend(predecessor_rows(node.seat.as_ref(), None));
     if !matches!(node.node, ManagerNodeRefV1::Portfolio { .. }) {
         // A project or area node: its own project is the seat row's.
-        rows.extend((0..node.children.len()).map(WorkspaceRow::Child));
+        for index in 0..node.children.len() {
+            push_child(&mut rows, node, index);
+        }
         return rows;
     }
     for (index, child) in node.children.iter().enumerate() {
         if !matches!(child.node, ManagerNodeRefV1::Portfolio { .. }) {
             continue;
         }
-        rows.push(WorkspaceRow::Child(index));
+        push_child(&mut rows, node, index);
         rows.extend(
             node.projects
                 .iter()
@@ -774,15 +848,22 @@ fn node_rows(node: &ManagerNodeWorkspaceV1) -> Vec<WorkspaceRow> {
             .filter(|(_, project)| covering_child(node, project.overview.project_id).is_none())
             .map(|(position, _)| WorkspaceRow::Project(position)),
     );
-    rows.extend(
-        node.children
-            .iter()
-            .enumerate()
-            .filter(|(_, child)| matches!(child.node, ManagerNodeRefV1::Area { .. }))
-            .map(|(index, _)| WorkspaceRow::Child(index)),
-    );
+    for (index, child) in node.children.iter().enumerate() {
+        if matches!(child.node, ManagerNodeRefV1::Area { .. }) {
+            push_child(&mut rows, node, index);
+        }
+    }
     rows.extend((0..node.missing_project_ids.len()).map(WorkspaceRow::MissingProject));
     rows
+}
+
+/// A child's row followed by its seat's predecessors.
+fn push_child(rows: &mut Vec<WorkspaceRow>, node: &ManagerNodeWorkspaceV1, index: usize) {
+    rows.push(WorkspaceRow::Child(index));
+    rows.extend(predecessor_rows(
+        node.children[index].seat.as_ref(),
+        Some(index),
+    ));
 }
 
 /// A project row sits under the child node covering it (depth 2), else
@@ -1313,6 +1394,13 @@ fn start_typing(app: &mut App) {
         workspace.error = Some(format!("No manager seat is selected; {LAUNCH_HINT}"));
         return;
     };
+    if matches!(seat.row, WorkspaceRow::Predecessor { .. }) {
+        workspace.error = Some(
+            "An earlier seat session is read-only history; press t to talk to the current seat"
+                .into(),
+        );
+        return;
+    }
     let Some(session_id) = seat.session_id else {
         workspace.error = Some(format!(
             "{} has no live session to talk to; {LAUNCH_HINT}",
@@ -1361,6 +1449,101 @@ async fn talk(app: &mut App) {
     start_typing(app);
 }
 
+/// #1627 R3: the selected seat row's session, or a refusal on the console.
+fn selected_seat_session(app: &mut App, action: &str) -> Option<(SeatEntry, Uuid)> {
+    let workspace = state(app)?;
+    let Some(seat) = workspace.selected_seat() else {
+        workspace.error = Some(format!("Select a seat row to {action}"));
+        return None;
+    };
+    match seat.session_id {
+        Some(id) => Some((seat, id)),
+        None => {
+            workspace.error = Some(format!(
+                "{} has no session to {action}; {LAUNCH_HINT}",
+                seat.label
+            ));
+            None
+        }
+    }
+}
+
+/// `s`: one line naming the selected seat session's lifecycle status, the
+/// seat health and where the session lives. Read only.
+fn seat_status(app: &mut App) {
+    let Some((seat, id)) = selected_seat_session(app, "show") else {
+        return;
+    };
+    let status = app
+        .sessions
+        .get(&id)
+        .map(|s| format!("{:?}", s.session.status));
+    let Some(workspace) = state(app) else { return };
+    let history = if matches!(seat.row, WorkspaceRow::Predecessor { .. }) {
+        " (earlier session, read only)"
+    } else {
+        ""
+    };
+    let status = status.unwrap_or_else(|| "not loaded".into());
+    workspace.error = None;
+    workspace.notice = Some(format!(
+        "{} {}{history}: status {status}, seat {}",
+        seat.label,
+        short(id),
+        seat.health.label()
+    ));
+}
+
+/// `x` (soft) / `X` (now, press twice): halt the selected seat's session
+/// through the same path as the session list's interrupt keys.
+async fn halt_seat(app: &mut App, hard: bool) {
+    let Some((seat, id)) = selected_seat_session(app, "halt") else {
+        return;
+    };
+    let status = app.sessions.get(&id).map(|s| s.session.status);
+    let haltable = matches!(
+        status,
+        Some(SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingApproval)
+    );
+    if !haltable {
+        let shown = status.map_or_else(|| "not loaded".to_string(), |s| format!("{s:?}"));
+        if let Some(workspace) = state(app) {
+            workspace.error = Some(format!(
+                "{} {} is {shown}; only a starting, running or waiting session can be halted",
+                seat.label,
+                short(id)
+            ));
+        }
+        return;
+    }
+    app.interrupt_session_by_id(id, hard).await;
+    if let Some(workspace) = state(app) {
+        workspace.error = None;
+        workspace.notice = Some(format!("Halt requested for {} {}", seat.label, short(id)));
+    }
+    refresh(app).await;
+}
+
+/// `a`: archive an earlier seat session. The current seat is refused:
+/// rotate or revoke it first, so the console never archives a seat that
+/// still holds authority.
+async fn archive_seat(app: &mut App) {
+    let Some((seat, id)) = selected_seat_session(app, "archive") else {
+        return;
+    };
+    if !matches!(seat.row, WorkspaceRow::Predecessor { .. }) {
+        if let Some(workspace) = state(app) {
+            workspace.error = Some(format!(
+                "{} is the current seat; revoke or replace it before archiving. Only earlier seat sessions can be archived here",
+                seat.label
+            ));
+        }
+        return;
+    }
+    app.archive_session_by_id(id).await;
+    refresh(app).await;
+}
+
 async fn enter(app: &mut App) {
     let Some(workspace) = state(app) else { return };
     match workspace.selected_row() {
@@ -1402,6 +1585,12 @@ async fn enter(app: &mut App) {
                 "That project no longer exists; re-appoint the grant without it ({LAUNCH_HINT})"
             ));
         }
+        // #1627: a predecessor opens its earlier session like any seat.
+        Some(WorkspaceRow::Predecessor { .. }) => {
+            if let Some(id) = workspace.selected_seat().and_then(|seat| seat.session_id) {
+                jump_to_session(app, id).await;
+            }
+        }
         // #1240: a child node opens its own console.
         Some(WorkspaceRow::Child(index)) => {
             if let Some(child) = workspace.child(index).map(|child| child.node) {
@@ -1422,7 +1611,7 @@ fn open_project_tab(app: &mut App) {
         Some(WorkspaceRow::Project(index)) => {
             workspace.project(index).map(|p| p.overview.project_id)
         }
-        Some(WorkspaceRow::Seat | WorkspaceRow::Child(_)) => {
+        Some(WorkspaceRow::Seat | WorkspaceRow::Child(_) | WorkspaceRow::Predecessor { .. }) => {
             workspace.selected_seat().and_then(|seat| seat.project_id)
         }
         _ => None,
@@ -1537,6 +1726,30 @@ async fn submit_launch(app: &mut App, confirm_cap_reductions: bool) {
 }
 
 async fn handle_launch_key(app: &mut App, key: KeyEvent) {
+    // Standard editing: a real cursor and selection in the launch prompt.
+    let editing_prompt = state(app)
+        .and_then(|w| w.launch.as_ref())
+        .is_some_and(|form| {
+            form.field == crate::overlay::global_manager_workspace_launch::LaunchField::Prompt
+                && !form.cap_confirm
+        });
+    if editing_prompt {
+        let result = app.edit_field(key, |overlay| match overlay {
+            OverlayState::GlobalManagerWorkspace(w) => {
+                w.launch.as_mut().map(|form| &mut form.prompt)
+            }
+            _ => None,
+        });
+        if result != crate::field_edit::FieldKey::Ignored {
+            if let Some(form) = state(app).and_then(|w| w.launch.as_mut()) {
+                if result == crate::field_edit::FieldKey::Edited {
+                    form.prompt_edited = true;
+                }
+                form.error = None;
+            }
+            return;
+        }
+    }
     let Some(form) = state(app).and_then(|w| w.launch.as_mut()) else {
         return;
     };
@@ -1695,6 +1908,10 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Backspace => open_parent(app).await,
         KeyCode::Char('i') => start_typing(app),
         KeyCode::Char('t') => talk(app).await,
+        KeyCode::Char('s') => seat_status(app),
+        KeyCode::Char('x') => halt_seat(app, false).await,
+        KeyCode::Char('X') => halt_seat(app, true).await,
+        KeyCode::Char('a') => archive_seat(app).await,
         KeyCode::Char('n') => open_launch_form(app),
         KeyCode::Tab => {
             if workspace.conversation_session_id().is_some() {

@@ -696,12 +696,15 @@ pub(super) async fn ensure_process_dead(
 /// start-time proof, and pidfd signal primitive as startup recovery. Other Unix
 /// platforms intentionally no-op because they do not expose Linux `/proc` and
 /// pidfds; lack of those facilities must not prevent the daemon from booting.
-pub fn reap_orphans_for_session(session_id: Uuid) -> crate::error::Result<usize> {
+pub fn reap_orphans_for_session(
+    session_id: Uuid,
+    turns: Vec<crate::store::provider_turn_custody::ProviderTurnCustody>,
+) -> crate::error::Result<usize> {
     #[cfg(test)]
     take_runtime_orphan_reap_failure(session_id)?;
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = session_id;
+        let _ = (session_id, turns);
         return Ok(0);
     }
     #[cfg(all(test, target_os = "linux"))]
@@ -709,9 +712,20 @@ pub fn reap_orphans_for_session(session_id: Uuid) -> crate::error::Result<usize>
         return reap_orphans_for_session_with_runtime_reap_proc_root_lease(session_id, lease);
     }
     #[cfg(target_os = "linux")]
-    reap_startup_owned_orphans_checked(&StartupProcessOwnership::for_sessions(HashSet::from([
-        session_id,
-    ])))
+    {
+        let mut ownership = StartupProcessOwnership::for_sessions(HashSet::from([session_id]));
+        // Refuse reclamation rather than report empty and allow a second
+        // provider turn to launch while this one is still alive.
+        for turn in &turns {
+            if turn.session_id == session_id && turn.is_adoptable()? {
+                return Err(crate::error::DaemonError::Process(
+                    "live_detached_turn: adoption required before reclaim".into(),
+                ));
+            }
+        }
+        ownership.detached_turns = turns;
+        reap_startup_owned_orphans_checked(&ownership)
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1601,6 +1615,7 @@ impl StartupProcessDomain {
 #[derive(Clone, Debug)]
 struct StartupProcessOwnership {
     domain: StartupProcessDomain,
+    detached_turns: Vec<crate::store::provider_turn_custody::ProviderTurnCustody>,
     /// `None` authorizes every exact namespace member at daemon boot. `Some`
     /// restricts runtime/settlement repair to exact Session stamps in the set.
     namespaced_session_ids: Option<HashSet<Uuid>>,
@@ -1624,6 +1639,7 @@ impl StartupProcessOwnership {
     fn for_sessions_in_domain(session_ids: HashSet<Uuid>, domain: StartupProcessDomain) -> Self {
         Self {
             domain,
+            detached_turns: Vec::new(),
             namespaced_session_ids: Some(session_ids.clone()),
             session_ids,
             invocation_ids: HashSet::new(),
@@ -1770,6 +1786,7 @@ fn reap_startup_process_ownership_for_domain_at(
         }
         let ownership = StartupProcessOwnership {
             domain: domain.clone(),
+            detached_turns: store.list_active_provider_turn_custody()?,
             namespaced_session_ids: None,
             session_ids,
             invocation_ids,
@@ -1780,6 +1797,9 @@ fn reap_startup_process_ownership_for_domain_at(
                 .stamps
                 .authorized_exact_stamp(process.pid, &ownership)?
             {
+                if detached_stamp_is_protected(&stamps, &ownership, proc_root)? {
+                    continue;
+                }
                 observed.push(StartupOrphanIdentity {
                     pid: process.pid,
                     start_time: process.start_time,
@@ -1827,6 +1847,27 @@ fn reap_startup_process_ownership_for_domain_at(
     Err(crate::error::DaemonError::Process(
         "startup provider inventory did not reach a fixed point".into(),
     ))
+}
+
+fn detached_stamp_is_protected(
+    stamps: &StartupExactStamp,
+    ownership: &StartupProcessOwnership,
+    proc_root: &Path,
+) -> crate::error::Result<bool> {
+    // Protect the exact invocation cohort (shim, provider and tools), never
+    // other incarnations sharing only the Session UUID or a legacy stamp.
+    if stamps.proof != StartupOwnershipProof::Namespaced {
+        return Ok(false);
+    }
+    for turn in &ownership.detached_turns {
+        if stamps.session_id == Some(turn.session_id)
+            && stamps.invocation_id == Some(turn.invocation_id)
+            && turn.is_adoptable_at(proc_root, &ownership.domain.namespace)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn reap_startup_owned_orphans_checked(
@@ -1885,6 +1926,9 @@ fn reap_startup_owned_orphans_at(
                     .stamps
                     .authorized_exact_stamp(process.pid, ownership)?
                 {
+                    if detached_stamp_is_protected(&stamps, ownership, proc_root)? {
+                        continue;
+                    }
                     observed.push(StartupOrphanIdentity {
                         pid: process.pid,
                         start_time: process.start_time,
@@ -7497,7 +7541,11 @@ mod tests {
             0
         );
         assert_eq!(
-            reap_orphans_for_session(session_id).expect("non-Linux runtime reaper"),
+            reap_orphans_for_session(
+                session_id,
+                store.list_active_provider_turn_custody().unwrap()
+            )
+            .expect("non-Linux runtime reaper"),
             0
         );
         assert_eq!(
@@ -8026,6 +8074,100 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[test]
+    fn startup_preserves_exact_detached_cohort_but_reaps_other_invocations() {
+        use crate::store::provider_turn_custody::NewProviderTurnCustody;
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let fixture = StartupReaperFixture::new();
+        let mut session = rsid_store::test_support::make_test_session();
+        session.id = Uuid::new_v4();
+        store.insert_session(&session).unwrap();
+        let invocation = Uuid::new_v4();
+        insert_running_invocation(
+            &store,
+            invocation,
+            rsi_common::model_control::ModelInvocationPurpose::SessionLaunchFresh,
+            "session_lifecycle",
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE model_invocations SET session_id=?2 WHERE id=?1",
+                rusqlite::params![invocation.to_string(), session.id.to_string()],
+            )
+            .unwrap();
+        store
+            .set_session_model_invocation(session.id, Some(invocation))
+            .unwrap();
+        let mut shim = fixture.spawn(Some(session.id), Some(invocation), &fixture.domain(), true);
+        let mut provider =
+            fixture.spawn(Some(session.id), Some(invocation), &fixture.domain(), true);
+        let mut stale = fixture.spawn(
+            Some(session.id),
+            Some(Uuid::new_v4()),
+            &fixture.domain(),
+            true,
+        );
+        let spool = tempfile::tempdir().unwrap(); // tmpfs-fixture-ok: lock files only; no sandbox allocation.
+        let lock = std::fs::File::create(spool.path().join("alive.lock")).unwrap();
+        lock.lock().unwrap();
+        let stat = std::fs::read_to_string(
+            fixture
+                .proc_root()
+                .join(shim.pid().to_string())
+                .join("stat"),
+        )
+        .unwrap();
+        let start_time = stat
+            .rsplit_once(") ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(19)
+            .unwrap()
+            .parse()
+            .unwrap();
+        store
+            .insert_provider_turn_custody(&NewProviderTurnCustody {
+                invocation_id: invocation,
+                session_id: session.id,
+                spool_dir: spool.path().to_path_buf(),
+                pid: shim.pid() as u32,
+                start_time: Some(start_time),
+                boot_id: Uuid::new_v4(),
+            })
+            .unwrap();
+        assert_eq!(
+            reap_startup_process_ownership_for_domain_at(
+                &store,
+                fixture.domain(),
+                fixture.proc_root(),
+                None
+            )
+            .unwrap(),
+            1
+        );
+        stale.wait_signalled("stale invocation is reaped");
+        shim.assert_alive("detached shim survives startup");
+        provider.assert_alive("provider in the exact detached invocation survives startup");
+        // Once lock liveness is gone the same durable row grants no exemption.
+        lock.unlock().unwrap();
+        assert_eq!(
+            reap_startup_process_ownership_for_domain_at(
+                &store,
+                fixture.domain(),
+                fixture.proc_root(),
+                None
+            )
+            .unwrap(),
+            2
+        );
+        shim.wait_signalled("unlocked shim is ordinary orphan");
+        provider.wait_signalled("unlocked provider is ordinary orphan");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
     fn startup_process_first_reaps_pre_session_agent_child_and_scheduled_fresh_invocations() {
         let store = crate::store::Store::open_in_memory().expect("startup ownership store");
         let fixture = StartupReaperFixture::new();
@@ -8406,6 +8548,7 @@ mod tests {
         );
         let foreign_ownership = StartupProcessOwnership {
             domain: StartupProcessDomain::for_socket(Path::new("/tmp/foreign-daemon.sock")),
+            detached_turns: Vec::new(),
             namespaced_session_ids: None,
             session_ids: HashSet::from([candidate]),
             invocation_ids: HashSet::new(),

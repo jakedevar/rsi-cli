@@ -879,6 +879,7 @@ fn daemon_setting_text_to_json(field: &str, raw: &str) -> serde_json::Value {
         | "codex_sandbox_mode"
         | "claude_config_isolation"
         | "system_prompt_preset"
+        | "editing_mode"
         | "stall_classifier_model"
         // Issue #35. A bare effort name is not valid JSON, so without this arm
         // it would only survive by falling through the `_` arm's error
@@ -1528,6 +1529,30 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("danger-full-access")
         );
+    }
+
+    /// Issue #1628: `editing_mode` starts `unset`, persists, and survives a
+    /// restart as the chosen mode.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn editing_mode_persistence_roundtrip() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path());
+        let config = crate::config::Config::from_env();
+        let rc = crate::config::RuntimeConfig::from_config(&config);
+        assert_eq!(rc.to_json()["editing_mode"], "unset");
+
+        rc.update_field("editing_mode", &serde_json::json!("standard"))
+            .unwrap();
+        assert!(persist_runtime_config_field(&store, &rc, "editing_mode").unwrap());
+        assert_eq!(
+            store.get_daemon_setting("editing_mode").unwrap().as_deref(),
+            Some("standard")
+        );
+
+        let restarted = crate::config::RuntimeConfig::from_config(&config);
+        apply_persisted_runtime_config(&store, &restarted).unwrap();
+        assert_eq!(restarted.to_json()["editing_mode"], "standard");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]

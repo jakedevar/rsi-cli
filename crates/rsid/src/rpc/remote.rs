@@ -4,6 +4,16 @@ use super::*;
 // AGENT_VERBS, READ_VERBS, native tools or the agent CLI catalog: an agent
 // must not be able to widen the allowed-device or project lists.
 impl RpcServer {
+    /// Bring the RSI Remote gateway back after a daemon start (#1639): every
+    /// deploy restart and `make release-install` restart rsid, which used to
+    /// leave a dead gateway dead. Best effort; the outcome is only logged.
+    pub async fn converge_remote_gateway(&self) {
+        match self.remote.converge().await {
+            Ok(outcome) => tracing::info!(?outcome, "RSI Remote gateway converged"),
+            Err(error) => tracing::warn!(%error, "RSI Remote gateway convergence failed"),
+        }
+    }
+
     pub(super) async fn handle_remote_get_status(
         &self,
         request: &RpcRequest,

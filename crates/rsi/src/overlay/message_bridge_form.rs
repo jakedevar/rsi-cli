@@ -37,6 +37,25 @@ pub(super) fn handle_message_bridge_form_key(app: &mut App, key: KeyEvent) {
         _ => return,
     };
 
+    // Standard editing: a real cursor and selection in the focused text field.
+    if app.edit_field(key, |overlay| match overlay {
+        OverlayState::MessageBridgeForm {
+            account,
+            allow_from,
+            working_dir,
+            ..
+        } => match (bridge, focused_field) {
+            (MessageBridgeKind::Signal, 1) => Some(account),
+            (MessageBridgeKind::Signal, 2) | (MessageBridgeKind::Imessage, 1) => Some(allow_from),
+            (MessageBridgeKind::Signal, 3) | (MessageBridgeKind::Imessage, 2) => Some(working_dir),
+            _ => None,
+        },
+        _ => None,
+    }) != crate::field_edit::FieldKey::Ignored
+    {
+        return;
+    }
+
     let field_count = field_count(bridge);
     match key.code {
         KeyCode::BackTab => focus_prev(app, field_count),

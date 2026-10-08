@@ -42,6 +42,23 @@ function requireString(value, label, maxBytes = 4096) {
   return value;
 }
 
+// A failed answer. `kind` says what the phone can safely tell the operator:
+// `unknown` means the answer may have been delivered; every other kind means
+// the gateway sent nothing to the host (or the host refused it).
+export class AnswerError extends ApiError {
+  constructor(kind, message, status = 0, retryAfter = null) {
+    super(message, status);
+    this.name = 'AnswerError';
+    this.kind = kind;
+    this.retryAfter = retryAfter;
+  }
+}
+
+const DECIMAL_ID = /^[1-9][0-9]*$/;
+const LOWER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const MAX_TARGET_OPTIONS = 8;
+const TARGET_KINDS = new Set(['question', 'approval']);
+
 function statusError(status) {
   if (status === 401) return new ApiError('Your session has expired. Reload the page to sign in again.', 401);
   if (status === 403) return new ApiError('The gateway denied this request. Check that this phone is allowed and the gateway is ready, then reload.', 403);
@@ -202,6 +219,102 @@ function parseDecisions(value) {
   return items.map(mapDecision);
 }
 
+// Versions are echoed as the host's decimal strings, never as numbers.
+const isMatch = (pattern, value) => typeof value === 'string' && pattern.test(value);
+
+function requireDecimal(value, label) {
+  const text = requireString(value, label, 32);
+  if (!DECIMAL_ID.test(text)) throw new ApiError(`Invalid ${label} in response.`);
+  return text;
+}
+
+// The operator-only decision-targets read. Versions and digests are kept as the
+// exact strings the host returned: they are echoed back, never interpreted.
+// `ready` needs a configured manager, a live fence and at least one item.
+function parseTargets(value) {
+  const document = requireRecord(value, 'decision targets');
+  const managerReady = document.manager === 'configured' && document.fence != null;
+  const fence = managerReady ? requireRecord(document.fence, 'decision fence') : null;
+  if (!Array.isArray(document.items) || document.items.length > MAX_DECISIONS) throw new ApiError('Invalid or oversized decision targets.');
+  const items = (managerReady ? document.items : []).map((raw) => {
+    const item = requireRecord(raw, 'decision target');
+    const kind = requireString(item.kind, 'decision target kind', 32);
+    if (!TARGET_KINDS.has(kind)) throw new ApiError('Invalid decision target kind in response.');
+    if (!Array.isArray(item.options) || item.options.length > MAX_TARGET_OPTIONS) throw new ApiError('Invalid decision target options in response.');
+    const decisionKey = requireString(item.decision_key, 'decision key', 160);
+    if (decisionKey === '') throw new ApiError('Invalid decision key in response.');
+    return {
+      decisionKey,
+      rowVersion: requireDecimal(item.row_version, 'decision row version'),
+      digest: requireString(item.target_digest, 'decision digest', 128),
+      kind,
+      title: requireString(item.title, 'decision title', 512),
+      detail: requireString(item.detail, 'decision detail', 2048),
+      options: item.options.map((option) => requireString(option, 'decision option', 128)),
+    };
+  });
+  const pending = document.pending_items ?? [];
+  if (!Array.isArray(pending) || pending.length > MAX_DECISIONS) throw new ApiError('Invalid pending targets.');
+  for (const raw of pending) {
+    const item = requireRecord(raw, 'pending target');
+    const kind = requireString(item.kind, 'pending kind', 32);
+    const decisionKey = requireString(item.decision_id, 'pending decision id', 160);
+    if (!TARGET_KINDS.has(kind) || !decisionKey.startsWith(kind === 'question' ? 'pending-question:' : 'pending-approval:')) throw new ApiError('Invalid pending identity.');
+    if (!Array.isArray(item.options) || item.options.length > MAX_TARGET_OPTIONS) throw new ApiError('Invalid pending options.');
+    const receipt = item.receipt == null ? null : parsePendingReceipt(item.receipt);
+    items.push({ pending: true, decisionKey, digest: requireString(item.target_digest, 'pending digest', 128), kind,
+      title: requireString(item.title, 'pending title', 512), detail: requireString(item.detail, 'pending detail', 2048),
+      options: item.options.map((option) => requireString(option, 'pending option', 128)), receipt });
+  }
+  return {
+    ready: items.length > 0,
+    fence: fence ? { policyVersion: requireDecimal(fence.policy_version, 'policy version'), scopeVersion: requireDecimal(fence.scope_version, 'scope version') } : null,
+    items,
+    truncated: document.truncated === true,
+  };
+}
+
+function parsePendingReceipt(value) {
+  const receipt = requireRecord(value, 'pending receipt');
+  if (!['queued', 'running', 'succeeded', 'refused', 'failed', 'uncertain'].includes(receipt.state)
+      || !isMatch(LOWER_UUID, receipt.receipt_key)) throw new ApiError('Invalid pending receipt.');
+  return { key: receipt.receipt_key, state: receipt.state };
+}
+
+// The gateway's error bodies are `{"error": code}`; bare statuses have none.
+async function readErrorCode(response) {
+  try {
+    const text = await response.text();
+    if (text.length > 4096) return '';
+    const value = JSON.parse(text);
+    return value !== null && typeof value === 'object' && typeof value.error === 'string' ? value.error : '';
+  } catch {
+    return '';
+  }
+}
+
+function retryAfterSeconds(response) {
+  const seconds = Number.parseInt(response.headers?.get?.('Retry-After') ?? '', 10);
+  return Number.isInteger(seconds) && seconds >= 1 ? Math.min(seconds, 3600) : null;
+}
+
+const waitText = (seconds) => (seconds === null ? 'a moment' : `${seconds} second${seconds === 1 ? '' : 's'}`);
+
+function answerRefusal(status, code, retryAfter) {
+  if (status === 409) return new AnswerError('stale', 'This decision changed. Refresh to see its current state; your draft was discarded.', 409);
+  if (status === 403) return new AnswerError('denied', 'The gateway refused this answer. Answers may be turned off, or the host declined it. Nothing was changed.', 403);
+  if (status === 429) return new AnswerError('rate_limited', `Too many answers too quickly. Nothing was sent. Try again in ${waitText(retryAfter)}.`, 429, retryAfter);
+  if (status === 503) return new AnswerError('busy', `The RSI host is busy. Nothing was sent. Try again in ${waitText(retryAfter)}.`, 503, retryAfter);
+  if ((status === 504 || status === 502) && code === 'outcome_unknown') {
+    return new AnswerError('unknown', status === 504 ? 'The RSI host did not reply in time, so it is not known whether your answer was delivered.' : 'The connection to the RSI host failed after sending, so it is not known whether your answer was delivered.', status);
+  }
+  if (status === 504) return new AnswerError('unavailable', 'The RSI host did not reply in time while checking this decision. Nothing was sent. Try again.', 504);
+  if (status === 502) return new AnswerError('unavailable', 'The RSI daemon is unavailable. Nothing was sent. Check that rsid is running on the host.', 502);
+  if (status === 400) return new AnswerError('invalid', 'The gateway could not accept this answer. Check its length and try again.', 400);
+  if (status === 401) return new AnswerError('session', 'Your session has expired. Reload the page to sign in again. Nothing was sent.', 401);
+  return new AnswerError('unexpected', `The RSI host returned ${status}. Refresh to check whether the decision is still waiting.`, status);
+}
+
 async function readBody(response) {
   const declaredLength = Number(response.headers.get('Content-Length') || 0);
   if (declaredLength > MAX_BODY_BYTES) throw new ApiError('Response is too large to display.');
@@ -337,7 +450,16 @@ export function createApi(fetchImpl = globalThis.fetch.bind(globalThis)) {
         decisions = null;
         decisionsError = error instanceof ApiError ? error.message : 'Could not load waiting decisions.';
       }
-      return { session: parseSession(session), events: parseEvents(window.map(mapEvent)), decisions, decisionsError, hasOlder: history.items.length === 25 };
+      // Answer targets are a second, optional read. 403 means answers are off
+      // (the gateway serves no targets then); any other failure is reported as
+      // `error` so a transient blip does not take a form away mid-draft.
+      let targets = { state: 'off', ready: false, fence: null, items: [], truncated: false };
+      try {
+        targets = { state: 'ok', ...parseTargets(await dataGet(`${base}/decision-targets`)) };
+      } catch (error) {
+        if (!(error instanceof ApiError && (error.status === 403 || error.status === 404))) targets = { state: 'error', ready: false, fence: null, items: [], truncated: false };
+      }
+      return { session: parseSession(session), events: parseEvents(window.map(mapEvent)), decisions, decisionsError, targets, hasOlder: history.items.length === 25 };
     },
     async getOlderHistory(id, before) {
       const projectId = projectBySession.get(id);
@@ -350,6 +472,77 @@ export function createApi(fetchImpl = globalThis.fetch.bind(globalThis)) {
       const history = requireRecord(await dataGet(`${base}/history?before=${before.sequence}:${before.id}`), 'session history');
       if (!Array.isArray(history.items)) throw new ApiError('Invalid or oversized event list.');
       return { events: parseEvents(history.items.map(mapEvent)), hasOlder: history.items.length === 25 };
+    },
+    // POST one answer. Resolves to `{key, deduplicated}` for a receipt; rejects
+    // with an `AnswerError` whose `kind` tells what is safe to say. The CSRF
+    // token is sent only here and on logout; the browser adds the exact Origin.
+    async answerDecision(sessionId, request) {
+      const projectId = projectBySession.get(sessionId);
+      if (projectId === undefined) throw new AnswerError('invalid', 'Refresh the session list before answering.');
+      const text = typeof request?.answer === 'string' ? request.answer : '';
+      if (text === '' || text.includes('\0') || new TextEncoder().encode(text).byteLength > 2048
+        || !isMatch(LOWER_UUID, request.idempotencyKey) || (!request.pending && (!isMatch(DECIMAL_ID, request.rowVersion)
+        || !isMatch(DECIMAL_ID, request.fence?.policyVersion) || !isMatch(DECIMAL_ID, request.fence?.scopeVersion)))
+        || typeof request.decisionKey !== 'string' || typeof request.digest !== 'string') {
+        throw new AnswerError('invalid', 'This answer is not valid. Nothing was sent.');
+      }
+      const path = `/api/v1/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(sessionId)}/decisions/${request.pending ? 'answer-pending' : 'answer'}`;
+      const body = JSON.stringify(request.pending ? {
+        decision_id: request.decisionKey, expected_target_digest: request.digest, answer: text, idempotency_key: request.idempotencyKey,
+      } : {
+        decision_key: request.decisionKey,
+        expected_row_version: request.rowVersion,
+        target_digest: request.digest,
+        fence: { policy_version: request.fence.policyVersion, scope_version: request.fence.scopeVersion },
+        answer: text,
+        idempotency_key: request.idempotencyKey,
+      });
+      const post = async () => {
+        try {
+          return await fetchImpl(path, {
+            method: 'POST',
+            headers: { Accept: 'application/json', 'content-type': 'application/json', 'x-rsi-csrf': csrf },
+            cache: 'no-store',
+            body,
+          });
+        } catch {
+          // The request may have reached the gateway before the link broke.
+          throw new AnswerError('unknown', 'Lost the connection while sending, so it is not known whether your answer was delivered.');
+        }
+      };
+      if (csrf === null) {
+        try {
+          await establishSession();
+        } catch (error) {
+          throw new AnswerError('session', error instanceof ApiError ? `${error.message} Nothing was sent.` : 'Could not sign in. Nothing was sent.', error?.status ?? 0);
+        }
+      }
+      let response = await post();
+      if (response.status === 401) {
+        // Denied before anything is dispatched, so one re-bootstrap and retry
+        // under the same key is safe.
+        try {
+          await establishSession();
+        } catch {
+          throw answerRefusal(401, '', null);
+        }
+        response = await post();
+      }
+      if (!response.ok) throw answerRefusal(response.status, await readErrorCode(response), retryAfterSeconds(response));
+      let receipt = {};
+      try {
+        const value = await readBody(response);
+        if (value !== null && typeof value === 'object') {
+          receipt = request.pending ? parsePendingReceipt(value) : {
+            key: typeof value.key === 'string' && value.key.length <= 256 ? value.key : '',
+            deduplicated: value.deduplicated === true,
+          };
+        }
+      } catch {
+        if (request.pending) throw new AnswerError('unknown', 'The answer receipt could not be read. Retry the same answer.');
+        receipt = {};
+      }
+      return receipt;
     },
     async logout() {
       if (csrf === null) return;

@@ -617,13 +617,7 @@ impl Store {
             blockers.push("job_running");
         }
         if workers_block {
-            let worker: bool = self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sessions WHERE status IN ('Starting','Running') \
-                 AND parent_id IS NOT NULL AND id!=?1 \
-                 AND COALESCE(session_kind,'') NOT IN ('Group','Epic'))",
-                [caller.to_string()],
-                |row| row.get(0),
-            )?;
+            let worker = !self.deploy_mid_turn_workers(caller)?.is_empty();
             if worker {
                 blockers.push("worker_mid_turn");
             }
@@ -641,12 +635,20 @@ impl Store {
              AND parent_id IS NOT NULL AND id!=?1 \
              AND COALESCE(session_kind,'') NOT IN ('Group','Epic') ORDER BY id",
         )?;
-        stmt.query_map([caller.to_string()], |row| row.get::<_, String>(0))?
+        let ids = stmt
+            .query_map([caller.to_string()], |row| row.get::<_, String>(0))?
             .map(|id| {
                 Uuid::parse_str(&id?)
                     .map_err(|error| DaemonError::Store(format!("worker session id: {error}")))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        let mut workers = Vec::new();
+        for id in ids {
+            if self.adoptable_provider_turn_for_session(id)?.is_none() {
+                workers.push(id);
+            }
+        }
+        Ok(workers)
     }
 }
 

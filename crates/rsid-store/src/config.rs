@@ -148,6 +148,7 @@ pub const PERSISTED_RUNTIME_CONFIG_FIELDS: &[&str] = &[
     "codex_sandbox_mode",
     "claude_config_isolation",
     "system_prompt_preset",
+    "follow_agent_created_projects",
     "stall_classifier_enabled",
     "stall_classifier_model",
     "stall_classifier_idle_secs",
@@ -175,6 +176,8 @@ pub const PERSISTED_RUNTIME_CONFIG_FIELDS: &[&str] = &[
     // admission read path looks the key up by that exact string.
     // `orchestration_max_child_effort_field_name_matches_store_key` locks the two together.
     "orchestration_max_child_effort",
+    // Issue #1628: operator text-editing mode (`unset | standard | vim`).
+    "editing_mode",
     // Issue #692: operator launch-model allowlist, enforced at the launch funnel.
     "launch_model_allowlist",
     "sandbox_build_cache_reclaim_enabled",
@@ -189,6 +192,7 @@ pub const PERSISTED_RUNTIME_CONFIG_FIELDS: &[&str] = &[
     // Issue #1007: the daemon-owned rolling merge queue.
     "rolling_queue_enabled",
     // Issue #1073: hold new work while a deploy waits for its quiet point.
+    "turn_detach_enabled",
     "deploy_drain_enabled",
     // Issue #1320/#1311: how long an agent deploy may hold new worker starts.
     "deploy_drain_hold_secs",
@@ -554,6 +558,10 @@ pub struct Config {
     /// exactly as before the classifier shipped; the static `stall_detector`
     /// action selector is the sole path. Runtime-mutable.
     pub stall_classifier_enabled: bool,
+    /// TUI follows a project an agent created through `AgentCreateProject`
+    /// (#1626): it switches to the new project's tab. Default on; the daemon
+    /// only stores and serves it, the TUI reads it at event time.
+    pub follow_agent_created_projects: bool,
     /// Startup recursive DAG recovery graph-count budget. Phase 5A.4 keeps
     /// restart recovery bounded and explicitly continuable.
     pub recursive_dag_startup_recovery_max_graphs: u32,
@@ -720,6 +728,12 @@ pub struct RuntimeConfig {
     /// `AGENT_VERBS`/`READ_VERBS`, so a session-attributed caller is refused by
     /// the pre-dispatch gate and cannot raise its own ceiling.
     pub orchestration_max_child_effort: RwLock<String>,
+    /// Issue #1628: operator text-editing mode, a canonical value from
+    /// `rsi_common::editing_mode::EDITING_MODE_CHOICES`. `"unset"` (default)
+    /// means the operator has not chosen yet, which makes the TUI show the
+    /// first-start prompt. Operator-only: reachable through
+    /// `GetDaemonConfig`/`UpdateDaemonConfig` only.
+    pub editing_mode: RwLock<String>,
     /// Issue #692: operator launch-model allowlist (model ids). Empty means
     /// unrestricted. Every launch's EFFECTIVE model (request, else project
     /// default, else provider default) is canonicalised (the Claude `[1m]`
@@ -779,6 +793,8 @@ pub struct RuntimeConfig {
     /// scheduled child wakes and new agent jobs so a busy hub can go quiet.
     /// Operator-only via `GetDaemonConfig`/`UpdateDaemonConfig`.
     pub deploy_drain_enabled: AtomicBool,
+    /// Opt in to the durable Claude turn shim; default off until QA approval.
+    pub turn_detach_enabled: AtomicBool,
     /// Issue #1320/#1311: an agent deploy holds new worker starts for at most
     /// this many seconds after it was requested (0..=3600, default 600; 0
     /// never holds). Past it the deploy keeps waiting for a quiet point without
@@ -869,6 +885,9 @@ pub struct RuntimeConfig {
     /// `UpdateDaemonConfig`. When false, the classifier task drops every
     /// signal it receives without invoking the LLM.
     pub stall_classifier_enabled: AtomicBool,
+    /// See [`Config::follow_agent_created_projects`]. Runtime-mutable via
+    /// `UpdateDaemonConfig`; read by the TUI from `GetDaemonConfig`.
+    pub follow_agent_created_projects: AtomicBool,
     /// Model name for the stall classifier LLM. The classifier client is built
     /// at daemon boot, so a changed model takes effect after a daemon restart.
     pub stall_classifier_model: RwLock<String>,
@@ -1011,6 +1030,7 @@ impl RuntimeConfig {
             orchestration_max_child_effort: RwLock::new(
                 rsi_common::model_control::ORCHESTRATION_MAX_CHILD_EFFORT_UNSET.to_string(),
             ),
+            editing_mode: RwLock::new(rsi_common::editing_mode::EDITING_MODE_UNSET.to_string()),
             launch_model_allowlist: RwLock::new(Vec::new()),
             provider_profile: RwLock::new(rsi_common::provider_profile::ProviderProfile::All),
             vault_settings: Arc::new(crate::vault::VaultSettings::default()),
@@ -1067,6 +1087,7 @@ impl RuntimeConfig {
                 rsi_common::cloud_spend::DEFAULT_DAILY_CAP_USD,
             ),
             rolling_queue_enabled: AtomicBool::new(false),
+            turn_detach_enabled: AtomicBool::new(false),
             deploy_drain_enabled: AtomicBool::new(true),
             deploy_drain_hold_secs: AtomicU64::new(
                 rsi_common::agent_deploy::DEPLOY_DRAIN_HOLD_DEFAULT_SECS,
@@ -1113,6 +1134,7 @@ impl RuntimeConfig {
             worker_scope_cpu_weight: AtomicU32::new(WORKER_SCOPE_CPU_WEIGHT_DEFAULT),
             sandbox_build_cache_pressure_active: AtomicBool::new(false),
             stall_classifier_enabled: AtomicBool::new(config.stall_classifier_enabled),
+            follow_agent_created_projects: AtomicBool::new(config.follow_agent_created_projects),
             stall_classifier_model: RwLock::new(config.stall_classifier_model.clone()),
             stall_classifier_idle_secs: AtomicU64::new(config.stall_classifier_idle_secs),
             stall_classifier_idle_secs_codex: AtomicU64::new(
@@ -1199,6 +1221,18 @@ impl RuntimeConfig {
             "stall_classifier_confidence_floor": *self.stall_classifier_confidence_floor.read(),
         });
         if let serde_json::Value::Object(ref mut map) = value {
+            // Outside the `json!` literal above: it is at the macro recursion
+            // limit.
+            map.insert(
+                "follow_agent_created_projects".to_string(),
+                self.follow_agent_created_projects
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "editing_mode".to_string(),
+                self.editing_mode.read().clone().into(),
+            );
             map.insert(
                 rsi_common::launch_allowlist::LAUNCH_MODEL_ALLOWLIST_FIELD.to_string(),
                 self.launch_model_allowlist.read().clone().into(),
@@ -1429,6 +1463,10 @@ impl RuntimeConfig {
             map.insert(
                 "rolling_queue_enabled".to_string(),
                 self.rolling_queue_enabled.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
+                "turn_detach_enabled".into(),
+                self.turn_detach_enabled.load(Ordering::Relaxed).into(),
             );
             map.insert(
                 "deploy_drain_enabled".to_string(),
@@ -2132,6 +2170,11 @@ impl RuntimeConfig {
                     .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
                 Ok(true)
             }
+            "turn_detach_enabled" => {
+                let enabled = value.as_bool().ok_or("expected bool")?;
+                self.turn_detach_enabled.store(enabled, Ordering::Relaxed);
+                Ok(true)
+            }
             "deploy_drain_enabled" => {
                 self.deploy_drain_enabled
                     .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
@@ -2530,6 +2573,19 @@ impl RuntimeConfig {
                     .store(secs, Ordering::Release);
                 Ok(true)
             }
+            "editing_mode" => {
+                // Issue #1628. Bounded enum on write; `null` and "" clear it
+                // back to `unset` (re-arming the first-start prompt).
+                let v = if value.is_null() {
+                    rsi_common::editing_mode::EDITING_MODE_UNSET
+                } else {
+                    value.as_str().ok_or("expected string")?
+                };
+                let canonical = rsi_common::editing_mode::normalize_editing_mode(v)
+                    .ok_or("expected one of: unset, standard, vim")?;
+                *self.editing_mode.write() = canonical.to_string();
+                Ok(true)
+            }
             "orchestration_max_child_effort" => {
                 // Issue #35 (b). Bounded enum on write. This is the boundary
                 // that makes the R8 LOW-2 read-path degrade unreachable for the
@@ -2603,6 +2659,11 @@ impl RuntimeConfig {
                     .prepare_sandbox_build_cache_update(field, value)?
                     .expect("matched 69A field must prepare");
                 self.publish_sandbox_build_cache_config(prepared);
+                Ok(true)
+            }
+            "follow_agent_created_projects" => {
+                self.follow_agent_created_projects
+                    .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
                 Ok(true)
             }
             "stall_classifier_enabled" => {
@@ -2916,6 +2977,9 @@ impl Config {
         self.claude_config_isolation = runtime_config.claude_config_isolation.read().clone();
         self.stall_classifier_enabled = runtime_config
             .stall_classifier_enabled
+            .load(Ordering::Relaxed);
+        self.follow_agent_created_projects = runtime_config
+            .follow_agent_created_projects
             .load(Ordering::Relaxed);
         self.stall_classifier_model = runtime_config.stall_classifier_model.read().clone();
         self.stall_classifier_idle_secs = runtime_config
@@ -3237,6 +3301,17 @@ impl Config {
             )
             .unwrap_or_else(|| "off".to_string());
 
+        // Operator setting (#1626): follow a project an agent created. Default on.
+        let follow_agent_created_projects = env_var_legacy!("FOLLOW_AGENT_CREATED_PROJECTS")
+            .ok()
+            .map(|s| {
+                !matches!(
+                    s.to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+            })
+            .unwrap_or(true);
+
         // Stall classifier knobs (opt-in; default off so daemon behavior is
         // unchanged from pre-RSI-0XX builds).
         let stall_classifier_enabled = env_var_legacy!("STALL_CLASSIFIER_ENABLED")
@@ -3456,6 +3531,7 @@ impl Config {
             codex_sandbox_mode,
             claude_config_isolation,
             stall_classifier_enabled,
+            follow_agent_created_projects,
             recursive_dag_startup_recovery_max_graphs,
             recursive_dag_startup_recovery_time_budget_ms,
             recursive_dag_recovery_controls_enabled,
@@ -3814,6 +3890,27 @@ mod tests {
         assert_eq!(catalogued, persisted);
     }
 
+    /// #1626: the TUI follows agent-created projects unless the operator turns
+    /// it off; the flag is persisted, defaults on and round-trips.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn follow_agent_created_projects_defaults_on_is_persisted_and_round_trips() {
+        assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&"follow_agent_created_projects"));
+        let config = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(config.to_json()["follow_agent_created_projects"], true);
+        assert!(
+            config
+                .update_field("follow_agent_created_projects", &serde_json::json!(false))
+                .unwrap()
+        );
+        assert_eq!(config.to_json()["follow_agent_created_projects"], false);
+        assert!(
+            config
+                .update_field("follow_agent_created_projects", &serde_json::json!("no"))
+                .is_err()
+        );
+    }
+
     /// #925: the satellite polling kill switch is a persisted daemon setting.
     /// It defaults on and round-trips false -> true through the JSON view.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
@@ -3898,6 +3995,41 @@ mod tests {
                 .update_field("deploy_drain_enabled", &serde_json::json!(1))
                 .is_err()
         );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn turn_detach_setting_defaults_off_persists_and_validates_boolean() {
+        let config = RuntimeConfig::from_config(&Config::default());
+        assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&"turn_detach_enabled"));
+        assert_eq!(config.to_json()["turn_detach_enabled"], false);
+        assert!(
+            config
+                .update_field("turn_detach_enabled", &serde_json::json!(true))
+                .unwrap()
+        );
+        assert_eq!(
+            config.persisted_field_value("turn_detach_enabled"),
+            Some(serde_json::json!(true))
+        );
+        for bad in [
+            serde_json::json!(1),
+            serde_json::json!("true"),
+            serde_json::Value::Null,
+        ] {
+            assert!(config.update_field("turn_detach_enabled", &bad).is_err());
+        }
+        assert!(config.turn_detach_enabled.load(Ordering::Relaxed));
+        assert!(
+            config
+                .update_field("turn_detach_enabled", &serde_json::json!(false))
+                .unwrap()
+        );
+        assert_eq!(
+            config.persisted_field_value("turn_detach_enabled"),
+            Some(serde_json::json!(false))
+        );
+        assert!(!config.turn_detach_enabled.load(Ordering::Relaxed));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
@@ -5989,6 +6121,32 @@ mod tests {
                     "GetDaemonConfig payload must expose the ceiling"
                 );
             }
+        });
+    }
+
+    /// Issue #1628: `editing_mode` defaults to `unset`, accepts only the
+    /// bounded enum, and `null` re-arms the first-start prompt.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn runtime_config_editing_mode_validates_and_clears() {
+        with_clean_env(|| {
+            let config = Config::from_env();
+            let rc = RuntimeConfig::from_config(&config);
+            assert_eq!(rc.to_json()["editing_mode"], "unset");
+            assert!(is_persisted_runtime_config_field("editing_mode"));
+            for choice in ["standard", "vim", " Vim "] {
+                rc.update_field("editing_mode", &serde_json::json!(choice))
+                    .expect("legal mode must be accepted");
+            }
+            assert_eq!(rc.to_json()["editing_mode"], "vim");
+            for bad in [serde_json::json!("emacs"), serde_json::json!(7)] {
+                rc.update_field("editing_mode", &bad)
+                    .expect_err("illegal mode must be rejected");
+                assert_eq!(rc.to_json()["editing_mode"], "vim");
+            }
+            rc.update_field("editing_mode", &serde_json::json!(null))
+                .expect("null clears");
+            assert_eq!(rc.to_json()["editing_mode"], "unset");
         });
     }
 

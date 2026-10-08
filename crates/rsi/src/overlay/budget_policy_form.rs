@@ -115,6 +115,42 @@ pub(super) fn handle_budget_policy_form_key(app: &mut App, key: KeyEvent) {
         _ => return,
     };
 
+    // Standard editing: a real cursor and selection in the focused text field.
+    let accept: fn(char) -> bool = match focused_field {
+        FIELD_SCOPE_ID | FIELD_PURPOSE => |_| true,
+        FIELD_ALERT_THRESHOLD_RATIO => |c| c.is_ascii_digit() || c == '.',
+        _ => |c| c.is_ascii_digit(),
+    };
+    if app.edit_field_filtered(
+        key,
+        |overlay| match overlay {
+            OverlayState::BudgetPolicyForm {
+                scope_id,
+                purpose,
+                max_total_tokens,
+                max_concurrency,
+                max_calls_per_window,
+                rate_window_seconds,
+                alert_threshold_ratio,
+                ..
+            } => match focused_field {
+                FIELD_SCOPE_ID => Some(scope_id),
+                FIELD_PURPOSE => Some(purpose),
+                FIELD_MAX_TOTAL_TOKENS => Some(max_total_tokens),
+                FIELD_MAX_CONCURRENCY => Some(max_concurrency),
+                FIELD_MAX_CALLS_PER_WINDOW => Some(max_calls_per_window),
+                FIELD_RATE_WINDOW_SECONDS => Some(rate_window_seconds),
+                FIELD_ALERT_THRESHOLD_RATIO => Some(alert_threshold_ratio),
+                _ => None,
+            },
+            _ => None,
+        },
+        accept,
+    ) != crate::field_edit::FieldKey::Ignored
+    {
+        return;
+    }
+
     match key.code {
         KeyCode::BackTab => cycle_field(app, false),
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => cycle_field(app, false),

@@ -429,16 +429,26 @@ impl Store {
         {
             return Err(refused("manager_v2_decision_claim_changed"));
         }
-        let changed = tx.execute("UPDATE appserver_approval_publications SET state='enqueued',outcome='response enqueued; provider consumption unconfirmed',updated_at=?1 WHERE session_id=?2 AND publication_id=?3 AND state='published' AND closure_state='open' AND target_json=?4",params![now(),delivery.target["session_id"].as_str(),delivery.target["publication_id"].as_str(),delivery.target.to_string()])?;
-        if changed != 1 {
-            return Err(refused("approval_publication_changed"));
-        }
-        tx.execute("UPDATE approvals SET status=?1,resolved_at=?2 WHERE id=(SELECT approval_id FROM appserver_approval_publications WHERE publication_id=?3)",params![if delivery.answer.trim()=="approve" {"Approved"} else {"Denied"},now(),delivery.target["publication_id"].as_str()])?;
+        self.mark_appserver_approval_enqueued(&delivery.target, &delivery.answer)?;
         let mut finished = delivery.clone();
         finished.state = "enqueued".into();
         finished.outcome=Some("response enqueued to the exact live writer; provider consumption unconfirmed; never automatically resent".into());
         self.manager_v2_delivery_transition_on(&config, &record, &finished)?;
         tx.commit()?;
+        Ok(())
+    }
+    /// Caller holds an immediate transaction and has checked its own answer
+    /// journal. Enqueue never closes the provider's exact open occurrence.
+    pub(crate) fn mark_appserver_approval_enqueued(
+        &self,
+        target: &Value,
+        answer: &str,
+    ) -> Result<()> {
+        let changed = self.conn.execute("UPDATE appserver_approval_publications SET state='enqueued',outcome='response enqueued; provider consumption unconfirmed',updated_at=?1 WHERE session_id=?2 AND publication_id=?3 AND state='published' AND closure_state='open' AND target_json=?4",params![now(),target["session_id"].as_str(),target["publication_id"].as_str(),target.to_string()])?;
+        if changed != 1 {
+            return Err(refused("approval_publication_changed"));
+        }
+        self.conn.execute("UPDATE approvals SET status=?1,resolved_at=?2 WHERE id=(SELECT approval_id FROM appserver_approval_publications WHERE publication_id=?3)",params![if answer.trim()=="approve" {"Approved"} else {"Denied"},now(),target["publication_id"].as_str()])?;
         Ok(())
     }
 }

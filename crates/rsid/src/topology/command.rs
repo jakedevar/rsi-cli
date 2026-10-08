@@ -16,11 +16,25 @@ use rsi_common::types::{CatalogOp, TopologyStep};
 use crate::error::Result;
 use crate::topology::catalog::{self, CommandOutcome, CommandPoll, SCRATCH_DIRS};
 use crate::topology::custody::{self, TopologyForkSource, node_pin_ref};
-use crate::topology::executor::{Executor, NodeEffects, failed, node_data};
+use crate::topology::executor::{Executor, NodeEffects, admission_hold_kind, failed, node_data};
 use crate::topology::steps::WorkflowSteps;
 use crate::topology::store::{
     self as rows, AttemptRow, AttemptStatus, ExecutionRow, ExecutionStatus, Settlement, failure,
 };
+
+/// What preparing a command attempt's sandbox produced.
+enum Prepared {
+    Ready((CatalogOp, std::path::PathBuf, String)),
+    /// A refusal was settled on the attempt.
+    Settled,
+    /// Capacity pressure (#1641 S4b): hold the node `Reserved`.
+    Held(&'static str),
+}
+
+enum PrepareRefusal {
+    Hold(&'static str),
+    Refused(String),
+}
 
 fn command_op(execution: &ExecutionRow, node: &str) -> Result<CatalogOp> {
     let steps = WorkflowSteps::from_workflow(&execution.definition)
@@ -75,8 +89,20 @@ impl<E: NodeEffects> Executor<E> {
                 return Ok(false);
             }
         }
-        let Some((op, sandbox, pre_head)) = self.prepare_command(execution, attempt).await? else {
-            return Ok(true);
+        // #1641 S4b: a cargo op takes a governor build slot (and with it the
+        // disk floor) before anything is allocated; pressure holds the node
+        // `Reserved` and the next tick asks again.
+        if let Some(kind) = self.effects.build_slot_held(attempt) {
+            return self.hold_attempt(execution, attempt, kind).await;
+        }
+        let (op, sandbox, pre_head) = match self.prepare_command(execution, attempt).await? {
+            Prepared::Ready(prepared) => prepared,
+            Prepared::Settled => return Ok(true),
+            Prepared::Held(kind) => {
+                // No sandbox exists yet: give the slot back and wait.
+                self.effects.release_build_slot(attempt.id);
+                return self.hold_attempt(execution, attempt, kind).await;
+            }
         };
         {
             let store = self.store.lock().await;
@@ -112,15 +138,17 @@ impl<E: NodeEffects> Executor<E> {
     }
 
     /// Resolve the op and allocate a fresh sandbox exactly at the fork
-    /// commit; any refusal is settled here (`None`).
+    /// commit; any refusal is settled here, except capacity pressure, which
+    /// holds the node (#1641 S4b).
     async fn prepare_command(
         &self,
         execution: &ExecutionRow,
         attempt: &AttemptRow,
-    ) -> Result<Option<(CatalogOp, std::path::PathBuf, String)>> {
+    ) -> Result<Prepared> {
         let refusal = match self.try_prepare_command(execution, attempt).await {
-            Ok(prepared) => return Ok(Some(prepared)),
-            Err(refusal) => refusal,
+            Ok(prepared) => return Ok(Prepared::Ready(prepared)),
+            Err(PrepareRefusal::Hold(kind)) => return Ok(Prepared::Held(kind)),
+            Err(PrepareRefusal::Refused(refusal)) => refusal,
         };
         self.settle(
             execution,
@@ -129,26 +157,32 @@ impl<E: NodeEffects> Executor<E> {
             failed(failure::CUSTODY_REFUSED, &refusal),
         )
         .await?;
-        Ok(None)
+        Ok(Prepared::Settled)
     }
 
     async fn try_prepare_command(
         &self,
         execution: &ExecutionRow,
         attempt: &AttemptRow,
-    ) -> std::result::Result<(CatalogOp, std::path::PathBuf, String), String> {
-        let op = command_op(execution, &attempt.node_id).map_err(|e| e.to_string())?;
+    ) -> std::result::Result<(CatalogOp, std::path::PathBuf, String), PrepareRefusal> {
+        let refused = |error: String| PrepareRefusal::Refused(error);
+        let op = command_op(execution, &attempt.node_id).map_err(|e| refused(e.to_string()))?;
         let fork = TopologyForkSource::verified(&execution.repo_root, &attempt.base_commit)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| refused(e.to_string()))?;
         let sandbox = self
             .effects
             .allocate_command_sandbox(attempt.session_id, fork)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| match admission_hold_kind(&error) {
+                Some(kind) => PrepareRefusal::Hold(kind),
+                None => refused(error.to_string()),
+            })?;
         let observed = custody::observe_sandbox_excluding(&sandbox, SCRATCH_DIRS)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| refused(e.to_string()))?;
         if observed.dirty || observed.head != attempt.base_commit {
-            return Err("fresh command sandbox does not match its fork commit".into());
+            return Err(refused(
+                "fresh command sandbox does not match its fork commit".into(),
+            ));
         }
         Ok((op, sandbox, observed.head))
     }

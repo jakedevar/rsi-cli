@@ -141,6 +141,23 @@ pub async fn tick(app: &mut App) {
     }
 }
 pub async fn handle_key(app: &mut App, key: KeyEvent) {
+    // Standard editing: a real cursor and selection in the filter being typed.
+    if matches!(&app.overlay, OverlayState::Fleet(s) if s.editing) {
+        match app.edit_field(key, |overlay| match overlay {
+            OverlayState::Fleet(s) => Some(&mut s.filter),
+            _ => None,
+        }) {
+            crate::field_edit::FieldKey::Edited => {
+                if let OverlayState::Fleet(s) = &mut app.overlay {
+                    s.selected = 0;
+                    s.selected_group = 0;
+                }
+                return;
+            }
+            crate::field_edit::FieldKey::Moved => return,
+            crate::field_edit::FieldKey::Ignored => {}
+        }
+    }
     let OverlayState::Fleet(s) = &mut app.overlay else {
         return;
     };

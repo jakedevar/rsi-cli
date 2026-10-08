@@ -118,6 +118,11 @@ class ArtifactLockTests(unittest.TestCase):
         (integrations / "fixture.rs").touch()
         env = os.environ.copy()
         env.pop("CARGO_TARGET_DIR", None)
+        # The merge-queue lander runs this suite with its own RSI_LANDER_*
+        # settings (RSI_LANDER_KEEP_RSID_ARTIFACTS=1 skips every cargo clean);
+        # tests opt into them through extra_env only.
+        for key in [key for key in env if key.startswith("RSI_LANDER_")]:
+            env.pop(key)
         env.update(
             PATH=f"{self.bin}:{env['PATH']}",
             FAKE_TARGET_DIRECTORY=str(self.target),
@@ -203,7 +208,8 @@ class ArtifactLockTests(unittest.TestCase):
         }
         self.finish(self.start("environment", extra_env=inherited))
         seen = set((self.control / "env-environment").read_text().split())
-        environment = {**os.environ, **inherited}
+        outer = {key: value for key, value in os.environ.items() if not key.startswith("RSI_LANDER_")}
+        environment = {**outer, **inherited}
         expected = {
             key
             for key in environment

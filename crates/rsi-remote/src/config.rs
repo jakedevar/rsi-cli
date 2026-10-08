@@ -24,6 +24,10 @@ pub struct Config {
     pub allowed_node_ids: Vec<String>,
     #[serde(default)]
     pub project_ids: Vec<String>,
+    /// Answer writes are a separate opt-in from the read policy. Off by
+    /// default; every answer route denies with zero dispatch while false.
+    #[serde(default)]
+    pub allow_answers: bool,
 }
 
 impl Config {
@@ -245,6 +249,7 @@ mod tests {
             owner_user_id: 1,
             allowed_node_ids: vec!["node-1".into()],
             project_ids: vec!["550e8400-e29b-41d4-a716-446655440000".into()],
+            ..Config::default()
         };
         assert!(config.validate().is_ok());
         for host in [
@@ -289,6 +294,7 @@ mod tests {
             owner_user_id: 1,
             allowed_node_ids: (0..count).map(|n| format!("{n:0>128}")).collect(),
             project_ids: vec!["550e8400-e29b-41d4-a716-446655440000".into()],
+            allow_answers: false,
         }
     }
 
@@ -323,5 +329,32 @@ mod tests {
         symlink(&target, &link).unwrap();
         assert!(write_replacing_unreadable(&link, &Config::default()).is_err());
         assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+    }
+
+    #[test]
+    fn allow_answers_defaults_off_and_round_trips() {
+        let parsed: Config = toml::from_str("enabled = false\n").unwrap();
+        assert!(!parsed.allow_answers);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("rsi-remote-answers-{}-{nonce}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("policy.toml");
+        let config = Config {
+            allow_answers: true,
+            ..Config::default()
+        };
+        write(&path, &config, true).unwrap();
+        assert!(read(&path).unwrap().allow_answers);
+        let config = Config {
+            allow_answers: false,
+            ..Config::default()
+        };
+        write(&path, &config, false).unwrap();
+        assert!(!read(&path).unwrap().allow_answers);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

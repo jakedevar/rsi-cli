@@ -73,11 +73,21 @@ pub fn parse_request(raw_headers: &[u8], canonical_host: &str) -> Result<Request
     if path.contains('?') || path.contains('%') || path.contains("..") {
         return Err("invalid request line");
     }
+    let answer = answer_route(path);
     let method = match (parts[0], path) {
-        ("GET", path) if allowed_get(path) => Method::Get,
+        ("GET", path) if allowed_get(path) && answer.is_none() => Method::Get,
         ("POST", "/auth/session" | "/auth/logout") => Method::Post,
+        ("POST", _) if answer.is_some() => Method::Post,
         _ => return Err("invalid request line"),
     };
+    // The answer POST and the decision-targets GET carry no query: a query on
+    // either is refused before any header or body check.
+    if query != Query::default()
+        && (matches!(method, Method::Post)
+            || read_method(path) == Some("RemoteGetDecisionTargetsV1"))
+    {
+        return Err("invalid request line");
+    }
     let headers = parse_headers(lines)?;
     if headers.get("host") != Some(&"localhost")
         || headers.get("x-forwarded-proto") != Some(&"https")
@@ -90,7 +100,7 @@ pub fn parse_request(raw_headers: &[u8], canonical_host: &str) -> Result<Request
         return Err("untrusted forwarding");
     }
     let content_length = content_length(&headers)?;
-    if matches!(method, Method::Post) && path == "/auth/session" {
+    if matches!(method, Method::Post) && (path == "/auth/session" || answer.is_some()) {
         if headers.get("content-type") != Some(&"application/json") {
             return Err("invalid content type");
         }
@@ -265,8 +275,47 @@ pub fn read_method(path: &str) -> Option<&'static str> {
             session,
             "decisions",
         ] if uuid(project) && uuid(session) => Some("RemoteGetDecisionsV1"),
+        [
+            "",
+            "api",
+            "v1",
+            "projects",
+            project,
+            "sessions",
+            session,
+            "decision-targets",
+        ] if uuid(project) && uuid(session) => Some("RemoteGetDecisionTargetsV1"),
         _ => None,
     }
+}
+
+/// The exact answer-POST shape. This is the only route that may become an
+/// answer request; every other path returns `None` here.
+#[must_use]
+pub fn answer_route(path: &str) -> Option<(String, String)> {
+    let parts: Vec<_> = path.split('/').collect();
+    match parts.as_slice() {
+        [
+            "",
+            "api",
+            "v1",
+            "projects",
+            project,
+            "sessions",
+            session,
+            "decisions",
+            "answer" | "answer-pending",
+        ] if uuid(project) && uuid(session) => {
+            Some(((*project).to_string(), (*session).to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// A canonical lowercase hyphenated UUID, the only form any route accepts.
+#[must_use]
+pub fn is_canonical_uuid(s: &str) -> bool {
+    uuid(s)
 }
 
 fn uuid(s: &str) -> bool {
@@ -545,10 +594,96 @@ mod tests {
             ),
             Some("RemoteGetDecisionsV1")
         );
+        assert_eq!(
+            read_method(
+                "/api/v1/projects/550e8400-e29b-41d4-a716-446655440000/sessions/550e8400-e29b-41d4-a716-446655440001/decision-targets"
+            ),
+            Some("RemoteGetDecisionTargetsV1")
+        );
+        assert_eq!(
+            read_method(
+                "/api/v1/projects/550e8400-e29b-41d4-a716-446655440000/sessions/550e8400-e29b-41d4-a716-446655440001/decisions/answer"
+            ),
+            None
+        );
         assert_eq!(read_method("/api/v1/AgentHalt"), None);
         assert_eq!(
             read_method("/api/v1/projects/550E8400-e29b-41d4-a716-446655440000/sessions"),
             None
         );
+    }
+
+    #[test]
+    fn decision_targets_and_answer_routes_parse_exactly() {
+        const PROJECT: &str = "550e8400-e29b-41d4-a716-446655440000";
+        const SESSION: &str = "550e8400-e29b-41d4-a716-446655440001";
+        let targets = format!("/api/v1/projects/{PROJECT}/sessions/{SESSION}/decision-targets");
+        let answer = format!("/api/v1/projects/{PROJECT}/sessions/{SESSION}/decisions/answer");
+
+        let parsed = parse_request(&get(&targets), HOST).unwrap();
+        assert_eq!(parsed.method, Method::Get);
+        assert_eq!(parsed.path, targets);
+        assert_eq!(answer_route(&targets), None);
+        assert_eq!(
+            answer_route(&answer),
+            Some((PROJECT.to_string(), SESSION.to_string()))
+        );
+
+        let json = "content-type: application/json\r\ncontent-length: 2\r\n";
+        let parsed =
+            parse_request(&request(&format!("POST {answer} HTTP/1.1"), json), HOST).unwrap();
+        assert_eq!(parsed.method, Method::Post);
+        assert_eq!(parsed.content_length, 2);
+
+        for extra in [
+            "content-type: text/plain\r\ncontent-length: 2\r\n",
+            "content-type: application/json\r\ncontent-length: 0\r\n",
+            "content-type: application/json\r\ncontent-length: 4097\r\n",
+        ] {
+            assert!(
+                parse_request(&request(&format!("POST {answer} HTTP/1.1"), extra), HOST).is_err(),
+                "{extra}"
+            );
+        }
+        assert!(
+            parse_request(
+                &request(&format!("POST {answer}?cursor=x HTTP/1.1"), json),
+                HOST
+            )
+            .is_err(),
+            "answer POST refuses a query"
+        );
+        assert!(
+            parse_request(&get(&format!("{targets}?cursor=x")), HOST).is_err(),
+            "decision-targets GET refuses a query"
+        );
+        assert!(
+            parse_request(&get(&answer), HOST).is_err(),
+            "GET answer denies"
+        );
+        for bad in [
+            format!(
+                "/api/v1/projects/{}/sessions/{SESSION}/decisions/answer",
+                PROJECT.to_uppercase()
+            ),
+            format!(
+                "/api/v1/projects/{PROJECT}/sessions/{}/decisions/answer",
+                SESSION.to_uppercase()
+            ),
+            format!("/api/v1/projects/{PROJECT}/sessions/{SESSION}/decisions/answer/extra"),
+            format!("/api/v1/projects/{PROJECT}/sessions/{SESSION}/decisions"),
+        ] {
+            assert!(
+                parse_request(
+                    &request(
+                        &format!("POST {bad} HTTP/1.1"),
+                        "content-type: application/json\r\ncontent-length: 2\r\n"
+                    ),
+                    HOST
+                )
+                .is_err(),
+                "{bad}"
+            );
+        }
     }
 }

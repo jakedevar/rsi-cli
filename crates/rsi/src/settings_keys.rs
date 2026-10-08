@@ -30,6 +30,7 @@ use rsi_common::types::SessionProvider;
 /// `app.daemon_features` list (Epic M design D.1's daemon-owned buckets).
 ///
 pub const DAEMON_FEATURE_SECTIONS: &[SettingsSection] = &[
+    SettingsSection::EditingMode,
     SettingsSection::ModelControl,
     SettingsSection::RetriesRecovery,
     SettingsSection::StallDetection,
@@ -642,10 +643,12 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
     // Model dropdown intercept: when the settings dropdown is open, route keys to it
     if app.settings_state.model_dropdown.open {
         use crate::widget::model_dropdown::{ModelDropdownAction, handle_model_dropdown_key};
+        let standard_editing = app.standard_editing();
         let action = handle_model_dropdown_key(
             &mut app.settings_state.model_dropdown,
             &key,
             &app.settings.custom_providers,
+            standard_editing,
         );
         let consumed = !matches!(action, ModelDropdownAction::Ignored);
         match action {
@@ -692,6 +695,16 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
     // query character that happens to collide with a bound key (`a`, `d`,
     // `R`, Enter, ...) is never stolen by that binding.
     if app.settings_state.query_active {
+        // Standard editing: a real cursor and selection in the query.
+        if app.standard_editing()
+            && app
+                .field_edit
+                .handle_key(&mut app.settings_state.query, key)
+                != crate::field_edit::FieldKey::Ignored
+        {
+            app.mark_dirty();
+            return true;
+        }
         return match key.code {
             KeyCode::Char(c) => {
                 app.settings_state.query.push(c);
@@ -1346,7 +1359,8 @@ pub fn item_count(section: SettingsSection, settings: &UserSettings) -> usize {
         SettingsSection::Budgets => 1,
         SettingsSection::ProviderKeys => ProviderCredentialSlot::ALL.len(),
         SettingsSection::McpServers => 1,
-        SettingsSection::ModelControl
+        SettingsSection::EditingMode
+        | SettingsSection::ModelControl
         | SettingsSection::RetriesRecovery
         | SettingsSection::StallDetection
         | SettingsSection::MemoryDreaming
@@ -1844,7 +1858,8 @@ fn toggle_setting(settings: &mut UserSettings, state: &SettingsState) {
         // Daemon-features-backed sections and the daemon-owned MemoryDreaming
         // rows are toggled via RPC (`LcAction::ToggleDaemonFeature`); UserSettings
         // is not mutated for them here.
-        SettingsSection::ModelControl
+        SettingsSection::EditingMode
+        | SettingsSection::ModelControl
         | SettingsSection::RetriesRecovery
         | SettingsSection::StallDetection
         | SettingsSection::Orchestration
@@ -2214,7 +2229,7 @@ mod tests {
     #[test]
     fn test_settings_category_all_count() {
         // Seven rail groups, including the satellite integration section.
-        assert_eq!(SettingsSection::ALL.len(), 25);
+        assert_eq!(SettingsSection::ALL.len(), 26);
     }
 
     #[test]

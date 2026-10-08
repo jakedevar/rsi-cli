@@ -25,6 +25,29 @@ fn emit_build_sha() {
     println!("cargo:rustc-env=RSI_BUILD_SHA={sha}");
 }
 
+/// Main worktree of the repo this binary is built from, embedded as
+/// `RSI_BUILD_MAIN_WORKTREE` (#1613). A daemon built in a manager sandbox
+/// (a git linked worktree) would otherwise embed a path that matches no
+/// project and that disappears when the sandbox is reclaimed; the parent of
+/// the git common dir is the stable checkout. Empty when git is missing, the
+/// source is not a repo or the common dir is not a `.git` directory (bare
+/// repo): the runtime then falls back to resolving the build dir itself.
+fn emit_build_main_worktree() {
+    let main = std::process::Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .map(std::path::PathBuf::from)
+        .filter(|common| common.file_name().is_some_and(|name| name == ".git"))
+        .and_then(|common| common.parent().map(std::path::Path::to_path_buf))
+        .map(|main| main.display().to_string())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=RSI_BUILD_MAIN_WORKTREE={main}");
+}
+
 // SEAM-GUARD-BEGIN
 /// `test-seam` carries fake capabilities and route-validation bypasses; it must
 /// never be compiled into a release build. A release-mode test run that needs
@@ -45,6 +68,7 @@ fn refuse_test_seam_in_release() {
 fn main() {
     refuse_test_seam_in_release();
     emit_build_sha();
+    emit_build_main_worktree();
     // Get the SQLite include directory from the bundled libsqlite3-sys crate.
     // This provides sqlite3.h / sqlite3ext.h needed by the sqlite-vec extension.
     let sqlite_include = std::env::var("DEP_SQLITE3_INCLUDE").unwrap_or_default();

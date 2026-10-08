@@ -1349,3 +1349,48 @@ async fn report_up_and_send_down_route_through_the_handle_and_the_catalog() {
         assert!(seat.verbs.contains(&verb), "{verb:?}");
     }
 }
+
+/// #1627: the workspace seat lists the sessions it rotated through, newest
+/// first, bounded by `SEAT_PREDECESSOR_LIMIT`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn workspace_seat_lists_its_rotation_lineage_bounded() {
+    let (control, store) = control_handle_with_store();
+    let p = portfolio(&store).await;
+    let before = control.operator_global_workspace().await.unwrap();
+    assert!(before.seat.unwrap().predecessors.is_empty());
+
+    let mut chain = vec![p.seat];
+    for _ in 0..(SEAT_PREDECESSOR_LIMIT + 2) {
+        let guard = store.lock().await;
+        let previous = *chain.last().unwrap();
+        let mut row = test_session(Uuid::new_v4(), PathBuf::from("/tmp/global-manager"));
+        row.continued_from = Some(previous);
+        row.status = SessionStatus::Running;
+        guard.insert_session(&row).unwrap();
+        guard
+            .update_session_status(previous, SessionStatus::Completed)
+            .unwrap();
+        assert!(guard.transfer_global_seat(previous, row.id).unwrap());
+        chain.push(row.id);
+    }
+    let workspace = control.operator_global_workspace().await.unwrap();
+    let seat = workspace.seat.unwrap();
+    assert_eq!(Some(&seat.session_id), chain.last());
+    let expected: Vec<Uuid> = chain
+        .iter()
+        .rev()
+        .skip(1)
+        .take(SEAT_PREDECESSOR_LIMIT)
+        .copied()
+        .collect();
+    assert_eq!(
+        seat.predecessors
+            .iter()
+            .map(|prior| prior.session_id)
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(seat.predecessors_truncated);
+    assert_eq!(seat.predecessors[0].status, SessionStatus::Completed);
+}

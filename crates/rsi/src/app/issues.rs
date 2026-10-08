@@ -1783,6 +1783,13 @@ impl App {
                 }
             }
             ActionId::IssueRunPoll => self.request_issue_manual_poll(pane_id),
+            ActionId::IssueRunTopology => {
+                crate::overlay::graph::run_topology_command(
+                    self,
+                    &format!("run {}", crate::overlay::graph::DEFAULT_ISSUE_TOPOLOGY),
+                )
+                .await;
+            }
             ActionId::IssueSelectFormValue => self.select_issue_editor_value(pane_id),
             ActionId::IssueRetryMutation => {
                 let pending = match self.active_tab().layout.find_pane(pane_id) {
@@ -1994,6 +2001,74 @@ impl App {
         true
     }
 
+    /// Standard editing (#1628): a real cursor and selection in the issue
+    /// editor's active text field. Returns whether the key was taken; Tab,
+    /// Esc, Up/Down, a frozen retry and non-text fields keep the old handling.
+    fn standard_issue_editor_key(
+        &mut self,
+        pane_id: PaneId,
+        key: crossterm::event::KeyEvent,
+    ) -> bool {
+        use crate::field_edit::FieldKey;
+        use crossterm::event::KeyCode;
+
+        if matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down
+        ) {
+            return false;
+        }
+        let mut field_edit = std::mem::take(&mut self.field_edit);
+        let mut refresh = None;
+        let taken = 'edit: {
+            let Some(Pane::Issues(state)) = self.active_tab_mut().layout.find_pane_mut(pane_id)
+            else {
+                break 'edit false;
+            };
+            if state.transient.pending_mutation.is_some() {
+                break 'edit false;
+            }
+            let Some(editor) = state.transient.editor.as_mut() else {
+                break 'edit false;
+            };
+            if !editor_accepts_text(editor) {
+                break 'edit false;
+            }
+            let result = field_edit.handle_key(editor_field_mut(editor), key);
+            if result == FieldKey::Ignored {
+                break 'edit false;
+            }
+            if result == FieldKey::Edited {
+                sync_editor_derived(editor);
+                editor.dirty = true;
+                editor.discard_armed = false;
+                editor.error = None;
+                if matches!(editor.mode, IssueEditorMode::Dependency { .. })
+                    && editor.active_field == 1
+                {
+                    refresh = editor_target_issue_id(editor)
+                        .map(|issue_id| (issue_id, editor.dependency_text.clone()));
+                }
+            }
+            true
+        };
+        self.field_edit = field_edit;
+        if let Some((issue_id, query)) = refresh {
+            self.request_issue_dependency_candidates(pane_id, issue_id, query);
+        }
+        taken
+    }
+
+    /// Whether the focused Issues pane has its editor open (a text field the
+    /// Standard chords must reach before the global table).
+    #[must_use]
+    pub fn issue_editor_open(&self) -> bool {
+        matches!(
+            self.focused_pane(),
+            Some(Pane::Issues(state)) if state.transient.editor.is_some()
+        )
+    }
+
     pub async fn handle_issue_workspace_editor_key(
         &mut self,
         key: crossterm::event::KeyEvent,
@@ -2061,6 +2136,10 @@ impl App {
         }
         if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
             return false;
+        }
+        if self.standard_editing() && self.standard_issue_editor_key(pane_id, key) {
+            self.mark_dirty();
+            return true;
         }
         let Some(Pane::Issues(state)) = self.active_tab_mut().layout.find_pane_mut(pane_id) else {
             return false;
@@ -2501,6 +2580,18 @@ impl App {
                 issue_id,
                 events_after.filter(|after| *after > 0),
             );
+        }
+    }
+
+    /// The Issue selected in the focused Issues pane's Local tab (the target of
+    /// `:topology run` and the run key).
+    pub(crate) fn focused_local_issue(&self) -> Option<Issue> {
+        let pane_id = self.active_tab().focused_pane;
+        match self.active_tab().layout.find_pane(pane_id) {
+            Some(Pane::Issues(state)) if state.active_tab == IssueWorkspaceTab::Local => {
+                self.selected_local_issue(pane_id)
+            }
+            _ => None,
         }
     }
 

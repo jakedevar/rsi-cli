@@ -1394,6 +1394,27 @@ async fn load(app: &mut App, query: AgentManagerInspectRequestV2, previous: Vec<
 }
 
 pub(super) async fn handle_key(app: &mut App, key: KeyEvent) {
+    // Standard editing: a real cursor and selection in the answer box.
+    let answering =
+        super::board_mut(app).is_some_and(|s| s.archive.is_none() && s.answer.is_some());
+    if answering {
+        let result = app.edit_field(key, |overlay| match overlay {
+            OverlayState::HarnessManagerV2(surface) => surface
+                .ledger
+                .answer
+                .as_mut()
+                .map(|draft| &mut draft.target.answer),
+            _ => None,
+        });
+        if result == crate::field_edit::FieldKey::Edited {
+            if let Some(draft) = super::board_mut(app).and_then(|s| s.answer.as_mut()) {
+                draft.target.idempotency_key = Uuid::new_v4().to_string();
+            }
+        }
+        if result != crate::field_edit::FieldKey::Ignored {
+            return;
+        }
+    }
     let Some(state) = super::board_mut(app) else {
         return;
     };

@@ -9,7 +9,9 @@ use rsid::codex::CodexClient;
 use rsid::config::{Config, RuntimeConfig};
 use rsid::dotenv::{DaemonDotenvStatus, load_daemon_dotenv};
 use rsid::error::Result;
-use rsid::instance_guard::{DaemonInstanceGuard, refuse_live_daemon_socket};
+use rsid::instance_guard::{
+    DaemonInstanceGuard, inherited_daemon_listener, refuse_live_daemon_socket,
+};
 use rsid::memory::manager::MemoryManager;
 use rsid::openai::OpenAiClient;
 use rsid::rpc::RpcServer;
@@ -273,7 +275,11 @@ async fn run_daemon() -> Result<()> {
     // Bridge the first guarded rollout: an already-running legacy binary does
     // not hold the new file lease. A connectable socket is positive incumbent
     // evidence and must never be unlinked. Missing/refused is the stale case.
-    refuse_live_daemon_socket(&config.socket_path).await?;
+    let inherited_listener = inherited_daemon_listener(&config.socket_path)?;
+    let socket_inherited = inherited_listener.is_some();
+    if !socket_inherited {
+        refuse_live_daemon_socket(&config.socket_path).await?;
+    }
 
     // Open/migrate the singleton Store before any provider probe or worker can
     // create a subprocess. The process-first ownership fence inventories
@@ -346,21 +352,19 @@ async fn run_daemon() -> Result<()> {
         warn!("Antigravity binary not found; Antigravity provider unavailable");
     }
 
-    // Remove stale socket
-    if config.socket_path.exists() {
-        warn!(socket = %config.socket_path.display(), "Removing stale socket file");
-        tokio::fs::remove_file(&config.socket_path).await?;
-    }
-
-    // Create Unix socket listener
-    let listener = UnixListener::bind(&config.socket_path)?;
-
-    // Set socket permissions (owner only)
-    #[cfg(unix)]
-    {
+    let listener = if let Some(listener) = inherited_listener {
+        UnixListener::from_std(listener)?
+    } else {
+        // Only the daemon-owned path probes, unlinks, binds and sets mode.
+        if config.socket_path.exists() {
+            warn!(socket = %config.socket_path.display(), "Removing stale socket file");
+            tokio::fs::remove_file(&config.socket_path).await?;
+        }
+        let listener = UnixListener::bind(&config.socket_path)?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o600))?;
-    }
+        listener
+    };
 
     info!(
         startup_milestone = "socket_bound",
@@ -1234,6 +1238,12 @@ async fn run_daemon() -> Result<()> {
     rpc_server.set_dreamer_handle(dreamer_handle.clone());
     rpc_server.init_dialectic(&config);
     let rpc_server = Arc::new(rpc_server);
+    // #1639: a daemon start follows every deploy and `make release-install`;
+    // restart the RSI Remote gateway if Remote is enabled and it is down.
+    {
+        let rpc_server = Arc::clone(&rpc_server);
+        tokio::spawn(async move { rpc_server.converge_remote_gateway().await });
+    }
 
     // Spawn retry handler loop.
     //
@@ -1799,9 +1809,11 @@ async fn run_daemon() -> Result<()> {
         .await?;
     }
 
-    // Clean up socket
-    if let Err(e) = tokio::fs::remove_file(&config.socket_path).await {
-        warn!(error = %e, "Failed to remove socket file");
+    // An external holder owns the inherited front door across daemon exits.
+    if !socket_inherited {
+        if let Err(e) = tokio::fs::remove_file(&config.socket_path).await {
+            warn!(error = %e, "Failed to remove socket file");
+        }
     }
 
     drop(instance_guard);
@@ -2545,7 +2557,7 @@ mod tests {
             .find("No supported provider found")
             .expect("no-provider return");
         let socket_bind = main_body
-            .find("UnixListener::bind")
+            .find("let listener = if let Some(listener) = inherited_listener")
             .expect("daemon socket bind");
         let first_status_mutation = main_body
             .find("ensure_c5_autofile_activation")
@@ -2609,7 +2621,9 @@ mod tests {
             .expect("startup recovery helper follows main");
         let main_body = &source[main_start..helper_start];
 
-        let socket_bind = main_body.find("UnixListener::bind").expect("socket bind");
+        let socket_bind = main_body
+            .find("let listener = if let Some(listener) = inherited_listener")
+            .expect("socket bind");
         let socket_bound = main_body
             .find("startup_milestone = \"socket_bound\"")
             .expect("truthful socket-bound milestone");
@@ -2696,7 +2710,17 @@ mod tests {
             .find("remove_file(&config.socket_path)")
             .expect("stale socket unlink");
 
-        assert!(lease < socket_probe);
+        let inherited_validation = main_body
+            .find("inherited_daemon_listener(&config.socket_path)")
+            .expect("validate inherited listener");
+        assert!(lease < inherited_validation);
+        assert!(inherited_validation < socket_probe);
+        assert!(main_body.contains("if !socket_inherited {\n        refuse_live_daemon_socket"));
+        assert!(
+            main_body
+                .contains("if !socket_inherited {\n        if let Err(e) = tokio::fs::remove_file")
+        );
+        assert!(main_body.contains("UnixListener::from_std(listener)?\n    } else {"));
         let ownership_fence = main_body
             .find("reap_startup_process_ownership_checked")
             .expect("process ownership fence");

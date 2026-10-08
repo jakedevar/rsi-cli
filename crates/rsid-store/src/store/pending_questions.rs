@@ -5,6 +5,9 @@
 //! binds it to that publication. A failure or restart between them leaves an
 //! explicit unresolved gate; matching question text never repairs identity.
 
+#[path = "remote_answers.rs"]
+pub mod remote_answers;
+
 use super::Store;
 use crate::error::{DaemonError, Result};
 use chrono::{SecondsFormat, Utc};
@@ -35,6 +38,16 @@ impl Store {
         raw: Option<&str>,
     ) -> Result<PendingQuestionPublication> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let publication = Self::reserve_pending_question_in_transaction(&tx, session_id, raw)?;
+        tx.commit()?;
+        Ok(publication)
+    }
+
+    pub(super) fn reserve_pending_question_in_transaction(
+        tx: &Transaction<'_>,
+        session_id: Uuid,
+        raw: Option<&str>,
+    ) -> Result<PendingQuestionPublication> {
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         if tx.execute(
             "UPDATE sessions SET pending_question_json=?1,updated_at=?2 WHERE id=?3",
@@ -43,7 +56,6 @@ impl Store {
         {
             // Retain the legacy setter's no-op for a missing session. A producer
             // bind will still reject this nonexistent publication.
-            tx.commit()?;
             return Ok(PendingQuestionPublication {
                 session_id,
                 id: Uuid::new_v4(),
@@ -73,7 +85,6 @@ impl Store {
             ],
             |r| r.get(0),
         )?;
-        tx.commit()?;
         Ok(PendingQuestionPublication {
             session_id,
             id,
@@ -103,6 +114,24 @@ impl Store {
         question: &PendingQuestion,
     ) -> Result<i64> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let event_id = Self::bind_pending_question_in_transaction(
+            &tx,
+            publication,
+            event,
+            provenance,
+            question,
+        )?;
+        tx.commit()?;
+        Ok(event_id)
+    }
+
+    pub(super) fn bind_pending_question_in_transaction(
+        tx: &Transaction<'_>,
+        publication: &PendingQuestionPublication,
+        event: &ConversationEvent,
+        provenance: Option<&ConversationEventProvenanceV1>,
+        question: &PendingQuestion,
+    ) -> Result<i64> {
         let raw = serde_json::to_string(question)?;
         let current: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pending_question_publications p
@@ -161,7 +190,6 @@ impl Store {
             "UPDATE sessions SET pending_question_json=?1 WHERE id=?2",
             params![raw, event.session_id.to_string()],
         )?;
-        tx.commit()?;
         Ok(event_id)
     }
 
@@ -229,6 +257,13 @@ impl Store {
             params![now,session_id.to_string()])?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Distinguish an answered publication from a question never published.
+    pub fn pending_question_was_cleared(&self, session_id: Uuid) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pending_question_publications WHERE session_id=?1 AND state='cleared')",
+            [session_id.to_string()], |r| r.get(0))?)
     }
 }
 

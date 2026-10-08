@@ -667,7 +667,11 @@ impl PinnedSandboxRoot {
             let stat =
                 fstatat(Some(fd), name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(|_| unreadable())?;
             let kind = SFlag::from_bits_truncate(stat.st_mode);
-            if !is_reclaimable_target_entry(name.to_bytes(), kind) {
+            if !is_reclaimable_target_entry(name.to_bytes(), kind)
+                && !(kind == SFlag::S_IFDIR
+                    && is_cargo_target_triple_name(name.to_bytes())
+                    && target_triple_dir_holds_only_profile_dirs(fd, name))
+            {
                 return Err((
                     SkipReason::TargetUnrecognizedContent,
                     SandboxReclaimCheck::with_subject("target_entry_unrecognized", name.to_bytes()),
@@ -1052,6 +1056,80 @@ fn check(name: &'static str) -> SandboxReclaimCheck {
 /// Anything else may be a manager's or an operator's state (#1429) and keeps
 /// the whole tree. Entry types are exact: a symlink or special file named like
 /// a Cargo entry is not one.
+/// Whether `name` is shaped like a Rust target triple (`wasm32-unknown-unknown`,
+/// `x86_64-unknown-linux-gnu`): the directory `cargo build --target` creates
+/// beside `debug/` (#1684). Name-only; the caller still checks its contents.
+fn is_cargo_target_triple_name(name: &[u8]) -> bool {
+    const ARCHES: [&[u8]; 17] = [
+        b"x86_64",
+        b"i686",
+        b"i586",
+        b"aarch64",
+        b"arm",
+        b"thumb",
+        b"wasm32",
+        b"wasm64",
+        b"riscv32",
+        b"riscv64",
+        b"powerpc",
+        b"s390x",
+        b"mips",
+        b"sparc",
+        b"loongarch64",
+        b"nvptx64",
+        b"asmjs",
+    ];
+    let segments: Vec<&[u8]> = name.split(|byte| *byte == b'-').collect();
+    (3..=4).contains(&segments.len())
+        && ARCHES.iter().any(|arch| segments[0].starts_with(arch))
+        && segments.iter().all(|segment| {
+            !segment.is_empty()
+                && segment.iter().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'_' | b'.')
+                })
+        })
+}
+
+/// A Cargo target-triple directory holds only profile directories
+/// (`debug/`, `release/`, custom profiles). Any file, link or special entry
+/// may be someone's state, so the whole target is retained (#1684).
+fn target_triple_dir_holds_only_profile_dirs(target_fd: RawFd, name: &CStr) -> bool {
+    let Ok(raw) = nix::fcntl::openat(
+        Some(target_fd),
+        name,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return false;
+    };
+    // `Dir` takes ownership of `raw` and closes it on drop.
+    let Ok(mut dir) = Dir::from_fd(raw) else {
+        return false;
+    };
+    let dir_fd = raw;
+    for entry in dir.iter() {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let child = entry.file_name();
+        if matches!(child.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        if current_pass_state().charge_filesystem_entry(0).is_err() {
+            return false;
+        }
+        let Ok(stat) = fstatat(Some(dir_fd), child, AtFlags::AT_SYMLINK_NOFOLLOW) else {
+            return false;
+        };
+        if SFlag::from_bits_truncate(stat.st_mode) != SFlag::S_IFDIR {
+            return false;
+        }
+    }
+    true
+}
+
 fn is_reclaimable_target_entry(name: &[u8], kind: SFlag) -> bool {
     const FIXTURE_SUFFIX: &[u8] = b"-fixtures";
     if kind == SFlag::S_IFDIR {
@@ -4797,6 +4875,37 @@ mod tests {
         assert_eq!(meta.ino(), ino, "external link must keep the same inode");
         assert_eq!(meta.len(), len, "external link content must be intact");
         assert_eq!(meta.nlink(), 1, "only the external link may remain");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn cargo_target_guard_accepts_cross_target_triple_dirs_of_profile_dirs_only() {
+        for name in [
+            &b"wasm32-unknown-unknown"[..],
+            b"x86_64-unknown-linux-gnu",
+            b"aarch64-apple-darwin",
+            b"thumbv7em-none-eabihf",
+        ] {
+            assert!(is_cargo_target_triple_name(name), "{name:?}");
+        }
+        for name in [&b"lander"[..], b"debug", b"foo-bar-baz", b"x86_64", b"a-b"] {
+            assert!(!is_cargo_target_triple_name(name), "{name:?}");
+        }
+        let (_temp, base, root, id) = fixture();
+        let pinned = PinnedSandboxRoot::open(&base, &root, id).unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join("target/wasm32-unknown-unknown/release")).unwrap();
+        assert_eq!(pinned.ensure_idle_cargo_target(), Ok(()));
+        // A file beside the profile dirs may be someone's state: retain all.
+        std::fs::write(root.join("target/wasm32-unknown-unknown/notes"), b"keep").unwrap();
+        assert_eq!(
+            pinned.ensure_idle_cargo_target(),
+            Err(SkipReason::TargetUnrecognizedContent)
+        );
+        assert_eq!(
+            std::fs::read(root.join("target/wasm32-unknown-unknown/notes")).unwrap(),
+            b"keep"
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]

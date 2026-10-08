@@ -316,6 +316,7 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
             {
                 Ok(_) => {
                     app.notify_success(format!("Created project: {}", name));
+                    app.trigger_projects_fetch_immediate().await;
                 }
                 Err(e) => {
                     app.notify_error(format!("Create project failed: {}", e));
@@ -436,6 +437,10 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
 
         LcAction::ResolveTopologyAttempt(args) => {
             crate::overlay::graph::resolve_topology_attempt_command(app, &args).await;
+        }
+
+        LcAction::RunTopology(args) => {
+            crate::overlay::graph::run_topology_command(app, &args).await;
         }
 
         LcAction::OpenGraphReview => {

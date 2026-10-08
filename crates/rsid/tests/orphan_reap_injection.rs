@@ -64,7 +64,7 @@ fn spawn_stand_in(sid_value: Option<&str>) -> tokio::process::Child {
 /// Drive the (blocking `/proc`-walking) reaper the same way `continue_session`
 /// does — on a blocking thread.
 async fn reap(sid: Uuid) -> rsid::error::Result<usize> {
-    tokio::task::spawn_blocking(move || rsid::session::reap_orphans_for_session(sid))
+    tokio::task::spawn_blocking(move || rsid::session::reap_orphans_for_session(sid, Vec::new()))
         .await
         .expect("reap task joins")
 }

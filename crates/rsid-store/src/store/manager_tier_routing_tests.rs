@@ -2256,3 +2256,26 @@ fn excluded_claims_never_starve_an_orphan_claim() {
             .all(|id| message_state(&c.store, *id) == "uncertain")
     );
 }
+
+/// #1635: an area seat holds no project-administration right, in the catalog
+/// and in the store's authority resolution alike.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn area_seats_hold_no_project_administration_right() {
+    let c = chain();
+    for area in [&c.parent, &c.leaf] {
+        let seat = area.seat_root_session_id;
+        assert!(!c.store.agent_project_admin(seat).unwrap());
+        assert_eq!(
+            code(c.store.agent_project_scope(seat).unwrap_err()),
+            rsi_common::agent_projects::PROJECT_NOT_AUTHORIZED
+        );
+        let verbs = c.store.agent_authority_projection(seat).unwrap().verbs;
+        assert!(
+            !verbs.contains(&rsi_common::agent_control_schema::AgentControlVerbV1::CreateProject)
+        );
+        assert!(
+            !verbs.contains(&rsi_common::agent_control_schema::AgentControlVerbV1::UpdateProject)
+        );
+    }
+}

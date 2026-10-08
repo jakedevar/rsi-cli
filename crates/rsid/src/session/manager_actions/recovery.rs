@@ -58,8 +58,12 @@ impl SessionManager {
             None if !require_row => {}
             _ => return Ok(None),
         }
+        let orphan_store = std::sync::Arc::clone(&self.store);
         let reaped = tokio::task::spawn_blocking(move || {
-            super::super::reaper::reap_orphans_for_session(session)
+            let turns = orphan_store
+                .blocking_lock()
+                .list_active_provider_turn_custody()?;
+            super::super::reaper::reap_orphans_for_session(session, turns)
         })
         .await;
         let Ok(Ok(reaped)) = reaped else {

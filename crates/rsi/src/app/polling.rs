@@ -1165,6 +1165,14 @@ impl App {
                 }
                 false
             }
+            rsi_common::agent_projects::PROJECT_CREATED_EVENT => {
+                match serde_json::from_value::<rsi_common::agent_projects::ProjectCreatedEventV1>(
+                    event.data,
+                ) {
+                    Ok(parsed) => self.note_agent_created_project(parsed),
+                    Err(_) => false,
+                }
+            }
             "child_spawned" => {
                 #[derive(serde::Deserialize)]
                 struct ChildSpawnedInner {

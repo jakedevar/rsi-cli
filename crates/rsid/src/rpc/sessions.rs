@@ -1,5 +1,24 @@
 use super::*;
 
+/// Operator-local write registration. The attributed-caller gate runs before
+/// family routing; this method never belongs to an agent catalog.
+pub(super) fn is_operator_method(method: &str) -> bool {
+    method == "AnswerPendingDecisionV1"
+}
+
+fn parse_pending_decision_answer(
+    request: &RpcRequest,
+) -> Result<rsi_common::remote_pending_decisions::AnswerPendingDecisionV1> {
+    if request.session_token.is_some()
+        || request.jsonrpc != "2.0"
+        || serde_json::to_vec(&request.params)?.len() > 4096
+    {
+        return Err(DaemonError::InvalidParam("remote_answer_invalid".into()));
+    }
+    serde_json::from_value(request.params.clone())
+        .map_err(|_| DaemonError::InvalidParam("remote_answer_invalid".into()))
+}
+
 /// RPC params for getting a specific session (daemon-local, not in common).
 #[derive(Debug, Deserialize)]
 pub struct GetSessionParams {
@@ -269,6 +288,20 @@ pub struct SearchObservationsParams {
 }
 
 impl RpcServer {
+    pub(super) async fn handle_answer_pending_decision(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let params = parse_pending_decision_answer(request)?;
+        let receipt = self
+            .session_manager
+            .store()
+            .lock()
+            .await
+            .prepare_remote_answer(&params)?;
+        Ok(serde_json::to_value(receipt)?)
+    }
+
     pub(super) async fn handle_answer_question(
         &self,
         request: &RpcRequest,
@@ -1341,5 +1374,60 @@ impl RpcServer {
         .map_err(|e| DaemonError::Rpc(format!("Store task failed: {}", e)))??;
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod pending_decision_answer_tests {
+    use super::*;
+    use rsi_common::agent_control_schema::AgentControlVerbV1;
+    use serde_json::json;
+
+    fn request() -> RpcRequest {
+        RpcRequest::new(
+            "AnswerPendingDecisionV1",
+            json!({
+                "project_id": Uuid::new_v4().to_string(),
+                "session_id": Uuid::new_v4().to_string(),
+                "decision_id": format!("pending-question:{}",Uuid::new_v4()),
+                "expected_target_digest": "sha256:test",
+                "answer": "choose this", "idempotency_key": Uuid::new_v4().to_string(),
+                "origin": { "kind": "remote", "client_node": "device", "gateway_epoch": Uuid::new_v4().to_string() }
+            }),
+        )
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn pending_decision_method_is_operator_only() {
+        let method = "AnswerPendingDecisionV1";
+        assert!(is_operator_method(method));
+        assert!(!super::super::agent_gate::is_allowed_for_attributed_caller(
+            method
+        ));
+        assert!(!super::super::agent_gate::AGENT_VERBS.contains(&method));
+        assert!(!super::super::agent_gate::READ_VERBS.contains(&method));
+        assert!(AgentControlVerbV1::from_method_name(method).is_none());
+        assert!(parse_pending_decision_answer(&request()).is_ok());
+        let mut attributed = request();
+        attributed.session_token = Some("test-token".into());
+        assert!(parse_pending_decision_answer(&attributed).is_err());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn pending_decision_invalid_wire_is_refused_before_store_dispatch() {
+        let mut invalid = request();
+        invalid.jsonrpc = "1.0".into();
+        assert!(parse_pending_decision_answer(&invalid).is_err());
+        let mut invalid = request();
+        invalid.params["unknown"] = json!(true);
+        assert!(parse_pending_decision_answer(&invalid).is_err());
+        let mut invalid = request();
+        invalid.params["origin"]["kind"] = json!("agent");
+        assert!(parse_pending_decision_answer(&invalid).is_err());
+        let mut invalid = request();
+        invalid.params["answer"] = json!("x".repeat(4097));
+        assert!(parse_pending_decision_answer(&invalid).is_err());
     }
 }

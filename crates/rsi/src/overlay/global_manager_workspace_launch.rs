@@ -38,17 +38,20 @@ pub enum LaunchField {
     Model,
     Effort,
     Scope,
+    /// The project the global seat's session lives in (global role only).
+    Host,
     Prompt,
     Submit,
 }
 
 impl LaunchField {
-    const ORDER: [Self; 7] = [
+    const ORDER: [Self; 8] = [
         Self::Role,
         Self::Provider,
         Self::Model,
         Self::Effort,
         Self::Scope,
+        Self::Host,
         Self::Prompt,
         Self::Submit,
     ];
@@ -61,6 +64,7 @@ impl LaunchField {
             Self::Model => "Model",
             Self::Effort => "Effort",
             Self::Scope => "Scope",
+            Self::Host => "Host",
             Self::Prompt => "Prompt",
             Self::Submit => "",
         }
@@ -98,6 +102,9 @@ pub struct LaunchForm {
     pub launch: ManagerLaunchChoiceV2,
     pub scope: Vec<ScopeEntry>,
     pub scope_cursor: usize,
+    /// #1627: the operator's explicit host project for the global seat; `None`
+    /// takes the default (`default_host`). Always one of the checked scope.
+    pub host: Option<Uuid>,
     pub prompt: String,
     /// The operator edited the prompt: stop regenerating it.
     pub prompt_edited: bool,
@@ -190,6 +197,7 @@ impl LaunchForm {
             launch,
             scope,
             scope_cursor: 0,
+            host: None,
             prompt: String::new(),
             prompt_edited: false,
             field: LaunchField::Role,
@@ -207,7 +215,10 @@ impl LaunchForm {
     pub fn fields(&self) -> Vec<LaunchField> {
         LaunchField::ORDER
             .into_iter()
-            .filter(|field| *field != LaunchField::Scope || self.role == LaunchRole::Global)
+            .filter(|field| {
+                !matches!(field, LaunchField::Scope | LaunchField::Host)
+                    || self.role == LaunchRole::Global
+            })
             .collect()
     }
 
@@ -231,6 +242,32 @@ impl LaunchForm {
 
     fn checked(&self) -> Vec<&ScopeEntry> {
         self.scope.iter().filter(|entry| entry.checked).collect()
+    }
+
+    /// #1627: the host project when the operator does not pick one: the
+    /// tab's project if it is in scope, else the first project in scope.
+    #[must_use]
+    pub fn default_host(&self) -> Option<Uuid> {
+        let checked = self.checked();
+        self.active_project
+            .filter(|id| checked.iter().any(|e| e.project_id == *id))
+            .or_else(|| checked.first().map(|e| e.project_id))
+    }
+
+    /// The host the global seat will launch in: the explicit choice, else
+    /// the default.
+    #[must_use]
+    pub fn effective_host(&self) -> Option<Uuid> {
+        self.host
+            .filter(|id| self.scope.iter().any(|e| e.checked && e.project_id == *id))
+            .or_else(|| self.default_host())
+    }
+
+    /// Drop an explicit host that left the scope.
+    fn drop_stale_host(&mut self) {
+        if self.host != self.effective_host() && self.host.is_some() {
+            self.host = None;
+        }
     }
 
     /// The default first instruction for the current role and scope.
@@ -322,6 +359,17 @@ impl LaunchForm {
                 let checked = self.checked().len();
                 format!("{checked} of {} projects", self.scope.len())
             }
+            LaunchField::Host => match self.effective_host() {
+                Some(id) => {
+                    let name = self.project_name(id).unwrap_or("project");
+                    if self.host.is_some() {
+                        name.to_string()
+                    } else {
+                        format!("{name} (default)")
+                    }
+                }
+                None => "(no project in scope)".into(),
+            },
             LaunchField::Prompt => self.prompt.clone(),
             LaunchField::Submit => if self.launched.is_some() {
                 "[ Retry the appointment ]"
@@ -372,6 +420,14 @@ impl LaunchForm {
                         ((self.scope_cursor as isize + delta).rem_euclid(len as isize)) as usize;
                 }
             }
+            LaunchField::Host => {
+                let ids: Vec<Uuid> = self.checked().iter().map(|e| e.project_id).collect();
+                if let Some(current) = self.effective_host() {
+                    if let Some(next) = step(&ids, &current, delta) {
+                        self.host = Some(next);
+                    }
+                }
+            }
             LaunchField::Prompt | LaunchField::Submit => {}
         }
     }
@@ -386,6 +442,7 @@ impl LaunchForm {
     fn toggle_scope(&mut self) {
         if let Some(entry) = self.scope.get_mut(self.scope_cursor) {
             entry.checked = !entry.checked;
+            self.drop_stale_host();
             self.regenerate_prompt();
         }
     }
@@ -395,6 +452,7 @@ impl LaunchForm {
         for entry in &mut self.scope {
             entry.checked = !all;
         }
+        self.drop_stale_host();
         self.regenerate_prompt();
     }
 
@@ -432,10 +490,7 @@ impl LaunchForm {
                         &gone.to_string()[..8]
                     ));
                 }
-                let home = self
-                    .active_project
-                    .filter(|id| scope.contains(id))
-                    .unwrap_or(scope[0]);
+                let home = self.effective_host().unwrap_or(scope[0]);
                 Ok(LaunchRequest {
                     role: self.role,
                     launch: self.launch.clone(),

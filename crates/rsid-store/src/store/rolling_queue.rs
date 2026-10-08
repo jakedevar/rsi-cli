@@ -351,6 +351,19 @@ impl Store {
         new: &NewQueueEntry,
         now: DateTime<Utc>,
     ) -> Result<(RollingQueueEntryV1, bool)> {
+        self.enqueue_rolling_queue_source_for(new, None, now)
+    }
+
+    /// [`Self::enqueue_rolling_queue_source`] with an explicit settlement-wake
+    /// target (#1641 S2). A topology land node queues a topology node session
+    /// as the source (its replay identity); the outcome is delivered to the
+    /// owning manager or Epic lead instead of resuming a finished node.
+    pub fn enqueue_rolling_queue_source_for(
+        &self,
+        new: &NewQueueEntry,
+        wake_session_id: Option<Uuid>,
+        now: DateTime<Utc>,
+    ) -> Result<(RollingQueueEntryV1, bool)> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         if let Some(existing) = entry_by_key(&tx, new.source_session_id, &new.idempotency_key)? {
             let same = existing.source_commit == new.source_commit
@@ -374,8 +387,9 @@ impl Store {
         tx.execute(
             "INSERT INTO rolling_queue_entries(id, project_id, repo_path, source_commit, \
              source_session_id, owner_epic_id, binding, work_key, migration_version, \
-             hot_files_json, test_filters_json, state, idempotency_key, enqueued_at, row_version) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'queued',?12,?13,1)",
+             hot_files_json, test_filters_json, state, idempotency_key, enqueued_at, row_version, \
+             wake_session_id) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'queued',?12,?13,1,?14)",
             params![
                 id.to_string(),
                 new.project_id.map(|value| value.to_string()),
@@ -392,6 +406,7 @@ impl Store {
                     .map_err(|e| DaemonError::Store(e.to_string()))?,
                 new.idempotency_key,
                 stamp(now),
+                wake_session_id.map(|value| value.to_string()),
             ],
         )?;
         let entry = tx
@@ -915,6 +930,27 @@ impl Store {
         Ok((!matches!(tip_status.as_str(), "Archived" | "Deleted")).then_some(tip))
     }
 
+    /// The entry a `(source session, replay key)` pair already created, if
+    /// any (#1641 S2: a land node adopts it after a restart).
+    pub fn get_rolling_queue_entry_by_key(
+        &self,
+        source_session_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<Option<RollingQueueEntryV1>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {ENTRY_COLUMNS} FROM rolling_queue_entries \
+                     WHERE source_session_id=?1 AND idempotency_key=?2"
+                ),
+                params![source_session_id.to_string(), idempotency_key],
+                map_entry,
+            )
+            .optional()?
+            .map(|row| row.entry))
+    }
+
     pub fn get_rolling_queue_entry(&self, id: Uuid) -> Result<Option<RollingQueueEntryV1>> {
         Ok(self
             .conn
@@ -1130,6 +1166,62 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(second.entry.source_commit, "b".repeat(40));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn topology_land_entry_wakes_its_owner_not_the_node_session_and_replays_by_key() {
+        let store = store();
+        let node_session = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let new = new_entry(node_session, 'c', "attempt-key");
+        let (entry, replayed) = store
+            .enqueue_rolling_queue_source_for(&new, Some(owner), Utc::now())
+            .unwrap();
+        assert!(!replayed);
+        // A restart finds the same entry by its replay identity, and a
+        // duplicate enqueue returns it instead of a second row.
+        assert_eq!(
+            store
+                .get_rolling_queue_entry_by_key(node_session, "attempt-key")
+                .unwrap()
+                .map(|found| found.id),
+            Some(entry.id)
+        );
+        assert!(
+            store
+                .get_rolling_queue_entry_by_key(node_session, "other-key")
+                .unwrap()
+                .is_none()
+        );
+        let (again, replayed) = store
+            .enqueue_rolling_queue_source_for(&new, Some(owner), Utc::now())
+            .unwrap();
+        assert!(replayed);
+        assert_eq!(again.id, entry.id);
+        // The settlement wake reaches the owning manager or Epic lead, never
+        // a finished topology node session.
+        let claimed = store
+            .claim_next_rolling_queue_entry(Utc::now())
+            .unwrap()
+            .unwrap();
+        store
+            .settle_rolling_queue_entry(
+                claimed.entry.id,
+                RollingQueueEntryState::Published,
+                &published(&"9".repeat(40)),
+                Utc::now(),
+            )
+            .unwrap()
+            .expect("settle wakes");
+        let wakes: Vec<_> = store
+            .list_scheduled_jobs()
+            .unwrap()
+            .into_iter()
+            .filter(|job| job.name.starts_with("merge-queue-"))
+            .collect();
+        assert_eq!(wakes.len(), 1);
+        assert_eq!(wakes[0].wake_session_id, Some(owner));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
@@ -1652,20 +1744,18 @@ mod tests {
             .enqueue_rolling_queue_source(&new_entry(source, 'a', "legacy"), Utc::now())
             .unwrap()
             .0;
+        // Rewind to just before V160 (the queue wake migration). Later steps
+        // already applied to this database must be undone too, or replaying
+        // them collides with their objects: V161 created provider_turn_custody
+        // (its index and triggers drop with the table).
         store
             .conn
-            .execute_batch("ALTER TABLE rolling_queue_entries DROP COLUMN wake_session_id")
-            .unwrap();
-        // The latest step is the queue wake migration; derive its predecessor
-        // so the fixture remains valid if landing renumbers it.
-        store
-            .conn
-            .pragma_update(
-                None,
-                "user_version",
-                super::super::LATEST_SCHEMA_VERSION - 1,
+            .execute_batch(
+                "ALTER TABLE rolling_queue_entries DROP COLUMN wake_session_id;
+                 DROP TABLE provider_turn_custody;",
             )
             .unwrap();
+        store.conn.pragma_update(None, "user_version", 159).unwrap();
         store.init_schema().unwrap();
         store.init_schema().unwrap();
         assert_eq!(

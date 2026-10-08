@@ -7,8 +7,10 @@ pub mod client;
 pub mod clipboard;
 pub mod commands;
 pub mod daemon_resources;
+pub mod editing_mode_prompt;
 pub mod efficiency_stats;
 pub mod event;
+pub mod field_edit;
 pub mod file_utils;
 pub mod file_viewer;
 pub mod file_viewer_commands;
@@ -35,6 +37,10 @@ pub mod provider_profile_view;
 pub mod settings;
 pub mod settings_keys;
 pub mod settings_registry;
+#[cfg(test)]
+mod standard_inputs_3b_tests;
+#[cfg(test)]
+mod standard_inputs_tests;
 pub mod state;
 pub mod suggestions;
 pub mod terminal;

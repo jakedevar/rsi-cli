@@ -42,6 +42,7 @@ pub use ideas::{IdeaControllerWriteFault, inject_d03_idea_controller_write_fault
 pub mod agent_deploys;
 pub mod agent_deploys_operator;
 pub mod agent_jobs;
+pub mod agent_projects;
 mod catalog_convergence;
 pub mod child_autonomy;
 pub mod custody_lock_order;
@@ -83,6 +84,7 @@ pub mod program_runs;
 mod projects;
 pub mod provider_exhaustion;
 pub mod provider_status;
+pub mod provider_turn_custody;
 pub mod queue;
 mod rate_limits;
 pub mod recursive_dag;

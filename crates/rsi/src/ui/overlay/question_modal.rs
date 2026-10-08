@@ -115,13 +115,16 @@ pub fn render_question_modal(
 
     // 3. Render Textarea
     let mut ta = textarea.clone();
-    let is_insert = matches!(mode, PopupMode::Insert);
+    let standard = _app.standard_editing();
+    let is_insert = standard || matches!(mode, PopupMode::Insert);
     let border_color = if is_insert {
         theme::peach()
     } else {
         theme::overlay_border()
     };
-    let border_title = if is_insert {
+    let border_title = if standard {
+        " Other / Free text "
+    } else if is_insert {
         " INSERT "
     } else {
         " Other / Free text "
@@ -145,7 +148,13 @@ pub fn render_question_modal(
     frame.render_widget(&ta, chunks[3]);
 
     // 4. Render Footer
-    let footer_text = if is_insert {
+    let footer_text = if standard {
+        if q.multi_select {
+            "  Type to answer · Up/Down move · Space toggle · Enter next/send · Ctrl+Enter send · Ctrl+D decline · Esc dismiss  (select all that apply)"
+        } else {
+            "  Type to answer · Up/Down choose · 1-9 select · Enter next/send · Ctrl+Enter send · Ctrl+D decline · Esc dismiss"
+        }
+    } else if is_insert {
         "  INSERT  Esc normal "
     } else if q.multi_select {
         "  NORMAL  Space toggle · Enter next · Ctrl+Enter submit · d decline · Esc dismiss  (select all that apply)"

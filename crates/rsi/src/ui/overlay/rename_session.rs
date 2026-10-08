@@ -25,6 +25,18 @@ pub(super) fn render_rename_session_overlay(frame: &mut Frame, area: Rect, title
     frame.render_widget(Clear, popup_area);
     frame.render_widget(block, popup_area);
 
+    if crate::field_edit::standard_frame() {
+        // Standard editing: draw the caret and selection in the text itself,
+        // scrolled so the caret stays visible.
+        let spans = crate::field_edit::draw_fit(
+            title,
+            Style::default().fg(theme::text()),
+            inner.width as usize,
+        );
+        frame.render_widget(Paragraph::new(ratatui::text::Line::from(spans)), inner);
+        return;
+    }
+
     // Truncate display text from the left if it overflows the inner area
     let display = if title.len() > inner.width as usize {
         let overflow = title.len() - inner.width as usize + 3; // +3 for "..."

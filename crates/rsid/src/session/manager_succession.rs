@@ -141,7 +141,12 @@ impl SessionManager {
         {
             return Err(refused("manager_succession_rotation_disabled"));
         }
-        tokio::task::spawn_blocking(move || super::reaper::reap_orphans_for_session(predecessor))
+        let orphan_store = std::sync::Arc::clone(&self.store);
+        let turns = orphan_store
+            .lock()
+            .await
+            .list_active_provider_turn_custody()?;
+        tokio::task::spawn_blocking(move || super::reaper::reap_orphans_for_session(predecessor, turns))
             .await
             .map_err(|_| refused("manager_succession_predecessor_unsettled"))?
             .map_err(|error| {
@@ -499,7 +504,12 @@ impl Runtime {
                 }
             }
         }
-        tokio::task::spawn_blocking(move || super::reaper::reap_orphans_for_session(id))
+        let orphan_store = std::sync::Arc::clone(&self.store);
+        let turns = orphan_store
+            .lock()
+            .await
+            .list_active_provider_turn_custody()?;
+        tokio::task::spawn_blocking(move || super::reaper::reap_orphans_for_session(id, turns))
             .await
             .map_err(|_| refused("manager_succession_cleanup_unsettled"))?
             .map_err(|error| {

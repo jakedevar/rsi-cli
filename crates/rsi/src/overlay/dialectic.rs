@@ -35,6 +35,16 @@ pub(super) async fn handle_dialectic_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Standard editing: every printable key types (`q` and `s` included),
+    // with a real cursor and selection in the question.
+    if app.edit_field(key, |overlay| match overlay {
+        OverlayState::Dialectic { input, .. } => Some(input),
+        _ => None,
+    }) != crate::field_edit::FieldKey::Ignored
+    {
+        return;
+    }
+
     match key.code {
         KeyCode::Esc => {
             if let OverlayState::Dialectic { input, .. } = &app.overlay {

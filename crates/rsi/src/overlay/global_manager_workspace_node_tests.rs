@@ -3,7 +3,7 @@
 use chrono::Utc;
 use crossterm::event::KeyCode;
 use rsi_common::fleet::{FleetGroup, FleetUsage};
-use rsi_common::global_manager::GlobalIssueCountsV1;
+use rsi_common::global_manager::{GlobalIssueCountsV1, SeatPredecessorV1};
 use rsi_common::manager_node_workspace::{
     ManagerNodeAreaGrantV1, ManagerNodeChildV1, ManagerNodeCountsV1, ManagerNodeFleetV1,
     ManagerNodePendingEscalationV1, ManagerNodeWorkspaceV1,
@@ -501,4 +501,74 @@ async fn n_in_a_node_console_launches_only_project_managers() {
         panic!("console open");
     };
     assert_eq!(state.selected, 0);
+}
+
+#[test]
+fn a_child_seats_rotations_list_under_its_row_in_a_node_console() {
+    let f = super::tests::fixture();
+    let mut node = pinnacle_node(&f);
+    let earlier = Uuid::new_v4();
+    node.children[0].seat.as_mut().unwrap().predecessors = vec![SeatPredecessorV1 {
+        session_id: earlier,
+        project_id: Some(f.a.id),
+        status: SessionStatus::Completed,
+        provider: rsi_common::types::SessionProvider::Claude,
+        model: None,
+        context_fill_pct: Some(88.0),
+        cost_usd: None,
+        updated_at: Utc::now(),
+    }];
+    let state = node_state(node, Utc::now());
+    let rows = state.rows();
+    assert_eq!(rows[1], WorkspaceRow::Child(0));
+    assert_eq!(
+        rows[2],
+        WorkspaceRow::Predecessor {
+            child: Some(0),
+            index: 0
+        }
+    );
+    let prior = state.seat(rows[2]).unwrap();
+    assert_eq!((prior.level, prior.depth), (SeatLevel::Portfolio, 2));
+    assert_eq!(prior.session_id, Some(earlier));
+    assert_eq!(prior.project_id, Some(f.a.id));
+}
+
+/// #1628 slice 3b: the launch prompt gets a cursor and selection in Standard
+/// editing; Vim mode keeps appending.
+#[tokio::test]
+async fn launch_prompt_is_edited_in_place_in_standard_mode_only() {
+    use crate::overlay::global_manager_workspace_launch::LaunchField;
+    for (mode, expected) in [("standard", "big hello world"), ("vim", "hello worldbig ")] {
+        let f = super::tests::fixture();
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        crate::settings::DaemonFeatureEntry::update_from_json(
+            &mut app.daemon_features,
+            &serde_json::json!({ "editing_mode": mode }),
+        );
+        app.projects = vec![f.a.clone(), f.b.clone()];
+        app.overlay = OverlayState::GlobalManagerWorkspace(Box::new(node_state(
+            pinnacle_node(&f),
+            Utc::now(),
+        )));
+        for code in [KeyCode::Char('j'), KeyCode::Char('j'), KeyCode::Char('n')] {
+            handle_key(&mut app, key(code)).await;
+        }
+        let OverlayState::GlobalManagerWorkspace(state) = &mut app.overlay else {
+            panic!("console open");
+        };
+        let form = state.launch.as_mut().expect("launch form open");
+        form.field = LaunchField::Prompt;
+        form.prompt = "hello world".to_string();
+        handle_key(&mut app, key(KeyCode::Home)).await;
+        for c in "big ".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c))).await;
+        }
+        let OverlayState::GlobalManagerWorkspace(state) = &app.overlay else {
+            panic!("console open");
+        };
+        let form = state.launch.as_ref().expect("launch form open");
+        assert_eq!(form.prompt, expected, "{mode}");
+        assert!(form.prompt_edited, "{mode}: typing marks the prompt edited");
+    }
 }

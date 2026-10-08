@@ -497,6 +497,19 @@ impl DaemonFeatureEntry {
                 },
             },
             Self {
+                field: "editing_mode".to_string(),
+                label: "Editing mode".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: rsi_common::editing_mode::EDITING_MODE_CHOICES
+                        .iter()
+                        .map(|choice| (*choice).to_string())
+                        .collect(),
+                    // "unset" is the canonical default: overwritten by
+                    // update_from_json after the first GetDaemonConfig response.
+                    current: 0,
+                },
+            },
+            Self {
                 field: "orchestration_max_child_effort".to_string(),
                 label: "Orchestration max child effort".to_string(),
                 value: DaemonFeatureValue::Cycle {
@@ -601,6 +614,11 @@ impl DaemonFeatureEntry {
             Self {
                 field: "rolling_queue_enabled".to_string(),
                 label: "Rolling merge queue".to_string(),
+                value: DaemonFeatureValue::Bool(false),
+            },
+            Self {
+                field: "turn_detach_enabled".to_string(),
+                label: "Detach Claude turns".to_string(),
                 value: DaemonFeatureValue::Bool(false),
             },
             Self {
@@ -1182,6 +1200,11 @@ impl DaemonFeatureEntry {
                 field: "gv_info_dashboard".to_string(),
                 label: "Graph overlay: info dashboard".to_string(),
                 value: DaemonFeatureValue::Bool(false),
+            },
+            Self {
+                field: "follow_agent_created_projects".to_string(),
+                label: "Follow agent-created projects".to_string(),
+                value: DaemonFeatureValue::Bool(true),
             },
             Self {
                 field: "topology_executor_enabled".to_string(),
@@ -3596,6 +3619,29 @@ mod tests {
     }
 
     #[test]
+    fn follow_agent_created_projects_defaults_on_and_round_trips() {
+        let mut entries = DaemonFeatureEntry::defaults();
+        let value = |entries: &[DaemonFeatureEntry]| {
+            entries
+                .iter()
+                .find(|e| e.field == "follow_agent_created_projects")
+                .map(|e| e.value.clone())
+        };
+        assert!(matches!(
+            value(&entries),
+            Some(DaemonFeatureValue::Bool(true))
+        ));
+        DaemonFeatureEntry::update_from_json(
+            &mut entries,
+            &serde_json::json!({ "follow_agent_created_projects": false }),
+        );
+        assert!(matches!(
+            value(&entries),
+            Some(DaemonFeatureValue::Bool(false))
+        ));
+    }
+
+    #[test]
     fn stall_classifier_enabled_is_bool_toggle() {
         let entries = DaemonFeatureEntry::defaults();
         let entry = entries
@@ -3940,6 +3986,25 @@ mod tests {
             &serde_json::json!({"harness_context_editing": false}),
         );
         assert!(matches!(find(&features).1, DaemonFeatureValue::Bool(false)));
+    }
+
+    #[test]
+    fn turn_detach_tui_defaults_off_and_refreshes_operator_toggle() {
+        let mut features = DaemonFeatureEntry::defaults();
+        let value = |features: &[DaemonFeatureEntry]| {
+            features
+                .iter()
+                .find(|feature| feature.field == "turn_detach_enabled")
+                .expect("turn detach toggle must be in the settings overlay")
+                .value
+                .clone()
+        };
+        assert!(matches!(value(&features), DaemonFeatureValue::Bool(false)));
+        DaemonFeatureEntry::update_from_json(
+            &mut features,
+            &serde_json::json!({"turn_detach_enabled": true}),
+        );
+        assert!(matches!(value(&features), DaemonFeatureValue::Bool(true)));
     }
 
     #[test]

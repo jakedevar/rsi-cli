@@ -94,7 +94,9 @@ async fn persist_tracked_provider_event(
         question
     };
     let event = rejection.as_ref().unwrap_or(event);
-    let persisted = if let Some(question) = detected_question.as_ref() {
+    let persisted = if event.id > 0 {
+        Ok(event.id)
+    } else if let Some(question) = detected_question.as_ref() {
         persistence
             .publish_question_event(event.clone(), provenance, question.clone())
             .await
@@ -120,6 +122,81 @@ async fn persist_tracked_provider_event(
         }
     }
     (detected_question, persisted)
+}
+
+/// Persist one spool line before publishing its normalized events. The receipt
+/// is held by the launched ClaudeProcess, not provider JSON. All content blocks
+/// from a frame and the newline cursor share the store transaction.
+async fn persist_detached_batch(
+    active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
+    store: &Arc<tokio::sync::Mutex<Store>>,
+    session_id: Uuid,
+    generation: u64,
+    cursor: crate::store::provider_turn_custody::ProviderTurnCursor,
+    stream: &StreamEvent,
+    events: &mut [ConversationEvent],
+) -> crate::error::Result<()> {
+    use crate::store::provider_turn_custody::ProviderTurnEvent;
+    let batch = {
+        let guard = active.read().await;
+        let tracked = guard
+            .get(&session_id)
+            .filter(|t| t.spawn_generation == generation)
+            .ok_or(crate::error::DaemonError::SessionNotFound(session_id))?;
+        // Prior history is borrowed; only this frame's few blocks are cloned.
+        let mut history = Vec::new();
+        let mut pending = tracked.pending_question.clone();
+        events
+            .iter_mut()
+            .map(|event| {
+                if super::question::is_rejection_of_pending(
+                    event,
+                    &tracked.events,
+                    pending.as_ref(),
+                ) || super::question::is_rejection_of_pending(event, &history, pending.as_ref())
+                {
+                    *event = super::question::tag_rejection(event);
+                }
+                let question = super::question::detect(tracked.session.provider, event);
+                if question.is_some() {
+                    pending = question.clone();
+                }
+                history.push(event.clone());
+                let producer_kind = if stream.event_type == "assistant"
+                    && event.event_type == EventType::Message
+                    && event.role == Some(Role::Assistant)
+                {
+                    ConversationEventProducerKindV1::ProviderAssistantOutput
+                } else if stream.event_type == "process_error" {
+                    ConversationEventProducerKindV1::DaemonProviderDiagnostic
+                } else {
+                    ConversationEventProducerKindV1::ProviderOther
+                };
+                ProviderTurnEvent {
+                    event: event.clone(),
+                    question,
+                    provenance: Some(ConversationEventProvenanceV1 {
+                        producer_kind,
+                        model_invocation_id: cursor.invocation_id,
+                        provider_event_type: stream.event_type.clone(),
+                    }),
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let ids = store
+        .lock()
+        .await
+        .consume_provider_turn_line(cursor, &batch)?
+        .ok_or_else(|| {
+            crate::error::DaemonError::Store(
+                "detached turn reader lost boot or cursor custody".into(),
+            )
+        })?;
+    for (event, id) in events.iter_mut().zip(ids) {
+        event.id = id;
+    }
+    Ok(())
 }
 
 /// Staleness window: a Claude + Running session that has gone this long
@@ -1876,6 +1953,39 @@ impl SessionManager {
         codegraph_handle: Option<crate::codegraph::IndexHandle>,
         custody_runtime: crate::sandbox::custody::CustodyExecutionRuntime,
     ) {
+        let detached_turn = {
+            let guard = active.read().await;
+            guard
+                .get(&session_id)
+                .filter(|t| t.spawn_generation == expected_generation)
+                .and_then(|t| t.process.as_ref())
+                .and_then(super::types::ProviderProcess::detached_turn)
+        };
+        let detached_boot = if let Some(turn) = &detached_turn {
+            let registration = async {
+                persistence.barrier().await?;
+                let boot = store.lock().await.program_run_boot_id();
+                if let Some(row) = &turn.adopted {
+                    if row.boot_id != boot {
+                        return Err(crate::error::DaemonError::Process(
+                            "adopted custody boot changed".into(),
+                        ));
+                    }
+                    return Ok(boot);
+                }
+                let row = turn.custody(session_id, boot).await?;
+                let guard = store.lock().await;
+                guard.abandon_unlocked_provider_turns_from_prior_boot(session_id, boot)?;
+                guard.insert_provider_turn_custody(&row)?;
+                Ok::<_, crate::error::DaemonError>(boot)
+            }
+            .await;
+            let boot = registration.as_ref().ok().copied();
+            turn.start(registration.map_err(|error| error.to_string()));
+            boot
+        } else {
+            None
+        };
         let mut sequence: i32 = initial_sequence;
         // Boundary-delivered operator messages (#1062) are written here, by the
         // one owner of this session's sequence counter.
@@ -1913,8 +2023,21 @@ impl SessionManager {
                     )
                 })
         };
-        let mut turn_number: i32 = 0;
-        let mut received_any_event = false;
+        let mut turn_number: i32 = if detached_turn.as_ref().is_some_and(|t| t.adopted.is_some()) {
+            active.read().await.get(&session_id).map_or(0, |t| {
+                t.turn_metrics
+                    .iter()
+                    .map(|m| m.turn_number)
+                    .max()
+                    .unwrap_or(0)
+            })
+        } else {
+            0
+        };
+        let mut received_any_event = detached_turn
+            .as_ref()
+            .and_then(|t| t.adopted.as_ref())
+            .is_some_and(|row| row.stdout_offset > 0);
         let mut received_meaningful_output = false;
         let prior_meaningful_output = {
             let active_guard = active.read().await;
@@ -1934,7 +2057,15 @@ impl SessionManager {
         // #1484: set when Claude Code rejects the selected model on stderr, so
         // the later `result` frame cannot relabel the exit as `success`.
         let mut rejected_model_notice: Option<String> = None;
-        let mut current_result = TerminalResult::None;
+        let mut current_result = if let Some(turn) = &detached_turn {
+            match turn.consumed_terminal_event().await {
+                Ok(Some(event)) if event.event_type == "result" => result_evidence(&event),
+                Ok(Some(_)) | Err(_) => TerminalResult::ProviderError,
+                Ok(None) => TerminalResult::None,
+            }
+        } else {
+            TerminalResult::None
+        };
         // AppServer enqueue is not provider receipt. Keep the effect-possible
         // row open until this monitor observes the next turn's result frame.
         let mut inflight_operator_message: Option<Uuid> = None;
@@ -2062,6 +2193,12 @@ impl SessionManager {
 
         // Main event loop - NO LOCKS held while waiting for events
         let break_reason: MonitorBreakReason = loop {
+            if detached_turn
+                .as_ref()
+                .is_some_and(|turn| turn.is_handed_off())
+            {
+                return;
+            }
             if let Some(reason) = terminal_reason {
                 let active_generation = {
                     let active_guard = active.read().await;
@@ -2088,6 +2225,10 @@ impl SessionManager {
             let candidate_deadline = terminal_deadline;
             let producer_close_deadline = post_settlement_deadline;
             tokio::select! {
+                _ = async {
+                    if let Some(turn) = &detached_turn { turn.wait_for_handoff().await; }
+                    else { std::future::pending::<()>().await; }
+                } => return,
                 _ = stop_rx.recv() => {
                     tracing::debug!(session_id = %session_id, "Received stop signal");
                     // Distinguish user interrupt from rotation interrupt:
@@ -2265,7 +2406,10 @@ impl SessionManager {
                             expected_generation,
                             "Stale monitor ignored rotation deadline before coordinator advance"
                         );
-                        return;
+                        // Use the custody-settlement epilogue before the
+                        // generation fence rejects this monitor's finalization.
+                        settlement_outcome = Some(ProcessSettlementOutcome::GenerationChanged);
+                        break MonitorBreakReason::StreamClosed;
                     }
 
                     match timeout_action {
@@ -2433,9 +2577,22 @@ impl SessionManager {
                 event_opt = provider_session.next_event(), if !stream_drained => {
                     match event_opt {
                         Some(stream_event) => {
+                            let spool_cursor = detached_turn.as_ref().and_then(|turn| turn.next_receipt());
+                            let auxiliary = detached_turn.as_ref().map(|turn| turn.next_auxiliary()).unwrap_or_default();
                             received_any_event = true;
+                            if stream_event.event_type == "turn_spool_checkpoint" && spool_cursor.is_some() {
+                                if let Err(error) = persist_detached_batch(&active, &store, session_id, expected_generation,
+                                    spool_cursor.unwrap(), &stream_event, &mut []).await {
+                                    tracing::error!(%session_id, %error, "Failed to persist detached turn cursor");
+                                    current_result = TerminalResult::ProviderError;
+                                    terminal_reason = Some(MonitorBreakReason::Result);
+                                    terminal_deadline = Some(tokio::time::Instant::now());
+                                    stream_drained = true;
+                                }
+                                continue;
+                            }
 
-                            if stream_event.event_type == "approval_resolved" {
+                            if spool_cursor.is_none() && stream_event.event_type == "approval_resolved" {
                                 if let Err(error)=super::pending_approvals::resolve_monitor_approval(approval_lease.as_ref(),&active,&persistence,session_id,expected_generation,&mut sequence,&stream_event.data).await {
                                     persistence.record_session_diagnostic(
                                         session_id,
@@ -2447,7 +2604,7 @@ impl SessionManager {
                                 }
                                 continue;
                             }
-                            if stream_event.event_type == "approval_request" {
+                            if spool_cursor.is_none() && stream_event.event_type == "approval_request" {
                                 let invocation = provider_session.app_server_approval_invocation();
                                 match super::pending_approvals::publish_monitor_approval(
                                     approval_lease.as_ref(), &active, &persistence, session_id, expected_generation,
@@ -2536,7 +2693,7 @@ impl SessionManager {
                                         tracing::warn!(session_id = %session_id, source, error = %error_text, "provider emitted a diagnostic event");
                                     }
                                     sequence += 1;
-                                    let error_event = ConversationEvent {
+                                    let mut error_event = ConversationEvent {
                                         id: 0,
                                         session_id,
                                         sequence,
@@ -2553,13 +2710,24 @@ impl SessionManager {
                                             terminal_provider_error,
                                         ))),
                                     };
+                                    if let Some(cursor) = spool_cursor {
+                                        if let Err(error) = persist_detached_batch(&active, &store, session_id, expected_generation,
+                                            cursor, &stream_event, std::slice::from_mut(&mut error_event)).await {
+                                            tracing::error!(%session_id, %error, "Failed to persist detached diagnostic and cursor");
+                                            current_result = TerminalResult::ProviderError;
+                                            terminal_reason = Some(MonitorBreakReason::Result);
+                                            terminal_deadline = Some(tokio::time::Instant::now());
+                                            stream_drained = true;
+                                            continue;
+                                        }
+                                    }
                                     {
                                         let mut active_guard = active.write().await;
                                         if let Some(tracked) = active_guard.get_mut(&session_id) {
                                             tracked.events.push(error_event.clone());
                                         }
                                     }
-                                    let persisted = if let Some(model_invocation_id) = current_model_invocation_id {
+                                    let persisted = if error_event.id > 0 { Ok(error_event.id) } else if let Some(model_invocation_id) = current_model_invocation_id {
                                         persistence.insert_event_with_provenance(
                                             error_event.clone(),
                                             ConversationEventProvenanceV1 {
@@ -2583,6 +2751,18 @@ impl SessionManager {
                                         session_id,
                                         event: error_event,
                                     });
+                                }
+                                if stream_event.data.get("error").and_then(|value| value.as_str()).is_none() {
+                                    if let Some(cursor) = spool_cursor {
+                                        if let Err(error) = persist_detached_batch(&active, &store, session_id, expected_generation,
+                                            cursor, &stream_event, &mut []).await {
+                                            tracing::error!(%session_id, %error, "Failed to consume detached diagnostic line");
+                                            current_result = TerminalResult::ProviderError;
+                                            terminal_reason = Some(MonitorBreakReason::Result);
+                                            terminal_deadline = Some(tokio::time::Instant::now());
+                                            stream_drained = true;
+                                        }
+                                    }
                                 }
                                 if terminal_provider_error {
                                     if let Some(stop_reason) =
@@ -3314,7 +3494,7 @@ impl SessionManager {
                             // The app-server emits "tool_call" (bidirectional RPC) rather than
                             // "tool_use" (CLI stdout). When the provider calls a dynamic tool,
                             // dispatch to the registry and send the result back.
-                            if stream_event.event_type == "tool_call" {
+                            if spool_cursor.is_none() && stream_event.event_type == "tool_call" {
                                 // The provider's exact JSON-RPC id (number or string),
                                 // echoed back unchanged. A frame with no usable id
                                 // cannot be answered, so it is not executed.
@@ -3401,7 +3581,7 @@ impl SessionManager {
                             // detection, result handling) still run for a type
                             // that yields no conversation event.
                             let mut assistant_text_this_event = String::new();
-                            let converted = Self::convert_recognized_stream_event(
+                            let mut converted = Self::convert_recognized_stream_event(
                                 &stream_event,
                                 session_id,
                                 &mut sequence,
@@ -3411,6 +3591,28 @@ impl SessionManager {
                                     .note(session_id, &stream_event.event_type);
                                 Vec::new()
                             });
+                            // Codex custom-tool transcript events belong to the same
+                            // stdout frame as turn.completed. Commit them with that
+                            // cursor, so a boot cannot replay half of the frame.
+                            if !auxiliary.is_empty() {
+                                let mut extra = Vec::new();
+                                for event in &auxiliary {
+                                    extra.extend(Self::convert_recognized_stream_event(event, session_id, &mut sequence).unwrap_or_default());
+                                }
+                                extra.append(&mut converted);
+                                converted = extra;
+                            }
+                            if let Some(cursor) = spool_cursor {
+                                if let Err(error) = persist_detached_batch(&active, &store, session_id, expected_generation,
+                                    cursor, &stream_event, &mut converted).await {
+                                    tracing::error!(%session_id, %error, "Failed to persist detached events and cursor");
+                                    current_result = TerminalResult::ProviderError;
+                                    terminal_reason = Some(MonitorBreakReason::Result);
+                                    terminal_deadline = Some(tokio::time::Instant::now());
+                                    stream_drained = true;
+                                    continue;
+                                }
+                            }
                             for conv_event in converted {
                                 // Update local assistant content accumulator (no lock needed).
                                 match conv_event.role {
@@ -4451,6 +4653,36 @@ impl SessionManager {
                 }
             }
         };
+
+        if detached_turn
+            .as_ref()
+            .is_some_and(|turn| turn.is_handed_off())
+        {
+            return;
+        }
+        if let (Some(turn), Some(boot)) = (&detached_turn, detached_boot) {
+            let guard = store.lock().await;
+            if turn.is_handed_off() {
+                return;
+            }
+            let complete = turn.complete.load(std::sync::atomic::Ordering::Acquire)
+                && guard
+                    .get_provider_turn_custody(turn.invocation_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|row| {
+                        std::fs::metadata(turn.spool_dir.join("stdout"))
+                            .is_ok_and(|metadata| metadata.len() == row.stdout_offset)
+                    });
+            let settled = if complete {
+                guard.finish_provider_turn_custody(turn.invocation_id, boot)
+            } else {
+                guard.abandon_provider_turn_custody(turn.invocation_id, boot)
+            };
+            if let Err(error) = settled {
+                tracing::error!(%session_id, %error, "Failed to settle turn custody");
+            }
+        }
 
         // A delivery queued as the monitor ends still gets its transcript line.
         super::boundary_mail::drain_operator_transcript_inbox(
@@ -9632,4 +9864,578 @@ mod pending_question_producer_tests {
             "ask-resumed"
         );
     }
+
+    /// #1641 S3b: the on-call manager's ruling on a topology node's question
+    /// is delivered to the node's own session, not a new one.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn manager_ruling_on_node_question_resumes_the_same_session() {
+        let (manager, _dir, config, session) = fixture().await;
+        let (policy_version, execution) = {
+            let store = manager.store.lock().await;
+            let grant = store
+                .get_harness_manager_policy(config.project_id)
+                .unwrap()
+                .unwrap();
+            let updated = store
+                .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                    project_id: config.project_id,
+                    expected_scope_version: config.row_version,
+                    expected_policy_version: grant.row_version,
+                    idempotency_key: "node-ruling-policy".into(),
+                    policy: ManagerPolicyV2 {
+                        capabilities: vec![ManagerCapabilityV2::WorkPlan],
+                        ..Default::default()
+                    },
+                })
+                .unwrap();
+            // The fixture's session is the node of a running topology execution.
+            let execution = Uuid::new_v4();
+            let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            store
+                .conn
+                .execute(
+                    "INSERT INTO topology_executions (id,topology_name_snapshot,workflow_id,definition_json,definition_digest,requested_by_kind,repo_root,base_commit,custody_plan_json,status,created_at,updated_at)
+                     VALUES (?1,'node-question','wf','{}','d','manager','/tmp/repo','0000000000000000000000000000000000000000','{}','running',?2,?2)",
+                    rusqlite::params![execution.to_string(), now],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO topology_node_attempts (id,execution_id,node_id,iteration,attempt_no,node_kind,status,dedup_key,session_id,input_json,created_at,updated_at)
+                     VALUES (?1,?2,'A',0,1,'session','running',?3,?4,'{}',?5,?5)",
+                    rusqlite::params![
+                        Uuid::new_v4().to_string(),
+                        execution.to_string(),
+                        format!("dedup-{execution}"),
+                        session.to_string(),
+                        now
+                    ],
+                )
+                .unwrap();
+            (updated.row_version, execution)
+        };
+        publish(&manager, provider_event(session, 1, "ask-node"))
+            .await
+            .unwrap();
+        let delivery = {
+            let store = manager.store.lock().await;
+            store
+                .manager_v2_refresh_question_decisions(&config)
+                .unwrap();
+            let key = format!("question:{session}");
+            let decision = store
+                .manager_v2_record(&config, "decision", &key)
+                .unwrap()
+                .unwrap();
+            store
+                .manager_v2_commit_update(
+                    config.manager_session_id,
+                    &AgentManagerUpdateRequestV2 {
+                        project_id: None,
+                        fence: ManagerFenceV2 {
+                            scope_version: config.row_version,
+                            policy_version,
+                        },
+                        idempotency_key: "rule-node-question".into(),
+                        change: ManagerUpdateV2::DecisionRuling {
+                            key,
+                            expected_row_version: decision.row_version,
+                            target_digest: decision.payload["target_digest"]
+                                .as_str()
+                                .unwrap()
+                                .into(),
+                            answer: "Use the reserved version".into(),
+                            owner_manager_session_id: None,
+                        },
+                    },
+                    &crate::store::manager_ledger::LedgerObservation::default(),
+                )
+                .unwrap();
+            store
+                .manager_v2_claim_decision_delivery(&config, Uuid::new_v4())
+                .unwrap()
+                .expect("the ruling queued a delivery")
+        };
+        assert_eq!(delivery.target["session_id"], json!(session));
+        assert_eq!(delivery.answer, "Use the reserved version");
+        manager
+            .check_manager_decision_runtime(&delivery)
+            .await
+            .unwrap();
+        cold_completed(&manager, session).await;
+        let process = super::super::launch::install_controller_candidate_test_process(session);
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            manager.continue_manager_decision(delivery),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // The same session was resumed exactly once and its question cleared.
+        assert_eq!(
+            process
+                .productive_start_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        {
+            let store = manager.store.lock().await;
+            assert_eq!(store.manager_v2_question_target(session).unwrap(), None);
+            let attempt_session: String = store
+                .conn
+                .query_row(
+                    "SELECT session_id FROM topology_node_attempts WHERE execution_id=?1",
+                    [execution.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(attempt_session, session.to_string());
+        }
+        super::super::launch::drop_controller_candidate_test_stream(session);
+    }
+
+    /// Move the fixture's active tracked session into the completed map so the
+    /// terminal answer path takes the ordinary cold-resume road instead of
+    /// interrupting a live provider.
+    async fn cold_completed(manager: &SessionManager, session: Uuid) {
+        let tracked = manager.active.write().await.remove(&session).unwrap();
+        let mut cached = CompletedSession::for_test(tracked.session);
+        cached.events = tracked.events;
+        cached.events_hydrated = true;
+        manager.completed.write().await.insert(session, cached);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn terminal_answer_published_question_delivers_once_and_clears_publication() {
+        let (manager, _dir, _config, session) = fixture().await;
+        publish(&manager, provider_event(session, 1, "ask-terminal"))
+            .await
+            .unwrap();
+        cold_completed(&manager, session).await;
+        let process = super::super::launch::install_controller_candidate_test_process(session);
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            manager.answer_question(session, "Use the reserved version".into()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            process
+                .productive_start_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        {
+            let store = manager.store.lock().await;
+            assert_eq!(store.manager_v2_question_target(session).unwrap(), None);
+            assert_eq!(
+                store
+                    .get_session(session)
+                    .unwrap()
+                    .unwrap()
+                    .pending_question,
+                None
+            );
+        }
+        super::super::launch::drop_controller_candidate_test_stream(session);
+    }
+
+    /// Review fix (#990 slice 1, P1): the old answer must not run any
+    /// bookkeeping once the resumed provider's monitor is live. The NEW
+    /// monitor itself publishes an AskUserQuestion after the new tracked
+    /// session is installed and before the old `answer_question` returns; the
+    /// new runtime question and its wait timer survive. The continuation parks
+    /// after spawning the monitor (a test-only phase hook), the test feeds the
+    /// question through the monitor's real publication path, waits for the
+    /// monitor to have published it, and only then lets the answer return.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn terminal_answer_does_not_erase_new_question_published_before_return() {
+        let (manager, _dir, _config, session) = fixture().await;
+        publish(&manager, provider_event(session, 1, "ask-old-race"))
+            .await
+            .unwrap();
+        cold_completed(&manager, session).await;
+        let process = super::super::launch::install_controller_candidate_test_process(session);
+        let (reached, resume) = super::super::launch::install_controller_candidate_test_pause(
+            session,
+            super::super::launch::ControllerCandidateTestPhase::ContinuationAfterMonitorSpawn,
+        );
+        let (answer_result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(
+                manager.answer_question(session, "Use the reserved version".into()),
+                async {
+                    reached.await.unwrap();
+                    super::super::launch::send_controller_candidate_test_event(
+                        session,
+                        StreamEvent {
+                            event_type: "assistant".into(),
+                            data: json!({"message":{"content":[
+                                {"type":"tool_use","id":"ask-resumed-race","name":"AskUserQuestion","input":question()}
+                            ]}}),
+                        },
+                    )
+                    .await;
+                    // Barrier: the new monitor has processed the question
+                    // (runtime state set and publication durable) while the
+                    // old answer is still parked before returning.
+                    loop {
+                        let runtime_set = manager
+                            .active
+                            .read()
+                            .await
+                            .get(&session)
+                            .is_some_and(|tracked| {
+                                tracked.pending_question.is_some()
+                                    && tracked.approval_wait_start.is_some()
+                            });
+                        let published = manager
+                            .store
+                            .lock()
+                            .await
+                            .manager_v2_question_target(session)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|target| target["tool_use_id"] == "ask-resumed-race");
+                        if runtime_set && published {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    resume.send(()).unwrap();
+                }
+            )
+        })
+        .await
+        .unwrap();
+        answer_result.unwrap();
+        {
+            let active = manager.active.read().await;
+            let tracked = active.get(&session).unwrap();
+            assert_eq!(tracked.pending_question, Some(question()));
+            assert_eq!(tracked.session.pending_question, Some(question()));
+            assert!(tracked.approval_wait_start.is_some());
+        }
+        assert_eq!(
+            manager
+                .store
+                .lock()
+                .await
+                .manager_v2_question_target(session)
+                .unwrap()
+                .unwrap()["tool_use_id"],
+            "ask-resumed-race"
+        );
+        manager.interrupt_session(session).await.unwrap();
+        super::super::launch::drop_controller_candidate_test_stream(session);
+        assert_eq!(
+            process
+                .productive_start_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    /// Review fix (#990 slice 1, P2): a published terminal answer is itself the
+    /// answer, so the delivered user turn is exactly the encoded answer and
+    /// carries no "no human has answered" notice.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn terminal_answer_published_turn_is_exactly_the_encoded_answer() {
+        let (manager, _dir, _config, session) = fixture().await;
+        publish(&manager, provider_event(session, 1, "ask-notice"))
+            .await
+            .unwrap();
+        cold_completed(&manager, session).await;
+        let process = super::super::launch::install_controller_candidate_test_process(session);
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            manager.answer_question(session, "Use the reserved version".into()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let expected = "My answer to your question: Use the reserved version";
+        let delivered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let found = manager
+                    .active
+                    .read()
+                    .await
+                    .get(&session)
+                    .and_then(|tracked| {
+                        tracked
+                            .events
+                            .iter()
+                            .find(|event| {
+                                event.role == Some(Role::User)
+                                    && event.content.contains("Use the reserved version")
+                            })
+                            .map(|event| event.content.clone())
+                    });
+                if let Some(content) = found {
+                    break content;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(delivered, expected);
+        manager.persistence.barrier().await.unwrap();
+        let persisted = manager
+            .store
+            .lock()
+            .await
+            .load_events(session)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.content.contains("Use the reserved version"))
+            .map(|event| event.content)
+            .collect::<Vec<_>>();
+        assert_eq!(persisted, vec![expected.to_string()]);
+        manager.interrupt_session(session).await.unwrap();
+        super::super::launch::drop_controller_candidate_test_stream(session);
+        assert_eq!(
+            process
+                .productive_start_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn terminal_answer_paused_before_clear_wins_and_manager_delivery_refuses() {
+        let (manager, _dir, config, session) = fixture().await;
+        publish(&manager, provider_event(session, 1, "ask-race"))
+            .await
+            .unwrap();
+        cold_completed(&manager, session).await;
+        let delivery = answer(&manager, &config, session, "race-manager-answer").await;
+        let process = super::super::launch::install_controller_candidate_test_process(session);
+        let (reached, resume) = super::super::launch::install_controller_candidate_test_pause(
+            session,
+            super::super::launch::ControllerCandidateTestPhase::ManagerQuestionBeforeClear,
+        );
+        let (terminal_result, manager_result) =
+            tokio::time::timeout(Duration::from_secs(30), async {
+                tokio::join!(
+                    manager.answer_question(session, "Use the reserved version".into()),
+                    async {
+                        // The terminal answer now holds the spawn guard, paused
+                        // before its guarded clear. Release it, then run the
+                        // manager delivery for the same publication.
+                        reached.await.unwrap();
+                        resume.send(()).unwrap();
+                        manager.continue_manager_decision(delivery).await
+                    }
+                )
+            })
+            .await
+            .unwrap();
+        terminal_result.unwrap();
+        let error = manager_result.unwrap_err();
+        assert!(
+            error.to_string().contains("manager_v2_decision")
+                || error.to_string().contains("runtime_changed")
+                || error.to_string().contains("target_changed"),
+            "unexpected manager refusal: {error}"
+        );
+        // Exactly one provider turn was delivered, by the terminal answer.
+        assert_eq!(
+            process
+                .productive_start_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        super::super::launch::drop_controller_candidate_test_stream(session);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn terminal_answer_newer_publication_before_clear_refuses_and_newer_stays_pending() {
+        let (manager, _dir, _config, session) = fixture().await;
+        publish(&manager, provider_event(session, 1, "ask-old"))
+            .await
+            .unwrap();
+        cold_completed(&manager, session).await;
+        let process = super::super::launch::install_controller_candidate_test_process(session);
+        let (reached, resume) = super::super::launch::install_controller_candidate_test_pause(
+            session,
+            super::super::launch::ControllerCandidateTestPhase::ManagerQuestionBeforeClear,
+        );
+        let newer = PendingQuestion {
+            questions: vec![QuestionItem {
+                question: "Use the newer allocation?".into(),
+                header: "Migration".into(),
+                options: vec![],
+                multi_select: false,
+            }],
+        };
+        let newer_raw = serde_json::to_string(&newer).unwrap();
+        let (answer_result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(
+                manager.answer_question(session, "answer-old".into()),
+                async {
+                    // Reserve a newer publication for the same session between the
+                    // terminal capture and its guarded clear.
+                    reached.await.unwrap();
+                    manager
+                        .store
+                        .lock()
+                        .await
+                        .update_session_pending_question_json(session, Some(&newer_raw))
+                        .unwrap();
+                    resume.send(()).unwrap();
+                }
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            process
+                .productive_start_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let error = answer_result.unwrap_err();
+        assert!(
+            error.to_string().contains("question_already_answered"),
+            "unexpected refusal: {error}"
+        );
+        let store = manager.store.lock().await;
+        assert_eq!(
+            store
+                .get_session(session)
+                .unwrap()
+                .unwrap()
+                .pending_question,
+            Some(newer)
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn terminal_answer_runtime_only_question_refuses_without_clearing() {
+        let (manager, _dir, _config, session) = fixture().await;
+        {
+            let mut active = manager.active.write().await;
+            let tracked = active.get_mut(&session).unwrap();
+            tracked.pending_question = Some(question());
+            tracked.session.pending_question = Some(question());
+        }
+        cold_completed(&manager, session).await;
+        let process = super::super::launch::install_controller_candidate_test_process(session);
+        let error = manager
+            .answer_question(session, "answer runtime only".into())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("question_not_published"));
+        assert_eq!(
+            process
+                .productive_start_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            manager
+                .completed
+                .read()
+                .await
+                .get(&session)
+                .unwrap()
+                .session
+                .pending_question,
+            Some(question())
+        );
+        super::super::launch::drop_controller_candidate_test_stream(session);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn terminal_answer_refuses_before_any_start_when_another_path_cleared_first() {
+        let (manager, _dir, _config, session) = fixture().await;
+        publish(&manager, provider_event(session, 1, "ask-reverse"))
+            .await
+            .unwrap();
+        cold_completed(&manager, session).await;
+        let target = manager
+            .store
+            .lock()
+            .await
+            .manager_v2_question_target(session)
+            .unwrap()
+            .unwrap();
+        let process = super::super::launch::install_controller_candidate_test_process(session);
+        let (reached, resume) =
+            super::super::lifecycle::install_continuation_pause_for_test(session);
+        let (answer_result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(
+                manager.answer_question(session, "answer-late".into()),
+                async {
+                    // The terminal answer has captured its target and waits for
+                    // the guard; another path (manager or phone) answers first.
+                    reached.await.unwrap();
+                    manager
+                        .store
+                        .lock()
+                        .await
+                        .clear_pending_question_exact(session, &target)
+                        .unwrap();
+                    resume.send(()).unwrap();
+                }
+            )
+        })
+        .await
+        .unwrap();
+        let error = answer_result.unwrap_err();
+        assert!(
+            error.to_string().contains("question_already_answered"),
+            "unexpected refusal: {error}"
+        );
+        // Refused under the guard before any interrupt or provider start.
+        assert_eq!(
+            process
+                .productive_start_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        super::super::launch::drop_controller_candidate_test_stream(session);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn terminal_answer_without_any_pending_question_refuses_before_any_start() {
+        let (manager, _dir, _config, session) = fixture().await;
+        // WaitingApproval alone is not a publication: no question has ever
+        // been published or cleared in this fixture.
+        cold_completed(&manager, session).await;
+        let process = super::super::launch::install_controller_candidate_test_process(session);
+        let error = tokio::time::timeout(
+            Duration::from_secs(30),
+            manager.answer_question(session, "answer-nothing".into()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("question_not_published"),
+            "unexpected refusal: {error}"
+        );
+        assert_eq!(
+            process
+                .productive_start_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        super::super::launch::drop_controller_candidate_test_stream(session);
+    }
 }
+
+#[cfg(test)]
+mod turn_detach_tests;

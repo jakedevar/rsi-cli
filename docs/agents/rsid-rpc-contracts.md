@@ -559,7 +559,16 @@ declares nothing for it, and `make check-touched-shards` refuses it (exit 2). Th
 `scoped-test` targets also pass `--total-max-sec` (1140, under the 20-minute
 cap): each sequential package gets the lesser of its own budget and the time left,
 and a package with none left reports `scoped_test_timeout` instead of being cut
-off by the job cap. Names and targets use
+off by the job cap. The typed `test {scoped_test:{base, head?}}` form (#1638, any
+leaf; `base`/`head` are bare branch, `origin/<branch>` or 40-hex refs, no other
+field) runs `scripts/scoped-test --base B [--head H] --runtime-max-sec T-120
+--total-max-sec T-60 --cpu-quota 200` in the caller's sandbox under the ordinary
+test unit and `timeout_minutes` rules (T = the timeout in seconds), needing no
+manifest entry. The script's last line is `SCOPED_TEST_RECEIPT <json>`; the job
+settles `succeeded` only on exit 0 with `ok: true` and carries it as
+`result.receipt` next to `result.exit_code` and the job `log_path`
+(`scoped_test_receipt_missing` when none was printed). Submit with `wake: "none"`
+and arm one `AgentScheduleWake mode:"when"`. Names and targets use
 ASCII letters, digits, `_`, `-`, `.` and cannot start with `-` (200 bytes max).
 The manifest is version 1, at most 64 KiB and 64 recipes, with no unknown
 fields; its resolved path must stay inside the worktree. Missing manifests or
@@ -1138,8 +1147,22 @@ tokened caller again with `portable_bundle_operator_only`). Logic:
   (`AgentManagerControl`, `AgentManagerLaunchIssueWorker`, review allocations)
   stays `queued` because `Store::claim_manager_action_with_create_admission` leaves
   it unclaimed (the deploy-drain mechanism, #1073); a topology node of a
-  manager- or Epic-lead-requested execution stays `Reserved`
-  (`NodeEffects::launch_held`, retried on the executor tick) and writes nothing.
+  topology node stays `Reserved` (`NodeEffects::launch_held`, retried on the
+  executor tick) and writes nothing. The hold covers every execution's
+  later node launches, manager-, Epic-lead- or operator-requested alike; only
+  the first launches of an operator-requested execution (before any of its
+  attempts has settled) start when asked (#1641 S4b).
+- **Resource pressure holds topology nodes, never fails them (#1641 S4b).** A
+  node launch refused by the sandbox capacity gate (JSON-RPC `-32029`,
+  `launch.rs::admit_sandbox_allocation`: `free_space_limit` or
+  `source_root_limit`) returns the attempt to `Reserved`; the executor writes
+  one `admission_hold{kind: disk_floor|source_root_limit}` event per transition
+  (not per tick) and the 30 s tick launches it once the pressure clears. A
+  command node takes a governor build slot (`governor.rs`, gates: slots, load,
+  memory, `min_free_disk_gb`) before its sandbox is allocated; while the slot
+  is not granted it stays `Reserved` with `admission_hold{kind: disk_floor|build_slot}`,
+  and the slot is released when the node settles. A sandbox-capacity refusal
+  of a command node holds it the same way.
   Both start on their own when the load drops. `load` is the 1-minute average
   (`/proc/loadavg` on Linux; any other platform, or an unreadable file, is
   `supported: false` and admits everything).
@@ -1154,8 +1177,8 @@ tokened caller again with `portable_bundle_operator_only`). Logic:
 - **Never held.** Operator launches, a worker's `AgentSpawnChild` children,
   retries, rotation successors, Issue worker `continue_from` launches,
   recovery of topology attempts already `Launching`, lead recovery (`replace_lead`, `retry_lead`,
-  `resume_lead`), every non-create manager action, and topology executions the
-  operator requested.
+  `resume_lead`), every non-create manager action, and the first launches of a
+  topology execution the operator requested.
 - **Visibility.** `AgentManagerGetAction` carries `held {reason: host_load, load,
   threshold, recent_admissions}` on a queued create (a deploy hold, when both
   apply, is reported first). `AgentGetDaemonInfo.host_load` reports `threshold`,
@@ -1198,3 +1221,57 @@ tokened caller again with `portable_bundle_operator_only`). Logic:
   keyed by signature.
 - **TUI.** `:manager friction [<hours>]` summarizes the rollup; the manager
   board's Inspect · Friction section lists one project's rows.
+
+## Agent-created projects (#1626)
+
+- **Agent verbs.** `AgentCreateProject {name, path, description?, color?}` and
+  `AgentUpdateProject {project_id, name?, path?, description?, color?}`
+  (native `rsi_control_create_project`, `rsi_control_update_project`). Types
+  and refusal codes: `rsi_common::agent_projects`; authority and writes:
+  `Store::agent_project_scope` / `agent_register_project` /
+  `agent_edit_project` (`rsid-store/src/store/agent_projects.rs`); path
+  containment and cache refresh: `session/agent_projects.rs`.
+- **Authority.** A project manager in Execute mode, not paused, acts on its
+  own project; a portfolio seat in Execute mode, not paused, acts on its
+  grant's coverage. A session holding both seats evaluates each seat
+  independently: any permitting seat suffices and coverage is the union. The catalog (`VerbRights::project_admin`) and the store
+  use the same predicate. Caller identity comes from the token. An area seat
+  or a worker is refused `project_not_authorized`.
+- **Create.** The path must be absolute, exist, be a directory and sit inside
+  a configured workspace root (`project_path_invalid`); with no workspace roots
+  configured the path must be a strict descendant of the daemon user's home
+  directory, never the home directory, anything under `~/.rsi`, or `/`. A path
+  equal to, containing or inside the harness root, or any path change on the
+  harness project, is `project_harness_protected` (operator-only); authority is checked
+  before the filesystem is touched. Names are unique (`project_name_taken`),
+  a directory registers once (`project_path_taken`); the same name and
+  directory again returns the project with `deduplicated:true` only inside the
+  caller's coverage (otherwise `project_name_taken`, no project fields). The created
+  project has no manager and is not added to the creator's grant. The daemon
+  rebuilds its launch-time project index and the project's RSI.md cache, as
+  the operator's `CreateProject` does. A handle built without a manager (a
+  rotation-built Harness handle) refuses `project_admin_unavailable` rather
+  than leave those caches stale.
+- **Update.** Limited to the caller's coverage; an uncovered or unknown id is
+  `project_not_in_scope`. A path change is refused while the project has a
+  Starting, Running or WaitingApproval session (`project_has_live_sessions`).
+  An omitted field is unchanged (a description cannot be cleared by an agent).
+- **Delete and archive are not agent verbs.** `projects` has no archive state
+  (adding one is a migration, not part of this slice) and a hard delete is the
+  operator's `DeleteProject`. Revisit archive with the migration if the
+  operator asks.
+- **`project_created` event (slice 2).** A new agent create (not a replay, not
+  an operator `CreateProject`, which publishes nothing) publishes
+  `DaemonEvent::ProjectCreated {project_id, name, source:"agent",
+  created_by_session_id}` as bus event `project_created`; it is daemon-global.
+  The payload type is `rsi_common::agent_projects::ProjectCreatedEventV1`.
+- **Operator surfaces.** The operator already has `CreateProject`,
+  `UpdateProject` and `DeleteProject`. The TUI handles `project_created`
+  (`app/agent_projects.rs`): it records the event, refreshes the project list,
+  switches to the new project's tab when the persisted daemon setting
+  `follow_agent_created_projects` is on (default on; Settings ▸ Orchestration,
+  `UpdateDaemonConfig`), and, when the creator is the active global seat and the
+  project is not in its grant, offers the grant addition as a `y` confirm in
+  `:manager tree` (or `:manager global add-project <name>` when an overlay is
+  open). The offer is an operator `ConfigureGlobalManager` call fenced on the
+  grant version; the agent never makes it.

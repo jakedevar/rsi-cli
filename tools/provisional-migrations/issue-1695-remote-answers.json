@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "version": 162,
+  "files": [
+    {
+      "path": "crates/rsid-store/src/store/migrations/v162.rs",
+      "path_template": "crates/rsid-store/src/store/migrations/v${VERSION}.rs",
+      "source_blob": "sha256:e649a4537cce0c2fb769f5ff2c51b19dc4e3d42b1248b4f03168bb7ad26fc2ef",
+      "sites": [
+        {
+          "anchor": "fn migrate_v162(",
+          "replacement": "fn migrate_v${VERSION}(",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 162 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "\"user_version\", 162",
+          "replacement": "\"user_version\", ${VERSION}",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "path_template": "crates/rsid-store/src/store/tests.rs",
+      "source_blob": "sha256:c2a2b78dae0cc8a6163fb2bb2ed2871adc16b1e4c218fbae8cef0b692e49dfc5",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 162;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        },
+        {
+          "anchor": "if active >= 162 && target < 162 {",
+          "replacement": "if active >= ${VERSION} && target < ${VERSION} {",
+          "scope": "unit"
+        }
+      ]
+    }
+  ]
+}

@@ -99,11 +99,12 @@ pub(super) fn render_label_picker(
     }
 
     // Row 0: filter input
-    let filter_line = Line::from(vec![
-        Span::styled("> ", Style::default().fg(theme::mauve())),
-        Span::styled(filter, Style::default().fg(theme::text())),
-        Span::styled("\u{2588}", Style::default().fg(theme::text())), // cursor block
-    ]);
+    let mut filter_spans = vec![Span::styled("> ", Style::default().fg(theme::mauve()))];
+    filter_spans.extend(crate::field_edit::draw(
+        filter,
+        Style::default().fg(theme::text()),
+    ));
+    let filter_line = Line::from(filter_spans);
     let filter_area = Rect::new(inner.x, inner.y, inner.width, 1);
     frame.render_widget(Paragraph::new(filter_line), filter_area);
 

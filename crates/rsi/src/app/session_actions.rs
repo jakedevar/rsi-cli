@@ -1017,7 +1017,12 @@ impl App {
                 return;
             }
         };
+        self.archive_session_by_id(session_id).await;
+    }
 
+    /// Archive `session_id` exactly as the session list does (#1627: the
+    /// manager console reuses it for earlier seat sessions).
+    pub async fn archive_session_by_id(&mut self, session_id: Uuid) {
         // For active sessions: mark for auto-archive on completion
         if let Some(state) = self.sessions.get(&session_id)
             && matches!(
@@ -1439,6 +1444,14 @@ impl App {
     /// Interrupt the selected session, including the selected list row in detail view.
     pub async fn interrupt_focused_session(&mut self, hard: bool) {
         if let Some(session_id) = self.selected_session_id_for_lifecycle_action() {
+            self.interrupt_session_by_id(session_id, hard).await;
+        }
+    }
+
+    /// Halt `session_id` as the session list's `x` / `X` do (#1627: the
+    /// manager console reuses it for seat rows).
+    pub async fn interrupt_session_by_id(&mut self, session_id: Uuid, hard: bool) {
+        {
             if hard {
                 let confirmed = self.interrupt_now_confirmation.is_some_and(|(id, at)| {
                     id == session_id && at.elapsed() < std::time::Duration::from_secs(5)

@@ -107,7 +107,7 @@ PY
 }
 
 # The deployable binaries, as AgentRequestDeploy names them (DEPLOY_BINARIES).
-RSID_DEPLOY_BINARIES=(rsid rsi rsi-rpc rsi-agent-mcp rsi-build-rustc rsi-contract-validate rsi-rolling-land rsi-remote rsid-supervisor.sh)
+RSID_DEPLOY_BINARIES=(rsid rsi rsi-rpc rsi-agent-mcp rsi-build-rustc rsi-contract-validate rsi-rolling-land rsi-remote rsi-turn-shim rsi-socket-hold rsid-supervisor.sh)
 
 # stabilize_installed_binaries <bin-dir> <cargo-release-dir> <stable-dir>
 #

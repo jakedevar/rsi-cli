@@ -379,6 +379,9 @@ pub enum LcAction {
     /// `:topology-resolve [<execution_id>] <action> [<preserved_commit>]` —
     /// operator resolution of a blocked durable topology execution (#634).
     ResolveTopologyAttempt(String),
+    /// `:topology run <name> [<epic>]` — start a stored topology on the focused
+    /// Issue (#1746).
+    RunTopology(String),
 
     // --- Entity Cards ---
     /// Open the card editor for the current project.
@@ -781,6 +784,7 @@ impl LcAction {
             LcAction::JumpAttentionN(..) => "JumpAttentionN",
             LcAction::OpenRecentFileN(..) => "OpenRecentFileN",
             LcAction::ResolveTopologyAttempt(..) => "ResolveTopologyAttempt",
+            LcAction::RunTopology(..) => "RunTopology",
             LcAction::RefreshNavigation => "RefreshNavigation",
             LcAction::RefreshCurrentView => "RefreshCurrentView",
             LcAction::RefreshMetadata => "RefreshMetadata",
@@ -1032,6 +1036,7 @@ mod tests {
             LcAction::ShrinkSidebar,
             LcAction::OpenGraphReview,
             LcAction::ResolveTopologyAttempt("inspect".into()),
+            LcAction::RunTopology("run issue-implement-review-land".into()),
             LcAction::OpenProjectCard,
             LcAction::OpenUserCard,
             LcAction::AddProjectCardFact("fact".into()),

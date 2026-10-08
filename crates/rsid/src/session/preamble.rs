@@ -213,33 +213,126 @@ pub fn harness_root() -> Option<&'static Path> {
 }
 
 fn discover_harness_root() -> Option<PathBuf> {
-    if let Ok(s) = rsi_common::identity::env_with_legacy(
+    let env_root = rsi_common::identity::env_with_legacy(
         "RSI_HARNESS_ROOT",
         &["MOTHERSHIP_HARNESS_ROOT", "FLYWHEEL_HARNESS_ROOT"],
-    ) {
-        let p = PathBuf::from(s);
+    )
+    .ok()
+    .map(PathBuf::from);
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let found = discover_harness_root_from(
+        env_root.as_deref(),
+        std::env::current_dir().ok().as_deref(),
+        exe_dir.as_deref(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        Some(env!("RSI_BUILD_MAIN_WORKTREE"))
+            .filter(|main| !main.is_empty())
+            .map(Path::new),
+    );
+    if found.is_none() {
+        tracing::warn!("Unable to discover harness root containing .claude/; preamble disabled");
+    }
+    found
+}
+
+/// Ordered discovery of the daemon's own harness checkout: the operator's
+/// `RSI_HARNESS_ROOT`, the daemon's cwd, its executable's directory, then the
+/// repo this binary was built from (#1613). The last step keeps an installed
+/// daemon (`~/.rsi/install/rsid`, started with an arbitrary cwd) resolving the
+/// RSI project for `AgentCreateIssue {harness: true}` from any project; none of
+/// it depends on a caller's working directory.
+///
+/// A build dir inside a git linked worktree (a manager sandbox) resolves to the
+/// MAIN worktree first, so the root is the stable checkout a project registers
+/// and survives the sandbox's reclaim: the build-time embedded `build_main`,
+/// else the main worktree read from the build dir's own git metadata.
+pub(crate) fn discover_harness_root_from(
+    env_root: Option<&Path>,
+    cwd: Option<&Path>,
+    exe_dir: Option<&Path>,
+    build_dir: &Path,
+    build_main: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(p) = env_root {
         if p.join(SHARED_DIR).join(BASE_FILENAME).is_file() {
-            return Some(p);
+            return Some(p.to_path_buf());
         }
         tracing::warn!(
             root = %p.display(),
             "RSI_HARNESS_ROOT set but base preamble not found; falling through to discovery"
         );
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(found) = walk_up_for_claude(&cwd) {
-            return Some(found);
-        }
+    cwd.into_iter()
+        .chain(exe_dir)
+        .chain(build_main)
+        .find_map(walk_up_for_claude)
+        .or_else(|| {
+            // The build dir's own root, mapped to its main worktree when it is
+            // a linked one and that checkout carries the harness too.
+            let root = walk_up_for_claude(build_dir)?;
+            Some(
+                main_worktree_of(&root)
+                    .filter(|main| main.join(SHARED_DIR).join(BASE_FILENAME).is_file())
+                    .unwrap_or(root),
+            )
+        })
+}
+
+/// The main worktree of the git checkout rooted at `start` (a directory holding
+/// `.git`, never an ancestor: a test or nested tree must not escape upward), mapped through a linked worktree's `.git` file
+/// (`gitdir: <main>/.git/worktrees/<name>`, whose `commondir` names the main
+/// `.git`) to the parent of the common dir. `None` outside a repo, for a bare
+/// common dir, or when the metadata is unreadable. Pure file reads, so it is
+/// portable and needs no git binary.
+fn main_worktree_of(start: &Path) -> Option<PathBuf> {
+    let top = start;
+    let dot_git = top.join(".git");
+    if dot_git.is_dir() {
+        return Some(top.to_path_buf());
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            if let Some(found) = walk_up_for_claude(parent) {
-                return Some(found);
-            }
-        }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = Path::new(text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim());
+    let gitdir = top.join(gitdir);
+    let common = match std::fs::read_to_string(gitdir.join("commondir")) {
+        Ok(rel) => gitdir.join(rel.trim()),
+        // `<main>/.git/worktrees/<name>` -> `<main>/.git`.
+        Err(_) => gitdir.parent()?.parent()?.to_path_buf(),
+    };
+    let common = std::fs::canonicalize(&common).ok()?;
+    if common.file_name().is_some_and(|name| name == ".git") {
+        common.parent().map(Path::to_path_buf)
+    } else {
+        None
     }
-    tracing::warn!("Unable to discover harness root containing .claude/; preamble disabled");
-    None
+}
+
+/// Test fixture: a main checkout at `<root>/main` and a git linked worktree of
+/// it at `<root>/sandbox` (git's own on-disk layout), both carrying the base
+/// preamble. Returns `(main, build_dir)` with `build_dir` the worktree's
+/// `crates/rsid`.
+#[cfg(test)]
+pub(crate) fn linked_worktree_fixture(root: &Path) -> (PathBuf, PathBuf) {
+    let main = root.join("main");
+    let sandbox = root.join("sandbox");
+    let admin = main.join(".git/worktrees/sandbox");
+    std::fs::create_dir_all(&admin).unwrap();
+    std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::write(
+        sandbox.join(".git"),
+        format!("gitdir: {}\n", admin.display()),
+    )
+    .unwrap();
+    for checkout in [&main, &sandbox] {
+        let shared = checkout.join(SHARED_DIR);
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join(BASE_FILENAME), "BASE").unwrap();
+    }
+    let build_dir = sandbox.join("crates/rsid");
+    std::fs::create_dir_all(&build_dir).unwrap();
+    (std::fs::canonicalize(&main).unwrap(), build_dir)
 }
 
 fn walk_up_for_claude(start: &Path) -> Option<PathBuf> {
@@ -1183,6 +1276,67 @@ mod tests {
         assert!(guidance.contains("`AgentGetStatus` / `rsi_control_status`"));
         assert!(!guidance.contains("## Appointed harness manager"));
         assert!(!guidance.contains("`AgentManagerControl`"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn harness_root_falls_back_to_the_build_repo_when_cwd_and_exe_are_elsewhere() {
+        let build = tempfile::tempdir().expect("build repo");
+        let shared = build.path().join(SHARED_DIR);
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join(BASE_FILENAME), "BASE").unwrap();
+        let crate_dir = build.path().join("crates/rsid");
+        std::fs::create_dir_all(&crate_dir).unwrap();
+        // Fixed paths: the test TMPDIR may itself sit inside a repo checkout.
+        let cwd = Path::new("/rsi-test-no-such-daemon-cwd");
+        let install = Path::new("/rsi-test-no-such-install");
+        let found = discover_harness_root_from(
+            Some(Path::new("/rsi-test-no-such-env-root")),
+            Some(cwd),
+            Some(install),
+            &crate_dir,
+            None,
+        );
+        assert_eq!(found.as_deref(), Some(build.path()));
+        // An operator-set root still wins over every fallback.
+        let operator = tempfile::tempdir().expect("operator root");
+        let op_shared = operator.path().join(SHARED_DIR);
+        std::fs::create_dir_all(&op_shared).unwrap();
+        std::fs::write(op_shared.join(BASE_FILENAME), "BASE").unwrap();
+        assert_eq!(
+            discover_harness_root_from(Some(operator.path()), Some(cwd), None, &crate_dir, None)
+                .as_deref(),
+            Some(operator.path())
+        );
+        // Nothing discoverable stays unresolved (typed refusal downstream).
+        assert_eq!(
+            discover_harness_root_from(None, Some(cwd), None, install, None),
+            None
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn harness_root_resolves_a_linked_worktree_build_dir_to_its_main_worktree() {
+        let tmp = tempfile::tempdir().expect("fixture root");
+        let (main, build_dir) = linked_worktree_fixture(tmp.path());
+        let cwd = Path::new("/rsi-test-no-such-daemon-cwd");
+        // Runtime resolution from the sandbox build dir alone.
+        assert_eq!(
+            discover_harness_root_from(None, Some(cwd), None, &build_dir, None).as_deref(),
+            Some(main.as_path())
+        );
+        // The build-time embedded main worktree wins, and survives the
+        // sandbox being reclaimed.
+        std::fs::remove_dir_all(tmp.path().join("sandbox")).unwrap();
+        assert_eq!(
+            discover_harness_root_from(None, Some(cwd), None, &build_dir, Some(&main)).as_deref(),
+            Some(main.as_path())
+        );
+        // A plain (non-linked) checkout keeps its own root.
+        assert_eq!(main_worktree_of(&main).as_deref(), Some(main.as_path()));
+        // Outside any repo nothing resolves.
+        assert_eq!(main_worktree_of(Path::new("/rsi-test-no-such-dir")), None);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]

@@ -52,9 +52,11 @@ impl SessionManager {
                     if !proved_dead {
                         let kill = tokio::time::timeout(Duration::from_secs(5), process.kill()).await;
                         let alive = process.is_alive();
+                        let orphan_store = std::sync::Arc::clone(&store);
                         #[cfg(target_os = "linux")]
                         let reap = tokio::task::spawn_blocking(move || {
-                            crate::session::reaper::reap_orphans_for_session(session_id)
+                            let turns = orphan_store.blocking_lock().list_active_provider_turn_custody()?;
+                            crate::session::reaper::reap_orphans_for_session(session_id, turns)
                         }).await.map_err(|error| DaemonError::Process(format!("question cleanup reaper join failed: {error}")))?;
                         #[cfg(not(target_os = "linux"))]
                         let reap: Result<usize> = Err(DaemonError::Process("question cleanup requires exact process-cohort proof".into()));

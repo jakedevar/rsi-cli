@@ -119,6 +119,8 @@ pub struct ModelDropdownState {
     pub filter_query: String,
     /// Printable keys edit the filter instead of invoking vim shortcuts.
     pub filter_editing: bool,
+    /// Cursor and selection in the filter under Standard editing (#1628).
+    pub filter_cursor: crate::field_edit::FieldEdit,
     /// Active provider for this dropdown instance.
     pub provider: rsi_common::types::SessionProvider,
     /// Index into custom providers (None = built-in provider).
@@ -142,6 +144,7 @@ impl ModelDropdownState {
             selected_index,
             filter_query: String::new(),
             filter_editing: false,
+            filter_cursor: crate::field_edit::FieldEdit::default(),
             provider,
             custom_provider_index: None,
             models,
@@ -266,6 +269,7 @@ impl Default for ModelDropdownState {
             selected_index: 0,
             filter_query: String::new(),
             filter_editing: false,
+            filter_cursor: crate::field_edit::FieldEdit::default(),
             provider: rsi_common::types::SessionProvider::Claude,
             custom_provider_index: None,
             models: Vec::new(),

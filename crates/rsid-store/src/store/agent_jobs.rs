@@ -908,6 +908,7 @@ mod tests {
                 release: false,
             }),
             JobParams::Test(TestJobParams {
+                scoped_test: None,
                 recipe: None,
                 shard: None,
                 filterset: None,

@@ -499,6 +499,68 @@ fn fence_for(tip: Uuid) -> ContinuationFenceV1 {
         epic: None,
         lead_generation: None,
         authority: ContinuationAuthorityV1::Automated,
+        observed_restart_cut: None,
+    }
+}
+
+/// A continuation that emits no event still invalidates the restart cursor.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn restart_cut_claim_refuses_an_invocation_change_without_an_event() {
+    let store = Store::open_in_memory().unwrap();
+    let tip = session(&store, None);
+    let (observed, cursor) = store.restart_cut_observation(tip).unwrap().unwrap();
+    assert_eq!(observed.status, cursor.status);
+    assert_eq!(observed.stop_reason, cursor.stop_reason);
+    let mut fence = fence_for(tip);
+    fence.observed_restart_cut = Some(cursor.clone());
+    store.claim_continuation_effect(&fence, &[]).unwrap();
+    store
+        .set_session_model_invocation(tip, Some(Uuid::new_v4()))
+        .unwrap();
+    assert_eq!(
+        store.conversation_max_sequence(tip).unwrap(),
+        cursor.event_sequence
+    );
+    let refused = store.claim_continuation_effect(&fence, &[]).unwrap_err();
+    assert_eq!(
+        crate::store::manager_actions::fence::continuation_fence_code(&refused),
+        Some(crate::store::manager_actions::fence::CONTINUATION_TURN_CHANGED)
+    );
+}
+
+/// Changes to classification alone must not authorize a stale restart resume.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn restart_cut_claim_revalidates_status_and_stop_reason() {
+    for change_status in [false, true] {
+        let store = Store::open_in_memory().unwrap();
+        let tip = session(&store, None);
+        let (_, cursor) = store.restart_cut_observation(tip).unwrap().unwrap();
+        let mut fence = fence_for(tip);
+        fence.observed_restart_cut = Some(cursor.clone());
+        if change_status {
+            store
+                .update_session_status(tip, rsi_common::types::SessionStatus::Completed)
+                .unwrap();
+        } else {
+            store
+                .conn
+                .execute(
+                    "UPDATE sessions SET stop_reason='operator_interrupt' WHERE id=?1",
+                    [tip.to_string()],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.conversation_max_sequence(tip).unwrap(),
+            cursor.event_sequence
+        );
+        let refused = store.claim_continuation_effect(&fence, &[]).unwrap_err();
+        assert_eq!(
+            crate::store::manager_actions::fence::continuation_fence_code(&refused),
+            Some(crate::store::manager_actions::fence::CONTINUATION_TURN_CHANGED)
+        );
     }
 }
 

@@ -693,13 +693,16 @@ impl RsiControlReadSessionEventsTool {
 
 /// The global manager verbs that have a native tool (#872 Slice B), plus
 /// the N-level routing verbs (#1238) and the node overview (#1240).
-pub(crate) const GLOBAL_NATIVE_VERBS: [AgentControlVerbV1; 6] = [
+pub(crate) const GLOBAL_NATIVE_VERBS: [AgentControlVerbV1; 8] = [
     AgentControlVerbV1::GlobalOverview,
     AgentControlVerbV1::GlobalSend,
     AgentControlVerbV1::ReportToGlobal,
     AgentControlVerbV1::ReportUp,
     AgentControlVerbV1::SendDown,
     AgentControlVerbV1::ManagerOverview,
+    // #1626: project administration for project managers and portfolio seats.
+    AgentControlVerbV1::CreateProject,
+    AgentControlVerbV1::UpdateProject,
 ];
 
 /// Run one native global-manager verb (#872 Slice B). Authority is checked by
@@ -742,6 +745,16 @@ pub(crate) async fn execute_global_verb(
         AgentControlVerbV1::ManagerOverview => serde_json::to_value(
             control
                 .agent_manager_overview(caller, serde_json::from_value(args).map_err(invalid)?)
+                .await?,
+        ),
+        AgentControlVerbV1::CreateProject => serde_json::to_value(
+            control
+                .agent_create_project(caller, serde_json::from_value(args).map_err(invalid)?)
+                .await?,
+        ),
+        AgentControlVerbV1::UpdateProject => serde_json::to_value(
+            control
+                .agent_update_project(caller, serde_json::from_value(args).map_err(invalid)?)
                 .await?,
         ),
         _ => {

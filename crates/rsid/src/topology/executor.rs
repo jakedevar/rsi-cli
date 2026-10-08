@@ -34,7 +34,12 @@ use crate::topology::custody::{
 use crate::topology::graph::{
     GraphShape, InstanceState, MAX_ATTEMPTS_PER_NODE, RegionDecision, RegionProgress,
 };
+use crate::topology::land::{LandEnqueue, LandRequest, LandStatus};
 use crate::topology::launch::NodeLaunchBuilder;
+use crate::topology::oncall;
+use crate::topology::review::{
+    ExtraRound, ExtraRoundRequest, OncallAcceptance, ReviewRequest, ReviewStatus,
+};
 use crate::topology::steps::WorkflowSteps;
 use crate::topology::store::{
     self as rows, AttemptRow, AttemptStatus, ExecutionRow, ExecutionStatus, NewAttempt, Settlement,
@@ -51,11 +56,91 @@ const ADVANCE_ROUNDS: usize = 32;
 /// Settled executions cleaned per settlement-cleanup pass.
 pub(crate) const CLEANUP_BATCH: usize = 64;
 
+/// The prompt a restart-cut node session continues with: the same words the
+/// restart journal's own continuation uses.
+const RESTART_RESUME_PROMPT: &str = "The daemon restarted after interrupting your active turn. Continue the task from its durable state.";
+
+/// How a restart resume of a node session ended (#1728).
+enum ResumeOutcome {
+    Continued,
+    Refused,
+    Deferred,
+}
+
 /// What the daemon observes about a node session.
 #[derive(Clone, Debug)]
 pub(crate) struct SessionObservation {
     pub(crate) status: SessionStatus,
     pub(crate) sandbox_root: Option<PathBuf>,
+    /// When the session entered its current wait on an answer, if the daemon
+    /// knows (#1704). `None` when it does not; the wait then starts at the
+    /// last moment the attempt was known not to be waiting.
+    pub(crate) waiting_since: Option<chrono::DateTime<Utc>>,
+    /// #1641 S4a: the provider supports resuming this exact session.
+    pub(crate) resumable: bool,
+    /// #1641 S4a: the daemon's restart journal still owns this session (a
+    /// deploy drain or graceful restart cut its turn and the startup pass has
+    /// not continued it yet). It is live, not ended.
+    pub(crate) restart_intent_pending: bool,
+    /// Why the session stopped, as the daemon recorded it.
+    pub(crate) stop_reason: Option<String>,
+    /// Cumulative milliseconds the session has spent in waits that already
+    /// ended (its own counter, which an answer or resume never clears). A wait
+    /// that began and ended between two observations leaves no open wait to
+    /// see, only this total (#1704). `None` when the daemon does not know.
+    pub(crate) waited_ms: Option<u64>,
+    /// #1728: classification, journal ownership and turn cursor read in
+    /// one store snapshot. Production recovery defers if this is unavailable.
+    pub(crate) restart_cut_fence: Option<crate::store::manager_actions::fence::RestartCutFenceV1>,
+}
+
+impl SessionObservation {
+    /// #1641 S4a: the session was cut off by a daemon restart rather than
+    /// ending on its own. A crash leaves it `Failed` with no recorded cause;
+    /// a graceful restart, a shutdown or a deploy drain leaves it
+    /// `Interrupted` with the restart cause. A session the restart journal
+    /// already tried (and refused) carries `daemon_restart_resume:..` and is
+    /// not retried here.
+    pub(crate) fn cut_by_restart(&self) -> bool {
+        let reason = self.stop_reason.as_deref().unwrap_or("").trim();
+        match self.status {
+            SessionStatus::Failed => reason.is_empty() || reason.starts_with("interrupted:"),
+            SessionStatus::Interrupted => matches!(
+                reason,
+                "interrupted:daemon_restart"
+                    | "interrupted:daemon_shutdown"
+                    | "interrupted:deploy_drain"
+            ),
+            _ => false,
+        }
+    }
+}
+
+/// One answer delivery to a parked node's session (#1715).
+#[derive(Clone, Debug)]
+pub(crate) struct AnswerContinuation {
+    pub(crate) session_id: Uuid,
+    pub(crate) prompt: String,
+    pub(crate) binding: crate::topology::store::AnswerBinding,
+}
+
+/// #1641 S4b: the `admission_hold` kind of a launch refused by the sandbox
+/// capacity gate (`launch.rs`, JSON-RPC code -32029), or `None` for any other
+/// error. A direct-root limit is `source_root_limit`; a free-space shortfall is
+/// `disk_floor`.
+pub(crate) fn admission_hold_kind(error: &DaemonError) -> Option<&'static str> {
+    let DaemonError::StructuredRpc {
+        rpc_code: -32029,
+        data,
+        ..
+    } = error
+    else {
+        return None;
+    };
+    Some(match data["code"].as_str() {
+        Some("source_root_limit") => "source_root_limit",
+        _ => "disk_floor",
+    })
 }
 
 /// One node launch: the reserved attempt's identity plus its launch config.
@@ -116,19 +201,156 @@ pub(crate) trait NodeEffects: Send + Sync + 'static {
         async {}
     }
     /// Host-load admission (#1417): `true` while the daemon holds this
-    /// attempt's launch because the host is too loaded for a manager's new
-    /// worker. The attempt stays `Reserved`, nothing is written and the driver
-    /// asks again on its next tick. `agent_requested` is false for an operator
-    /// execution, which is never held; `since` (the execution's age) orders
-    /// held launches oldest-first. Production forwards to the host-load gate;
-    /// the default never holds.
-    fn launch_held(
-        &self,
-        _agent_requested: bool,
-        _since: DateTime<Utc>,
-        _attempt: &AttemptRow,
-    ) -> bool {
+    /// attempt's launch because the host is too loaded for a new worker. The
+    /// attempt stays `Reserved`, nothing is written and the driver asks again
+    /// on its next tick. `unattended` is false only for the first launches of
+    /// an operator-requested execution (an operator start is immediate); every
+    /// later node of any execution is held like any other (#1641 S4b). `since`
+    /// (the execution's age) orders held launches oldest-first. Production
+    /// forwards to the host-load gate; the default never holds.
+    fn launch_held(&self, _unattended: bool, _since: DateTime<Utc>, _attempt: &AttemptRow) -> bool {
         false
+    }
+    /// #1641 S4b: a command node that runs cargo takes a governor build slot
+    /// (which also applies the disk floor, `min_free_disk_gb`) before it
+    /// starts. `Some(kind)` (`disk_floor` or `build_slot`) holds the attempt
+    /// `Reserved` until the slot is granted; the slot is kept for the attempt
+    /// until [`Self::release_build_slot`]. The default never holds.
+    fn build_slot_held(&self, _attempt: &AttemptRow) -> Option<&'static str> {
+        None
+    }
+    /// Release the build slot [`Self::build_slot_held`] granted (idempotent).
+    fn release_build_slot(&self, _attempt_id: Uuid) {}
+    /// Review nodes (#1641): open a review assignment for the commit under
+    /// review and return its id. Must be idempotent per `request.attempt_id`
+    /// so a crash between the request and its record never opens a second
+    /// assignment. The default refuses: a daemon without a review service
+    /// blocks the node (`review_unsettled`) instead of waiting forever.
+    fn request_review(&self, _request: ReviewRequest) -> impl Future<Output = Result<Uuid>> + Send {
+        async {
+            Err(DaemonError::PolicyDenied(
+                "the review service is not wired to topology review nodes".into(),
+            ))
+        }
+    }
+    /// Review nodes: the assignment's current verdict, re-derived from
+    /// durable state on every call (never cached).
+    fn review_status(&self, _assignment_id: Uuid) -> impl Future<Output = ReviewStatus> + Send {
+        async { ReviewStatus::Unsettled("review_service_unavailable".into()) }
+    }
+    /// Review nodes (#1715): whether one more round of an exhausted review is
+    /// policy-valid, re-derived from the review ledger. The default offers the
+    /// node's own reviewer; production applies the store's closure-specialist
+    /// and round-budget rules.
+    fn review_extra_round(
+        &self,
+        _request: ExtraRoundRequest,
+    ) -> impl Future<Output = ExtraRound> + Send {
+        async { ExtraRound::Same }
+    }
+    /// Review nodes (#1740): record the on-call manager's `accept` ruling on an
+    /// exhausted review as a review-ledger fact for that assignment and exact
+    /// commit, so the land node's admission re-check admits it. Idempotent.
+    /// The default refuses: without a review ledger the ruling cannot admit
+    /// a landing, so the node blocks instead of routing to a refused land.
+    fn record_oncall_acceptance(
+        &self,
+        _acceptance: OncallAcceptance,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async {
+            Err(DaemonError::PolicyDenied(
+                "the review ledger is not wired to topology review nodes".into(),
+            ))
+        }
+    }
+    /// Land nodes (#1641 S2): the merge-queue entry an earlier incarnation
+    /// already created for this landing (found by its replay key), if any.
+    /// A crash between the enqueue and its record must adopt it, never
+    /// enqueue or abandon a second.
+    fn find_land_entry(&self, _request: &LandRequest) -> impl Future<Output = Option<Uuid>> + Send {
+        async { None }
+    }
+    /// Land nodes: enqueue the accepted commit on the merge queue on behalf
+    /// of the execution's owner, re-checking the acceptance and the owner's
+    /// authority first. Idempotent per `request.dedup_key`. The default
+    /// refuses: a daemon without a merge queue fails the node instead of
+    /// waiting forever. An `Err` is transient and asked again next tick.
+    fn enqueue_land(
+        &self,
+        _request: LandRequest,
+    ) -> impl Future<Output = Result<LandEnqueue>> + Send {
+        async {
+            Ok(LandEnqueue::Refused(
+                "the merge queue is not wired to topology land nodes".into(),
+            ))
+        }
+    }
+    /// Land nodes: the queue entry's current state, re-derived from the
+    /// queue on every call (never cached).
+    fn land_status(&self, _entry_id: Uuid) -> impl Future<Output = LandStatus> + Send {
+        async {
+            LandStatus::Refused {
+                state: "unavailable".into(),
+                reason: "merge_queue_unavailable".into(),
+            }
+        }
+    }
+    /// #1641 S3a: one operator attention message (the daemon's system
+    /// message bus). Called once per transition into a visible wait, never
+    /// per tick. The default drops it.
+    fn notify_operator(&self, _level: &str, _message: String) {}
+
+    /// #1641 S3c / #1715: deliver a ruling's answer to the node's own
+    /// (finished) session through the continue path, bound to the exact
+    /// execution, attempt and decision. The continuation rechecks the binding
+    /// under the session's spawn guard and durably claims the delivery before
+    /// the provider effect, so cancellation, the deadline or a supersession
+    /// stop it and a crash after the effect never repeats it. The default
+    /// refuses, so a daemon without a provider path blocks the waiting node
+    /// visibly instead of hanging.
+    fn continue_with_answer(
+        &self,
+        _request: AnswerContinuation,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async {
+            Err(DaemonError::InvalidParam(
+                "this daemon cannot continue a topology node session".into(),
+            ))
+        }
+    }
+
+    /// #1641 S3c: continue the node's own (finished) session with `prompt`,
+    /// the normal continue path. The default refuses, so a daemon without a
+    /// provider path blocks the waiting node visibly instead of hanging.
+    fn continue_session(
+        &self,
+        _session_id: Uuid,
+        _prompt: String,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async {
+            Err(DaemonError::InvalidParam(
+                "this daemon cannot continue a topology node session".into(),
+            ))
+        }
+    }
+
+    /// #1728: continue a node session a daemon restart cut off. Production
+    /// takes the same fenced path as every other automated continuation
+    /// (published tip, spawn guard, effect claim), so an operator continuation
+    /// of the same session that got there first refuses this one with the
+    /// typed `continuation_target_busy` instead of racing it. The default is
+    /// the plain continuation. `observed_restart_cut` carries the classification
+    /// and cursor from the same snapshot: the
+    /// continuation refuses `continuation_turn_changed` under the spawn guard
+    /// if the session's conversation moved since (a competing continuation
+    /// started and finished in between).
+    fn resume_cut_session(
+        &self,
+        session_id: Uuid,
+        prompt: String,
+        _observed_restart_cut: Option<crate::store::manager_actions::fence::RestartCutFenceV1>,
+    ) -> impl Future<Output = Result<()>> + Send {
+        self.continue_session(session_id, prompt)
     }
 }
 
@@ -260,6 +482,11 @@ fn retry_due(
         Some(failure::LOST_BEFORE_SESSION | failure::LOST_AFTER_SESSION | failure::INTERRUPTED) => {
             count(&failure::INFRASTRUCTURE) < MAX_ATTEMPTS_PER_NODE as usize
         }
+        // A review with no usable verdict earns exactly one new assignment;
+        // the second one blocks (settled as `blocked`, never reaching here).
+        Some(failure::REVIEW_UNSETTLED) => count(&[failure::REVIEW_UNSETTLED]) <= 1,
+        // "One more round" from the on-call manager reopens the review once.
+        Some(failure::REVIEW_REOPENED) => count(&[failure::REVIEW_REOPENED]) <= 1,
         // Node failures keep the legacy `FailurePolicy::Retry` budget
         // exactly (`repeat_policy.max_iterations`, default 1 retry): the
         // kill switch must not change an ordinary workflow's behaviour.
@@ -328,9 +555,20 @@ fn edge_taken(
                     .and_then(Value::as_bool)
                     == Some(when == EdgeWhen::GateTrue)
             }
-            EdgeWhen::Failure | EdgeWhen::VerdictAccepted | EdgeWhen::VerdictChangesRequested => {
-                false
+            EdgeWhen::VerdictAccepted | EdgeWhen::VerdictChangesRequested => {
+                let verdict = if when == EdgeWhen::VerdictAccepted {
+                    "accepted"
+                } else {
+                    "changes_requested"
+                };
+                index
+                    .result(&edge.source, at)
+                    .and_then(|attempt| attempt.output.as_ref())
+                    .and_then(|output| output.pointer("/fields/verdict"))
+                    .and_then(Value::as_str)
+                    == Some(verdict)
             }
+            EdgeWhen::Failure => false,
         },
         // Legacy `FailurePolicy::Skip`: downstream still runs.
         InstanceState::Skipped => when == EdgeWhen::Success,
@@ -369,6 +607,9 @@ fn render_upstream(output: &NodeData, pass_content: bool) -> String {
             continue;
         }
         match value {
+            GraphValue::List(items) if key == "findings" => {
+                lines.push(crate::topology::review::render_findings(items));
+            }
             GraphValue::String(text) if text.contains('\n') => {
                 lines.push(format!("{key}:\n```\n{}\n```", text.trim_end()));
             }
@@ -492,7 +733,10 @@ impl<E: NodeEffects> Executor<E> {
             .filter(|attempt| attempt.status.in_flight())
             .filter(|attempt| {
                 execution.status != ExecutionStatus::Blocked
-                    || attempt.status == AttemptStatus::Running
+                    || matches!(
+                        attempt.status,
+                        AttemptStatus::Running | AttemptStatus::Waiting
+                    )
             })
             .collect();
         let mut changed = false;
@@ -1021,12 +1265,20 @@ impl<E: NodeEffects> Executor<E> {
             }
         };
         let input = if shape.is_source(node_id) {
-            let mut input = execution
-                .input
-                .clone()
-                .and_then(|value| serde_json::from_value::<NodeData>(value).ok())
-                .unwrap_or_default();
+            let mut input = crate::topology::starters::source_input(execution.input.as_ref());
             input.remove("base_commit");
+            // The on-call seat is the executor's, not the node's.
+            input.remove(rsi_common::topology_agent::ON_CALL_INPUT_KEY);
+            // #1641 S5a: the accepted Issue snapshot reads as the Issue.
+            if let Some(issue) = input
+                .get(crate::topology::starters::ISSUE_INPUT_KEY)
+                .and_then(crate::topology::starters::render_issue)
+            {
+                input.insert(
+                    crate::topology::starters::ISSUE_INPUT_KEY,
+                    GraphValue::String(issue),
+                );
+            }
             input
         } else {
             // Typed downstream rendering (plan §3): one section per taken
@@ -1096,6 +1348,16 @@ impl<E: NodeEffects> Executor<E> {
         region: usize,
         iteration: u32,
     ) -> Result<()> {
+        // An accepted review ends its fix loop: nothing is left to change.
+        let review_accepted = shape.region_nodes(region).iter().any(|node| {
+            shape.steps().is_review(node)
+                && index
+                    .result(node, iteration)
+                    .and_then(|attempt| attempt.output.as_ref())
+                    .and_then(|output| output.pointer("/fields/verdict"))
+                    .and_then(Value::as_str)
+                    == Some("accepted")
+        });
         let mut lead_halted = false;
         for attempt in shape
             .region_nodes(region)
@@ -1110,9 +1372,13 @@ impl<E: NodeEffects> Executor<E> {
             }
             _ => false,
         };
-        let decision = match shape.decide_region(region, iteration, lead_halted, predicate_met) {
-            RegionDecision::Continue => "continue".to_owned(),
-            RegionDecision::Halt(reason) => format!("halt:{reason}"),
+        let decision = if review_accepted {
+            "halt:review_accepted".to_owned()
+        } else {
+            match shape.decide_region(region, iteration, lead_halted, predicate_met) {
+                RegionDecision::Continue => "continue".to_owned(),
+                RegionDecision::Halt(reason) => format!("halt:{reason}"),
+            }
         };
         let update = {
             let store = self.store.lock().await;
@@ -1162,6 +1428,10 @@ impl<E: NodeEffects> Executor<E> {
             let store = self.store.lock().await;
             rows::settle_attempt(&store, execution.id, attempt, status, &settlement)?
         };
+        if attempt.node_kind == "command" {
+            // #1641 S4b: a settled command never keeps its governor slot.
+            self.effects.release_build_slot(attempt.id);
+        }
         self.publish([update]);
         Ok(())
     }
@@ -1171,6 +1441,12 @@ impl<E: NodeEffects> Executor<E> {
     async fn drive_attempt(&self, execution: &ExecutionRow, attempt: &AttemptRow) -> Result<bool> {
         if attempt.node_kind == "command" {
             return self.drive_command(execution, attempt).await;
+        }
+        if attempt.node_kind == "review" {
+            return self.drive_review(execution, attempt).await;
+        }
+        if attempt.node_kind == "land" {
+            return self.drive_land(execution, attempt).await;
         }
         match attempt.status {
             AttemptStatus::Reserved | AttemptStatus::Launching => {
@@ -1193,6 +1469,9 @@ impl<E: NodeEffects> Executor<E> {
                 self.launch_attempt(execution, attempt).await
             }
             AttemptStatus::Running => self.observe_attempt(execution, attempt).await,
+            // A session that ended with a question waits for the on-call ruling
+            // (#1641 S3c).
+            AttemptStatus::Waiting => self.drive_session_decision(execution, attempt).await,
             _ => Ok(false),
         }
     }
@@ -1225,10 +1504,16 @@ impl<E: NodeEffects> Executor<E> {
             // Retries and recovery of a launch already in progress continue
             // admitted work. Check spent invocation keys before consulting the
             // hold, so a lost launch can settle even while the host is busy.
+            // #1641 S4b: the hold covers every execution's later nodes; only
+            // the first launches of an operator-requested execution are
+            // immediate (nothing has settled yet).
             if attempt.attempt_no == 1
                 && attempt.status == AttemptStatus::Reserved
                 && self.effects.launch_held(
-                    execution.agent_requested(),
+                    execution.agent_requested()
+                        || rows::load_attempts(&store, execution.id)?
+                            .iter()
+                            .any(|other| !other.status.in_flight()),
                     execution.created_at,
                     attempt,
                 )
@@ -1287,6 +1572,12 @@ impl<E: NodeEffects> Executor<E> {
             Err(error) => {
                 if let Some(observed) = self.effects.session(attempt.session_id).await {
                     self.adopt(execution, attempt, observed).await?;
+                } else if let Some(kind) = admission_hold_kind(&error) {
+                    // #1641 S4b: capacity pressure (-32029) is a delay, never
+                    // a failure: the sandbox gate refused before any session
+                    // or invocation existed, so the attempt returns to
+                    // `Reserved` and the next tick launches it again.
+                    return self.hold_attempt(execution, attempt, kind).await;
                 } else {
                     self.settle(
                         execution,
@@ -1303,6 +1594,26 @@ impl<E: NodeEffects> Executor<E> {
             }
         }
         Ok(true)
+    }
+
+    /// #1641 S4b: return a launching attempt to `Reserved` because resource
+    /// pressure refused it, and record one `admission_hold{kind}` event per
+    /// transition (a tick that finds it still held writes nothing). Returns
+    /// whether a durable row changed.
+    pub(crate) async fn hold_attempt(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+        kind: &str,
+    ) -> Result<bool> {
+        let update = {
+            let store = self.store.lock().await;
+            rows::release_launching(&store, attempt.id)?;
+            rows::note_admission_hold(&store, execution.id, attempt, kind)?
+        };
+        let changed = update.is_some();
+        self.publish(update);
+        Ok(changed)
     }
 
     async fn adopt(
@@ -1383,10 +1694,63 @@ impl<E: NodeEffects> Executor<E> {
         }
         let sandbox = observed
             .sandbox_root
+            .clone()
             .or_else(|| attempt.sandbox_root.clone());
+        // A session that waits on a human answer needs the on-call manager.
+        let waiting = observed.status == SessionStatus::WaitingApproval;
+        self.reconcile_on_call(execution, attempt, waiting).await?;
+        let paused = self
+            .account_node_wait(
+                execution,
+                attempt,
+                waiting,
+                observed.waiting_since,
+                observed.waited_ms,
+            )
+            .await?;
+        // The restart journal owns a session it cut off (deploy drain or
+        // graceful restart) and continues it at startup: live, never settled.
+        let journal_owned = observed.restart_intent_pending
+            && matches!(
+                observed.status,
+                SessionStatus::Interrupted | SessionStatus::Failed
+            );
+        // A crash or an unjournaled restart cut: continue the same session
+        // once for this boot instead of preserving or retrying it.
+        if previous_boot
+            && !journal_owned
+            && observed.resumable
+            && observed.cut_by_restart()
+            && execution.status != ExecutionStatus::Cancelling
+        {
+            match self
+                .resume_after_restart(execution, attempt, observed.restart_cut_fence)
+                .await?
+            {
+                ResumeOutcome::Continued => return Ok(true),
+                ResumeOutcome::Deferred => return Ok(false),
+                ResumeOutcome::Refused => {}
+            }
+        }
         let (status, settlement) = match observed.status {
-            status if !status.is_terminal() => return self.observe_live(execution, attempt).await,
-            SessionStatus::Completed => self.observe_completed(execution, attempt, sandbox).await?,
+            // A cancelling execution does not wait on the journal: the
+            // session is terminal, so there is nothing to interrupt and the
+            // attempt settles `cancelled` (the journal row is left alone).
+            status
+                if !status.is_terminal()
+                    || (journal_owned && execution.status != ExecutionStatus::Cancelling) =>
+            {
+                return self.observe_live(execution, attempt, paused).await;
+            }
+            SessionStatus::Completed => {
+                let observed = self.observe_completed(execution, attempt, sandbox).await?;
+                if observed.0 == AttemptStatus::Waiting {
+                    // Parked on a question for the on-call manager; nothing
+                    // to settle.
+                    return Ok(true);
+                }
+                observed
+            }
             SessionStatus::Failed if !previous_boot => (
                 AttemptStatus::Failed,
                 failed(failure::SESSION_FAILED, "node session failed"),
@@ -1413,18 +1777,221 @@ impl<E: NodeEffects> Executor<E> {
         Ok(true)
     }
 
-    /// A live session: interrupt it while cancelling, or bound its wall time.
-    async fn observe_live(&self, execution: &ExecutionRow, attempt: &AttemptRow) -> Result<bool> {
+    /// #1641 S4a: continue the node's own session, cut off by a restart this
+    /// attempt's previous boot never saw end, through the normal continue path
+    /// with the daemon's restart prompt. At most once per attempt per boot.
+    /// `Continued`: the attempt stays `running` (`node_resumed_after_restart`).
+    /// `Refused`: already tried this boot, or the continuation was refused
+    /// (`node_resume_refused`); the caller falls back to the preserve/retry
+    /// of plan §3.4. `Deferred`: a competing continuation owns the session
+    /// (#1728); the attempt is left as it is.
+    async fn resume_after_restart(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+        observed_restart_cut: Option<crate::store::manager_actions::fence::RestartCutFenceV1>,
+    ) -> Result<ResumeOutcome> {
+        if rows::node_resume_tried(&*self.store.lock().await, attempt.id, self.boot_id)? {
+            return Ok(ResumeOutcome::Refused);
+        }
+        let outcome = self
+            .effects
+            .resume_cut_session(
+                attempt.session_id,
+                rsi_common::daemon_message::wrap("daemon-restart", RESTART_RESUME_PROMPT),
+                observed_restart_cut,
+            )
+            .await;
+        // Another continuation already owns the session (an operator got
+        // there first), or has run since this observation (the turn cursor
+        // moved): the observation is stale, so nothing is recorded, nothing
+        // is preserved and the next observation follows the session.
+        if outcome.as_ref().err().is_some_and(|error| {
+            use crate::store::manager_actions::fence::{
+                CONTINUATION_TARGET_BUSY, CONTINUATION_TURN_CHANGED, continuation_fence_code,
+            };
+            matches!(
+                continuation_fence_code(error),
+                Some(CONTINUATION_TARGET_BUSY | CONTINUATION_TURN_CHANGED)
+            )
+        }) {
+            tracing::info!(
+                execution_id = %execution.id,
+                node = %attempt.node_id,
+                session_id = %attempt.session_id,
+                "restart resume of a topology node session deferred: another continuation owns it"
+            );
+            return Ok(ResumeOutcome::Deferred);
+        }
+        let reason = outcome.as_ref().err().map(ToString::to_string);
+        let update = {
+            let store = self.store.lock().await;
+            rows::record_node_resume(
+                &store,
+                execution.id,
+                &attempt.node_id,
+                attempt.id,
+                self.boot_id,
+                match &reason {
+                    None => Ok(()),
+                    Some(reason) => Err(reason.as_str()),
+                },
+            )?
+        };
+        self.publish([update]);
+        if let Some(reason) = reason {
+            tracing::warn!(
+                execution_id = %execution.id,
+                node = %attempt.node_id,
+                session_id = %attempt.session_id,
+                %reason,
+                "restart resume of a topology node session refused; preserving instead"
+            );
+        }
+        Ok(if outcome.is_ok() {
+            ResumeOutcome::Continued
+        } else {
+            ResumeOutcome::Refused
+        })
+    }
+
+    /// #1641 S3a: a node that needs the on-call manager (its session waits on
+    /// an answer) while no seat is live records one `on_call_unavailable`
+    /// event, one operator attention message and a snapshot `waiting`; the
+    /// matching `on_call_restored` clears it when a seat is live again or the
+    /// node stops needing one. Resolved from rows every tick, once per
+    /// transition. Nothing here changes the attempt.
+    pub(crate) async fn reconcile_on_call(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+        needs: bool,
+    ) -> Result<()> {
+        let needs = needs && execution.status != ExecutionStatus::Cancelling;
+        let seat = oncall::seat_of(execution.input.as_ref());
+        let (update, unavailable) = {
+            let store = self.store.lock().await;
+            let waiting = rows::on_call_waits(&store, execution.id)?
+                .iter()
+                .any(|wait| wait.node_id == attempt.node_id);
+            if !needs && !waiting {
+                return Ok(());
+            }
+            let resolved = oncall::resolve(&store, execution.project_id, &seat)?;
+            match (needs, resolved) {
+                (true, oncall::OnCall::Unavailable { reason }) => (
+                    rows::record_on_call_unavailable(
+                        &store,
+                        execution.id,
+                        &attempt.node_id,
+                        attempt.id,
+                        reason,
+                        &seat,
+                    )?,
+                    Some(reason),
+                ),
+                (true, oncall::OnCall::Live { .. }) => (
+                    rows::record_on_call_restored(
+                        &store,
+                        execution.id,
+                        &attempt.node_id,
+                        "on_call_live",
+                    )?,
+                    None,
+                ),
+                (false, _) => (
+                    rows::record_on_call_restored(
+                        &store,
+                        execution.id,
+                        &attempt.node_id,
+                        "no_longer_needed",
+                    )?,
+                    None,
+                ),
+            }
+        };
+        let Some(update) = update else {
+            return Ok(());
+        };
+        self.publish([update]);
+        if let Some(reason) = unavailable {
+            self.effects.notify_operator(
+                "warn",
+                format!(
+                    "Topology execution {} ({}): node '{}' needs the on-call manager and none is \
+                     live ({reason}). It waits until a seat is live; answer its question \
+                     yourself or restore the manager.",
+                    execution.id, execution.name, attempt.node_id
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    /// #1641 S3b: open or close the attempt's wait on an answer and return the
+    /// time already spent waiting. The node wall clock pauses for it: a node
+    /// that waits for the on-call manager is not running, so the wait must not
+    /// spend the node's wall time.
+    pub(crate) async fn account_node_wait(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+        waiting: bool,
+        waiting_since: Option<chrono::DateTime<Utc>>,
+        session_waited_ms: Option<u64>,
+    ) -> Result<chrono::TimeDelta> {
+        // The idle-session stall timer must not end a deliberate wait.
+        oncall::note_answer_wait(attempt.session_id, waiting);
+        let (updates, waited) = {
+            let store = self.store.lock().await;
+            // Waits the session finished between two observations left no
+            // open wait; its own total still has them (#1704).
+            let mut updates = vec![rows::record_node_waits_between_observations(
+                &store,
+                execution.id,
+                &attempt.node_id,
+                attempt.id,
+                session_waited_ms,
+            )?];
+            updates.push(if waiting {
+                // The wait began when the session started waiting, which may
+                // be before this first observation of it (#1704).
+                rows::record_node_wait_started(
+                    &store,
+                    execution.id,
+                    &attempt.node_id,
+                    attempt.id,
+                    waiting_since,
+                    attempt.started_at.unwrap_or(execution.created_at),
+                )?
+            } else {
+                rows::record_node_wait_ended(
+                    &store,
+                    execution.id,
+                    &attempt.node_id,
+                    attempt.id,
+                    session_waited_ms,
+                )?
+            });
+            (updates, rows::node_waited(&store, attempt.id)?)
+        };
+        self.publish(updates.into_iter().flatten());
+        Ok(waited.total(Utc::now()))
+    }
+
+    /// A live session: interrupt it while cancelling, or bound its wall time
+    /// (less the time it spent waiting on an answer).
+    async fn observe_live(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+        paused: chrono::TimeDelta,
+    ) -> Result<bool> {
         if execution.status == ExecutionStatus::Cancelling {
             self.effects.interrupt(attempt.session_id).await;
             return Ok(false);
         }
-        let started = attempt.started_at.unwrap_or(execution.created_at);
-        let wall_deadline = started + SESSION_WALL_TIME;
-        let deadline = execution
-            .deadline_at
-            .map_or(wall_deadline, |deadline| deadline.min(wall_deadline));
-        if Utc::now() < deadline {
+        if !wall_time_expired_after(execution, attempt, paused) {
             return Ok(false);
         }
         self.effects.interrupt(attempt.session_id).await;
@@ -1468,6 +2035,11 @@ impl<E: NodeEffects> Executor<E> {
             }
         };
         if observed.dirty {
+            // A node that asks a question mid-work keeps its sandbox as it is:
+            // the same session continues in it after the ruling (#1641 S3c).
+            if self.parks_on_question(execution, attempt).await? {
+                return Ok((AttemptStatus::Waiting, Settlement::default()));
+            }
             // T1's `uncommitted_work` is preserved work, never discarded.
             return Ok(Self::preserve(execution, attempt, &sandbox));
         }
@@ -1493,6 +2065,12 @@ impl<E: NodeEffects> Executor<E> {
             }
         };
         if handoff.strict_status != PipelineStatusV2::Complete {
+            if self
+                .park_on_blocker_question(execution, attempt, &handoff, &content)
+                .await?
+            {
+                return Ok((AttemptStatus::Waiting, Settlement::default()));
+            }
             return Ok((
                 AttemptStatus::Blocked,
                 Settlement {
@@ -1602,6 +2180,28 @@ impl<E: NodeEffects> Executor<E> {
                 ..Settlement::default()
             },
         ))
+    }
+
+    /// Whether a finished session with a dirty sandbox ended on a BLOCKED
+    /// handoff that names a question, and was parked on a decision for it.
+    async fn parks_on_question(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+    ) -> Result<bool> {
+        let output = self.effects.output(attempt.session_id).await?;
+        let Some(GraphValue::String(content)) = output.get("content") else {
+            return Ok(false);
+        };
+        let content = content.clone();
+        let Ok(handoff) = parse_pipeline_handoff_v2(&content, "") else {
+            return Ok(false);
+        };
+        if handoff.strict_status == PipelineStatusV2::Complete {
+            return Ok(false);
+        }
+        self.park_on_blocker_question(execution, attempt, &handoff, &content)
+            .await
     }
 
     /// An interrupted or lost session: diverged work is preserved and blocks;
@@ -1721,6 +2321,26 @@ impl<E: NodeEffects> Executor<E> {
         .await?;
         Ok(Some(execution.status))
     }
+}
+
+/// Whether the attempt outlived its node wall time or the execution deadline.
+pub(crate) fn wall_time_expired(execution: &ExecutionRow, attempt: &AttemptRow) -> bool {
+    wall_time_expired_after(execution, attempt, chrono::TimeDelta::zero())
+}
+
+/// `wall_time_expired` with the node's paused (waiting-on-an-answer) time added
+/// to its own wall deadline; the execution deadline stays absolute.
+pub(crate) fn wall_time_expired_after(
+    execution: &ExecutionRow,
+    attempt: &AttemptRow,
+    paused: chrono::TimeDelta,
+) -> bool {
+    let started = attempt.started_at.unwrap_or(execution.created_at);
+    let wall_deadline = started + SESSION_WALL_TIME + paused;
+    let deadline = execution
+        .deadline_at
+        .map_or(wall_deadline, |deadline| deadline.min(wall_deadline));
+    Utc::now() >= deadline
 }
 
 pub(crate) fn failed(class: &'static str, error: &str) -> Settlement {

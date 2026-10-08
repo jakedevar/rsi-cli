@@ -14,6 +14,10 @@ use std::cell::Cell;
 use std::path::Path;
 use tui_textarea::CursorMove;
 
+mod standard;
+
+pub(crate) use standard::{enter_standard, has_selection, selected_text};
+
 /// Full context from a prompt compilation, preserved for persistence.
 #[derive(Debug, Clone)]
 pub struct CompileContext {
@@ -55,6 +59,14 @@ pub struct InputSurface {
     /// Render width of the textarea area, set each frame by the render function.
     /// Used by insert-mode auto-wrap to break long lines into real buffer lines.
     pub wrap_width: Cell<usize>,
+    /// Standard (non-modal) editing is active for this surface (#1628). The
+    /// owner sets it before each key from the operator's `editing_mode`; it
+    /// is `false` for every Vim surface, so Vim behaviour is untouched.
+    pub standard_editing: bool,
+    /// Where the composer text was last drawn: the text area and the scroll
+    /// offset in wrapped rows. Set by the renderer so a mouse click can be
+    /// mapped back to a buffer position.
+    pub text_geometry: Cell<Option<(ratatui::layout::Rect, u16)>>,
 }
 
 impl Default for InputSurface {
@@ -75,6 +87,8 @@ impl Default for InputSurface {
             corrected_preview: None,
             corrected_compile_context: None,
             wrap_width: Cell::new(0),
+            standard_editing: false,
+            text_geometry: Cell::new(None),
         }
     }
 }
@@ -150,7 +164,11 @@ impl InputSurface {
         textarea.set_cursor_line_style(ratatui::style::Style::default());
         textarea.set_block(ratatui::widgets::Block::default());
         *self.textarea = textarea;
-        self.mode = PopupMode::Normal;
+        self.mode = if self.standard_editing {
+            PopupMode::Insert
+        } else {
+            PopupMode::Normal
+        };
         self.vim_state.reset_transient();
         self.suggestions_visible = false;
         self.filtered_indices.clear();
@@ -225,6 +243,10 @@ pub struct InputSurfaceConfig<'a> {
     /// When false, only Ctrl+Enter submits and plain Enter inserts a newline (legacy).
     /// Ctrl+Enter from any mode always submits regardless of this flag.
     pub submit_on_enter: bool,
+    /// Standard (non-modal) editing instead of the vim modes (#1628). Owners
+    /// pass the operator's live `editing_mode` on every key, so a settings
+    /// change applies on the next key.
+    pub standard_editing: bool,
 }
 
 /// Process a key event through the InputSurface.
@@ -241,6 +263,8 @@ pub fn handle_key(
     key: KeyEvent,
     config: &InputSurfaceConfig<'_>,
 ) -> InputAction {
+    surface.standard_editing = config.standard_editing;
+
     // 1. Ctrl+Enter submits from any mode (even if empty — caller decides behavior)
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Enter {
         let content = surface.content_for_send();
@@ -286,7 +310,12 @@ pub fn handle_key(
         }
     }
 
-    // 3. Mode-specific handling
+    // 3. Standard (non-modal) editing replaces both vim modes (#1628).
+    if surface.standard_editing {
+        return standard::handle_standard_key(surface, key, config);
+    }
+
+    // 4. Mode-specific handling
     match surface.mode {
         PopupMode::Insert => handle_insert_mode(surface, key, config),
         PopupMode::Normal => handle_normal_mode(surface, key, config),
@@ -309,36 +338,8 @@ fn handle_insert_mode(
         return InputAction::Close;
     }
 
-    // Suggestion navigation when visible. Plain Enter follows the surface's
-    // primary action (submit/newline); Tab is the explicit accept chord.
-    if surface.suggestions_visible {
-        match key.code {
-            KeyCode::Esc => {
-                surface.suggestions_visible = false;
-                return InputAction::Consumed;
-            }
-            KeyCode::Tab => {
-                accept_suggestion(surface, config.available_commands, config.working_dir);
-                return InputAction::Consumed;
-            }
-            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                move_suggestion_selection(surface, 1);
-                return InputAction::Consumed;
-            }
-            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                move_suggestion_selection(surface, -1);
-                return InputAction::Consumed;
-            }
-            KeyCode::Down => {
-                move_suggestion_selection(surface, 1);
-                return InputAction::Consumed;
-            }
-            KeyCode::Up => {
-                move_suggestion_selection(surface, -1);
-                return InputAction::Consumed;
-            }
-            _ => {} // Fall through to normal input
-        }
+    if let Some(action) = handle_suggestion_keys(surface, key, config) {
+        return action;
     }
 
     // Plain Enter submits when submit_on_enter is true (and suggestion popup is
@@ -421,6 +422,46 @@ fn handle_insert_mode(
     update_suggestions(surface, config.available_commands, config.working_dir);
 
     InputAction::Consumed
+}
+
+/// Suggestion-popup keys shared by the vim insert handler and the standard
+/// handler. Plain Enter follows the surface's primary action (submit/newline);
+/// Tab is the explicit accept chord. `None` means the key is not a popup key.
+fn handle_suggestion_keys(
+    surface: &mut InputSurface,
+    key: KeyEvent,
+    config: &InputSurfaceConfig<'_>,
+) -> Option<InputAction> {
+    if !surface.suggestions_visible {
+        return None;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            surface.suggestions_visible = false;
+            Some(InputAction::Consumed)
+        }
+        KeyCode::Tab => {
+            accept_suggestion(surface, config.available_commands, config.working_dir);
+            Some(InputAction::Consumed)
+        }
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            move_suggestion_selection(surface, 1);
+            Some(InputAction::Consumed)
+        }
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            move_suggestion_selection(surface, -1);
+            Some(InputAction::Consumed)
+        }
+        KeyCode::Down => {
+            move_suggestion_selection(surface, 1);
+            Some(InputAction::Consumed)
+        }
+        KeyCode::Up => {
+            move_suggestion_selection(surface, -1);
+            Some(InputAction::Consumed)
+        }
+        _ => None, // Fall through to normal input
+    }
 }
 
 /// Handle keys in normal mode.
@@ -672,6 +713,7 @@ mod tests {
             available_commands: &[],
             working_dir: None,
             submit_on_enter: true,
+            standard_editing: false,
         }
     }
 
@@ -681,6 +723,7 @@ mod tests {
             available_commands: &[],
             working_dir: None,
             submit_on_enter: true,
+            standard_editing: false,
         }
     }
 
@@ -691,6 +734,7 @@ mod tests {
             available_commands: &[],
             working_dir: None,
             submit_on_enter: false,
+            standard_editing: false,
         }
     }
 
@@ -1113,6 +1157,7 @@ mod tests {
             available_commands: &commands,
             working_dir: None,
             submit_on_enter: true,
+            standard_editing: false,
         };
 
         handle_key(&mut surface, key(KeyCode::Char('/')), &config);

@@ -5621,6 +5621,8 @@ pub enum CursorStyle {
     Block,
 }
 
+/// Returns the vertical scroll (in wrapped rows) the text was drawn at, so a
+/// click can be mapped back to a buffer position.
 pub fn render_wrapped_textarea(
     frame: &mut Frame,
     area: Rect,
@@ -5628,10 +5630,10 @@ pub fn render_wrapped_textarea(
     cursor_style: CursorStyle,
     visual_selection: Option<((usize, usize), (usize, usize))>,
     background: Color,
-) {
+) -> u16 {
     let width = area.width as usize;
     if width == 0 || area.height == 0 {
-        return;
+        return 0;
     }
 
     let logical_lines = textarea.lines();
@@ -5936,6 +5938,104 @@ pub fn render_wrapped_textarea(
             }
         }
     }
+    scroll_offset
+}
+
+/// The selection a surface draws: the Standard selection, or the Vim visual
+/// selection while one is active (#1628).
+pub(crate) fn surface_selection_for_render(
+    surface: &crate::input_surface::InputSurface,
+) -> Option<((usize, usize), (usize, usize))> {
+    if surface.standard_editing {
+        standard_selection_for_render(&surface.textarea)
+    } else if surface.vim_state.visual.is_some() {
+        surface.textarea.selection_range()
+    } else {
+        None
+    }
+}
+
+/// The textarea selection as the renderer's inclusive range, for Standard
+/// editing. tui-textarea reports the end exclusively; an empty selection
+/// highlights nothing.
+fn standard_selection_for_render(
+    textarea: &tui_textarea::TextArea<'_>,
+) -> Option<((usize, usize), (usize, usize))> {
+    let (start, end) = textarea.selection_range()?;
+    if start == end {
+        return None;
+    }
+    let end = if end.1 > 0 {
+        (end.0, end.1 - 1)
+    } else {
+        // The selection runs through the previous line's newline.
+        let prev = end.0.checked_sub(1)?;
+        (prev, textarea.lines()[prev].chars().count())
+    };
+    Some((start, end))
+}
+
+/// Map a wrapped (visual) position inside the composer text back to a buffer
+/// `(row, col)`, mirroring the chunking `render_wrapped_textarea` draws.
+/// `width` is the text area width; rows past the end land on the last line's
+/// end. Used to place the cursor on a mouse click (#1628).
+pub(crate) fn textarea_position_at_visual(
+    lines: &[String],
+    width: usize,
+    visual_row: usize,
+    visual_col: usize,
+) -> (usize, usize) {
+    let width = width.max(1);
+    let mut row_counter = 0usize;
+    for (line_idx, line) in lines.iter().enumerate() {
+        if line.is_empty() {
+            if row_counter == visual_row {
+                return (line_idx, 0);
+            }
+            row_counter += 1;
+            continue;
+        }
+        let indent_char_len = line[..line.len() - line.trim_start().len()].chars().count();
+        let mut remaining = line.as_str();
+        let mut consumed_bytes = 0usize;
+        let mut is_first = true;
+        while !remaining.is_empty() {
+            let effective_width = if is_first {
+                width
+            } else {
+                width.saturating_sub(indent_char_len).max(1)
+            };
+            let chunk_len = if remaining.len() <= effective_width {
+                remaining.len()
+            } else {
+                word_boundary_break(remaining, effective_width)
+            };
+            if chunk_len == 0 {
+                break;
+            }
+            let is_last = chunk_len == remaining.len();
+            if row_counter == visual_row {
+                let visual_indent = if is_first { 0 } else { indent_char_len };
+                let chunk = &remaining[..chunk_len];
+                let chunk_chars = chunk.chars().count();
+                // A wrapped (non-last) row's end is the next row's start.
+                let max_col = if is_last {
+                    chunk_chars
+                } else {
+                    chunk_chars.saturating_sub(1)
+                };
+                let col_in_chunk = visual_col.saturating_sub(visual_indent).min(max_col);
+                let before = line[..consumed_bytes].chars().count();
+                return (line_idx, before + col_in_chunk);
+            }
+            row_counter += 1;
+            is_first = false;
+            consumed_bytes += chunk_len;
+            remaining = &remaining[chunk_len..];
+        }
+    }
+    let last = lines.len().saturating_sub(1);
+    (last, lines.get(last).map_or(0, |l| l.chars().count()))
 }
 
 /// Check if a (row, col) position is within a selection range.
@@ -5999,11 +6099,19 @@ pub fn render_input_bar(
     };
 
     let surface = &state.input_bar.surface;
-    let is_insert = focused && surface.mode == PopupMode::Insert;
-    let leader = (focused && surface.mode == PopupMode::Normal && surface.vim_state.is_idle())
+    // Standard editing (#1628) is always typing: no Normal mode to show.
+    let standard = app.standard_editing();
+    let surface_mode = if standard {
+        PopupMode::Insert
+    } else {
+        surface.mode
+    };
+    let is_insert = focused && surface_mode == PopupMode::Insert;
+    let leader = (focused && surface_mode == PopupMode::Normal && surface.vim_state.is_idle())
         .then_some(app.vim_machine_prefix)
         .flatten();
-    let mode = match (surface.mode, leader) {
+    let mode = match (surface_mode, leader) {
+        (PopupMode::Insert, _) if standard => "EDIT",
         (PopupMode::Insert, _) => "INSERT",
         (PopupMode::Normal, Some(' ')) => "LEADER: SPACE",
         (PopupMode::Normal, Some('g' | 'G')) => "LEADER: G",
@@ -6104,13 +6212,13 @@ pub fn render_input_bar(
     let has_content = surface.has_content();
     let cursor_style = if !focused {
         CursorStyle::Hidden
-    } else if surface.mode == PopupMode::Insert {
+    } else if surface_mode == PopupMode::Insert {
         CursorStyle::Beam
     } else {
         CursorStyle::Block
     };
 
-    if surface.correction_in_flight && !(surface.mode == PopupMode::Insert || has_content) {
+    if surface.correction_in_flight && !(surface_mode == PopupMode::Insert || has_content) {
         // Show in-flight badge in the textarea area when there's nothing else to render there
         let badge_line = Line::from(Span::styled(
             "Compiling…",
@@ -6125,13 +6233,15 @@ pub fn render_input_bar(
             badge_area,
         );
     } else if has_content {
-        let visual_sel = if surface.vim_state.visual.is_some() {
+        let visual_sel = if standard {
+            standard_selection_for_render(&surface.textarea)
+        } else if surface.vim_state.visual.is_some() {
             surface.textarea.selection_range()
         } else {
             None
         };
         surface.wrap_width.set(chunks[2].width as usize);
-        render_wrapped_textarea(
+        let scroll = render_wrapped_textarea(
             frame,
             chunks[2],
             &surface.textarea,
@@ -6139,6 +6249,7 @@ pub fn render_input_bar(
             visual_sel,
             input_bg,
         );
+        surface.text_geometry.set(Some((chunks[2], scroll)));
     } else {
         let hint = Line::from(Span::styled(
             "Type your message…",
@@ -12225,6 +12336,43 @@ mod tests {
                 (60 - INPUT_PROMPT_WIDTH - 4) as usize
             );
         }
+    }
+
+    #[test]
+    fn render_input_bar_standard_mode_shows_a_typing_surface_with_a_selection() {
+        let _pinned_theme = crate::ui::theme::pin_theme_state();
+        use crate::app::app_test_helpers;
+
+        let (mut app, session_id) = app_test_helpers::with_session_detail();
+        crate::settings::DaemonFeatureEntry::update_from_json(
+            &mut app.daemon_features,
+            &serde_json::json!({ "editing_mode": "standard" }),
+        );
+        let surface = &mut app.sessions.get_mut(&session_id).unwrap().input_bar.surface;
+        // The fixture surface is still in vim Normal mode; Standard renders it
+        // as a typing surface regardless.
+        surface.textarea.insert_str("hello world");
+        surface.textarea.select_all();
+        let text = render_input_bar_text(&app, session_id);
+        assert!(text.contains("EDIT"), "{text}");
+        assert!(text.contains("hello world"), "{text}");
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 5)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_input_bar(frame, Rect::new(0, 0, 60, 5), session_id, true, &app);
+            })
+            .unwrap();
+        let selected = crate::ui::theme::visual_selection_bg();
+        let buffer = terminal.backend().buffer();
+        let highlighted = (0..60u16)
+            .filter(|x| buffer[(*x, 1)].bg == selected)
+            .count();
+        assert_eq!(
+            highlighted,
+            "hello world".len(),
+            "the whole draft is highlighted"
+        );
     }
 
     #[test]

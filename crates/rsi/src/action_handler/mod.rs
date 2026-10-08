@@ -247,6 +247,7 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         | LcAction::OpenBtop
         | LcAction::OpenGraphReview
         | LcAction::ResolveTopologyAttempt(_)
+        | LcAction::RunTopology(_)
         | LcAction::GoToTrash
         | LcAction::OpenProjectCard
         | LcAction::OpenUserCard
@@ -541,6 +542,7 @@ pub(crate) async fn dispatch_registered_action(
         | ActionId::IssueOpenSession
         | ActionId::IssueRefresh
         | ActionId::IssueRunPoll
+        | ActionId::IssueRunTopology
         | ActionId::IssueSelectFormValue
         | ActionId::IssueRetryMutation
         | ActionId::IssueInspectorNextSection

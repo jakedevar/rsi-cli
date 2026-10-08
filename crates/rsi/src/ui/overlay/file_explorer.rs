@@ -336,11 +336,13 @@ fn render_finder(frame: &mut Frame, inner: Rect, finder: &ExplorerFinder) {
     }
 
     let input_area = Rect::new(inner.x, inner.y, inner.width, 1);
-    let input_line = Line::from(vec![
-        Span::styled("/ ", Style::default().fg(theme::blue())),
-        Span::raw(finder.query.clone()),
-        Span::styled("█", Style::default().fg(theme::blue())),
-    ]);
+    let mut input_spans = vec![Span::styled("/ ", Style::default().fg(theme::blue()))];
+    input_spans.extend(crate::field_edit::draw_with_caret(
+        &finder.query,
+        Style::default(),
+        Style::default().fg(theme::blue()),
+    ));
+    let input_line = Line::from(input_spans);
     frame.render_widget(Paragraph::new(input_line), input_area);
 
     let list_height = usize::from(inner.height.saturating_sub(2)); // -1 input, -1 hint

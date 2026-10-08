@@ -94,6 +94,19 @@ pub(super) async fn handle_project_form_key(app: &mut App, key: KeyEvent) {
         _ => return,
     };
 
+    // Standard editing: a real cursor and selection in the focused text field.
+    if app.edit_field(key, |overlay| match overlay {
+        OverlayState::ProjectForm { name, path, .. } => match focused_field {
+            0 => Some(name),
+            1 => Some(path),
+            _ => None,
+        },
+        _ => None,
+    }) != crate::field_edit::FieldKey::Ignored
+    {
+        return;
+    }
+
     match key.code {
         // Shift+Tab: cycle fields backward (BackTab for legacy, Tab+Shift for DISAMBIGUATE)
         KeyCode::BackTab => {
@@ -236,6 +249,11 @@ async fn submit_project_form(app: &mut App, editing_id: Option<uuid::Uuid>) {
             }
         }
     }
+
+    // The daemon publishes no event for an operator create or edit, and the
+    // poll can lag (or not run on an install with no sessions): reload the
+    // list so the picker below shows the project just saved.
+    app.trigger_projects_fetch_immediate().await;
 
     // Go back to picker
     open_project_picker(app, crate::types::ProjectPickerContext::GlobalFilter);

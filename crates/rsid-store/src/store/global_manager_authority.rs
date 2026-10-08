@@ -323,6 +323,44 @@ impl Store {
         Ok(heads)
     }
 
+    /// #1641 S3a: the session of `project`'s manager seat when that manager
+    /// can act now (unrevoked config and grant, a seat session that is not
+    /// archived or deleted). `None` when the project has no live manager.
+    pub fn on_call_project_manager_seat(&self, project: Uuid) -> Result<Option<Uuid>> {
+        let Some(config) = self.get_harness_manager(project)? else {
+            return Ok(None);
+        };
+        if config.is_revoked()
+            || !self.manager_v2_ledger_live(
+                project,
+                config.manager_session_id,
+                config.row_version,
+            )?
+        {
+            return Ok(None);
+        }
+        Ok(config.current_session_id)
+    }
+
+    /// #1641 S3a: the active portfolio nodes covering `project` whose seat
+    /// session is live, nearest (deepest) first, as `(node_id, seat_session)`.
+    pub fn on_call_portfolio_seats(&self, project: Uuid) -> Result<Vec<(Uuid, Uuid)>> {
+        let mut seats = Vec::new();
+        for head in self.portfolio_chain_heads(project)?.into_iter().rev() {
+            let live = self.get_session(head.seat_root)?.is_some_and(|session| {
+                !matches!(
+                    session.status,
+                    rsi_common::types::SessionStatus::Archived
+                        | rsi_common::types::SessionStatus::Deleted
+                )
+            });
+            if live {
+                seats.push((head.node_id, head.seat_root));
+            }
+        }
+        Ok(seats)
+    }
+
     /// The index in `chain` of the node whose ledger principal `config` is.
     fn chain_position(chain: &[PortfolioHead], config: &HarnessManagerConfigV1) -> Option<usize> {
         chain.iter().position(|head| {

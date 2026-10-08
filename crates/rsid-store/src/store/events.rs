@@ -49,6 +49,11 @@ impl Store {
             )?;
         }
         tx.commit()?;
+        self.note_committed_provider_event(event, event_id);
+        Ok(event_id)
+    }
+
+    pub(super) fn note_committed_provider_event(&self, event: &ConversationEvent, event_id: i64) {
         // #1343: telemetry has its own transaction after the event is durable;
         // even a database error that rolls it back cannot undo ingestion.
         if let Err(error) = super::friction::note_repeated_tool_error(&self.conn, event, event_id) {
@@ -64,7 +69,6 @@ impl Store {
                 "assistant event persisted but delivered mail could not be acknowledged"
             );
         }
-        Ok(event_id)
     }
 
     /// Shared event/provenance writer for transactions with additional producer

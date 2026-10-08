@@ -84,6 +84,8 @@ pub enum AgentControlVerbV1 {
     ManagerAppointChild,
     ManagerRevokeChild,
     ManagerOverview,
+    CreateProject,
+    UpdateProject,
 }
 
 /// Native tool whose advertised input is the same request schema as one
@@ -134,6 +136,8 @@ pub enum NativeAgentControlToolV1 {
     RsiControlReportUp,
     RsiControlSendDown,
     RsiControlManagerOverview,
+    RsiControlCreateProject,
+    RsiControlUpdateProject,
 }
 
 impl NativeAgentControlToolV1 {
@@ -186,6 +190,8 @@ impl NativeAgentControlToolV1 {
             Self::RsiControlReportUp => "rsi_control_report_up",
             Self::RsiControlSendDown => "rsi_control_send_down",
             Self::RsiControlManagerOverview => "rsi_control_manager_overview",
+            Self::RsiControlCreateProject => "rsi_control_create_project",
+            Self::RsiControlUpdateProject => "rsi_control_update_project",
         }
     }
 
@@ -241,6 +247,8 @@ impl NativeAgentControlToolV1 {
             Self::RsiControlReportUp => AgentControlVerbV1::ReportUp,
             Self::RsiControlSendDown => AgentControlVerbV1::SendDown,
             Self::RsiControlManagerOverview => AgentControlVerbV1::ManagerOverview,
+            Self::RsiControlCreateProject => AgentControlVerbV1::CreateProject,
+            Self::RsiControlUpdateProject => AgentControlVerbV1::UpdateProject,
         }
     }
 }
@@ -623,6 +631,14 @@ impl AgentControlVerbV1 {
                 crate::manager_node_workspace::AgentManagerOverviewRequestV1,
                 |_: &crate::manager_node_workspace::AgentManagerOverviewRequestV1| Ok::<(), ()>(())
             ),
+            Self::CreateProject => decode!(
+                crate::agent_projects::AgentCreateProjectRequestV1,
+                |r: &crate::agent_projects::AgentCreateProjectRequestV1| r.validate()
+            ),
+            Self::UpdateProject => decode!(
+                crate::agent_projects::AgentUpdateProjectRequestV1,
+                |r: &crate::agent_projects::AgentUpdateProjectRequestV1| r.validate()
+            ),
         }
     }
 }
@@ -841,6 +857,8 @@ const REQUEST_DEPLOY_SCHEMA: &str = r#"{"type":"object","additionalProperties":f
 const QUERY_FAILURE_SIGNATURES_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"test_id":{"type":["string","null"],"minLength":1,"maxLength":512,"default":null,"description":"Exact libtest/nextest test id, e.g. session::launch::tests::x"},"digest":{"type":["string","null"],"pattern":"^[0-9a-f]{64}$","default":null,"description":"sha256 failure digest (rsi-known-failure block prints it); both fields must match when both are set"}}}"#;
 const MANAGER_OVERVIEW_SCHEMA: &str =
     r#"{"type":"object","additionalProperties":false,"properties":{}}"#;
+const CREATE_PROJECT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["name","path"],"properties":{"name":{"type":"string","minLength":1,"maxLength":128,"description":"Unique project name shown in the TUI tab bar"},"path":{"type":"string","minLength":1,"maxLength":4096,"description":"Absolute directory of the repository or working tree; it must exist and sit inside a configured workspace root; with no workspace roots configured, a strict descendant of the daemon user's home directory (not the home directory itself, anything under ~/.rsi, or /)"},"description":{"type":["string","null"],"maxLength":2048,"default":null},"color":{"type":["string","null"],"pattern":"^#[0-9a-fA-F]{6}$","default":null,"description":"Tab color as #rrggbb"}}}"#;
+const UPDATE_PROJECT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["project_id"],"properties":{"project_id":{"type":"string","format":"uuid","description":"A project in your coverage: your own project (project manager) or a project of your grant (portfolio seat)"},"name":{"type":["string","null"],"minLength":1,"maxLength":128,"default":null},"path":{"type":["string","null"],"minLength":1,"maxLength":4096,"default":null,"description":"New absolute directory; refused while the project has a live session"},"description":{"type":["string","null"],"maxLength":2048,"default":null},"color":{"type":["string","null"],"pattern":"^#[0-9a-fA-F]{6}$","default":null}}}"#;
 const GLOBAL_OVERVIEW_SCHEMA: &str =
     r#"{"type":"object","additionalProperties":false,"properties":{}}"#;
 const MANAGER_LAUNCH_ISSUE_WORKER_BASE_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["issue","brief","launch","idempotency_key"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"issue":{"type":"integer","minimum":1,"description":"The Issue's display number in your project"},"brief":{"type":"string","minLength":1,"maxLength":24576,"description":"The worker's task text; it reads its own Issue with AgentGetIssue, so do not paste the Issue"},"launch":{"type":"object","additionalProperties":false,"required":["provider","model"],"properties":{"provider":{"type":"string","description":"Provider; must be in your policy's allowed_launches"},"model":{"type":"string","minLength":1,"maxLength":256},"effort":{"type":["string","null"],"maxLength":32,"default":null}}},"parent_epic_id":{"type":["string","null"],"format":"uuid","default":null,"description":"The Epic to create the worker under; optional when your scope holds exactly one Epic"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key; a replay returns the same worker"}}}"#;
@@ -964,7 +982,7 @@ const MANAGER_RESOLVE_ESCALATION_SCHEMA: &str = r#"{"type":"object","additionalP
 
 const GET_AUTHORITY_CATALOG_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"verb":{"type":["string","null"],"default":null,"description":"Optional control name: an Agent* method, a native rsi_control_* tool, or its mcp__rsi-agent__ spelling. With verb the response is compact: just that control's detail (whether you may call it, parameter schema, one minimal valid example request, and its stable refusal codes with next steps); omit verb for the full manual."}}}"#;
 
-const SUBMIT_JOB_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["kind","params"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"sandbox_session_id":{"type":["string","null"],"format":"uuid","default":null,"description":"landing and cloud_gate only: run in this terminal, in-reach session's sandbox"},"kind":{"type":"string","enum":["test","build","landing","cloud_gate","cloud_sweep"]},"params":{"type":"object","description":"test: {recipe: declared name in the worktree .rsi/jobs.toml (version 1; recipes.NAME: runner just|make, target, timeout_minutes cap 5-180, cpu_quota_percent 1-1600); uses local justfile/Makefile; no arguments; request timeout must fit the declaration} or {shard,filterset?} or {package,filters[],lib_only?,exact?:boolean (default false; true passes libtest --exact for whole test names; package only; empty filters still run every test)} or {candidate_receipt: branch or 40-hex sha; manager/Epic lead only; result.receipt is the typed candidate receipt}; every test job also takes timeout_minutes? (5-180; default the operator job_test_timeout_mins, 20; above the default needs the manager or an Epic lead, except qa_lane:{sha:40-lowercase-hex} on a known shard: current live unsuperseded AgentManagerLaunchIssueWorker binding with explicit manager qa_lane:true delegation or manager/Epic lead, timeout 5-90, default capped at 90, SHA labels submission-time HEAD only; no dirtiness check or exact-tested-bytes proof; use a manager pinned detached worktree plus worktree on an ordinary test for an exact pin, at most two running QA lanes per owner; QA never supports recipe, package or candidate_receipt; past timeout the unit is stopped and the job fails job_timed_out); build: {command:check|build,package|workspace,all_targets?,release?}; landing/cloud_gate: {accepted:40-hex sha,test_filters?:[PACKAGE=FILTER]}; cloud_sweep: {sha:40-hex current rolling tip}. Typed fields only; no command line."},"name":{"type":"string","minLength":1,"maxLength":80},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Optional replay key"},"worktree":{"type":"string","description":"Appointed manager only: another worktree of your own repository to run in; default is your sandbox"},"wake":{"type":["string","null"],"enum":["owner","none",null],"default":"owner","description":"owner (default): one resume wake to you when this job settles. none: no per-job wake; the job still settles and AgentGetJob/AgentListJobs return its result. Submit a batch with none, then arm one AgentScheduleWake mode when with when.jobs_terminal so you are woken once"}}}"#;
+const SUBMIT_JOB_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["kind","params"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"sandbox_session_id":{"type":["string","null"],"format":"uuid","default":null,"description":"landing and cloud_gate only: run in this terminal, in-reach session's sandbox"},"kind":{"type":"string","enum":["test","build","landing","cloud_gate","cloud_sweep"]},"params":{"type":"object","description":"test: {recipe: declared name in the worktree .rsi/jobs.toml (version 1; recipes.NAME: runner just|make, target, timeout_minutes cap 5-180, cpu_quota_percent 1-1600); uses local justfile/Makefile; no arguments; request timeout must fit the declaration} or {scoped_test:{base,head?}: run scripts/scoped-test --base <ref> [--head <ref>] in your sandbox (bare branch, origin/<branch> or 40-hex refs only, no other arguments; submit with wake none, arm ONE AgentScheduleWake mode when, end your turn; result.exit_code and the job log_path are set, result.receipt is the scoped-test receipt {ok,exit_code,base,head,filters,log_dir,packages[{package,status,completed}]}, refusal scoped_test_receipt_missing when none was printed)} or {shard,filterset?} or {package,filters[],lib_only?,exact?:boolean (default false; true passes libtest --exact for whole test names; package only; empty filters still run every test)} or {candidate_receipt: branch or 40-hex sha; manager/Epic lead only; result.receipt is the typed candidate receipt}; every test job also takes timeout_minutes? (5-180; default the operator job_test_timeout_mins, 20; above the default needs the manager or an Epic lead, except qa_lane:{sha:40-lowercase-hex} on a known shard: current live unsuperseded AgentManagerLaunchIssueWorker binding with explicit manager qa_lane:true delegation or manager/Epic lead, timeout 5-90, default capped at 90, SHA labels submission-time HEAD only; no dirtiness check or exact-tested-bytes proof; use a manager pinned detached worktree plus worktree on an ordinary test for an exact pin, at most two running QA lanes per owner; QA never supports recipe, scoped_test, package or candidate_receipt; past timeout the unit is stopped and the job fails job_timed_out); build: {command:check|build,package|workspace,all_targets?,release?}; landing/cloud_gate: {accepted:40-hex sha,test_filters?:[PACKAGE=FILTER]}; cloud_sweep: {sha:40-hex current rolling tip}. Typed fields only; no command line."},"name":{"type":"string","minLength":1,"maxLength":80},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Optional replay key"},"worktree":{"type":"string","description":"Appointed manager only: another worktree of your own repository to run in; default is your sandbox"},"wake":{"type":["string","null"],"enum":["owner","none",null],"default":"owner","description":"owner (default): one resume wake to you when this job settles. none: no per-job wake; the job still settles and AgentGetJob/AgentListJobs return its result. Submit a batch with none, then arm one AgentScheduleWake mode when with when.jobs_terminal so you are woken once"}}}"#;
 
 const GET_JOB_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["job_id"],"properties":{"job_id":{"type":"string","format":"uuid"}}}"#;
 
@@ -978,12 +996,12 @@ const ENQUEUE_LANDING_SOURCE_SCHEMA: &str = r#"{"type":"object","additionalPrope
 
 const TOPOLOGY_UPSERT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["name","definition","scope","idempotency_key"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"name":{"type":"string","minLength":1,"maxLength":128,"description":"Topology name, unique per owner"},"definition":{"type":"object","required":["nodes","edges"],"properties":{"nodes":{"type":"array","items":{"type":"object"}},"edges":{"type":"array","items":{"type":"object"}},"until":{"type":["object","null"]}},"description":"TopologyDefinition: nodes (id, kind, label, prereqs, params incl. typed step, custody, explicit provider/model/effort), edges, until; the daemon validates it and returns diagnostics"},"scope":{"type":"string","enum":["epic","manager"],"description":"epic: owned by one Epic (leads may only use this); manager: owned by the current manager"},"epic_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Target Epic for a manager epic-scoped upsert; a lead's Epic is daemon-derived and, if given, must match"},"expected_revision":{"type":["integer","null"],"minimum":1,"default":null,"description":"CAS fence to revise an existing topology; omit to create"},"validate_only":{"type":"boolean","default":false,"description":"Report diagnostics without writing"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL; reuse only for identical content"}}}"#;
 const TOPOLOGY_LIST_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"scope":{"type":["string","null"],"enum":["epic","manager",null],"default":null},"epic_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Narrow to one Epic in your scope"},"include_executions":{"type":"boolean","default":false},"cursor":{"type":["string","null"],"maxLength":128,"default":null,"description":"next_cursor from the previous page"},"limit":{"type":["integer","null"],"minimum":1,"maximum":32,"default":null}}}"#;
-const TOPOLOGY_EXECUTE_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["topology_id","expected_digest","epic_id","idempotency_key"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"topology_id":{"type":"string","format":"uuid"},"expected_digest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$","description":"definition_digest returned by list or upsert"},"epic_id":{"type":"string","format":"uuid","description":"Epic the execution runs under; must be in your scope"},"inputs":{"type":["object","null"],"default":null},"base_commit":{"type":["string","null"],"pattern":"^[0-9a-fA-F]{40}$","default":null,"description":"Full 40-hex base; omitted resolves origin/rolling once at acceptance"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL; a replay returns deduplicated=true"}}}"#;
+const TOPOLOGY_EXECUTE_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["topology_id","expected_digest","epic_id","idempotency_key"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"topology_id":{"type":"string","format":"uuid"},"expected_digest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$","description":"definition_digest returned by list or upsert"},"epic_id":{"type":"string","format":"uuid","description":"Epic the execution runs under; must be in your scope"},"inputs":{"type":["object","null"],"default":null},"on_call":{"description":"Seat that answers node questions: {\"kind\":\"project_manager\"} (default: the project manager, else the covering portfolio seat) or {\"kind\":\"portfolio\",\"node_id\":uuid}","default":null,"oneOf":[{"type":"null"},{"type":"object","additionalProperties":false,"required":["kind"],"properties":{"kind":{"const":"project_manager"}}},{"type":"object","additionalProperties":false,"required":["kind","node_id"],"properties":{"kind":{"const":"portfolio"},"node_id":{"type":"string","format":"uuid"}}}]},"base_commit":{"type":["string","null"],"pattern":"^[0-9a-fA-F]{40}$","default":null,"description":"Full 40-hex base; omitted resolves origin/rolling once at acceptance"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL; a replay returns deduplicated=true"}}}"#;
 const TOPOLOGY_GET_EXECUTION_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["execution_id"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"execution_id":{"type":"string","format":"uuid"},"after_sequence":{"type":["integer","null"],"minimum":0,"default":null,"description":"next_sequence from the previous page"},"limit":{"type":["integer","null"],"minimum":1,"maximum":64,"default":null}}}"#;
 const TOPOLOGY_INTERRUPT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["execution_id","expected_row_version","idempotency_key"],"properties":{"project_id":{"type":["string","null"],"format":"uuid","default":null,"description":"Global manager only: the granted project to act in; omit for your own project"},"execution_id":{"type":"string","format":"uuid"},"expected_row_version":{"type":"integer","minimum":1,"description":"row_version observed via get_execution; refresh after stale_version"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL"}}}"#;
 const TOPOLOGY_RESOLVE_ATTEMPT_SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["execution_id","attempt_id","action","expected_row_version","idempotency_key"],"properties":{"execution_id":{"type":"string","format":"uuid"},"attempt_id":{"type":"string","format":"uuid","description":"Attempt blocked on preserved work"},"action":{"type":"string","enum":["inspect","accept","retry","discard"],"description":"discard is manager (Automation) only; a lead is refused"},"expected_row_version":{"type":"integer","minimum":1},"idempotency_key":{"type":"string","minLength":1,"maxLength":128,"description":"Replay key, at most 128 UTF-8 bytes, without NUL"},"confirm_preserved_commit":{"type":["string","null"],"pattern":"^[0-9a-fA-F]{40}$","default":null,"description":"Full 40-hex preserved_commit; required iff action=discard, refused otherwise"}}}"#;
 
-static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 65]> = LazyLock::new(|| {
+static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 67]> = LazyLock::new(|| {
     [
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::GetAuthorityCatalog,
@@ -1445,6 +1463,20 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 65]> = Lazy
             parameters_json: MANAGER_OVERVIEW_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlManagerOverview),
         },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::CreateProject,
+            method: "AgentCreateProject",
+            description: "Project manager (Execute mode, not paused) or portfolio seat (#1626): register a new RSI project for a directory so work can start there. Give a unique name and an absolute path to an existing directory inside a configured workspace root (with none configured: a strict descendant of the daemon user's home directory, never the home directory itself, ~/.rsi or /); description and color are optional. The project appears in the operator's project list; it has no manager yet and is not added to your coverage (the operator or your parent grants that). A repeat with the same name and directory returns the existing project with deduplicated:true only when it is in your coverage; otherwise project_name_taken. A path equal to, containing or inside the harness root is project_harness_protected. Refused: project_not_authorized, project_name_taken, project_path_taken, project_path_invalid, project_harness_protected. There is no agent verb that deletes or archives a project.",
+            parameters_json: CREATE_PROJECT_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlCreateProject),
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::UpdateProject,
+            method: "AgentUpdateProject",
+            description: "Project manager (Execute mode, not paused) or portfolio seat (#1626): rename a project or change its path, description or color, limited to projects in your coverage (your own project for a project manager; your grant's projects for a portfolio seat). Send only the fields to change. A path change is refused while the project has a live session (project_has_live_sessions), and any path change on the harness project is project_harness_protected (operator-only). A seat that is both a project manager and a portfolio seat acts on the union of what its permitting seats cover. A project outside your coverage, or one that does not exist, is project_not_in_scope. Nothing is deleted.",
+            parameters_json: UPDATE_PROJECT_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlUpdateProject),
+        },
     ]
 });
 
@@ -1711,6 +1743,14 @@ mod tests {
                 crate::manager_node_workspace::AgentManagerOverviewRequestV1,
             >(value)
             .map(drop),
+            AgentControlVerbV1::CreateProject => {
+                serde_json::from_value::<crate::agent_projects::AgentCreateProjectRequestV1>(value)
+                    .map(drop)
+            }
+            AgentControlVerbV1::UpdateProject => {
+                serde_json::from_value::<crate::agent_projects::AgentUpdateProjectRequestV1>(value)
+                    .map(drop)
+            }
         }
     }
 
@@ -2287,6 +2327,7 @@ mod tests {
                     "expected_digest",
                     "idempotency_key",
                     "inputs",
+                    "on_call",
                     "topology_id",
                 ],
                 &[
@@ -2341,6 +2382,16 @@ mod tests {
             ),
             (AgentControlVerbV1::GlobalOverview, &[], &[]),
             (AgentControlVerbV1::ManagerOverview, &[], &[]),
+            (
+                AgentControlVerbV1::CreateProject,
+                &["color", "description", "name", "path"],
+                &["name", "path"],
+            ),
+            (
+                AgentControlVerbV1::UpdateProject,
+                &["color", "description", "name", "path", "project_id"],
+                &["project_id"],
+            ),
             (
                 AgentControlVerbV1::GlobalSend,
                 &["idempotency_key", "message", "project_id"],
@@ -2705,6 +2756,8 @@ mod tests {
                             | AgentControlVerbV1::GlobalAppointManager
                             // #1239: a covered project to seat a PM in.
                             | AgentControlVerbV1::ManagerAppointChild
+                            // #1626: the project to edit, inside the caller's coverage.
+                            | AgentControlVerbV1::UpdateProject
                     )
                 {
                     continue;

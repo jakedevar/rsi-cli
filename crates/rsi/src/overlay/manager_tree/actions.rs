@@ -1537,6 +1537,32 @@ pub(crate) async fn offer_cap_confirmation(
     true
 }
 
+/// #1626: offer to add an agent-created project to the global grant. Opens the
+/// tree on the usual confirm step: `y` sends the CAS-fenced request, Esc
+/// leaves the grant alone. The agent never makes this change itself.
+pub(crate) async fn offer_grant_addition(
+    app: &mut App,
+    title: String,
+    lines: Vec<String>,
+    request: ConfigureGlobalManagerRequestV1,
+) -> bool {
+    super::open(app).await;
+    if state(app).is_none() {
+        return false;
+    }
+    confirm(
+        app,
+        PendingAction {
+            title,
+            destructive: false,
+            lines,
+            rpc: "ConfigureGlobalManager".into(),
+            request: PreparedRequest::ConfigureGlobal(request),
+        },
+    );
+    true
+}
+
 /// Send the confirmed RPC, then reload the tree whatever the outcome.
 async fn commit(app: &mut App) {
     let Some(tree) = state(app) else { return };

@@ -444,6 +444,7 @@ mod tests {
             owner_user_id: OWNER,
             allowed_node_ids: vec![NODE.into()],
             project_ids: vec![],
+            ..Config::default()
         }
     }
 

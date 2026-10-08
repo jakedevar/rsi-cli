@@ -15,6 +15,7 @@ mod issue_541_tests;
 mod lead_review_tests;
 mod live_bookkeeping;
 mod mail_capacity;
+mod topology_review;
 mod work_identity;
 mod work_view;
 

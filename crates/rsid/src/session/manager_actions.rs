@@ -1223,9 +1223,15 @@ impl SessionManager {
         }
         // Map removal alone is not an OS-process settlement witness. Reprove
         // the exact daemon-owned cohort to a bounded two-empty-pass fixed point.
-        tokio::task::spawn_blocking(move || super::reaper::reap_orphans_for_session(predecessor))
-            .await
-            .map_err(|_| refused("manager_v2_predecessor_unsettled"))??;
+        let orphan_store = std::sync::Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || {
+            let turns = orphan_store
+                .blocking_lock()
+                .list_active_provider_turn_custody()?;
+            super::reaper::reap_orphans_for_session(predecessor, turns)
+        })
+        .await
+        .map_err(|_| refused("manager_v2_predecessor_unsettled"))??;
         self.store
             .lock()
             .await
@@ -1387,8 +1393,14 @@ impl SessionManager {
                 let _ = process.interrupt();
             }
         }
-        match tokio::task::spawn_blocking(move || super::reaper::reap_orphans_for_session(target))
-            .await
+        let orphan_store = std::sync::Arc::clone(&self.store);
+        match tokio::task::spawn_blocking(move || {
+            let turns = orphan_store
+                .blocking_lock()
+                .list_active_provider_turn_custody()?;
+            super::reaper::reap_orphans_for_session(target, turns)
+        })
+        .await
         {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
@@ -1498,9 +1510,15 @@ impl SessionManager {
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        tokio::task::spawn_blocking(move || super::reaper::reap_orphans_for_session(target))
-            .await
-            .map_err(|_| refused("manager_v2_candidate_unconfirmed"))??;
+        let orphan_store = std::sync::Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || {
+            let turns = orphan_store
+                .blocking_lock()
+                .list_active_provider_turn_custody()?;
+            super::reaper::reap_orphans_for_session(target, turns)
+        })
+        .await
+        .map_err(|_| refused("manager_v2_candidate_unconfirmed"))??;
         Ok(())
     }
 

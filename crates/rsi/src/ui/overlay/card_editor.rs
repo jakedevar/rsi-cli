@@ -134,22 +134,33 @@ pub(super) fn render_card_editor(
                 } else {
                     edit_text
                 };
-                let line = Line::from(vec![
-                    Span::styled(
-                        &idx_str,
-                        Style::default()
-                            .fg(theme::mauve())
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(display_text, Style::default().fg(theme::text())),
-                    Span::styled("\u{2588}", Style::default().fg(theme::text())),
-                ]);
+                let idx_span = Span::styled(
+                    &idx_str,
+                    Style::default()
+                        .fg(theme::mauve())
+                        .add_modifier(Modifier::BOLD),
+                );
+                let text_style = Style::default().fg(theme::text());
+                let line = if crate::field_edit::standard_frame() {
+                    // Standard editing: the caret and selection are drawn in the text.
+                    let mut spans = vec![idx_span];
+                    spans.extend(crate::field_edit::draw_fit(
+                        edit_text, text_style, text_width,
+                    ));
+                    Line::from(spans)
+                } else {
+                    Line::from(vec![
+                        idx_span,
+                        Span::styled(display_text, text_style),
+                        Span::styled("\u{2588}", text_style),
+                    ])
+                };
                 let row_area = Rect::new(inner.x, row_y, inner.width, 1);
                 frame.render_widget(Paragraph::new(line), row_area);
 
                 // Set cursor position for blinking
                 let cursor_x = inner.x + idx_str.len() as u16 + display_text.len() as u16;
-                if cursor_x < inner.x + inner.width {
+                if !crate::field_edit::standard_frame() && cursor_x < inner.x + inner.width {
                     frame.set_cursor_position(Position::new(cursor_x, row_y));
                 }
             } else {

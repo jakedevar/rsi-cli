@@ -644,6 +644,8 @@ impl RpcServer {
             "AgentRequestDeploy" => self.handle_agent_request_deploy(request).await,
             "AgentGlobalOverview" => self.handle_agent_global_overview(request).await,
             "AgentManagerOverview" => self.handle_agent_manager_overview(request).await,
+            "AgentCreateProject" => self.handle_agent_create_project(request).await,
+            "AgentUpdateProject" => self.handle_agent_update_project(request).await,
             "AgentGlobalSend" => self.handle_agent_global_send(request).await,
             "AgentGlobalAppointManager" => self.handle_agent_global_appoint_manager(request).await,
             "AgentManagerAppointChild" => self.handle_agent_manager_appoint_child(request).await,
@@ -903,6 +905,9 @@ impl RpcServer {
             "UpdateSessionDescription" => self.handle_update_session_description(request).await,
             "UpdateSessionRating" => self.handle_update_session_rating(request).await,
             "UpdateActiveTask" => self.handle_update_active_task(request).await,
+            method if sessions::is_operator_method(method) => {
+                self.handle_answer_pending_decision(request).await
+            }
             "AnswerQuestion" => self.handle_answer_question(request).await,
             // Project methods
             "CreateProject" => self.handle_create_project(request).await,
@@ -1276,6 +1281,7 @@ fn event_type_str(event: &DaemonEvent) -> &'static str {
         DaemonEvent::CompilePromptFailed { .. } => "compile_prompt_failed",
         DaemonEvent::SandboxOrphanCleaned { .. } => "sandbox_orphan_cleaned",
         DaemonEvent::ChildSpawned { .. } => "child_spawned",
+        DaemonEvent::ProjectCreated { .. } => "project_created",
         DaemonEvent::HaltDirective { .. } => "halt_directive",
         DaemonEvent::SessionSpawnDeduped { .. } => "session_spawn_deduped",
         DaemonEvent::SessionClassified { .. } => "session_classified",
@@ -1370,6 +1376,8 @@ fn event_matches_session(event: &DaemonEvent, session_id: Uuid) -> bool {
         DaemonEvent::SandboxOrphanCleaned { .. } => true,
         // Child-spawned events are global (TUI updates hierarchy view).
         DaemonEvent::ChildSpawned { .. } => true,
+        // ProjectCreated is daemon-global: the TUI follows it (#1626).
+        DaemonEvent::ProjectCreated { .. } => true,
         // HaltDirective: scoped to the emitting session but loop executor
         // subscribes globally; always deliver so it can filter by session_id.
         DaemonEvent::HaltDirective { .. } => true,

@@ -18,6 +18,26 @@ fn safe(value: &str, max_chars: usize) -> String {
         .collect()
 }
 
+/// A form row: the active text field shows the Standard cursor.
+fn field_row(
+    label: String,
+    value: &str,
+    selected: bool,
+    text_limit: Option<usize>,
+) -> Line<'static> {
+    let style = if selected {
+        Style::default().fg(theme::text()).bg(theme::surface2())
+    } else {
+        Style::default().fg(theme::subtext0())
+    };
+    let editing = selected && text_limit.is_some() && crate::field_edit::standard_frame();
+    let shown = match text_limit {
+        Some(limit) if !editing => safe(value, limit),
+        _ => value.to_string(),
+    };
+    Line::from(crate::field_edit::field_row(&label, &shown, style, editing))
+}
+
 fn row(text: String, selected: bool) -> Line<'static> {
     Line::from(Span::styled(
         text,
@@ -69,8 +89,9 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &SatelliteRegistryOve
                 field,
             } => {
                 lines.push(Line::from(format!("Peer ID  {peer_id:?}")));
+                let limits = [Some(120), Some(36), None, None, None, Some(37 * 64), None];
                 for (idx, (name, value)) in [
-                    ("Label", safe(label, 120)),
+                    ("Label", label.clone()),
                     ("Expected installation ID", expected_installation_id.clone()),
                     ("Enabled", enabled.to_string()),
                     ("Session reads", read_enabled.to_string()),
@@ -87,9 +108,11 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &SatelliteRegistryOve
                 .into_iter()
                 .enumerate()
                 {
-                    lines.push(row(
-                        format!("{} {name}: {value}", if *field == idx { "▸" } else { " " }),
+                    lines.push(field_row(
+                        format!("{} {name}: ", if *field == idx { "▸" } else { " " }),
+                        &value,
                         *field == idx,
+                        limits[idx],
                     ));
                 }
                 lines.push(Line::default());
@@ -101,6 +124,7 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &SatelliteRegistryOve
                 lines.push(Line::from(
                     "Inbound delivery policy for THIS host (empty refuses all hub messages)",
                 ));
+                let limits = [Some(37 * 64); 2];
                 for (idx, (name, value)) in [
                     (
                         "Allowed hub installation IDs (comma-separated)",
@@ -111,9 +135,11 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &SatelliteRegistryOve
                 .into_iter()
                 .enumerate()
                 {
-                    lines.push(row(
-                        format!("{} {name}: {value}", if *field == idx { "▸" } else { " " }),
+                    lines.push(field_row(
+                        format!("{} {name}: ", if *field == idx { "▸" } else { " " }),
+                        &value,
                         *field == idx,
+                        limits[idx],
                     ));
                 }
             }
@@ -129,10 +155,11 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &SatelliteRegistryOve
                 ..
             } => {
                 lines.push(Line::from(format!("Link ID  {link_id:?}")));
+                let limits = [Some(100), Some(100), Some(100), None, None, None];
                 for (idx, (name, value)) in [
-                    ("Local socket path", safe(socket_path, 100)),
-                    ("SSH target", safe(ssh_target, 100)),
-                    ("Trust reference", safe(trust_reference, 100)),
+                    ("Local socket path", socket_path.clone()),
+                    ("SSH target", ssh_target.clone()),
+                    ("Trust reference", trust_reference.clone()),
                     ("Direction", format!("{direction:?}")),
                     ("Enabled", enabled.to_string()),
                     ("Priority", priority.to_string()),
@@ -140,9 +167,11 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &SatelliteRegistryOve
                 .into_iter()
                 .enumerate()
                 {
-                    lines.push(row(
-                        format!("{} {name}: {value}", if *field == idx { "▸" } else { " " }),
+                    lines.push(field_row(
+                        format!("{} {name}: ", if *field == idx { "▸" } else { " " }),
+                        &value,
                         *field == idx,
+                        limits[idx],
                     ));
                 }
                 lines.push(Line::default());

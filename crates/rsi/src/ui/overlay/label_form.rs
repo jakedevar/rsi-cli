@@ -62,12 +62,14 @@ pub(super) fn render_label_form(
             Style::default().fg(theme::overlay_hint())
         };
 
-        let cursor = if is_focused { "\u{2588}" } else { "" };
-        let line = Line::from(vec![
-            Span::styled(format!("{:>6}: ", label), label_style),
-            Span::styled(value.to_string(), Style::default().fg(theme::text())),
-            Span::styled(cursor, Style::default().fg(theme::text())),
-        ]);
+        let value_style = Style::default().fg(theme::text());
+        let mut spans = vec![Span::styled(format!("{:>6}: ", label), label_style)];
+        if is_focused {
+            spans.extend(crate::field_edit::draw(&value.to_string(), value_style));
+        } else {
+            spans.push(Span::styled(value.to_string(), value_style));
+        }
+        let line = Line::from(spans);
         let row_area = Rect::new(inner.x, row_y, inner.width, 1);
         frame.render_widget(Paragraph::new(line), row_area);
     }

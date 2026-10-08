@@ -1117,3 +1117,381 @@ async fn appserver_approval_unsupported_protocols_and_unoffered_binary_choices_s
 
 #[path = "lifecycle_tests.rs"]
 mod lifecycle_tests;
+
+fn remote_request(
+    w: &World,
+    target: &Value,
+) -> rsi_common::remote_pending_decisions::AnswerPendingDecisionV1 {
+    use rsi_common::{
+        remote_pending_decisions::*,
+        remote_read::{Text, WireUuid},
+    };
+    AnswerPendingDecisionV1 {
+        project_id: WireUuid::new(w.config.project_id.to_string()).unwrap(),
+        session_id: WireUuid::new(w.session.to_string()).unwrap(),
+        decision_id: Text::new(format!(
+            "pending-approval:{}",
+            target["publication_id"].as_str().unwrap()
+        ))
+        .unwrap(),
+        expected_target_digest: Text::new(
+            crate::store::harness_manager_v2::fingerprint(target).unwrap(),
+        )
+        .unwrap(),
+        answer: Text::new("approve".into()).unwrap(),
+        idempotency_key: WireUuid::new(Uuid::new_v4().to_string()).unwrap(),
+        origin: RemoteAnswerOriginV1 {
+            kind: RemoteAnswerOriginKindV1::Remote,
+            client_node: Text::new("test-device".into()).unwrap(),
+            gateway_epoch: WireUuid::new(Uuid::new_v4().to_string()).unwrap(),
+        },
+    }
+}
+
+async fn queue_remote(
+    w: &World,
+    target: &Value,
+) -> rsi_common::remote_pending_decisions::AnswerPendingDecisionV1 {
+    let request = remote_request(w, target);
+    w.manager
+        .store
+        .lock()
+        .await
+        .prepare_remote_answer(&request)
+        .unwrap();
+    request
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn manager_inbox_approval_refuses_new_remote_keys_but_replays_accepted_key() {
+    use rsi_common::remote_read::WireUuid;
+    for accepted_before_inbox in [false, true] {
+        let mut w = World::new().await;
+        w.inject(json!(1724), METHOD);
+        let target = w.publication(None, "published").await;
+        let mut request = remote_request(&w, &target);
+        let store = w.manager.store.lock().await;
+        let receipt = accepted_before_inbox.then(|| store.prepare_remote_answer(&request).unwrap());
+        store
+            .manager_v2_refresh_approval_decisions(&w.config)
+            .unwrap();
+        let key = crate::store::pending_approvals::approval_decision_key(&target);
+        let row = store
+            .manager_v2_record(&w.config, "decision", &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.payload["status"], "pending");
+        assert_eq!(
+            row.payload["target_digest"],
+            request.expected_target_digest.as_str()
+        );
+        if let Some(receipt) = receipt {
+            assert_eq!(store.prepare_remote_answer(&request).unwrap(), receipt);
+            request.idempotency_key = WireUuid::new(Uuid::new_v4().to_string()).unwrap();
+        }
+        assert!(matches!(store.prepare_remote_answer(&request).unwrap_err(),
+            crate::error::DaemonError::InvalidParam(code) if code == "decision_changed"));
+        let count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM remote_answer_deliveries", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, i64::from(accepted_before_inbox));
+        drop(store);
+        assert!(matches!(
+            w.writes.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        w.finish().await;
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn corrupt_remote_answer_does_not_block_later_phone_approval_delivery() {
+    use rsi_common::remote_pending_decisions::{RemoteAnswerReceiptV1, RemoteAnswerStateV1};
+    for recovering in [false, true] {
+        let mut w = World::new().await;
+        w.inject(json!(17241), METHOD);
+        let corrupt_target = w.publication(None, "published").await;
+        let corrupt = queue_remote(&w, &corrupt_target).await;
+        w.inject(json!(17242), METHOD);
+        let target = w.publication(Some(&corrupt_target), "published").await;
+        let healthy = queue_remote(&w, &target).await;
+        {
+            let store = w.manager.store.lock().await;
+            if recovering {
+                let old_boot = Uuid::new_v4();
+                assert_eq!(
+                    store.claim_remote_answer(old_boot).unwrap().unwrap().key(),
+                    corrupt.idempotency_key.as_str()
+                );
+                assert_eq!(
+                    store.claim_remote_answer(old_boot).unwrap().unwrap().key(),
+                    healthy.idempotency_key.as_str()
+                );
+            }
+            store.conn.execute("UPDATE remote_answer_deliveries SET outcome_json='{}' WHERE idempotency_key=?1",
+                [corrupt.idempotency_key.as_str()]).unwrap();
+        }
+        w.manager.reconcile_harness_managers_once().await.unwrap();
+        w.response(true, 17242).await;
+        {
+            let store = w.manager.store.lock().await;
+            let raw: String = store
+                .conn
+                .query_row(
+                    "SELECT outcome_json FROM remote_answer_deliveries WHERE idempotency_key=?1",
+                    [corrupt.idempotency_key.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let receipt: RemoteAnswerReceiptV1 = serde_json::from_str(&raw).unwrap();
+            assert_eq!(receipt.receipt_key, corrupt.idempotency_key);
+            assert_eq!(receipt.state, RemoteAnswerStateV1::Refused);
+            assert_eq!(receipt.outcome.unwrap()["code"], "remote_answer_corrupt");
+            assert_eq!(
+                store.prepare_remote_answer(&healthy).unwrap().state,
+                RemoteAnswerStateV1::Succeeded
+            );
+            assert!(
+                !store
+                    .remote_answer_delivery(corrupt.idempotency_key.as_str())
+                    .unwrap()
+                    .unwrap()
+                    .effect_started
+            );
+        }
+        w.manager.reconcile_harness_managers_once().await.unwrap();
+        assert!(matches!(
+            w.writes.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        w.finish().await;
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn remote_answer_corrupt_journal_does_not_starve_auth_notices_or_manager_seat() {
+    for recovering in [false, true] {
+        let mut w = World::new().await;
+        w.inject(json!(1713), METHOD);
+        let target = w.publication(None, "published").await;
+        let request = queue_remote(&w, &target).await;
+        {
+            let store = w.manager.store.lock().await;
+            if recovering {
+                store.claim_remote_answer(Uuid::new_v4()).unwrap().unwrap();
+            }
+            // Valid JSON, but not a receipt: models an unreadable journal row.
+            store.conn.execute("UPDATE remote_answer_deliveries SET outcome_json='{}' WHERE idempotency_key=?1",
+                [request.idempotency_key.as_str()]).unwrap();
+            let mut failed = crate::session::agent_verbs::tests::test_session(
+                Uuid::new_v4(),
+                w._dir.path().to_owned(),
+            );
+            failed.project_id = Some(w.config.project_id);
+            failed.provider = SessionProvider::Codex;
+            failed.status = SessionStatus::Failed;
+            failed.stop_reason = Some("provider_error:provider_auth_invalid".into());
+            failed.duration_ms = Some(0);
+            store.insert_session(&failed).unwrap();
+            // Healthy seats without prior evidence intentionally write no
+            // record. Seed a real down transition, with recovery disabled so
+            // reaching the seat reconciler cannot launch a provider.
+            let grant = store
+                .get_harness_manager_policy(w.config.project_id)
+                .unwrap()
+                .unwrap();
+            store
+                .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                    project_id: w.config.project_id,
+                    expected_scope_version: w.config.row_version,
+                    expected_policy_version: grant.row_version,
+                    idempotency_key: "corrupt-journal-no-seat-recovery".into(),
+                    policy: ManagerPolicyV2 {
+                        max_recovery_attempts: 0,
+                        ..Default::default()
+                    },
+                })
+                .unwrap();
+            store.conn.execute("UPDATE sessions SET status='Failed',stop_reason='controlled_manager_failure' WHERE id=?1",
+                [w.config.current_session_id.unwrap().to_string()]).unwrap();
+            assert!(store.manager_seat_state(&w.config).unwrap().is_none());
+        }
+        // Settling the unreadable receipt also lets unrelated lanes advance.
+        for _ in 0..2 {
+            w.manager.reconcile_harness_managers_once().await.unwrap();
+        }
+        let store = w.manager.store.lock().await;
+        assert!(store.manager_seat_state(&w.config).unwrap().is_some());
+        let notices: i64 = store.conn.query_row(
+            "SELECT count(*) FROM harness_manager_notices WHERE project_id=?1 AND subject_id='provider_auth_invalid:Codex'",
+            [w.config.project_id.to_string()], |row| row.get(0)).unwrap();
+        assert_eq!(notices, 1);
+        drop(store);
+        assert!(matches!(
+            w.writes.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        w.finish().await;
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn remote_native_writer_capacity_timeout_requeues_before_effect_and_then_enqueues_once() {
+    use rsi_common::remote_pending_decisions::RemoteAnswerStateV1;
+    let mut w = World::new().await;
+    w.inject(json!(1712), METHOD);
+    let target = w.publication(None, "published").await;
+    let request = queue_remote(&w, &target).await;
+    let runtime = WRITERS
+        .lock()
+        .unwrap()
+        .get(&w.session)
+        .and_then(Weak::upgrade)
+        .unwrap();
+    let mut permits = Vec::new();
+    for _ in 0..w.writes.max_capacity() {
+        permits.push(
+            runtime
+                .writer
+                .prepare_approval(
+                    &json!(1712),
+                    METHOD,
+                    &target["params"],
+                    ApprovalDecision::Approve,
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    w.manager.reconcile_remote_answers_once().await.unwrap();
+    let store = w.manager.store.lock().await;
+    let receipt = store.prepare_remote_answer(&request).unwrap();
+    assert_eq!(receipt.state, RemoteAnswerStateV1::Queued);
+    assert_eq!(receipt.outcome.unwrap()["pre_effect_retries"], 1);
+    assert!(
+        !store
+            .remote_answer_delivery(request.idempotency_key.as_str())
+            .unwrap()
+            .unwrap()
+            .effect_started
+    );
+    drop(store);
+    drop(permits);
+    w.manager.reconcile_remote_answers_once().await.unwrap();
+    w.response(true, 1712).await;
+    assert_eq!(
+        w.manager
+            .store
+            .lock()
+            .await
+            .prepare_remote_answer(&request)
+            .unwrap()
+            .state,
+        RemoteAnswerStateV1::Succeeded
+    );
+    assert_eq!(w.manager.reconcile_remote_answers_once().await.unwrap(), 0);
+    assert!(matches!(
+        w.writes.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    w.finish().await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn remote_native_answer_enqueues_once_and_keeps_provider_closure_open() {
+    use rsi_common::remote_pending_decisions::RemoteAnswerStateV1;
+    let mut w = World::new().await;
+    w.inject(json!(1701), METHOD);
+    let target = w.publication(None, "published").await;
+    let request = queue_remote(&w, &target).await;
+    w.manager.reconcile_harness_managers_once().await.unwrap();
+    w.response(true, 1701).await;
+    let store = w.manager.store.lock().await;
+    assert_eq!(
+        store.prepare_remote_answer(&request).unwrap().state,
+        RemoteAnswerStateV1::Succeeded
+    );
+    let state: (String, String) = store.conn.query_row("SELECT state,closure_state FROM appserver_approval_publications WHERE publication_id=?1",
+        [target["publication_id"].as_str().unwrap()], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(state, ("enqueued".into(), "open".into()));
+    drop(store);
+    w.manager.reconcile_harness_managers_once().await.unwrap();
+    assert!(matches!(
+        w.writes.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    w.finish().await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn remote_native_answer_changed_incarnation_refuses_without_enqueue() {
+    use rsi_common::remote_pending_decisions::RemoteAnswerStateV1;
+    let mut w = World::new().await;
+    w.inject(json!(1702), METHOD);
+    let target = w.publication(None, "published").await;
+    let request = queue_remote(&w, &target).await;
+    let old = WRITERS
+        .lock()
+        .unwrap()
+        .get(&w.session)
+        .and_then(Weak::upgrade)
+        .unwrap();
+    let replacement = register_writer(w.session, 1, old.writer.clone()).unwrap();
+    w.manager.reconcile_harness_managers_once().await.unwrap();
+    assert_eq!(
+        w.manager
+            .store
+            .lock()
+            .await
+            .prepare_remote_answer(&request)
+            .unwrap()
+            .state,
+        RemoteAnswerStateV1::Refused
+    );
+    assert!(matches!(
+        w.writes.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    drop(replacement);
+    w.finish().await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn remote_native_answer_post_enqueue_error_is_uncertain_and_never_retried() {
+    use rsi_common::remote_pending_decisions::RemoteAnswerStateV1;
+    let mut w = World::new().await;
+    w.inject(json!(1703), METHOD);
+    let target = w.publication(None, "published").await;
+    let request = queue_remote(&w, &target).await;
+    w.manager.store.lock().await.conn.execute_batch("CREATE TRIGGER remote_finish_fail BEFORE UPDATE ON appserver_approval_publications WHEN NEW.state='enqueued' BEGIN SELECT RAISE(ABORT,'controlled finish failure'); END;").unwrap();
+    w.manager.reconcile_harness_managers_once().await.unwrap();
+    w.response(true, 1703).await;
+    let store = w.manager.store.lock().await;
+    assert_eq!(
+        store.prepare_remote_answer(&request).unwrap().state,
+        RemoteAnswerStateV1::Uncertain
+    );
+    store
+        .conn
+        .execute_batch("DROP TRIGGER remote_finish_fail;")
+        .unwrap();
+    store.recover_remote_answers(Uuid::new_v4()).unwrap();
+    assert!(store.claim_remote_answer(Uuid::new_v4()).unwrap().is_none());
+    drop(store);
+    w.manager.reconcile_harness_managers_once().await.unwrap();
+    assert!(matches!(
+        w.writes.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    w.finish().await;
+}

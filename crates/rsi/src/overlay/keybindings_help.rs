@@ -69,6 +69,20 @@ pub(super) fn handle_keybindings_help_key(app: &mut App, key: KeyEvent) {
     };
 
     if search_active {
+        // Standard editing: a real cursor and selection in the filter.
+        match app.edit_field(key, |overlay| match overlay {
+            OverlayState::KeybindingsHelp { filter, .. } => Some(filter),
+            _ => None,
+        }) {
+            crate::field_edit::FieldKey::Edited => {
+                if let OverlayState::KeybindingsHelp { scroll_offset, .. } = &mut app.overlay {
+                    *scroll_offset = 0;
+                }
+                return;
+            }
+            crate::field_edit::FieldKey::Moved => return,
+            crate::field_edit::FieldKey::Ignored => {}
+        }
         // --- Search mode: text input for filter ---
         match key.code {
             KeyCode::Esc => {

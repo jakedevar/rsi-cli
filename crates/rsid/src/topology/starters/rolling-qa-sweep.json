@@ -1,0 +1,91 @@
+{
+  "nodes": [
+    {
+      "id": "baseline",
+      "kind": "Task",
+      "label": "Rolling health baseline",
+      "params": {
+        "custody": {
+          "from": "base"
+        },
+        "step": {
+          "kind": "command",
+          "op": {
+            "name": "rolling_baseline",
+            "crates": [
+              "rsi-common",
+              "rsid",
+              "rsi"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "healthy",
+      "kind": "Task",
+      "label": "All catalog checks passed",
+      "prereqs": [
+        "baseline"
+      ],
+      "params": {
+        "when": {
+          "baseline": "completed"
+        },
+        "step": {
+          "kind": "gate",
+          "condition": {
+            "op": "eq",
+            "path": "nodes.baseline.exit_code",
+            "value": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "triage",
+      "kind": "Task",
+      "label": "File an Issue per new red",
+      "prereqs": [
+        "baseline",
+        "healthy"
+      ],
+      "params": {
+        "instructions": "The rolling baseline failed. The upstream context holds the typed report for every crate. For each failing check that is new (search AgentListIssues with title_contains for the check and crate first), file exactly one Issue with AgentCreateIssue: kind bug, label qa, a title naming the crate and failing check, and a body with the failing command, the first error lines from the report and the rolling commit. Do not edit files, do not commit, and do not write qa-green.sha. Finish with a PIPELINE HANDOFF — TRIAGE: block with doc_path: inline, status: complete and the Issue numbers you filed (or 'none new').",
+        "provider": "claude",
+        "model": "claude-sonnet-5-5",
+        "effort": "medium",
+        "custody": {
+          "from": "node:baseline"
+        },
+        "when": {
+          "baseline": "failure",
+          "healthy": "gate_false"
+        },
+        "step": {
+          "kind": "session",
+          "expects_commit": false,
+          "pass_content": false
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "baseline",
+      "to": "healthy",
+      "loop_edge": false
+    },
+    {
+      "from": "baseline",
+      "to": "triage",
+      "loop_edge": false
+    },
+    {
+      "from": "healthy",
+      "to": "triage",
+      "loop_edge": false
+    }
+  ],
+  "until": null
+}

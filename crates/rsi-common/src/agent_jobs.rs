@@ -231,6 +231,18 @@ pub struct AgentListJobsRequestV1 {
     pub limit: Option<u32>,
 }
 
+/// #1638: run `scripts/scoped-test --base <base> [--head <head>]` in the
+/// caller's sandbox. Two bare refs and nothing else: no filters, no flags.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedTestParams {
+    /// Branch, `origin/<branch>` or full commit id the diff is taken against.
+    pub base: String,
+    /// Candidate to verify; must be the sandbox HEAD when omitted or named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+}
+
 /// `cargo test` (or one nextest shard) through the cargo build-slot wrapper.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -239,6 +251,10 @@ pub struct TestJobParams {
     /// Epic lead), at most 90 minutes and two running QA lanes per owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qa_lane: Option<QaLaneParams>,
+    /// #1638: `scripts/scoped-test` for this sandbox; the typed scoped-test
+    /// receipt is `result.receipt`. Exclusive with every other test form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoped_test: Option<ScopedTestParams>,
     /// Run one declared just/make gate from the worktree's `.rsi/jobs.toml`.
     /// Exclusive with package, shard and candidate-receipt runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -408,6 +424,12 @@ fn candidate_ref(value: &str) -> bool {
 }
 
 impl TestJobParams {
+    /// A `scoped_test` run (#1638).
+    #[must_use]
+    pub const fn is_scoped_test(&self) -> bool {
+        self.scoped_test.is_some()
+    }
+
     /// A `candidate_receipt` run: only the appointed manager or an Epic lead
     /// may submit it (it fetches and builds an arbitrary branch).
     #[must_use]
@@ -454,6 +476,20 @@ impl TestJobParams {
             {
                 return Err(JOB_INVALID_PARAMS);
             }
+        }
+        if let Some(scoped) = &self.scoped_test {
+            let ok = candidate_ref(&scoped.base)
+                && scoped.head.as_deref().is_none_or(candidate_ref)
+                && self.recipe.is_none()
+                && self.shard.is_none()
+                && self.package.is_none()
+                && self.candidate_receipt.is_none()
+                && self.filterset.is_none()
+                && self.filters.is_empty()
+                && !self.lib_only
+                && !self.exact
+                && self.qa_lane.is_none();
+            return ok.then_some(()).ok_or(JOB_INVALID_PARAMS);
         }
         if let Some(recipe) = &self.recipe {
             let ok = bare_token(recipe, &['.'])
@@ -637,7 +673,10 @@ pub struct AgentJobResultV1 {
     /// `cloud_sweep` jobs: the typed sweep verdict.
     #[serde(default)]
     pub sweep: Option<CloudSweepResultV1>,
-    /// `test` jobs with `candidate_receipt` (#1099): the typed candidate
+    /// `test` jobs with `scoped_test` (#1638): the `SCOPED_TEST_RECEIPT` the
+    /// script printed last (`ok`, `exit_code`, `base`, `head`, `filters`,
+    /// `log_dir`, per-package `status`/`completed`). `test` jobs with
+    /// `candidate_receipt` (#1099): the typed candidate
     /// receipt `scripts/check-touched-shards` produced (base, head, merge
     /// clean, shards compiled, audit verdicts, migrations, suggested filters).
     #[serde(default)]
@@ -801,6 +840,50 @@ mod tests {
             .typed_params(),
             Err(JOB_INVALID_PARAMS)
         );
+    }
+
+    /// #1638: the scoped-test form takes two bare refs and nothing else.
+    #[test]
+    fn scoped_test_jobs_take_only_bare_refs() {
+        let ok = |params| request(JobKind::Test, params).typed_params().is_ok();
+        assert!(ok(json!({"scoped_test":{"base":"origin/rolling"}})));
+        assert!(ok(
+            json!({"scoped_test":{"base":"origin/rolling","head":"HEAD"},"timeout_minutes":30})
+        ));
+        let valid = request(
+            JobKind::Test,
+            json!({"scoped_test":{"base":"rolling","head":"a".repeat(40)}}),
+        )
+        .typed_params()
+        .unwrap();
+        assert!(matches!(&valid, JobParams::Test(p) if p.is_scoped_test()));
+        assert_eq!(
+            serde_json::from_value::<JobParams>(serde_json::to_value(&valid).unwrap()).unwrap(),
+            valid
+        );
+        for bad in [
+            json!({"scoped_test":{}}),
+            json!({"scoped_test":{"base":""}}),
+            json!({"scoped_test":{"base":"--dry-run"}}),
+            json!({"scoped_test":{"base":"a..b"}}),
+            json!({"scoped_test":{"base":"x y"}}),
+            json!({"scoped_test":{"base":"x;id"}}),
+            json!({"scoped_test":{"base":"origin/rolling","head":"-x"}}),
+            json!({"scoped_test":{"base":"origin/rolling","head":"HEAD~1"}}),
+            json!({"scoped_test":{"base":"origin/rolling","args":["--filter","x"]}}),
+            json!({"scoped_test":{"base":"origin/rolling"},"args":["--tmpfs"]}),
+            json!({"scoped_test":{"base":"origin/rolling"},"filters":["rsid=x"]}),
+            json!({"scoped_test":{"base":"origin/rolling"},"recipe":"scoped-test"}),
+            json!({"scoped_test":{"base":"origin/rolling"},"package":"rsid"}),
+            json!({"scoped_test":{"base":"origin/rolling"},"shard":"other-01"}),
+            json!({"scoped_test":{"base":"origin/rolling"},"candidate_receipt":"rolling"}),
+            json!({"scoped_test":{"base":"origin/rolling"},"lib_only":true}),
+            json!({"scoped_test":{"base":"origin/rolling"},"exact":true}),
+            json!({"scoped_test":{"base":"origin/rolling"},"qa_lane":{"sha":"a".repeat(40)}}),
+            json!({"scoped_test":{"base":"origin/rolling"},"timeout_minutes":4}),
+        ] {
+            assert!(!ok(bad.clone()), "{bad}");
+        }
     }
 
     #[test]

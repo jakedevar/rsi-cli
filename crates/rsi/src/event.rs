@@ -215,7 +215,24 @@ async fn run_global_effect(app: &mut crate::app::App, effect: crate::key_tables:
         GlobalEffect::SessionListZoneNext => {
             crate::action_handler::dispatch_lc_action(app, LcAction::SessionListZoneNext).await;
         }
-        GlobalEffect::FocusLeft => app.focus_neighbor(crate::app::NavDirection::Left),
+        GlobalEffect::FocusLeft => {
+            // Standard editing (#1628): the detail pane's draft takes every
+            // printable key, and a list + detail tab is one layout leaf, so
+            // there is no neighbour to focus. Ctrl-H is the documented way
+            // back to the session list, where the global bindings live.
+            let single_leaf = app.tabs[app.active_tab].layout.leaf_ids().len() <= 1;
+            if app.standard_editing()
+                && single_leaf
+                && matches!(
+                    app.focused_pane(),
+                    Some(crate::types::Pane::SessionDetail { .. })
+                )
+            {
+                app.back_to_list();
+            } else {
+                app.focus_neighbor(crate::app::NavDirection::Left);
+            }
+        }
         GlobalEffect::FocusRight => app.focus_neighbor(crate::app::NavDirection::Right),
         GlobalEffect::ResizeOverlay(dw, dh) => app.adjust_overlay_geometry(0, 0, dw, dh),
         GlobalEffect::MoveOverlay(dx, dy) => app.adjust_overlay_geometry(dx, dy, 0, 0),
@@ -248,6 +265,31 @@ async fn step_once_with_clock<C: EventClock>(
     use crossterm::event::KeyEventKind;
     use keybindings::BindingMachine;
     use modalkit::key::TerminalKey;
+
+    // The first-start editing-mode prompt (#1628) owns every key until the
+    // operator answers; only the global quit chord escapes it.
+    if app.editing_mode_prompt.is_some() {
+        if key.kind != KeyEventKind::Press {
+            return KeyStepResult::default();
+        }
+        let quit = crate::key_tables::lookup(crate::key_tables::GLOBAL_KEY_INTERCEPTS, key, |g| {
+            global_guard_holds(app, g)
+        })
+        .map(|entry| entry.effect)
+        .filter(|effect| matches!(effect, crate::key_tables::GlobalEffect::Quit));
+        if let Some(effect) = quit {
+            run_global_effect(app, effect).await;
+        } else {
+            crate::editing_mode_prompt::handle_key(app, key).await;
+        }
+        return KeyStepResult {
+            suppress_poll: true,
+        };
+    }
+
+    // Text surfaces follow the live editing mode before their first key, not
+    // only at the next frame (#1628).
+    app.sync_standard_surfaces();
 
     // Ctrl+V clipboard paste - must come before the Press-only filter.
     // Ghostty with `performable:ctrl+v=paste_from_clipboard` sends
@@ -315,11 +357,16 @@ async fn step_once_with_clock<C: EventClock>(
     // chord for active text entry, quit/terminal, jumplist, pane focus and
     // zone cycling, overlay geometry, sidebar width and event selection. The
     // first row whose chord and context match wins.
-    let global =
+    // A Standard-mode composer takes the editing chords (word moves, text
+    // selection, Ctrl-C on a selection) before the global table (#1628).
+    let global = if app.standard_composer_claims(key) {
+        None
+    } else {
         crate::key_tables::lookup(crate::key_tables::GLOBAL_KEY_INTERCEPTS, key, |guard| {
             global_guard_holds(app, guard)
         })
-        .map(|entry| entry.effect);
+        .map(|entry| entry.effect)
+    };
     if let Some(effect) = global {
         run_global_effect(app, effect).await;
     }
@@ -328,8 +375,14 @@ async fn step_once_with_clock<C: EventClock>(
     // the input bar when no autocomplete suggestions are visible.
     // Mouse wheel also scrolls (see mouse event handler below).
     else {
+        // Standard editing owns the `:`, `/` and quick-input lines (a real
+        // cursor and selection), ahead of the pane navigation that Vim mode
+        // keeps live beside them.
+        if standard_line_edit(app, key) {
+            // The line editor consumed the key
+        } else if
         // Overlay captures all input when active
-        if crate::overlay::handle_overlay_key(app, key).await {
+        crate::overlay::handle_overlay_key(app, key).await {
             // Overlay consumed the key - skip normal dispatch
         } else if crate::file_viewer::handle_file_viewer_key(app, key) {
             // File viewer consumed the key
@@ -575,6 +628,7 @@ pub async fn run_event_loop(
                 if app.apply_bootstrap_event(result) {
                     app.mark_dirty();
                 }
+                crate::editing_mode_prompt::settle_on_start(&mut *app).await;
             }
 
             maybe_event = reader.next() => {
@@ -590,6 +644,17 @@ pub async fn run_event_loop(
                         use crossterm::event::{MouseEventKind, MouseButton};
                         const MOUSE_SCROLL_LINES: usize = 3;
                         match mouse.kind {
+                            // The first-start prompt (#1628) owns the mouse too.
+                            _ if app.editing_mode_prompt.is_some() => {
+                                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                                    crate::editing_mode_prompt::handle_click(
+                                        &mut *app,
+                                        mouse.column,
+                                        mouse.row,
+                                    )
+                                    .await;
+                                }
+                            }
                             MouseEventKind::Down(MouseButton::Left) => {
                                 if crate::overlay::file_explorer::handle_mouse_click(
                                     &mut *app,
@@ -710,6 +775,7 @@ pub async fn run_event_loop(
                     for lc_action in deferred {
                         crate::action_handler::dispatch_lc_action(app, lc_action).await;
                     }
+                    app.settle_agent_created_project().await;
                 } else {
                     // The worker normally emits a typed loss first. Channel
                     // closure without one is still routed through the same
@@ -1391,6 +1457,27 @@ fn spawn_external(
     result
 }
 
+/// Standard editing in the `:` / `/` / quick-input lines: a real cursor and
+/// selection. Returns whether the key was taken. Vim mode never takes it.
+fn standard_line_edit(app: &mut crate::app::App, key: KeyEvent) -> bool {
+    use crate::field_edit::FieldKey;
+    use crate::types::InputMode;
+
+    if !app.standard_editing() || app.any_overlay_active() {
+        return false;
+    }
+    let result = match app.input_mode {
+        InputMode::Command => app.field_edit.handle_key(&mut app.command_buffer, key),
+        InputMode::Input => app.field_edit.handle_key(&mut app.input_buffer, key),
+        InputMode::Search => app.field_edit.handle_key(&mut app.search_query, key),
+        InputMode::Normal => return false,
+    };
+    if result == FieldKey::Edited && app.input_mode == InputMode::Search {
+        app.apply_search();
+    }
+    result != FieldKey::Ignored
+}
+
 /// Handle key events in Input mode (typing a query for new session / continue).
 async fn handle_input_mode(app: &mut crate::app::App, key: KeyEvent) {
     use crate::key_tables::{LineEditEffect, LineEditor};
@@ -1535,6 +1622,11 @@ fn handle_mouse_click(app: &mut crate::app::App, col: u16, row: u16) {
         _ => return,
     };
 
+    // Standard editing: a click inside the composer text places the cursor.
+    if app.standard_editing() && place_composer_cursor(app, session_id, col, row) {
+        return;
+    }
+
     if app
         .sessions
         .get(&session_id)
@@ -1601,6 +1693,40 @@ fn handle_mouse_click(app: &mut crate::app::App, col: u16, row: u16) {
         crate::clipboard::osc52_copy(code);
         app.notify_success("Copied code block to clipboard");
     }
+}
+
+/// Place the composer cursor at a click inside its text area. Returns whether
+/// the click landed in the composer (#1628).
+fn place_composer_cursor(
+    app: &mut crate::app::App,
+    session_id: uuid::Uuid,
+    col: u16,
+    row: u16,
+) -> bool {
+    let Some(state) = app.sessions.get_mut(&session_id) else {
+        return false;
+    };
+    let surface = &mut state.input_bar.surface;
+    let Some((area, scroll)) = surface.text_geometry.get() else {
+        return false;
+    };
+    if col < area.x || col >= area.x + area.width || row < area.y || row >= area.y + area.height {
+        return false;
+    }
+    let visual_row = (row - area.y) as usize + scroll as usize;
+    let visual_col = (col - area.x) as usize;
+    let (r, c) = crate::ui::session::textarea_position_at_visual(
+        surface.textarea.lines(),
+        area.width as usize,
+        visual_row,
+        visual_col,
+    );
+    surface.textarea.cancel_selection();
+    surface
+        .textarea
+        .move_cursor(tui_textarea::CursorMove::Jump(r as u16, c as u16));
+    surface.vim_state.desired_col = None;
+    true
 }
 
 /// Detect click targets at the given screen coordinates within a session detail pane.
@@ -2220,6 +2346,11 @@ pub(crate) fn scroll_detail_lines(
 
 /// Check if the focused pane is a SessionDetail with its input bar in Insert mode.
 fn is_input_bar_insert(app: &crate::app::App) -> bool {
+    // Standard editing has no insert/normal split: the composer never blocks
+    // the global navigation chords, which stay available beside typing.
+    if app.standard_editing() {
+        return false;
+    }
     let session_id = match app.focused_pane() {
         Some(crate::types::Pane::SessionDetail { session_id }) => *session_id,
         _ => return false,
@@ -4350,5 +4481,235 @@ mod tests {
             ("search", "Ctrl-T", "search=Fixt"),
             ("search", "Ctrl-S", "search=Fixs"),
         ];
+    }
+
+    // ---- Standard editing in the session composer (#1628) ----
+
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    fn standard_composer(mode: &str) -> (crate::app::App, uuid::Uuid) {
+        let (mut app, id) = crate::app::app_test_helpers::with_session_detail();
+        *app.focused_pane_mut().unwrap() = Pane::SessionDetail { session_id: id };
+        set_editing_mode(&mut app, mode);
+        (app, id)
+    }
+
+    fn set_editing_mode(app: &mut crate::app::App, mode: &str) {
+        crate::settings::DaemonFeatureEntry::update_from_json(
+            &mut app.daemon_features,
+            &serde_json::json!({ "editing_mode": mode }),
+        );
+    }
+
+    async fn press(app: &mut crate::app::App, code: KeyCode, mods: KeyModifiers) {
+        step_once(app, KeyEvent::new(code, mods)).await;
+    }
+
+    async fn type_text(app: &mut crate::app::App, text: &str) {
+        for ch in text.chars() {
+            press(app, KeyCode::Char(ch), KeyModifiers::NONE).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_composer_types_every_key_including_vim_commands() {
+        let (mut app, id) = standard_composer("standard");
+        type_text(&mut app, "jk gg:wq").await;
+        let surface = &app.sessions[&id].input_bar.surface;
+        assert_eq!(surface.content(), "jk gg:wq");
+        assert_eq!(surface.mode, crate::types::PopupMode::Insert);
+        assert!(matches!(
+            app.focused_pane(),
+            Some(Pane::SessionDetail { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn standard_ctrl_c_copies_a_selection_and_otherwise_quits() {
+        let (mut app, id) = standard_composer("standard");
+        type_text(&mut app, "hello").await;
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL).await;
+        assert_eq!(
+            crate::input_surface::selected_text(&app.sessions[&id].input_bar.surface).as_deref(),
+            Some("hello")
+        );
+        assert!(
+            matches!(app.overlay, OverlayState::None),
+            "Ctrl-A selects, it does not open the AI command"
+        );
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL).await;
+        assert!(!app.quit, "Ctrl-C with a selection copies");
+        assert_eq!(
+            app.sessions[&id].input_bar.surface.textarea.yank_text(),
+            "hello"
+        );
+
+        // Collapse the selection: Ctrl-C keeps its global meaning.
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE).await;
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL).await;
+        assert!(app.quit, "Ctrl-C without a selection still quits");
+    }
+
+    #[tokio::test]
+    async fn standard_ctrl_arrows_move_by_word_not_pane_focus() {
+        let (mut app, id) = standard_composer("standard");
+        type_text(&mut app, "alpha beta").await;
+        press(&mut app, KeyCode::Left, KeyModifiers::CONTROL).await;
+        assert_eq!(
+            app.sessions[&id].input_bar.surface.textarea.cursor(),
+            (0, 6)
+        );
+        assert!(matches!(
+            app.focused_pane(),
+            Some(Pane::SessionDetail { .. })
+        ));
+        press(&mut app, KeyCode::Left, KeyModifiers::ALT).await;
+        assert_eq!(
+            app.sessions[&id].input_bar.surface.textarea.cursor(),
+            (0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_ctrl_h_returns_from_the_composer_to_the_session_list() {
+        let (mut app, _id) = standard_composer("standard");
+        type_text(&mut app, "x").await;
+        assert!(matches!(
+            app.focused_pane(),
+            Some(Pane::SessionDetail { .. })
+        ));
+        press(&mut app, KeyCode::Char('h'), KeyModifiers::CONTROL).await;
+        assert!(
+            matches!(app.focused_pane(), Some(Pane::SessionList { .. })),
+            "Ctrl-H leaves the draft for the session list"
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_esc_clears_a_selection_then_returns_to_the_session_list() {
+        let (mut app, id) = standard_composer("standard");
+        type_text(&mut app, "hello").await;
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL).await;
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE).await;
+        assert!(
+            matches!(app.focused_pane(), Some(Pane::SessionDetail { .. })),
+            "Esc with a selection only clears the selection"
+        );
+        assert_eq!(app.sessions[&id].input_bar.surface.content(), "hello");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE).await;
+        assert!(
+            matches!(app.focused_pane(), Some(Pane::SessionList { .. })),
+            "Esc with nothing to clear leaves the draft for the session list"
+        );
+    }
+
+    #[tokio::test]
+    async fn vim_esc_in_the_composer_still_goes_to_normal_mode() {
+        let (mut app, id) = standard_composer("vim");
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE).await;
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE).await;
+        assert_eq!(
+            app.sessions[&id].input_bar.surface.mode,
+            crate::types::PopupMode::Normal
+        );
+        assert!(matches!(
+            app.focused_pane(),
+            Some(Pane::SessionDetail { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn standard_shift_arrows_select_a_draft_and_keep_event_stepping_on_an_empty_one() {
+        let (mut app, id) = standard_composer("standard");
+        type_text(&mut app, "abc").await;
+        press(&mut app, KeyCode::Left, KeyModifiers::SHIFT).await;
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE).await;
+        assert_eq!(app.sessions[&id].input_bar.surface.content(), "ab");
+        assert!(app.standard_composer_claims(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)));
+        app.sessions.get_mut(&id).unwrap().input_bar.surface.clear();
+        assert!(!app.standard_composer_claims(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)));
+    }
+
+    #[tokio::test]
+    async fn the_composer_follows_the_editing_mode_live() {
+        let (mut app, id) = standard_composer("vim");
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE).await;
+        assert_eq!(
+            app.sessions[&id].input_bar.surface.content(),
+            "",
+            "vim starts in Normal mode"
+        );
+        set_editing_mode(&mut app, "standard");
+        type_text(&mut app, "x").await;
+        assert_eq!(app.sessions[&id].input_bar.surface.content(), "x");
+        set_editing_mode(&mut app, "vim");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE).await;
+        assert_eq!(
+            app.sessions[&id].input_bar.surface.mode,
+            crate::types::PopupMode::Normal,
+            "back in vim, Esc leaves insert mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn clicking_the_standard_composer_places_the_cursor() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let (mut app, id) = standard_composer("standard");
+        type_text(&mut app, "hello world").await;
+        let mut terminal = Terminal::new(TestBackend::new(60, 5)).unwrap();
+        terminal
+            .draw(|frame| {
+                crate::ui::session::render_input_bar(frame, Rect::new(0, 0, 60, 5), id, true, &app);
+            })
+            .unwrap();
+        let (area, _) = app.sessions[&id]
+            .input_bar
+            .surface
+            .text_geometry
+            .get()
+            .unwrap();
+        assert!(place_composer_cursor(&mut app, id, area.x + 4, area.y));
+        assert_eq!(
+            app.sessions[&id].input_bar.surface.textarea.cursor(),
+            (0, 4)
+        );
+        assert!(
+            !place_composer_cursor(&mut app, id, 0, 40),
+            "outside the composer"
+        );
+    }
+
+    #[test]
+    fn click_positions_map_through_wrapped_rows() {
+        let lines = vec![
+            "aaaa bbbb cccc".to_string(),
+            String::new(),
+            "dd".to_string(),
+        ];
+        // width 10: row 0 "aaaa bbbb ", row 1 "cccc", row 2 empty line, row 3 "dd".
+        assert_eq!(
+            crate::ui::session::textarea_position_at_visual(&lines, 10, 0, 3),
+            (0, 3)
+        );
+        assert_eq!(
+            crate::ui::session::textarea_position_at_visual(&lines, 10, 1, 2),
+            (0, 12)
+        );
+        assert_eq!(
+            crate::ui::session::textarea_position_at_visual(&lines, 10, 1, 99),
+            (0, 14)
+        );
+        assert_eq!(
+            crate::ui::session::textarea_position_at_visual(&lines, 10, 2, 5),
+            (1, 0)
+        );
+        assert_eq!(
+            crate::ui::session::textarea_position_at_visual(&lines, 10, 3, 1),
+            (2, 1)
+        );
+        assert_eq!(
+            crate::ui::session::textarea_position_at_visual(&lines, 10, 9, 1),
+            (2, 2)
+        );
     }
 }

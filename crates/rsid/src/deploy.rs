@@ -1192,6 +1192,8 @@ mod tests {
                 "rsi-agent-mcp",
                 "rsi-build-rustc",
                 "rsi-contract-validate",
+                "rsi-turn-shim",
+                "rsi-socket-hold",
                 "rsid-supervisor.sh"
             ]
         );

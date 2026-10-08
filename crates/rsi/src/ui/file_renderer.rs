@@ -250,7 +250,10 @@ fn apply_cursor_line_bg_to_spans(spans: Vec<Span<'static>>) -> Vec<Span<'static>
         .into_iter()
         .map(|s| {
             let mut style = s.style;
-            style.bg = Some(bg);
+            // A Standard-mode text selection stays visible on the cursor line.
+            if style.bg != Some(theme::visual_selection_bg()) {
+                style.bg = Some(bg);
+            }
             Span::styled(s.content, style)
         })
         .collect()
@@ -305,8 +308,9 @@ fn apply_highlights(
     spans: Vec<Span<'static>>,
     search_hits: &[(usize, usize, bool)],
     bracket_positions: &[usize],
+    selection: Option<(usize, usize)>,
 ) -> Vec<Span<'static>> {
-    if search_hits.is_empty() && bracket_positions.is_empty() {
+    if search_hits.is_empty() && bracket_positions.is_empty() && selection.is_none() {
         return spans;
     }
 
@@ -341,6 +345,13 @@ fn apply_highlights(
     for &pos in bracket_positions {
         if pos < chars_styles.len() {
             chars_styles[pos].1 = chars_styles[pos].1.bg(theme::bracket_match_bg());
+        }
+    }
+
+    // Standard-mode text selection (char range, end exclusive)
+    if let Some((start, end)) = selection {
+        for i in start..end.min(chars_styles.len()) {
+            chars_styles[i].1 = chars_styles[i].1.bg(theme::visual_selection_bg());
         }
     }
 
@@ -389,6 +400,12 @@ pub fn render_file_viewer_content(
     }
 
     let (cursor_row, cursor_col) = viewer.surface.textarea.cursor();
+    // Standard editing highlights its selection (Vim never did here).
+    let standard_selection = viewer
+        .surface
+        .standard_editing
+        .then(|| crate::ui::session::surface_selection_for_render(&viewer.surface))
+        .flatten();
 
     // Reserve 1 line at the bottom for search/command prompt
     let search_active = viewer.search.input_active;
@@ -600,10 +617,19 @@ pub fn render_file_viewer_content(
             }
         }
         let empty_hits: Vec<(usize, usize, bool)> = Vec::new();
+        let line_selection = standard_selection.and_then(|((sr, sc), (er, ec))| {
+            if line_num < sr || line_num > er {
+                return None;
+            }
+            let start = if line_num == sr { sc } else { 0 };
+            let end = if line_num == er { ec + 1 } else { usize::MAX };
+            (start < end).then_some((start, end))
+        });
         content_spans = apply_highlights(
             content_spans,
             search_hits.unwrap_or(&empty_hits),
             &bracket_positions,
+            line_selection,
         );
 
         // --- Word-wrap content spans into visual lines ---

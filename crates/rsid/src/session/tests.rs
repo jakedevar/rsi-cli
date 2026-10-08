@@ -8,6 +8,7 @@ mod restart_recovery;
 mod terminal_cause;
 mod terminal_watch_owner;
 mod transient_heal;
+mod turn_adoption;
 mod worker_no_result;
 
 use super::types::{PIPELINE_PATH_RE, TerminalFinalizeDecision};
@@ -1011,6 +1012,61 @@ async fn continue_retry_refusal_is_launch_time_and_not_a_started_provider() {
         !manager.active.read().await.contains_key(&session_id),
         "a refused launch must not leave an active provider incarnation"
     );
+}
+
+/// #1715 finding 2: the on-call answer's continuation is bound to the exact
+/// topology execution/attempt and rechecks it under the spawn guard before any
+/// launch. A binding with no live attempt behind it is refused at that fence:
+/// the refusal is the typed topology one, not the launch-time filesystem error
+/// the same session would otherwise hit, and no provider incarnation exists.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn topology_answer_continuation_is_fenced_by_its_exact_binding() {
+    let (mut manager, _dir) = manager();
+    let session_id = Uuid::new_v4();
+    let mut session = bare_session(session_id);
+    session.provider = SessionProvider::Codex;
+    session.claude_session_id = Some("resume-token".to_string());
+    session.working_dir = std::path::PathBuf::from("/definitely/missing/rsi-session-dir");
+    insert_row(&manager, &session).await;
+    manager.completed.write().await.insert(
+        session_id,
+        CompletedSession {
+            session,
+            events: Vec::new(),
+            turn_metrics: Vec::new(),
+            retry_cancel: None,
+            retry_fired_at: None,
+            superseded_by_retry: None,
+            events_hydrated: true,
+        },
+    );
+    stub_codex_launch_for_missing_working_dir(&mut manager);
+
+    let error = Box::pin(manager.continue_topology_answer(
+        session_id,
+        "My answer to your question: Keep it".to_string(),
+        crate::topology::store::AnswerBinding {
+            execution_id: Uuid::new_v4(),
+            attempt_id: Uuid::new_v4(),
+            decision_key: "topology:gone".to_string(),
+        },
+    ))
+    .await
+    .expect_err("an unbound topology answer must not reach the provider");
+
+    match &error {
+        crate::error::DaemonError::PolicyDenied(reason) => assert!(
+            reason.contains(crate::topology::store::ANSWER_REVOKED),
+            "{reason}"
+        ),
+        other => panic!("expected the typed topology refusal, got {other:?}"),
+    }
+    assert!(
+        manager.completed.read().await.contains_key(&session_id),
+        "the refused answer leaves the finished session as it was"
+    );
+    assert!(!manager.active.read().await.contains_key(&session_id));
 }
 
 /// Issue #572: mail to any Codex session is refused with the typed hold while

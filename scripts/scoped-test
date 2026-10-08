@@ -177,8 +177,29 @@ def selects_e2e(selections):
     return any(s["kind"] == "test" and s["target"] == E2E_TARGET for s in selections)
 
 
+E2E_PREBUILD_LIST = Path(__file__).resolve().parent / "e2e-prebuild-bins.txt"
+
+
+def e2e_prebuild_bins(path=E2E_PREBUILD_LIST):
+    """(package, binary) pairs from the single shared definition (#1651)."""
+    pairs = []
+    for line in path.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            package, binary = line.split()
+            pairs.append((package, binary))
+    return pairs
+
+
 def e2e_prebuild_command(cargo):
-    return [*cargo, "build", "-p", "rsid", "--bin", "rsid"]
+    # The list is shared with rsi-rolling-land so the two cannot drift (#1637).
+    pairs = e2e_prebuild_bins()
+    args = ["build"]
+    for package in dict.fromkeys(package for package, _ in pairs):
+        args += ["-p", package]
+    for _, binary in pairs:
+        args += ["--bin", binary]
+    return [*cargo, *args]
 
 
 def build_command(package, selections, cargo):
@@ -341,6 +362,20 @@ def static_guards(repo, base, head, audits):
     return failed
 
 
+# The typed receipt the daemon's scoped-test job reads from the log tail (#1638).
+RECEIPT = {"schema": 1, "emit": False, "packages": []}
+RECEIPT_PREFIX = "SCOPED_TEST_RECEIPT "
+
+
+def emit_receipt(exit_code):
+    """Print the one-line JSON receipt last, whatever way the run ended."""
+    if not RECEIPT["emit"]:
+        return
+    receipt = {k: v for k, v in RECEIPT.items() if k != "emit"}
+    receipt.update(exit_code=exit_code, ok=exit_code == 0)
+    print(RECEIPT_PREFIX + json.dumps(receipt, separators=(",", ":")), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="origin/rolling")
@@ -363,6 +398,7 @@ def main():
     args = parser.parse_args()
     if args.execute_plan:
         return execute_package(json.loads(Path(args.execute_plan).read_text()))
+    RECEIPT.update(emit=True, base=args.base, head=args.head, dry_run=args.dry_run)
     repo = Path(args.repo).resolve()
     run_started = time.monotonic()
     if args.filters is None and os.environ.get("RSI_SCOPED_TEST_FILTERS"):
@@ -403,6 +439,7 @@ def main():
         return derive_code or 1
     if not args.dry_run and checker["git_out"](repo, "rev-parse", "HEAD").strip() != head:
         raise ValueError("--head differs from this worktree's HEAD; use --dry-run to inspect another candidate")
+    RECEIPT.update(head=head, filters=list(filters))
     plan = selection_plan(filters, checker["shard_packages"](repo))
     python_tests = PYTHON_GATE.selected_tests(
         repo, PYTHON_GATE.changed_paths(repo, receipt_data.get("merge_base", args.base), head))
@@ -412,6 +449,7 @@ def main():
         print("scoped-test: systemd unavailable on this platform; plain wall-clock timeout, no CPU cap", flush=True)
     log_dir = Path(tempfile.mkdtemp(prefix="rsi-scoped-test-", dir="/tmp" if Path("/tmp").is_dir() else None))
     print(f"logs: {log_dir}", flush=True)
+    RECEIPT["log_dir"] = str(log_dir)
     if not plan and not python_commands:
         print("scoped-test: no test filters derived; no tests run", flush=True)
     matched, failed, summaries = set(), False, []
@@ -536,6 +574,7 @@ def main():
             status = ("timed out" if timed_out else "failed" if code or unmatched else
                       "passed" if completed else "not applicable")
             summary = f"scoped-test: {package}: {status} ({completed} completed tests)\n"
+            RECEIPT["packages"].append({"package": package, "status": status, "completed": completed})
             print(summary, end="", flush=True)
             with (log_dir / f"{package}.log").open("a") as log:
                 log.write(summary)
@@ -544,8 +583,11 @@ def main():
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        code = main()
     except (OSError, ValueError) as error:
-        sys.exit(f"scoped-test: {error}")
+        print(f"scoped-test: {error}", file=sys.stderr)
+        code = 1
     except KeyboardInterrupt:
-        sys.exit(130)
+        code = 130
+    emit_receipt(code)
+    sys.exit(code)

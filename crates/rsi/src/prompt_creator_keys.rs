@@ -125,6 +125,7 @@ fn handle_editor_key(app: &mut App, key: KeyEvent) -> bool {
     }
 
     // Delegate to the file viewer's InputSurface
+    let standard = app.standard_editing();
     if let Some(ref mut viewer) = app.prompt_creator_viewer {
         let config = crate::input_surface::InputSurfaceConfig {
             pass_through_unhandled: false,
@@ -132,6 +133,7 @@ fn handle_editor_key(app: &mut App, key: KeyEvent) -> bool {
             working_dir: None,
             // Prompt files are documents; Enter always inserts a line break.
             submit_on_enter: false,
+            standard_editing: standard,
         };
 
         let action = crate::input_surface::handle_key(&mut viewer.surface, key, &config);
@@ -161,6 +163,7 @@ fn handle_model_dropdown_key(app: &mut App, key: KeyEvent) -> bool {
     use crate::widget::model_dropdown::{
         ModelDropdownAction, handle_model_dropdown_key_with_providers,
     };
+    let standard_editing = app.standard_editing();
     let Some(dropdown) = app.prompt_creator_state.model_dropdown.as_mut() else {
         return true;
     };
@@ -172,7 +175,7 @@ fn handle_model_dropdown_key(app: &mut App, key: KeyEvent) -> bool {
     if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
         return true;
     }
-    match handle_model_dropdown_key_with_providers(dropdown, &key, &[], &[]) {
+    match handle_model_dropdown_key_with_providers(dropdown, &key, &[], &[], standard_editing) {
         ModelDropdownAction::Selected(model_id) => {
             app.prompt_creator_state.selected_model = Some(model_id);
             dropdown.close();

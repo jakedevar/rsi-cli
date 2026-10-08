@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use walkdir::WalkDir;
 
@@ -53,45 +53,7 @@ const CODEX_USAGE_LIMIT_MESSAGE_PREFIX: &str = "You've hit your usage limit.";
 pub(crate) const CODEX_USAGE_LIMIT_ERROR_CLASS: &str = "codex_usage_limit";
 
 /// Wraps a running Codex CLI process.
-pub struct CodexProcess {
-    child: Child,
-}
-
-#[cfg(test)]
-impl CodexProcess {
-    pub(crate) fn from_child_for_route_test(child: Child) -> Self {
-        Self { child }
-    }
-}
-
-impl CodexProcess {
-    /// Send SIGINT to gracefully interrupt the session.
-    pub fn interrupt(&self) -> Result<()> {
-        if let Some(pid) = self.child.id() {
-            nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGINT,
-            )
-            .map_err(|e| DaemonError::Process(format!("Failed to send SIGINT: {}", e)))?;
-        }
-        Ok(())
-    }
-
-    /// Force kill the process.
-    pub async fn kill(&mut self) -> Result<()> {
-        crate::process_scope::kill_worker_child(&mut self.child).await
-    }
-
-    /// OS pid of the provider child, `None` once it was reaped.
-    pub fn pid(&self) -> Option<u32> {
-        self.child.id()
-    }
-
-    /// Non-blocking check if the process has exited.
-    pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
-        Ok(self.child.try_wait()?)
-    }
-}
+pub type CodexProcess = crate::claude::CliTurnProcess;
 
 /// Per-runtime Codex executable override for tests, keyed by the runtime
 /// config's identity so one test's fake CLI never leaks into another test or a
@@ -636,12 +598,44 @@ impl CodexClient {
         config: &LaunchConfig,
         execution: CliExecutionCapability,
     ) -> Result<(CodexProcess, mpsc::Receiver<StreamEvent>)> {
+        self.launch_inner(config, execution, None)
+    }
+
+    pub(crate) fn launch_inner(
+        &self,
+        config: &LaunchConfig,
+        execution: CliExecutionCapability,
+        shim_override: Option<&Path>,
+    ) -> Result<(CodexProcess, mpsc::Receiver<StreamEvent>)> {
         if let Some(thread_id) = config.resume_session_id.as_deref() {
             self.validate_resume_history_for_launch(thread_id)?;
         }
         let invocation_id = execution.invocation_id();
         let mut cmd = self.build_cmd(config)?;
         crate::claude::stamp_execution_environment(&mut cmd, config, invocation_id)?;
+        if matches!(
+            config.provider,
+            None | Some(rsi_common::SessionProvider::Codex)
+        ) && let Some(shim) = crate::claude::turn_spool::available_shim(
+            config,
+            Some(&self.runtime_config),
+            shim_override,
+        ) {
+            let boundary = CodexTranscriptBoundary::for_launch(config.resume_session_id.as_deref());
+            let payload = format!(
+                "{}\n",
+                codex_stdin_payload(config, config.resume_session_id.is_some())
+            );
+            return crate::claude::turn_spool::launch(
+                &cmd,
+                config,
+                execution,
+                RuntimeExecutionRoute::CodexCli,
+                &shim,
+                crate::claude::turn_spool::TurnOutput::Codex { boundary },
+                Some(payload.as_bytes()),
+            );
+        }
         cmd = crate::process_scope::ScopedWorkerCommand::wrap_unspawned(&cmd, invocation_id)?;
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
@@ -962,7 +956,132 @@ impl CodexClient {
             });
         }
 
-        Ok((CodexProcess { child }, event_rx))
+        Ok((CodexProcess::direct(child), event_rx))
+    }
+}
+
+/// The detached reader uses the same adapters and transcript reconciliation
+/// as direct pipes. The boundary is captured before spawn and survives adoption.
+pub(crate) struct DetachedCodexDecoder {
+    boundary: CodexTranscriptBoundary,
+    thread: Option<String>,
+    context: Option<live_context::LiveContextReader>,
+    correlation: CodexStderrCorrelation,
+    next_poll: std::time::Instant,
+}
+
+impl DetachedCodexDecoder {
+    pub(crate) fn new(boundary: CodexTranscriptBoundary) -> Self {
+        Self {
+            context: Some(live_context::LiveContextReader::new(&boundary)),
+            boundary,
+            thread: None,
+            correlation: CodexStderrCorrelation::default(),
+            next_poll: std::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn rehydrate(&mut self, raw: &StreamEvent) {
+        let _ = crate::claude::turn_spool::decode_codex(raw.clone(), &mut self.thread);
+    }
+
+    pub(crate) async fn decode(
+        &mut self,
+        raw: StreamEvent,
+    ) -> (StreamEvent, Vec<StreamEvent>, Option<StreamEvent>) {
+        let mut extra = Vec::new();
+        let mut context = None;
+        if raw.event_type == "turn.completed"
+            && let Some(id) = &self.thread
+        {
+            if let Some(snapshot) =
+                read_latest_codex_turn_snapshot_with_retry(id, &self.boundary).await
+            {
+                self.correlation
+                    .failure_evidence
+                    .extend(snapshot.failure_evidence);
+                extra = snapshot.custom_tool_events;
+                context = snapshot
+                    .context_event
+                    .and_then(|event| match self.context.as_mut() {
+                        Some(reader) => reader.accept(event),
+                        None => Some(event),
+                    });
+            }
+        }
+        let event = if raw.event_type == "parse_error" {
+            let line = raw
+                .data
+                .get("raw_line")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            StreamEvent {
+                event_type: "process_error".into(),
+                data: serde_json::json!({
+                    "error": format!("Failed to parse Codex JSONL line: {}\nRaw line: {}",
+                        raw.data["error"], bounded_codex_transcript_field(line, 8 * 1024)), "source": "codex_parse"
+                }),
+            }
+        } else {
+            crate::claude::turn_spool::decode_codex(raw, &mut self.thread)
+        };
+        (event, extra, context)
+    }
+
+    pub(crate) async fn poll_context(&mut self) -> Option<StreamEvent> {
+        if std::time::Instant::now() < self.next_poll {
+            return None;
+        }
+        self.next_poll = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let id = self.thread.clone()?;
+        let mut reader = self.context.take()?;
+        match tokio::task::spawn_blocking(move || {
+            let event = reader.poll(&id);
+            (reader, event)
+        })
+        .await
+        {
+            Ok((reader, event)) => {
+                self.context = Some(reader);
+                event
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Codex live context reader stopped");
+                None
+            }
+        }
+    }
+
+    pub(crate) fn stderr(&mut self, text: &str) -> Vec<StreamEvent> {
+        let mut lines = Vec::new();
+        let mut fatal = CodexFatalStderrState::default();
+        let mut events = Vec::new();
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            if codex_stderr_suppression_reason(line.trim()).is_some() {
+                continue;
+            }
+            if let Some(error) = fatal.consume(line.to_string(), &mut lines) {
+                events.push(StreamEvent {
+                    event_type: "process_error".into(),
+                    data: serde_json::json!({
+                        "error": error, "source": "stderr", "terminal": true,
+                        "error_class": CODEX_STORAGE_FULL_ERROR_CLASS,
+                        "provider_event_type": CODEX_STORAGE_FULL_PROVIDER_EVENT_TYPE,
+                    }),
+                });
+            }
+        }
+        let records = filter_correlated_codex_stderr(
+            group_codex_stderr_records(lines),
+            &mut self.correlation,
+        );
+        let diagnostic = summarize_codex_stderr_records(&records);
+        if !diagnostic.records.is_empty() {
+            events.push(StreamEvent { event_type: "process_error".into(), data: serde_json::json!({
+                "error": diagnostic.rendered, "source": "stderr", "stderr_record_count": diagnostic.record_count,
+            }) });
+        }
+        events
     }
 }
 
@@ -1368,8 +1487,8 @@ fn find_codex_session_transcript(thread_id: &str) -> Option<PathBuf> {
         .map(|(_, path)| path)
 }
 
-#[derive(Clone, Debug)]
-struct CodexTranscriptWatermark {
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CodexTranscriptWatermark {
     path: PathBuf,
     byte_offset: u64,
     device: u64,
@@ -1377,8 +1496,8 @@ struct CodexTranscriptWatermark {
     prefix_tail: Vec<u8>,
 }
 
-#[derive(Clone, Debug)]
-enum CodexTranscriptBoundary {
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum CodexTranscriptBoundary {
     Fresh,
     Resume(CodexTranscriptWatermark),
     ResumeUnavailable,

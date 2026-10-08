@@ -26,6 +26,11 @@ use crate::agent_jobs::{
     JOB_KEY_INVALID, JOB_KIND_NOT_AUTHORIZED, JOB_KIND_UNSUPPORTED, JOB_LAUNCH_FAILED,
     JOB_NAME_INVALID, JOB_NOT_FOUND, JOB_PLATFORM_UNSUPPORTED,
 };
+use crate::agent_projects::{
+    PROJECT_ADMIN_UNAVAILABLE, PROJECT_HARNESS_PROTECTED, PROJECT_HAS_LIVE_SESSIONS,
+    PROJECT_NAME_TAKEN, PROJECT_NOT_AUTHORIZED, PROJECT_NOT_IN_SCOPE, PROJECT_PATH_INVALID,
+    PROJECT_PATH_TAKEN,
+};
 use crate::agent_provider_status::PROVIDER_STATUS_UNKNOWN_PROVIDER;
 use crate::agent_session_events::AGENT_READ_EVENTS_SCOPE_DENIED;
 use crate::global_manager::{
@@ -257,6 +262,12 @@ impl AgentControlVerbV1 {
             }),
             AgentControlVerbV1::GlobalOverview => serde_json::json!({}),
             AgentControlVerbV1::ManagerOverview => serde_json::json!({}),
+            AgentControlVerbV1::CreateProject => serde_json::json!({
+                "name": "Demo", "path": "/home/operator/code/demo"
+            }),
+            AgentControlVerbV1::UpdateProject => serde_json::json!({
+                "project_id": issue, "name": "Demo renamed"
+            }),
             AgentControlVerbV1::GlobalSend => serde_json::json!({
                 "project_id": issue, "message": "Land #872 and report back.",
                 "idempotency_key": "gm-rsi-route-1"
@@ -1151,6 +1162,72 @@ impl AgentControlVerbV1 {
                     refusal(
                         crate::manager_issue_worker::MANAGER_ISSUE_WORKER_PREDECESSOR_SANDBOX_UNAVAILABLE,
                         "the predecessor's sandbox is gone; launch with sandbox_source {\"commit\": \"<its last SHA>\"} instead",
+                    ),
+                ];
+                R
+            }
+            Self::CreateProject => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        PROJECT_NOT_AUTHORIZED,
+                        "only a project manager or portfolio seat in Execute mode (not paused) may call it; re-check AgentGetAuthorityCatalog",
+                    ),
+                    refusal(
+                        PROJECT_NAME_TAKEN,
+                        "project names are unique; pick another name",
+                    ),
+                    refusal(
+                        PROJECT_PATH_TAKEN,
+                        "another project already registers this directory; ask the operator or use that project",
+                    ),
+                    refusal(
+                        PROJECT_PATH_INVALID,
+                        "give an absolute path to an existing directory inside a configured workspace root (with none configured: a strict descendant of the daemon user's home directory, not ~/.rsi)",
+                    ),
+                    refusal(
+                        PROJECT_HARNESS_PROTECTED,
+                        "the harness root and its project are operator-only; pick a directory that does not overlap it",
+                    ),
+                    refusal(
+                        PROJECT_ADMIN_UNAVAILABLE,
+                        "this session handle cannot refresh project caches; call again after a fresh turn or via rsi-rpc",
+                    ),
+                ];
+                R
+            }
+            Self::UpdateProject => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        PROJECT_NOT_AUTHORIZED,
+                        "only a project manager or portfolio seat in Execute mode (not paused) may call it; re-check AgentGetAuthorityCatalog",
+                    ),
+                    refusal(
+                        PROJECT_NOT_IN_SCOPE,
+                        "name your own project (project manager) or a project of your grant (portfolio seat)",
+                    ),
+                    refusal(
+                        PROJECT_NAME_TAKEN,
+                        "project names are unique; pick another name",
+                    ),
+                    refusal(
+                        PROJECT_PATH_TAKEN,
+                        "another project already registers this directory",
+                    ),
+                    refusal(
+                        PROJECT_PATH_INVALID,
+                        "give an absolute path to an existing directory inside a configured workspace root (with none configured: a strict descendant of the daemon user's home directory, not ~/.rsi)",
+                    ),
+                    refusal(
+                        PROJECT_HARNESS_PROTECTED,
+                        "the harness project's path is operator-only, and no path may overlap the harness root",
+                    ),
+                    refusal(
+                        PROJECT_HAS_LIVE_SESSIONS,
+                        "wait until the project's sessions are idle or finished before changing its path",
+                    ),
+                    refusal(
+                        PROJECT_ADMIN_UNAVAILABLE,
+                        "this session handle cannot refresh project caches; call again after a fresh turn or via rsi-rpc",
                     ),
                 ];
                 R

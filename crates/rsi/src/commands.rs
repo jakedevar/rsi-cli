@@ -234,6 +234,11 @@ pub fn parse_command(input: &str) -> CommandResult {
             args.map(str::trim).unwrap_or_default().to_string(),
         )),
 
+        // :topology run <name> [<epic>] — start a topology on the focused Issue.
+        ActionId::TopologyRun => CommandResult::LcAction(LcAction::RunTopology(
+            args.map(str::trim).unwrap_or_default().to_string(),
+        )),
+
         // :dag — open read-only recursive DAG browser
         ActionId::Dag => CommandResult::LcAction(LcAction::OpenRecursiveDagBrowser),
 

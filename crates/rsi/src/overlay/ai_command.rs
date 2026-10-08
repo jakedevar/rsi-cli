@@ -9,6 +9,21 @@ use crate::types::OverlayState;
 use crossterm::event::{KeyCode, KeyEvent};
 
 pub(super) async fn handle_ai_command_key(app: &mut App, key: KeyEvent) -> bool {
+    // Standard editing: a real cursor and selection in the instruction (not
+    // while the request is in flight, when only Esc is live).
+    if matches!(
+        app.overlay,
+        OverlayState::AiCommand {
+            in_flight: false,
+            ..
+        }
+    ) && app.edit_field(key, |overlay| match overlay {
+        OverlayState::AiCommand { command, .. } => Some(command),
+        _ => None,
+    }) != crate::field_edit::FieldKey::Ignored
+    {
+        return true;
+    }
     let (command, source_text, source, in_flight) = match &mut app.overlay {
         OverlayState::AiCommand {
             command,

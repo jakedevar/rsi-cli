@@ -12,10 +12,18 @@ use std::{
 };
 use termwright::prelude::*;
 
+#[path = "e2e_tui/agent_projects.rs"]
+mod agent_projects;
+#[path = "e2e_tui/editing_mode.rs"]
+mod editing_mode;
+#[path = "e2e_tui/fresh_install.rs"]
+mod fresh_install;
 #[path = "e2e_tui/manager_decisions.rs"]
 mod manager_decisions;
 #[path = "e2e_tui/manager_presets.rs"]
 mod manager_presets;
+#[path = "e2e_tui/manager_seats.rs"]
+mod manager_seats;
 #[path = "e2e_tui/manager_surface.rs"]
 mod manager_surface;
 

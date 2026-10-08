@@ -147,6 +147,12 @@ impl ManagerLaunchPickerState {
         }
     }
     pub fn handle_key(&mut self, key: KeyEvent) -> PickerOutcome {
+        self.handle_key_with(key, false)
+    }
+
+    /// [`handle_key`](Self::handle_key) with the operator's editing mode, so
+    /// the model filter gets a cursor and selection under Standard editing.
+    pub fn handle_key_with(&mut self, key: KeyEvent, standard: bool) -> PickerOutcome {
         if self.stage == PickerStage::Effort
             && matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
         {
@@ -191,6 +197,7 @@ impl ManagerLaunchPickerState {
             &key,
             &PROVIDERS,
             &[],
+            standard,
         ) {
             ModelDropdownAction::ProviderCycled => {
                 self.needs_refresh = true;

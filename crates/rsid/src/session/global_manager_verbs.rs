@@ -16,6 +16,7 @@ use rsi_common::global_manager::{
     AgentGlobalOverviewRequestV1, AgentGlobalOverviewResultV1, AgentGlobalSendRequestV1,
     AgentReportToGlobalRequestV1, GlobalManagerMessageReceiptV1, GlobalManagerWorkspaceV1,
     GlobalPmSeatV1, GlobalProjectOverviewV1, GlobalSeatSessionV1, GlobalWorkspaceProjectV1,
+    SEAT_PREDECESSOR_LIMIT, SeatPredecessorV1,
 };
 use rsi_common::manager_tier_routing::{
     AgentReportUpRequestV1, AgentSendDownRequestV1, ManagerNodeRefV1, ManagerTierMessageReceiptV1,
@@ -113,8 +114,37 @@ impl AgentControlHandle {
     }
 
     /// A seat session as the workspace shows it; `None` when it is gone.
+    /// #1627: with the seat's earlier sessions (`continued_from` chain).
     pub(super) async fn seat_view(&self, id: Option<Uuid>) -> Option<GlobalSeatSessionV1> {
         let session = self.get_session(id?).await?;
+        let mut predecessors = Vec::new();
+        let mut truncated = false;
+        let mut seen = vec![session.id];
+        let mut cursor = session.continued_from;
+        while let Some(prior_id) = cursor {
+            if seen.contains(&prior_id) {
+                break;
+            }
+            if predecessors.len() >= SEAT_PREDECESSOR_LIMIT {
+                truncated = true;
+                break;
+            }
+            seen.push(prior_id);
+            let Some(prior) = self.get_session(prior_id).await else {
+                break;
+            };
+            cursor = prior.continued_from;
+            predecessors.push(SeatPredecessorV1 {
+                session_id: prior.id,
+                project_id: prior.project_id,
+                status: prior.status,
+                provider: prior.provider,
+                model: prior.model,
+                context_fill_pct: prior.context_fill_pct,
+                cost_usd: prior.cost_usd,
+                updated_at: prior.updated_at,
+            });
+        }
         Some(GlobalSeatSessionV1 {
             session_id: session.id,
             project_id: session.project_id,
@@ -125,6 +155,8 @@ impl AgentControlHandle {
             cost_usd: session.cost_usd,
             updated_at: session.updated_at,
             pending_question: session.pending_question.is_some(),
+            predecessors,
+            predecessors_truncated: truncated,
         })
     }
 

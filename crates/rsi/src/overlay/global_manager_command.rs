@@ -6,6 +6,9 @@
 //!   over the named projects (comma-separated, or space-separated single
 //!   words; default: every project), with the allowlist defaulting to the
 //!   operator's model directive and the PM policy to the Execute preset;
+//! - `:manager global add-project <names...>` adds named projects to the
+//!   active grant (the same CAS-fenced request as the one-key offer made when
+//!   an agent creates a project, #1626);
 //! - `:manager global revoke` revokes the active grant;
 //! - `:manager global set <field> <value> [confirm]` changes one cap of the
 //!   active grant's per-project policy (fields: `active`, `sessions`,
@@ -32,7 +35,7 @@ use crate::app::App;
 pub(crate) const CAP_CONFIRM_NOTICE: &str =
     "This lowers project caps: review the preview, y confirms, Esc cancels.";
 
-const USAGE: &str = "Use :manager global [appoint [project names...]|revoke|set <field> <value> [confirm]|configure <JSON>].";
+const USAGE: &str = "Use :manager global [appoint [project names...]|add-project <names...>|revoke|set <field> <value> [confirm]|configure <JSON>].";
 const SET_USAGE: &str = "Use :manager global set <active|sessions|containers|spend|groups> <value> [confirm] (spend: USD or none; groups: on|off).";
 
 /// The caps of a grant's per-project policy the operator edits directly
@@ -300,6 +303,114 @@ fn grant_summary(grant: &GlobalManagerGrantV1, projects: &[Project]) -> String {
     )
 }
 
+/// The request that adds `project_ids` to `grant`, everything else kept and
+/// fenced on the grant version read now.
+pub(crate) fn grant_addition_request(
+    grant: &GlobalManagerGrantV1,
+    project_ids: &[Uuid],
+) -> Result<ConfigureGlobalManagerRequestV1, String> {
+    let mut all = grant.project_ids.clone();
+    for id in project_ids {
+        if !all.contains(id) {
+            all.push(*id);
+        }
+    }
+    let request = ConfigureGlobalManagerRequestV1 {
+        session_id: grant.seat_session_id,
+        project_ids: all,
+        allowed_launches: grant.allowed_launches.clone(),
+        project_policy: grant.project_policy.clone(),
+        expected_grant_version: grant.grant_version,
+        idempotency_key: Uuid::new_v4().to_string(),
+    };
+    request
+        .validate()
+        .map_err(|error| format!("Global manager: {error}"))?;
+    Ok(request)
+}
+
+/// #1626: after an agent created `project_id`, offer the operator one key to
+/// add it to the creating global manager's grant. Only when the creator is the
+/// active seat and the project is not yet granted. Opens the manager tree on
+/// the confirm step when nothing else is open; otherwise points at the
+/// command. Never changes the grant itself.
+pub(crate) async fn offer_agent_project_grant(
+    app: &mut App,
+    project_id: Uuid,
+    project_name: &str,
+    creator: Uuid,
+) {
+    let Ok(Some(grant)) = app.client.get_global_manager().await else {
+        return;
+    };
+    if grant.state != "active"
+        || grant.seat_session_id != creator
+        || grant.project_ids.contains(&project_id)
+    {
+        return;
+    }
+    let Ok(request) = grant_addition_request(&grant, &[project_id]) else {
+        return;
+    };
+    if matches!(app.overlay, crate::types::OverlayState::None) {
+        let title = format!("Add \"{project_name}\" to the global manager's grant?");
+        let lines = vec![
+            format!(
+                "The global manager {} created this project; it cannot act on it until you grant it.",
+                &creator.to_string()[..8]
+            ),
+            format!(
+                "y adds it (grant v{} -> v{}); Esc leaves the grant unchanged.",
+                grant.grant_version,
+                grant.grant_version + 1
+            ),
+        ];
+        if crate::overlay::manager_tree::offer_grant_addition(app, title, lines, request).await {
+            return;
+        }
+    }
+    app.notify_success(format!(
+        "Agent created project \"{project_name}\". Grant it to the global manager with :manager global add-project {project_name}"
+    ));
+}
+
+/// `add-project <names...>`: add named projects to the active grant.
+async fn add_projects(app: &mut App, args: &str) -> Result<String, String> {
+    let grant = active_version(app)
+        .await?
+        .filter(|grant| grant.state == "active")
+        .ok_or_else(|| "No global manager is appointed.".to_string())?;
+    if args.trim().is_empty() {
+        return Err("Use :manager global add-project <project names...>.".into());
+    }
+    let ids = resolve_projects(&app.projects, args)?;
+    let request = grant_addition_request(&grant, &ids)?;
+    match app
+        .client
+        .configure_global_manager_confirmed(request.clone(), false)
+        .await
+    {
+        Ok(grant) => Ok(format!(
+            "Global manager grant updated: {}",
+            grant_summary(&grant, &app.projects)
+        )),
+        Err(error) => {
+            let error = error.to_string();
+            if crate::overlay::manager_tree::offer_cap_confirmation(
+                app,
+                "Add projects to the global manager's grant",
+                crate::overlay::manager_tree::PreparedRequest::ConfigureGlobal(request),
+                &error,
+            )
+            .await
+            {
+                return Ok(CAP_CONFIRM_NOTICE.into());
+            }
+            Err(format!("Global manager: {error}"))
+        }
+    }
+}
+
 /// `set <field> <value> [confirm]`: one cap of the active grant, everything
 /// else kept, fenced on the grant version read now.
 async fn set_cap(app: &mut App, raw: &str) -> Result<String, String> {
@@ -448,6 +559,12 @@ async fn run_global_command(app: &mut App, command: &str) -> Result<String, Stri
         ));
     }
     if let Some(raw) = command
+        .strip_prefix("add-project")
+        .filter(|rest| rest.is_empty() || rest.starts_with(' '))
+    {
+        return add_projects(app, raw).await;
+    }
+    if let Some(raw) = command
         .strip_prefix("set")
         .filter(|rest| rest.is_empty() || rest.starts_with(' '))
     {
@@ -555,6 +672,22 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn grant_addition_keeps_the_grant_and_fences_on_its_version() {
+        let grant = grant();
+        let kept = grant.project_ids[0];
+        let added = Uuid::new_v4();
+        let request = grant_addition_request(&grant, &[added, kept]).unwrap();
+        assert_eq!(
+            request.project_ids,
+            vec![grant.project_ids[0], grant.project_ids[1], added]
+        );
+        assert_eq!(request.session_id, grant.seat_session_id);
+        assert_eq!(request.expected_grant_version, 7);
+        assert_eq!(request.allowed_launches, grant.allowed_launches);
+        assert_eq!(request.project_policy, grant.project_policy);
     }
 
     #[test]

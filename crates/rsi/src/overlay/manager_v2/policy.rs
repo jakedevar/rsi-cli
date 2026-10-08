@@ -1392,11 +1392,26 @@ pub(super) async fn open(
 
 pub(super) async fn handle_key(app: &mut App, key: KeyEvent) {
     let socket = app.client.socket_path().to_path_buf();
+    let standard_editing = app.standard_editing();
+    // Standard editing: a real cursor and selection in the value being edited.
+    let editing = super::policy_mut(app).is_some_and(|s| s.picker.is_none() && s.edit.is_some());
+    if editing
+        && app.edit_field(key, |overlay| match overlay {
+            OverlayState::HarnessManagerV2(surface) => surface
+                .policy
+                .as_mut()
+                .and_then(|s| s.edit.as_mut())
+                .map(|(_, value)| value),
+            _ => None,
+        }) != crate::field_edit::FieldKey::Ignored
+    {
+        return;
+    }
     let Some(state) = super::policy_mut(app) else {
         return;
     };
     if let Some(picker) = &mut state.picker {
-        match picker.handle_key(key) {
+        match picker.handle_key_with(key, standard_editing) {
             PickerOutcome::Dismissed => {
                 state.picker = None;
                 state.catalog_request = None;

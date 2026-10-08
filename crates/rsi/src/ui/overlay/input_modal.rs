@@ -80,11 +80,7 @@ pub(super) fn render_input_modal(
     } else {
         session::CursorStyle::Block
     };
-    let visual_sel = if surface.vim_state.visual.is_some() {
-        surface.textarea.selection_range()
-    } else {
-        None
-    };
+    let visual_sel = session::surface_selection_for_render(surface);
 
     if has_preview {
         // Split layout: left = textarea, right = corrected preview
@@ -270,6 +266,13 @@ pub(super) fn render_input_modal(
                 theme::overlay_mode_normal_fg(),
                 theme::overlay_mode_normal_bg(),
                 "waiting for motion (d/w/b/e/$)",
+            )
+        } else if surface.standard_editing {
+            (
+                " EDIT ",
+                theme::overlay_mode_insert_fg(),
+                theme::overlay_mode_insert_bg(),
+                "Ctrl+Enter: send  Esc: close",
             )
         } else {
             match surface.mode {

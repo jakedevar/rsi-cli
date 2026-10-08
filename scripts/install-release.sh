@@ -65,6 +65,8 @@ RSI_AGENT_MCP_BIN="$TARGET_DIR/release/rsi-agent-mcp"
 CONTRACT_VALIDATE_BIN="$TARGET_DIR/release/rsi-contract-validate"
 # RSI Remote gateway (#1096): rsid's managed systemd user unit runs it from here.
 RSI_REMOTE_BIN="$TARGET_DIR/release/rsi-remote"
+TURN_SHIM_BIN="$TARGET_DIR/release/rsi-turn-shim"
+SOCKET_HOLD_BIN="$TARGET_DIR/release/rsi-socket-hold"
 # #1137: the spill stub tells workers to run a bare `rsi-spill show ...`. It is a
 # repo script (a thin shim over `rsi-rpc spill`), so link it next to rsi-rpc.
 RSI_SPILL_SCRIPT="$ROOT/scripts/rsi-spill"
@@ -119,7 +121,7 @@ if [[ "$LINK_ONLY" -eq 0 && "$NO_RESTART" -eq 0 && "$RESTART_NOW" != 1 ]]; then
 fi
 
 if [[ "$LINK_ONLY" -eq 0 ]]; then
-    cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin rsi --bin rsid --bin rsi-rpc --bin rsi-agent-mcp --bin rsi-build-rustc --bin rsi-contract-validate --bin rsi-rolling-land --bin rsi-remote
+    cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin rsi --bin rsid --bin rsi-rpc --bin rsi-agent-mcp --bin rsi-build-rustc --bin rsi-contract-validate --bin rsi-rolling-land --bin rsi-remote --bin rsi-turn-shim --bin rsi-socket-hold
 fi
 
 if [[ ! -x "$RSI_BIN" || ! -x "$RSID_BIN" || ! -x "$RSI_RPC_BIN" || ! -x "$RSI_AGENT_MCP_BIN" || ! -x "$BUILD_RUSTC_BIN" || ! -x "$CONTRACT_VALIDATE_BIN" ]]; then
@@ -168,6 +170,8 @@ ROLLING_LAND_BIN="$INSTALL_DIR/rsi-rolling-land"
 RSI_AGENT_MCP_BIN="$INSTALL_DIR/rsi-agent-mcp"
 CONTRACT_VALIDATE_BIN="$INSTALL_DIR/rsi-contract-validate"
 RSI_REMOTE_BIN="$INSTALL_DIR/rsi-remote"
+TURN_SHIM_BIN="$INSTALL_DIR/rsi-turn-shim"
+SOCKET_HOLD_BIN="$INSTALL_DIR/rsi-socket-hold"
 
 mkdir -p "$BIN_DIR"
 ln -sfn "$RSI_BIN" "$BIN_DIR/rsi"
@@ -177,6 +181,8 @@ ln -sfn "$RSI_RPC_BIN" "$BIN_DIR/rsi-rpc"
 ln -sfn "$RSI_AGENT_MCP_BIN" "$BIN_DIR/rsi-agent-mcp"
 ln -sfn "$CONTRACT_VALIDATE_BIN" "$BIN_DIR/rsi-contract-validate"
 [[ -x "$RSI_REMOTE_BIN" ]] && ln -sfn "$RSI_REMOTE_BIN" "$BIN_DIR/rsi-remote"
+[[ -x "$TURN_SHIM_BIN" ]] && ln -sfn "$TURN_SHIM_BIN" "$BIN_DIR/rsi-turn-shim"
+[[ -x "$SOCKET_HOLD_BIN" ]] && ln -sfn "$SOCKET_HOLD_BIN" "$BIN_DIR/rsi-socket-hold"
 ln -sfn "$RSI_SPILL_SCRIPT" "$BIN_DIR/rsi-spill"
 # The daemon rolling merge queue spawns the lander: it looks next to rsid first,
 # then on PATH (rolling_queue.rs LanderLauncher::discover).
@@ -282,6 +288,10 @@ restart_rsid() {
         return 0
     fi
 
+    if [[ ! -x "$SOCKET_HOLD_BIN" ]]; then
+        echo "Socket holder not installed at $SOCKET_HOLD_BIN; refusing a restart without the front door." >&2
+        return 1
+    fi
     run_restart_drain_hook
 
     echo "Restarting rsid (was running as PID(s): $(echo "$old_pids" | tr '\n' ' ')) ..."
@@ -311,20 +321,30 @@ restart_rsid() {
     mkdir -p "$RSI_HOME_DIR"
     local scope_unit=""
     if [[ "$platform" == Linux ]]; then
-        scope_unit="rsid-install-$(date +%s)-$$-$RANDOM.scope"
-        nohup systemd-run --user --scope --collect --unit="$scope_unit" \
+        # A collected service survives the installer and the agent process tree.
+        # The holder and supervisor retain the existing aggregate limits.
+        scope_unit="rsid-install-$(date +%s)-$$-$RANDOM.service"
+        systemd-run --user --collect --service-type=exec --unit="$scope_unit" \
             --slice=user.slice \
             --property="MemoryHigh=${RSID_SCOPE_MEMORY_HIGH_MIB}M" \
             --property="MemoryMax=${RSID_SCOPE_MEMORY_MAX_MIB}M" \
             --property="MemorySwapMax=${RSID_SCOPE_MEMORY_SWAP_MAX_MIB}M" \
             --property="CPUWeight=${RSID_SCOPE_CPU_WEIGHT}" \
-            -- "$INSTALL_DIR/rsid-supervisor.sh" "$RSID_BIN" \
-            </dev/null >>"$DAEMON_LOG" 2>&1 &
+            --property=StandardInput=null \
+            --property="StandardOutput=append:$DAEMON_LOG" \
+            --property="StandardError=append:$DAEMON_LOG" \
+            --setenv="PATH=$PATH" \
+            --setenv="RSI_SOCKET=$(daemon_socket_path)" \
+            --setenv="RSI_DAEMON_SOCKET_PATH=$(daemon_socket_path)" \
+            -- "$SOCKET_HOLD_BIN" "$(daemon_socket_path)" -- \
+            "$INSTALL_DIR/rsid-supervisor.sh" "$RSID_BIN"
     else
-        nohup "$RSID_BIN" </dev/null >>"$DAEMON_LOG" 2>&1 &
+        RSI_SOCKET="$(daemon_socket_path)" RSI_DAEMON_SOCKET_PATH="$(daemon_socket_path)" \
+        nohup "$SOCKET_HOLD_BIN" "$(daemon_socket_path)" -- \
+            "$INSTALL_DIR/rsid-supervisor.sh" "$RSID_BIN" \
+            </dev/null >>"$DAEMON_LOG" 2>&1 &
+        disown "$!"
     fi
-    local launcher_pid=$!
-    disown "$launcher_pid"
 
     local socket_path
     socket_path="$(daemon_socket_path)"

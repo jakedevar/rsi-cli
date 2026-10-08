@@ -85,6 +85,31 @@ pub fn render(frame: &mut Frame, area: Rect, state: &FleetState) {
             if state.reverse { "↓" } else { "↑" }
         )
     };
+    // Standard editing draws the filter's cursor and selection in place.
+    let filter_line = (crate::field_edit::standard_frame()
+        && state.editing
+        && state.error.is_none()
+        && !state.sorting)
+        .then(|| {
+            let mut spans = vec![ratatui::text::Span::raw(format!(
+                "{} /",
+                if state.focus_groups {
+                    "Usage"
+                } else {
+                    "Agents"
+                }
+            ))];
+            spans.extend(crate::field_edit::draw(
+                &clean(&state.filter),
+                Style::default().fg(theme::text()),
+            ));
+            spans.push(ratatui::text::Span::raw(format!(
+                "   sort: {} {}   ? help",
+                state.sort_label(),
+                if state.reverse { "↓" } else { "↑" }
+            )));
+            Line::from(spans)
+        });
     let total = state
         .snapshot
         .as_ref()
@@ -107,7 +132,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &FleetState) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(header),
-            Line::from(second),
+            filter_line.unwrap_or_else(|| Line::from(second)),
             Line::from(total),
         ])
         .style(Style::default().fg(theme::text())),

@@ -405,6 +405,26 @@ fn handle_cancellation_reason_key(
     run_id: Option<RecursiveSchedulerRunId>,
     input: String,
 ) {
+    if edit_dag_input(
+        app,
+        key,
+        |state| match &mut state.control {
+            RecursiveDagControlState::GraphReasonInput { input, .. }
+            | RecursiveDagControlState::RunReasonInput { input, .. } => Some(input),
+            _ => None,
+        },
+        false,
+        |state| {
+            if let RecursiveDagControlState::GraphReasonInput { error, .. }
+            | RecursiveDagControlState::RunReasonInput { error, .. } = &mut state.control
+            {
+                *error = None;
+            }
+            state.message = Some(cancellation_reason_prompt(kind).to_string());
+        },
+    ) {
+        return;
+    }
     match key.code {
         KeyCode::Esc => update_control_input(app, |state| {
             state.control = RecursiveDagControlState::Idle;
@@ -484,6 +504,33 @@ fn handle_cancellation_reason_key(
 }
 
 fn handle_recovery_budget_key(app: &mut App, key: KeyEvent) {
+    if edit_dag_input(
+        app,
+        key,
+        |state| match &mut state.control {
+            RecursiveDagControlState::RecoveryBudgetInput {
+                max_graphs_input,
+                time_budget_ms_input,
+                field,
+                ..
+            } => Some(match field {
+                RecursiveDagRecoveryInputField::MaxGraphs => max_graphs_input,
+                RecursiveDagRecoveryInputField::TimeBudgetMs => time_budget_ms_input,
+            }),
+            _ => None,
+        },
+        true,
+        |state| {
+            if let RecursiveDagControlState::RecoveryBudgetInput { field, error, .. } =
+                &mut state.control
+            {
+                *error = None;
+                state.message = Some(format!("continue recovery: editing {}", field.label()));
+            }
+        },
+    ) {
+        return;
+    }
     match key.code {
         KeyCode::Esc => update_control_input(app, |state| {
             state.control = RecursiveDagControlState::Idle;
@@ -595,6 +642,40 @@ fn active_recursive_browser_for_load(app: &App) -> Option<RecursiveDagBrowserSta
     active_recursive_browser(app)
         .filter(|state| app.recursive_dag_state_matches_current_project(state))
         .cloned()
+}
+
+/// The browser state of the open recursive DAG overlay, if any.
+fn browser_state_mut(overlay: &mut OverlayState) -> Option<&mut RecursiveDagBrowserState> {
+    match overlay {
+        OverlayState::RecursiveDagBrowser(state)
+        | OverlayState::GraphReview {
+            dashboard_state: Some(state),
+            ..
+        } => Some(state),
+        _ => None,
+    }
+}
+
+/// Standard editing for one of the browser's text inputs: a real cursor and
+/// selection. Returns whether the key was taken; `after` then resets the
+/// input's error and prompt exactly as a typed character did before.
+fn edit_dag_input(
+    app: &mut App,
+    key: KeyEvent,
+    pick: fn(&mut RecursiveDagBrowserState) -> Option<&mut String>,
+    digits_only: bool,
+    after: impl FnOnce(&mut RecursiveDagBrowserState),
+) -> bool {
+    let result = app.edit_field_filtered(
+        key,
+        |overlay| browser_state_mut(overlay).and_then(pick),
+        move |c| !digits_only || c.is_ascii_digit(),
+    );
+    if result == crate::field_edit::FieldKey::Ignored {
+        return false;
+    }
+    update_control_input(app, after);
+    true
 }
 
 fn update_control_input(app: &mut App, update: impl FnOnce(&mut RecursiveDagBrowserState)) {
@@ -1126,6 +1207,24 @@ fn handle_fake_run_input_key(app: &mut App, key: KeyEvent) -> bool {
         _ => return false,
     };
 
+    if edit_dag_input(
+        app,
+        key,
+        |state| match &mut state.fake_run {
+            RecursiveDagFakeRunState::MaxStepsInput { input, .. } => Some(input),
+            _ => None,
+        },
+        true,
+        |state| {
+            if let RecursiveDagFakeRunState::MaxStepsInput { error, .. } = &mut state.fake_run {
+                *error = None;
+            }
+            state.message = Some("FAKE scheduler requires explicit max_steps".to_string());
+        },
+    ) {
+        return true;
+    }
+
     match key.code {
         KeyCode::Esc => {
             update_fake_run_input(app, |state| {
@@ -1315,6 +1414,24 @@ fn handle_live_run_input_key(app: &mut App, key: KeyEvent) -> bool {
         },
         _ => return false,
     };
+
+    if edit_dag_input(
+        app,
+        key,
+        |state| match &mut state.live_run {
+            RecursiveDagLiveRunState::MaxStepsInput { input, .. } => Some(input),
+            _ => None,
+        },
+        true,
+        |state| {
+            if let RecursiveDagLiveRunState::MaxStepsInput { error, .. } = &mut state.live_run {
+                *error = None;
+            }
+            state.message = Some("LIVE scheduler requires explicit max_steps".to_string());
+        },
+    ) {
+        return true;
+    }
 
     match key.code {
         KeyCode::Esc => {
@@ -6165,6 +6282,81 @@ mod tests {
             warnings
                 .iter()
                 .any(|warning| warning.contains("task nodes truncated"))
+        );
+    }
+
+    // ---- Standard editing (#1628 slice 3b) ----
+
+    fn set_editing_mode(app: &mut App, mode: &str) {
+        crate::settings::DaemonFeatureEntry::update_from_json(
+            &mut app.daemon_features,
+            &serde_json::json!({ "editing_mode": mode }),
+        );
+    }
+
+    fn reason_input(app: &App) -> String {
+        match &browser_state(app).control {
+            RecursiveDagControlState::GraphReasonInput { input, .. } => input.clone(),
+            other => panic!("expected the reason input, got {other:?}"),
+        }
+    }
+
+    fn reason_app(mode: &str) -> App {
+        let state = ready_state(rsi_common::rpc::DaemonCapabilities::default());
+        let graph_id = state.selected_graph_id().expect("selected graph");
+        let mut app = app_with_state(state);
+        set_editing_mode(&mut app, mode);
+        if let OverlayState::RecursiveDagBrowser(state) = &mut app.overlay {
+            state.control = RecursiveDagControlState::GraphReasonInput {
+                graph_id,
+                input: "stop work".to_string(),
+                error: None,
+            };
+        }
+        app
+    }
+
+    #[test]
+    fn cancellation_reason_gets_a_cursor_in_standard_mode() {
+        let mut app = reason_app("standard");
+        handle_recursive_dag_key(&mut app, key(KeyCode::Home));
+        type_text(&mut app, "now ");
+        assert_eq!(reason_input(&app), "now stop work");
+        handle_recursive_dag_key(&mut app, key(KeyCode::Right));
+        type_text(&mut app, "!");
+        assert_eq!(reason_input(&app), "now s!top work");
+    }
+
+    #[test]
+    fn cancellation_reason_stays_append_only_in_vim_mode() {
+        let mut app = reason_app("vim");
+        handle_recursive_dag_key(&mut app, key(KeyCode::Left));
+        type_text(&mut app, "!");
+        assert_eq!(reason_input(&app), "stop work!");
+    }
+
+    #[test]
+    fn recovery_budget_edits_in_place_and_keeps_its_digit_filter() {
+        let mut app = reason_app("standard");
+        if let OverlayState::RecursiveDagBrowser(state) = &mut app.overlay {
+            state.control = RecursiveDagControlState::RecoveryBudgetInput {
+                max_graphs_input: "15".to_string(),
+                time_budget_ms_input: String::new(),
+                field: RecursiveDagRecoveryInputField::MaxGraphs,
+                error: None,
+            };
+        }
+        handle_recursive_dag_key(&mut app, key(KeyCode::Left));
+        type_text(&mut app, "2x");
+        let RecursiveDagControlState::RecoveryBudgetInput {
+            max_graphs_input, ..
+        } = &browser_state(&app).control
+        else {
+            panic!("recovery input should stay open");
+        };
+        assert_eq!(
+            max_graphs_input, "125",
+            "digit inserted before the 5; letter swallowed"
         );
     }
 }

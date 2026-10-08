@@ -386,12 +386,12 @@ fn render_name_row(
     let label_style = Style::default()
         .fg(theme::mauve())
         .add_modifier(Modifier::BOLD);
-    let mut spans = vec![
-        Span::styled("  Name: ", label_style),
-        Span::styled(name.to_string(), Style::default().fg(theme::text())),
-    ];
+    let text_style = Style::default().fg(theme::text());
+    let mut spans = vec![Span::styled("  Name: ", label_style)];
     if focused_field == CreateEntityField::Name && insert_mode {
-        spans.push(Span::styled("\u{2588}", Style::default().fg(theme::text())));
+        spans.extend(crate::field_edit::draw(name, text_style));
+    } else {
+        spans.push(Span::styled(name.to_string(), text_style));
     }
     frame.render_widget(
         Paragraph::new(Line::from(spans)),
@@ -421,9 +421,13 @@ fn render_body_region(
         .add_modifier(Modifier::BOLD);
     let mut spans: Vec<Span<'static>> = vec![Span::styled("  Body: ", label_style)];
     if focused {
-        let mode_hint = match body.mode {
-            PopupMode::Insert => "-- INSERT --",
-            PopupMode::Normal => "-- NORMAL --",
+        let mode_hint = if body.standard_editing {
+            "-- EDIT --"
+        } else {
+            match body.mode {
+                PopupMode::Insert => "-- INSERT --",
+                PopupMode::Normal => "-- NORMAL --",
+            }
         };
         spans.push(Span::styled(
             mode_hint,
@@ -451,8 +455,8 @@ fn render_body_region(
     } else {
         CursorStyle::Hidden
     };
-    let visual_sel = if focused && body.vim_state.visual.is_some() {
-        body.textarea.selection_range()
+    let visual_sel = if focused {
+        session::surface_selection_for_render(body)
     } else {
         None
     };
@@ -499,12 +503,11 @@ fn render_tags_row(
                 spans.push(Span::raw(" "));
             }
             ChipStatus::Pending => {
-                spans.push(Span::styled(
-                    chip.value.clone(),
-                    Style::default().fg(theme::text()),
-                ));
+                let text_style = Style::default().fg(theme::text());
                 if focused_field == CreateEntityField::Tag && insert_mode {
-                    spans.push(Span::styled("\u{2588}", Style::default().fg(theme::text())));
+                    spans.extend(crate::field_edit::draw(&chip.value, text_style));
+                } else {
+                    spans.push(Span::styled(chip.value.clone(), text_style));
                 }
             }
             ChipStatus::Invalid(err) => {
@@ -620,6 +623,18 @@ fn render_topology_row(
     ];
     if focused {
         spans.push(Span::raw("  "));
+        if crate::field_edit::standard_frame() {
+            // Standard editing: the filter is always visible with its cursor.
+            spans.push(Span::styled(
+                "filter: ",
+                Style::default().fg(theme::overlay_hint()),
+            ));
+            spans.extend(crate::field_edit::draw(
+                topology_filter,
+                Style::default().fg(theme::text()),
+            ));
+            spans.push(Span::raw("  "));
+        }
         let hint = if preview_open {
             "(Space: close preview, Enter: pick, Esc: clear)"
         } else {
@@ -646,12 +661,11 @@ fn render_topology_row(
     let row_count = visible.len().min(6) as u16;
     if row_count == 0 {
         // Filter narrowed to nothing — show the live filter buffer.
-        let filter_span = Span::styled(
-            format!("    filter: {}\u{2588}", topology_filter),
-            Style::default().fg(theme::overlay_hint()),
-        );
+        let style = Style::default().fg(theme::overlay_hint());
+        let mut filter_spans = vec![Span::styled("    filter: ", style)];
+        filter_spans.extend(crate::field_edit::draw(topology_filter, style));
         frame.render_widget(
-            Paragraph::new(Line::from(vec![filter_span])),
+            Paragraph::new(Line::from(filter_spans)),
             Rect::new(inner.x, y + 1, inner.width, 1),
         );
         return;

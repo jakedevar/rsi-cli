@@ -392,13 +392,22 @@ fn a_gate_record_refuses_a_manager_answer_and_stays_with_the_operator() {
         classify_decision(
             "question:abc",
             &json!({"question":"Rename the module?"}),
+            false,
             false
         )
         .is_some_and(|gate| gate.class == "human_approval")
     );
-    assert!(classify_decision("approval:abc", &json!({"question":"Run ls?"}), false).is_some());
     assert!(
-        classify_decision("choose", &json!({"question":"Rename the module?"}), false).is_none()
+        classify_decision("approval:abc", &json!({"question":"Run ls?"}), false, false).is_some()
+    );
+    assert!(
+        classify_decision(
+            "choose",
+            &json!({"question":"Rename the module?"}),
+            false,
+            false
+        )
+        .is_none()
     );
 }
 
@@ -1132,4 +1141,692 @@ fn a_reposted_question_keeps_its_asker_and_audit_trail() {
         .map(|entry| entry["event"].as_str().unwrap())
         .collect();
     assert_eq!(events, ["asked", "reasked"]);
+}
+
+// ── #1641 S3b: a topology node's question is the on-call manager's to rule on ──
+
+/// The lead's session as a live topology node attempt of a running execution.
+fn make_topology_node(store: &Store, session: Uuid, attempt_status: &str) {
+    let execution = Uuid::new_v4();
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    store
+        .conn
+        .execute(
+            "INSERT INTO topology_executions (id,topology_name_snapshot,workflow_id,definition_json,definition_digest,requested_by_kind,repo_root,base_commit,custody_plan_json,status,created_at,updated_at)
+             VALUES (?1,'node-question','wf','{}','d','manager','/tmp/repo','0000000000000000000000000000000000000000','{}','running',?2,?2)",
+            params![execution.to_string(), now],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO topology_node_attempts (id,execution_id,node_id,iteration,attempt_no,node_kind,status,dedup_key,session_id,input_json,created_at,updated_at)
+             VALUES (?1,?2,'A',0,1,'session',?3,?4,?5,'{}',?6,?6)",
+            params![
+                Uuid::new_v4().to_string(),
+                execution.to_string(),
+                attempt_status,
+                format!("dedup-{execution}"),
+                session.to_string(),
+                now
+            ],
+        )
+        .unwrap();
+}
+
+/// Like `raise_question` with the asker's own words.
+fn raise_node_question(store: &Store, session: Uuid, text: &str) {
+    raise_node_question_with_options(store, session, text, &[]);
+}
+
+fn raise_node_question_with_options(
+    store: &Store,
+    session: Uuid,
+    text: &str,
+    options: &[(&str, &str)],
+) {
+    use rsi_common::types::{
+        ConversationEvent, EventType, PendingQuestion, QuestionItem, QuestionOption,
+    };
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET provider='Claude' WHERE id=?1",
+            [session.to_string()],
+        )
+        .unwrap();
+    let question = PendingQuestion {
+        questions: vec![QuestionItem {
+            question: text.into(),
+            header: "Node".into(),
+            options: options
+                .iter()
+                .map(|(label, description)| QuestionOption {
+                    label: (*label).into(),
+                    description: (*description).into(),
+                })
+                .collect(),
+            multi_select: false,
+        }],
+    };
+    store
+        .publish_pending_question_event(
+            &ConversationEvent {
+                id: 0,
+                session_id: session,
+                sequence: 1,
+                event_type: EventType::ToolUse,
+                role: None,
+                created_at: Utc::now(),
+                content: String::new(),
+                tool_name: Some("AskUserQuestion".into()),
+                tool_input: Some(Box::new(json!(question))),
+                offload_id: None,
+                tool_use_id: Some("node-question-1".into()),
+                metadata: None,
+            },
+            None,
+            &question,
+        )
+        .unwrap();
+    store
+        .update_session_status(session, SessionStatus::WaitingApproval)
+        .unwrap();
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn topology_node_question_is_rulable_by_manager() {
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, policy());
+    make_topology_node(&store, lead.id, "running");
+    raise_node_question(&store, lead.id, "Use the reserved migration number?");
+    store
+        .manager_v2_refresh_question_decisions(&config)
+        .unwrap();
+    let key = format!("question:{}", lead.id);
+
+    // The board offers it to the manager, not the operator.
+    let row = operator_row(&store, &config, &key);
+    assert_eq!(row["answerable_by"], "manager");
+    assert_eq!(row["gate"], Value::Null);
+    let rulings = store.manager_v2_rulings_rows(&config, None, 16).unwrap().0;
+    assert!(rulings.iter().any(|row| row["key"] == json!(key)));
+
+    // The ruling queues the exact delivery to the same session.
+    let record = store
+        .manager_v2_record(&config, "decision", &key)
+        .unwrap()
+        .unwrap();
+    let request = AgentManagerUpdateRequestV2 {
+        project_id: None,
+        fence: ManagerFenceV2 {
+            scope_version: config.row_version,
+            policy_version: 1,
+        },
+        idempotency_key: "rule-node".into(),
+        change: ManagerUpdateV2::DecisionRuling {
+            key: key.clone(),
+            expected_row_version: record.row_version,
+            target_digest: record.payload["target_digest"].as_str().unwrap().into(),
+            answer: "Use number 162".into(),
+            owner_manager_session_id: None,
+        },
+    };
+    let receipt = store
+        .manager_v2_commit_update(
+            config.manager_session_id,
+            &request,
+            &LedgerObservation::default(),
+        )
+        .unwrap();
+    assert!(!receipt.deduplicated);
+    let settled = operator_row(&store, &config, &key);
+    assert_eq!(settled["status"], "answer_queued");
+    assert_eq!(settled["answer"], "Use number 162");
+    assert_eq!(settled["answered_by"]["kind"], "project_manager");
+    let deliveries = store
+        .manager_v2_records_of_kind(&config, "decision_delivery")
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].payload["state"], "queued");
+    assert_eq!(deliveries[0].payload["answer"], "Use number 162");
+    assert_eq!(
+        deliveries[0].payload["target"]["session_id"],
+        json!(lead.id)
+    );
+    // The coordinator claims it for delivery through the normal path.
+    let claimed = store
+        .manager_v2_claim_decision_delivery(&config, Uuid::new_v4())
+        .unwrap()
+        .expect("a queued delivery for the node's session");
+    assert_eq!(claimed.decision_key, key);
+    assert_eq!(claimed.answer, "Use number 162");
+    // A replay of the same ruling does not queue a second delivery.
+    let replay = store
+        .manager_v2_commit_update(
+            config.manager_session_id,
+            &request,
+            &LedgerObservation::default(),
+        )
+        .unwrap();
+    assert!(replay.deduplicated);
+    assert_eq!(
+        store
+            .manager_v2_records_of_kind(&config, "decision_delivery")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn topology_node_question_naming_main_stays_operator_gate() {
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, policy());
+    make_topology_node(&store, lead.id, "running");
+    raise_node_question(&store, lead.id, "May we merge this into `main`?");
+    store
+        .manager_v2_refresh_question_decisions(&config)
+        .unwrap();
+    let key = format!("question:{}", lead.id);
+    let row = operator_row(&store, &config, &key);
+    assert_eq!(row["answerable_by"], "operator");
+    assert_eq!(row["gate"], "main_or_release");
+    assert_eq!(row["gate_source"], "daemon_scan");
+    assert_eq!(
+        refusal(pm_rule(&store, &config, &key, "yes", "rule-main").unwrap_err()),
+        "manager_v2_decision_operator_gate"
+    );
+    let row = operator_row(&store, &config, &key);
+    assert_eq!(row["status"], "pending");
+    assert!(
+        store
+            .manager_v2_records_of_kind(&config, "decision_delivery")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn topology_node_question_option_naming_main_stays_operator_gate() {
+    // #1704: the gate is in an answer choice, not in the question text.
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, policy());
+    make_topology_node(&store, lead.id, "running");
+    raise_node_question_with_options(
+        &store,
+        lead.id,
+        "How should I proceed?",
+        &[
+            ("Merge to main", "Land the work"),
+            ("Keep working on rolling", "Continue"),
+        ],
+    );
+    store
+        .manager_v2_refresh_question_decisions(&config)
+        .unwrap();
+    let key = format!("question:{}", lead.id);
+    let row = operator_row(&store, &config, &key);
+    assert_eq!(row["answerable_by"], "operator");
+    assert_eq!(row["gate"], "main_or_release");
+    assert_eq!(row["gate_source"], "daemon_scan");
+    assert_eq!(
+        refusal(pm_rule(&store, &config, &key, "Merge to main", "rule-opt").unwrap_err()),
+        "manager_v2_decision_operator_gate"
+    );
+    assert_eq!(operator_row(&store, &config, &key)["status"], "pending");
+    assert!(
+        store
+            .manager_v2_records_of_kind(&config, "decision_delivery")
+            .unwrap()
+            .is_empty()
+    );
+    // A description alone can carry the gate too.
+    assert!(
+        classify_decision(
+            &key,
+            &json!({"question":"Proceed?","gate_text":"Proceed?\nYes\nDeploy to production"}),
+            true,
+            true
+        )
+        .is_some_and(|gate| gate.class == "main_or_release")
+    );
+    // A node question projected without the full text fails closed.
+    assert!(
+        classify_decision(&key, &json!({"question":"Rename the module?"}), true, true)
+            .is_some_and(|gate| gate.source == "reserved_key")
+    );
+}
+
+/// Rule on a running node's question and return its key (#1704).
+fn rule_node_question(store: &Store, config: &HarnessManagerConfigV1, lead: Uuid) -> String {
+    make_topology_node(store, lead, "running");
+    raise_node_question(store, lead, "Use the reserved migration number?");
+    store.manager_v2_refresh_question_decisions(config).unwrap();
+    let key = format!("question:{lead}");
+    pm_rule(store, config, &key, "Use number 162", "rule-cancel").unwrap();
+    let deliveries = store
+        .manager_v2_records_of_kind(config, "decision_delivery")
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    // The ruling is bound to the exact attempt and execution.
+    assert!(deliveries[0].payload["topology"]["attempt_id"].is_string());
+    assert!(deliveries[0].payload["topology"]["execution_id"].is_string());
+    key
+}
+
+fn cancel_topology_execution(store: &Store) {
+    store
+        .conn
+        .execute("UPDATE topology_executions SET status='cancelling'", [])
+        .unwrap();
+}
+
+fn assert_ruling_revoked_and_unblocked(store: &Store, config: &HarnessManagerConfigV1, key: &str) {
+    let row = operator_row(store, config, key);
+    assert_eq!(row["status"], "target_unavailable");
+    assert_eq!(row["blocks"]["launches"], false);
+    assert_eq!(row["blocks"]["epic_ids"], json!([]));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn queued_manager_ruling_is_revoked_by_cancellation_before_claim() {
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, policy());
+    let key = rule_node_question(&store, &config, lead.id);
+    assert_eq!(
+        operator_row(&store, &config, &key)["status"],
+        "answer_queued"
+    );
+    cancel_topology_execution(&store);
+    assert!(
+        store
+            .manager_v2_claim_decision_delivery(&config, Uuid::new_v4())
+            .unwrap()
+            .is_none()
+    );
+    let deliveries = store
+        .manager_v2_records_of_kind(&config, "decision_delivery")
+        .unwrap();
+    assert_eq!(deliveries[0].payload["state"], "revoked");
+    assert_ruling_revoked_and_unblocked(&store, &config, &key);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn claimed_manager_ruling_is_revoked_by_cancellation_before_effect() {
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, policy());
+    let key = rule_node_question(&store, &config, lead.id);
+    let claimed = store
+        .manager_v2_claim_decision_delivery(&config, Uuid::new_v4())
+        .unwrap()
+        .expect("claimable while the execution runs");
+    cancel_topology_execution(&store);
+    // Provider-effect admission refuses, and nothing marks the effect started.
+    let error = store
+        .manager_v2_set_decision_delivery(&claimed, "running", true, None)
+        .unwrap_err();
+    assert_eq!(refusal(error), "manager_v2_decision_topology_revoked");
+    store
+        .manager_v2_set_decision_delivery(&claimed, "blocked", false, Some("revoked".into()))
+        .unwrap();
+    assert_ruling_revoked_and_unblocked(&store, &config, &key);
+}
+
+/// Rewrite the stored delivery as the e81fef92a producer serialized it: a
+/// manager ruling with no topology binding at all (#1704).
+fn strip_delivery_binding(store: &Store) {
+    let changed = store
+        .conn
+        .execute(
+            "UPDATE harness_manager_v2_records
+             SET payload_json=json_remove(payload_json,'$.topology')
+             WHERE kind='decision_delivery'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    let deliveries = store
+        .manager_v2_records_of_kind(&store_config(store), "decision_delivery")
+        .unwrap();
+    assert!(deliveries[0].payload.get("topology").is_none());
+}
+
+fn store_config(store: &Store) -> HarnessManagerConfigV1 {
+    let project: String = store
+        .conn
+        .query_row(
+            "SELECT project_id FROM harness_manager_v2_records WHERE kind='decision_delivery'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    store
+        .get_harness_manager(Uuid::parse_str(&project).unwrap())
+        .unwrap()
+        .unwrap()
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn legacy_unbound_manager_ruling_is_revoked_not_treated_as_operator() {
+    // Deployed S3b queued a manager ruling with no binding; after this fix
+    // lands and before delivery the execution is cancelled while the exact
+    // pending question remains. The missing binding must not grant the
+    // operator's exemption: the audit identity says a manager ruled.
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, policy());
+    let key = rule_node_question(&store, &config, lead.id);
+    strip_delivery_binding(&store);
+    cancel_topology_execution(&store);
+    assert!(
+        store
+            .manager_v2_claim_decision_delivery(&config, Uuid::new_v4())
+            .unwrap()
+            .is_none()
+    );
+    let deliveries = store
+        .manager_v2_records_of_kind(&config, "decision_delivery")
+        .unwrap();
+    assert_eq!(deliveries[0].payload["state"], "revoked");
+    assert_ruling_revoked_and_unblocked(&store, &config, &key);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn legacy_unbound_manager_ruling_is_revoked_even_while_the_execution_runs() {
+    // Nothing verifies which attempt an unbound manager ruling answered.
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, policy());
+    let key = rule_node_question(&store, &config, lead.id);
+    strip_delivery_binding(&store);
+    assert!(
+        store
+            .manager_v2_claim_decision_delivery(&config, Uuid::new_v4())
+            .unwrap()
+            .is_none()
+    );
+    assert_ruling_revoked_and_unblocked(&store, &config, &key);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn recovered_pre_effect_legacy_manager_claim_is_revoked() {
+    // A pre-effect claim written by the deployed producer, recovered after a
+    // restart, must not reach the effect-start admission as an operator answer.
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, policy());
+    let key = rule_node_question(&store, &config, lead.id);
+    let claimed = store
+        .manager_v2_claim_decision_delivery(&config, Uuid::new_v4())
+        .unwrap()
+        .expect("claimable while bound and live");
+    assert!(claimed.topology.is_some());
+    strip_delivery_binding(&store);
+    // The restart returns the pre-effect claim to the queue; the claim check
+    // then revokes it.
+    assert_eq!(
+        store
+            .manager_v2_recover_decision_deliveries(Uuid::new_v4())
+            .unwrap(),
+        1
+    );
+    assert!(
+        store
+            .manager_v2_claim_decision_delivery(&config, Uuid::new_v4())
+            .unwrap()
+            .is_none()
+    );
+    assert_ruling_revoked_and_unblocked(&store, &config, &key);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn legacy_unbound_manager_claim_is_refused_at_effect_start() {
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, policy());
+    let key = rule_node_question(&store, &config, lead.id);
+    let mut claimed = store
+        .manager_v2_claim_decision_delivery(&config, Uuid::new_v4())
+        .unwrap()
+        .expect("claimable while bound and live");
+    strip_delivery_binding(&store);
+    claimed.topology = None;
+    let error = store
+        .manager_v2_set_decision_delivery(&claimed, "running", true, None)
+        .unwrap_err();
+    assert_eq!(refusal(error), "manager_v2_decision_topology_revoked");
+    store
+        .manager_v2_set_decision_delivery(&claimed, "blocked", false, Some("revoked".into()))
+        .unwrap();
+    assert_ruling_revoked_and_unblocked(&store, &config, &key);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn operator_answer_to_node_question_survives_topology_cancellation() {
+    // The operator's answer path keeps its authority: it carries no binding.
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, policy());
+    make_topology_node(&store, lead.id, "running");
+    raise_node_question(&store, lead.id, "Use the reserved migration number?");
+    store
+        .manager_v2_refresh_question_decisions(&config)
+        .unwrap();
+    let key = format!("question:{}", lead.id);
+    let record = store
+        .manager_v2_record(&config, "decision", &key)
+        .unwrap()
+        .unwrap();
+    store
+        .manager_v2_prepare_decision_answer(
+            &rsi_common::harness_manager_v2::AnswerHarnessManagerDecisionRequestV2 {
+                project_id: config.project_id,
+                fence: ManagerFenceV2 {
+                    scope_version: config.row_version,
+                    policy_version: 1,
+                },
+                decision_key: key.clone(),
+                expected_row_version: record.row_version,
+                target_digest: record.payload["target_digest"].as_str().unwrap().into(),
+                answer: "operator says go".into(),
+                idempotency_key: "operator-node".into(),
+            },
+            |_, _, _, _| unreachable!(),
+        )
+        .unwrap();
+    cancel_topology_execution(&store);
+    let claimed = store
+        .manager_v2_claim_decision_delivery(&config, Uuid::new_v4())
+        .unwrap()
+        .expect("the operator's answer is not fenced by the topology");
+    assert!(claimed.topology.is_none());
+    assert_eq!(claimed.answer, "operator says go");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn non_topology_question_stays_reserved_gate() {
+    // An ordinary worker's question is a human gate whatever its text says:
+    // the S3b classifier must not loosen it.
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, policy());
+    raise_node_question(&store, lead.id, "Use the reserved migration number?");
+    store
+        .manager_v2_refresh_question_decisions(&config)
+        .unwrap();
+    let key = format!("question:{}", lead.id);
+    let row = operator_row(&store, &config, &key);
+    assert_eq!(row["answerable_by"], "operator");
+    assert_eq!(row["gate"], "human_approval");
+    assert_eq!(row["gate_source"], "reserved_key");
+    assert_eq!(
+        refusal(pm_rule(&store, &config, &key, "Use 162", "rule-plain").unwrap_err()),
+        "manager_v2_decision_operator_gate"
+    );
+    assert!(
+        !store
+            .manager_v2_rulings_rows(&config, None, 16)
+            .unwrap()
+            .0
+            .iter()
+            .any(|row| row["key"] == json!(key))
+    );
+
+    // Neither does a topology attempt that has ended, or one of another kind of
+    // key, make a question rulable: only a live node attempt's own question.
+    make_topology_node(&store, lead.id, "succeeded");
+    let row = operator_row(&store, &config, &key);
+    assert_eq!(row["answerable_by"], "operator");
+    assert_eq!(row["gate_source"], "reserved_key");
+    assert!(
+        classify_decision(&key, &json!({"question":"Rename the module?"}), true, false).is_some()
+    );
+    assert!(
+        classify_decision("approval:abc", &json!({"question":"Run ls?"}), true, true)
+            .is_some_and(|gate| gate.source == "reserved_key")
+    );
+    assert!(
+        classify_decision("accept:abc", &json!({"question":"Accept?"}), true, true)
+            .is_some_and(|gate| gate.source == "reserved_key")
+    );
+    // A node question without its exact answer target cannot be delivered, so
+    // it is not rulable either.
+    assert!(
+        classify_decision(&key, &json!({"question":"Rename the module?"}), false, true)
+            .is_some_and(|gate| gate.source == "reserved_key")
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn topology_decision_is_filed_once_and_its_gate_decides_who_may_rule() {
+    // #1641 S3c: the daemon files a node's question under a `topology:` key.
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, policy());
+    let epic = lead.parent_id.unwrap();
+    let request = |key: &str, gate: Option<&str>, question: &str| TopologyDecisionRequest {
+        key: key.into(),
+        epic,
+        question: question.into(),
+        context: Some("execution e, node A".into()),
+        gate: gate.map(str::to_owned),
+        source_digest: "d1".into(),
+        actor: json!({"kind":"topology_executor","session_id":null,"node_label":null}),
+    };
+
+    // The daemon cannot mint a reserved gate key.
+    for key in ["question:x", "accept:x", "approval:x", "plain-key"] {
+        assert_eq!(
+            refusal(
+                store
+                    .manager_v2_put_topology_decision(&config, &request(key, None, "Rename?"))
+                    .unwrap_err()
+            ),
+            "manager_v2_reserved_decision_key",
+            "{key}"
+        );
+    }
+
+    // Filed once: a second call returns the same record unchanged.
+    let first = store
+        .manager_v2_put_topology_decision(
+            &config,
+            &request("topology:e:A:0:1", None, "Keep the old field or rename it?"),
+        )
+        .unwrap();
+    let again = store
+        .manager_v2_put_topology_decision(
+            &config,
+            &request("topology:e:A:0:1", None, "A different text"),
+        )
+        .unwrap();
+    assert_eq!(first.row_version, again.row_version);
+    assert_eq!(
+        again.payload["question"],
+        "Keep the old field or rename it?"
+    );
+    assert_eq!(first.payload["status"], "pending");
+    assert_eq!(first.payload["asked_by"]["kind"], "topology_executor");
+    assert_eq!(first.payload["history"][0]["note"], "execution e, node A");
+    assert_eq!(
+        first.payload["target_digest"],
+        json!(topology_decision_digest("topology:e:A:0:1", "d1").unwrap())
+    );
+
+    // No declared gate: the board offers it to the manager, who rules.
+    let row = operator_row(&store, &config, "topology:e:A:0:1");
+    assert_eq!(row["answerable_by"], "manager");
+    assert_eq!(row["gate"], Value::Null);
+    pm_rule(&store, &config, "topology:e:A:0:1", "Keep it", "rule-1").unwrap();
+    let ruled = operator_row(&store, &config, "topology:e:A:0:1");
+    assert_eq!(ruled["status"], "answered");
+    assert_eq!(ruled["answer"], "Keep it");
+    assert_eq!(ruled["answered_by"]["kind"], "project_manager");
+
+    // A declared gate is the operator's alone.
+    store
+        .manager_v2_put_topology_decision(
+            &config,
+            &request("topology:e:B:0:1", Some("main_or_release"), "Which tag?"),
+        )
+        .unwrap();
+    assert_eq!(
+        operator_row(&store, &config, "topology:e:B:0:1")["answerable_by"],
+        "operator"
+    );
+    assert_eq!(
+        refusal(pm_rule(&store, &config, "topology:e:B:0:1", "v1", "rule-2").unwrap_err()),
+        "manager_v2_decision_operator_gate"
+    );
+    // So is a question that names a gate without declaring it.
+    store
+        .manager_v2_put_topology_decision(
+            &config,
+            &request("topology:e:C:0:1", None, "May we merge to main?"),
+        )
+        .unwrap();
+    assert_eq!(
+        refusal(pm_rule(&store, &config, "topology:e:C:0:1", "yes", "rule-3").unwrap_err()),
+        "manager_v2_decision_operator_gate"
+    );
+
+    // Withdrawal ends a pending record once, and nothing else.
+    assert!(
+        store
+            .manager_v2_withdraw_topology_decision(&config, "topology:e:B:0:1", "cancelled")
+            .unwrap()
+    );
+    assert!(
+        !store
+            .manager_v2_withdraw_topology_decision(&config, "topology:e:B:0:1", "cancelled")
+            .unwrap()
+    );
+    assert_eq!(
+        operator_row(&store, &config, "topology:e:B:0:1")["status"],
+        "withdrawn"
+    );
+    assert!(
+        !store
+            .manager_v2_withdraw_topology_decision(&config, "topology:e:A:0:1", "late")
+            .unwrap(),
+        "an answered record is not withdrawn"
+    );
+
+    // An Epic the ledger does not cover is refused.
+    let mut foreign = request("topology:e:D:0:1", None, "Rename?");
+    foreign.epic = Uuid::new_v4();
+    assert_eq!(
+        refusal(
+            store
+                .manager_v2_put_topology_decision(&config, &foreign)
+                .unwrap_err()
+        ),
+        "manager_v2_scope_denied"
+    );
 }

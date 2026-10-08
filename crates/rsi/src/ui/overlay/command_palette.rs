@@ -40,12 +40,16 @@ pub(super) fn render_command_palette(
         ""
     };
     let input = if argument_edit { argument_input } else { query };
+    let mut spans = vec![Span::styled(
+        format!(":{prompt} "),
+        Style::default().fg(theme::blue()),
+    )];
+    spans.extend(crate::field_edit::draw(
+        input,
+        Style::default().fg(theme::text()),
+    ));
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(format!(":{prompt} "), Style::default().fg(theme::blue())),
-            Span::styled(input.to_string(), Style::default().fg(theme::text())),
-            Span::styled("█", Style::default().fg(theme::text())),
-        ])),
+        Paragraph::new(Line::from(spans)),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
     frame.render_widget(

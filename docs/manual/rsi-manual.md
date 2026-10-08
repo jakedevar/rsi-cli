@@ -164,7 +164,7 @@ The harness manager coordinates Epic leads under an operator-owned scope and pol
 |  | `:manager clear` | Clear manager scope | Clears the harness manager's scope. |
 |  | `:fleet` | Open fleet workspace | Shows active agents and usage rates across all projects. |
 | `gm` | `:global-manager` `:gm` `:manager workspace` | Open global manager workspace | Opens the global manager workspace above all projects: the grant, the global seat and each granted project's PM health; Enter opens the seat or a PM session. |
-|  | `:manager global [arg]` | Show global manager grant | Shows the active global manager grant; `:manager global set <active\|sessions\|containers\|spend\|groups> <value>` changes one per-project cap; `:manager global configure <JSON>` sends a full typed grant request. |
+|  | `:manager global [arg]` | Show global manager grant | Shows the active global manager grant; `:manager global set <active\|sessions\|containers\|spend\|groups> <value>` changes one per-project cap; `:manager global add-project <names...>` adds projects to the grant; `:manager global configure <JSON>` sends a full typed grant request. |
 |  | `:manager global appoint [arg]` | Appoint global manager | Appoints the focused session as the global manager over the named projects (comma-separated; default: every project). |
 |  | `:manager global revoke` | Revoke global manager | Revokes the active global manager grant; the seat keeps its session but loses its authority. |
 |  | `:manager portfolio [arg]` | Manager portfolio nodes | Lists managers above project level (portfolio nodes of any tier); `:manager portfolio show <node>`, `appoint <label> [projects...]` (focused session as seat; `--adopt <node,...>` appoints it above existing nodes), `configure <JSON>` and `revoke <node>` inspect or change one. |
@@ -185,6 +185,7 @@ The Issues workspace tracks project issues; the scheduled-jobs browser runs recu
 | Issues: `Enter` |  | Inspect or open linked session | Inspects the selected issue, or opens its linked session when one exists. |
 | Issues: `r` |  | Refresh active Issue view | Refreshes the active Issues tab from the daemon. |
 | Issues: `P` |  | Run poll now | Runs the issue sync poll now instead of waiting for its schedule. |
+| Issues: `T` |  | Run topology on issue | Starts the issue-implement-review-land topology on the selected issue under its project's Epic and opens the run view. |
 | Issues: `Enter` |  | Select highlighted form value | Selects the highlighted value in the open issue form field. |
 | Issues: `Ctrl-Enter` |  | Retry identical Issue write | Retries the last failed issue write with the identical request and idempotency key. |
 | Issues: `Tab` |  | Select next inspector history section | Moves the issue inspector to its next history section. |
@@ -294,6 +295,7 @@ Operator views: diagnostics, memory search, graph review, the recursive DAG brow
 |  | `:diagnostics` `:diag` | Open diagnostics | Opens the diagnostics overlay. |
 | `<Space>v` | `:graph` | Open graph review | Opens the visual workflow graph review editor. |
 |  | `:topology-resolve [arg]` | Resolve preserved topology work | Inspects, accepts, retries or discards preserved work on a blocked durable topology execution: `:topology-resolve [<execution_id>] inspect\|accept\|retry\|discard [<commit>]` (the id may be omitted when exactly one is blocked; discard needs the full preserved commit). |
+|  | `:topology [arg]` | Run a topology on the focused Issue | Starts a stored topology on the focused Issue in the Issues workspace: `:topology run <name> [<epic>]`. The Epic defaults to the focused or only live Epic of the Issue's project; the run view opens on the started execution. |
 |  | `:dag` | Open recursive DAG | Opens the recursive DAG browser. |
 |  | `:ask [arg]` | Ask a question | Opens the dialectic question overlay; `:ask <question>` asks directly. |
 | `<Space>gq` |  | Answer waiting question | Opens the question modal for a session waiting on your answer. |
@@ -423,6 +425,14 @@ How typing and submitting behave.
 | Submit on Enter | Plain Enter submits in submit-capable inputs; Shift-Enter inserts a newline. Document editors always insert a newline. | toggle | TUI (state.json) | immediately |
 | Auto-open question panel | Opens a waiting session's question panel automatically when nothing else is open. | toggle | TUI (state.json) | immediately |
 | Prompt compiler | Enables prompt compilation (Ctrl-Y in the input bar); off, compile requests return nothing. | toggle | TUI (state.json) | immediately |
+
+#### Editing Mode
+
+Standard or Vim text editing in every input.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| Editing mode | Standard edits like a normal text field (typing inserts, arrows move); Vim is the modal editing RSI was built around. Applies live; `unset` asks again at the next start. | choice | daemon field `editing_mode` | immediately |
 
 ### MODELS — Which model does which job?
 
@@ -554,6 +564,7 @@ Background queue and recursive DAG controls.
 | Recursive DAG max concurrent graphs | Maximum recursive DAG graphs running at once. | choice | daemon field `recursive_dag_max_concurrent_graphs` | immediately |
 | Graph overlay: render recursive origin | Draws each node's recursive-spawn origin edge in the graph overlay (:dag). | toggle | daemon field `gv_render_recursive_origin` | immediately |
 | Graph overlay: info dashboard | Shows the info dashboard panel in the graph overlay (:dag). | toggle | daemon field `gv_info_dashboard` | immediately |
+| Follow agent-created projects | Switches to the new project's tab when an agent creates a project (AgentCreateProject). On (default): the TUI jumps to the tab of a project an agent just created and offers, in one key, to add it to the creating global manager's grant. Off: the project still appears in the tab bar and the grant offer still shows, but the view stays where it is. | toggle | daemon field `follow_agent_created_projects` | immediately |
 | Durable topology executor | Kill switch for the durable topology executor (#634); off, no durable execution advances or recovers and live topology runs use the legacy in-memory runner. | toggle | daemon field `topology_executor_enabled` | immediately |
 | Topology build nodes | Most topology build nodes the durable executor runs at once (1-16; the page cycles 1-4). | choice | daemon field `topology_max_concurrent_build_nodes` | immediately |
 | Topology bulk fan-out on OpenRouter (0 off) | Minimum leaf count for OpenRouter topology bulk fan-out; 0 disables it. | choice | daemon field `topology_bulk_fanout_min_openrouter` | immediately |
@@ -567,6 +578,7 @@ Background queue and recursive DAG controls.
 | Worker slice MemorySwapMax (MiB) | Aggregate worker swap ceiling; applies after restarting rsid. | choice | daemon field `worker_scope_memory_swap_max_mib` | after daemon restart |
 | Worker slice CPUWeight | Relative CPU weight of the aggregate worker slice; applies after restarting rsid. | choice | daemon field `worker_scope_cpu_weight` | after daemon restart |
 | Rolling merge queue | Daemon-owned queue that gates each enqueued source once and fast-forwards it onto rolling; off refuses new enqueues. When on, the current manager or an Epic lead enqueues an accepted source and ends the turn; the daemon runs the lander gate and wakes the owner once with the landed SHA, refusal or failing tests. Turning it off stops new enqueues and claims; entries already gating finish. | toggle | daemon field `rolling_queue_enabled` | immediately |
+| Detach Claude turns | Run new Claude CLI turns through the durable turn shim (default off). Applies to the next Claude turn. Turning it off reads provider output directly from a pipe. Experimental: enabling is unsafe until transport authority across daemon boots (#1711) lands. Sessions that ran a detached turn are kept in the trash and cannot be purged. | toggle | daemon field `turn_detach_enabled` | immediately |
 | Hold new work while a deploy waits | While an agent-requested deploy waits for its quiet point, hold new child launches, child continuations, scheduled child wakes and new agent jobs. Running turns and jobs are never interrupted, and parentless operator sessions and the deploy's caller are never held. Held work runs after the deploy settles; the hold is released at the deploy's max wait even if the hub never went quiet. Held work is listed in AgentGetDaemonInfo (deploy_drain) with the reason deploy_draining. Turn off to let a deploy wait without holding anything. | toggle | daemon field `deploy_drain_enabled` | immediately |
 | Deploy hold limit (s) | How long an agent-requested deploy may hold new launches while it waits for its quiet point (0-3600 seconds, default 600; 0 never holds). A worker turn can run for an hour, so a deploy that held new launches until its max wait starved the manager. Past this limit the deploy keeps waiting for a quiet point (no lander, job or scoped worker mid-turn) without holding anything, then holds again only from its first quiet poll until the restart. An operator restart is not limited. The manager can also cancel its own waiting deploy (AgentRequestDeploy cancel: true). | choice | daemon field `deploy_drain_hold_secs` | immediately |
 | Host load limit for new launches | Hold a manager's new worker launches while the host's 1-minute load average is above this (0-1024, default 40; 0 never holds). Several projects' managers share one host, and their workers build and test, so a dozen started together push the load far past the core count. While the 1-minute load plus the launches admitted in the last minute is above this limit, the daemon holds a manager's create_session (Issue workers and topology nodes included): it stays queued, never refused, shows as held: host_load in AgentManagerGetAction and AgentGetDaemonInfo, and starts on its own when the load drops, oldest first. Operator sessions, a worker's own spawns, retries and lead recovery are never held. Platforms without a load average admit everything. | choice | daemon field `host_load_admission_threshold` | immediately |
@@ -756,6 +768,7 @@ Every `:` command, its aliases and argument form. Type a unique alias and Enter,
 | `:diagnostics` | `:diag` | Open diagnostics | Opens the diagnostics overlay. |
 | `:graph` |  | Open graph review | Opens the visual workflow graph review editor. |
 | `:topology-resolve [arg]` |  | Resolve preserved topology work | Inspects, accepts, retries or discards preserved work on a blocked durable topology execution: `:topology-resolve [<execution_id>] inspect\|accept\|retry\|discard [<commit>]` (the id may be omitted when exactly one is blocked; discard needs the full preserved commit). |
+| `:topology [arg]` |  | Run a topology on the focused Issue | Starts a stored topology on the focused Issue in the Issues workspace: `:topology run <name> [<epic>]`. The Epic defaults to the focused or only live Epic of the Issue's project; the run view opens on the started execution. |
 | `:dag` |  | Open recursive DAG | Opens the recursive DAG browser. |
 | `:context [arg]` | `:ctx [arg]` | Set active task context | Sets or clears the active task context for new launches. |
 | `:card [arg]` |  | Edit entity card | Opens the entity card editor for the current project or the named entity. |
@@ -768,7 +781,7 @@ Every `:` command, its aliases and argument form. Type a unique alias and Enter,
 | `:manager clear` |  | Clear manager scope | Clears the harness manager's scope. |
 | `:fleet` |  | Open fleet workspace | Shows active agents and usage rates across all projects. |
 | `:global-manager` | `:gm` `:manager workspace` | Open global manager workspace | Opens the global manager workspace above all projects: the grant, the global seat and each granted project's PM health; Enter opens the seat or a PM session. |
-| `:manager global [arg]` |  | Show global manager grant | Shows the active global manager grant; `:manager global set <active\|sessions\|containers\|spend\|groups> <value>` changes one per-project cap; `:manager global configure <JSON>` sends a full typed grant request. |
+| `:manager global [arg]` |  | Show global manager grant | Shows the active global manager grant; `:manager global set <active\|sessions\|containers\|spend\|groups> <value>` changes one per-project cap; `:manager global add-project <names...>` adds projects to the grant; `:manager global configure <JSON>` sends a full typed grant request. |
 | `:manager global appoint [arg]` |  | Appoint global manager | Appoints the focused session as the global manager over the named projects (comma-separated; default: every project). |
 | `:manager global revoke` |  | Revoke global manager | Revokes the active global manager grant; the seat keeps its session but loses its authority. |
 | `:manager portfolio [arg]` |  | Manager portfolio nodes | Lists managers above project level (portfolio nodes of any tier); `:manager portfolio show <node>`, `appoint <label> [projects...]` (focused session as seat; `--adopt <node,...>` appoints it above existing nodes), `configure <JSON>` and `revoke <node>` inspect or change one. |
@@ -988,6 +1001,7 @@ Registry keys of the Issues workspace; some apply only in the tab or mode the ac
 | `Enter` | Inspect or open linked session | Inspects the selected issue, or opens its linked session when one exists. |
 | `r` | Refresh active Issue view | Refreshes the active Issues tab from the daemon. |
 | `P` | Run poll now | Runs the issue sync poll now instead of waiting for its schedule. |
+| `T` | Run topology on issue | Starts the issue-implement-review-land topology on the selected issue under its project's Epic and opens the run view. |
 | `Enter` | Select highlighted form value | Selects the highlighted value in the open issue form field. |
 | `Ctrl-Enter` | Retry identical Issue write | Retries the last failed issue write with the identical request and idempotency key. |
 | `Tab` | Select next inspector history section | Moves the issue inspector to its next history section. |
@@ -1696,6 +1710,10 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `g / G` | Jump to first / last |
 | `i` | Type to the selected seat's manager here |
 | `t` | Select the console's own seat and type to it |
+| `s` | Show the selected seat session's status |
+| `x` | Halt the selected seat session (soft stop) |
+| `X` | Halt the selected seat session now (press twice) |
+| `a` | Archive the selected earlier seat session |
 | `n` | Launch and appoint a manager (seat, launch, scope) |
 | `Tab` | Focus the conversation: j/k, Ctrl-D/U scroll, g/G ends |
 | `Enter / l` | Open the seat's session in its project tab, or a child node's console |

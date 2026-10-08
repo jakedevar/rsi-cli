@@ -149,3 +149,25 @@ h1 { margin: 0; font-size: 27px; line-height: 1.15; letter-spacing: -.04em; }
   .icon-button[aria-busy="true"] svg { animation: turn .9s linear infinite; }
   @keyframes turn { to { transform: rotate(360deg); } }
 }
+
+/* Answer forms (#990 A4) */
+.answer-card { padding: 12px 0; border-top: 1px solid var(--line); }
+.answer-card:first-child { border-top: 0; padding-top: 0; }
+.answer-form { display: grid; gap: 10px; margin-top: 8px; min-width: 0; }
+.answer-options { display: flex; flex-wrap: wrap; gap: 8px; }
+.option-button { min-height: 44px; max-width: 100%; padding: 0 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); color: var(--ink); font-size: 13px; font-weight: 600; overflow-wrap: anywhere; cursor: pointer; }
+.option-button.is-picked { border-color: var(--green); background: var(--green-soft); color: var(--green); }
+.option-button:disabled { opacity: .55; cursor: default; }
+.answer-label { display: grid; gap: 6px; }
+.answer-label-text { color: var(--muted); font-size: 11px; font-weight: 650; }
+.answer-text { width: 100%; box-sizing: border-box; min-height: 76px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: #fff; color: var(--ink); font: 16px/1.5 inherit; resize: vertical; }
+.answer-text:read-only { background: var(--paper); color: var(--muted); }
+.answer-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.primary-button { min-height: 44px; padding: 0 18px; border: 0; border-radius: 10px; background: var(--green); color: #fff; font-size: 13px; font-weight: 700; cursor: pointer; }
+.primary-button:disabled { opacity: .55; cursor: default; }
+.answer-note, .answer-status { margin: 0; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.answer-note { color: var(--muted); }
+.answer-status-busy, .answer-status-idle { color: var(--muted); }
+.answer-status-ok { color: var(--green); }
+.answer-status-warn { color: var(--amber); }
+.answer-status-error { color: var(--red); }

@@ -328,7 +328,9 @@ class PerFileProvisionalMigrationTest(unittest.TestCase):
             "        if version < 129 {\n            settled();\n        }\n"
             "        Ok(())\n    }\n}\n")
     TESTS = ("// RSI-RELEASED-MIGRATION-BEGIN: test-catalog\n// fixed\n"
-             "// RSI-RELEASED-MIGRATION-END: test-catalog\nconst REWIND: i32 = 129;\n")
+             "// RSI-RELEASED-MIGRATION-END: test-catalog\nconst REWIND: i32 = 129;\n"
+             # An unrelated literal equal to the provisional number (#1655).
+             "fn pagination() {\n    assert_eq!(second.events.len(), 130);\n}\n")
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="rsi-renumber-dir-test-")
@@ -427,6 +429,49 @@ class PerFileProvisionalMigrationTest(unittest.TestCase):
             RENUMBER.inspect(self.repo, self.base,
                              self.git(worktree, "rev-parse", "HEAD"), self.base)
         self.assertTrue(source)
+
+    def commit_extra(self, label, name, text):
+        worktree = Path(self.temp.name) / f"source-{label}"
+        self.write(worktree, name, text)
+        self.git(worktree, "add", name)
+        self.git(worktree, "commit", "-q", "-m", f"extra {name}")
+        return self.git(worktree, "rev-parse", "HEAD")
+
+    def test_unchanged_literal_and_cargo_lock_do_not_block_a_renumbered_landing(self):
+        first_source = self.source("alpha")
+        second_source = self.commit_extra(
+            self.source("beta") and "beta", "Cargo.lock",
+            '[[package]]\nname = "uuid"\nchecksum = "ab130cd"\n')
+        _first, first_candidate = self.candidate(first_source, self.base)
+        _second, final = self.candidate(second_source, first_candidate)
+        manifest = RENUMBER.revision_inventory(self.repo, final)
+        self.assertEqual(manifest["latest_schema_version"], 131)
+        tests = self.git(self.repo, "show", f"{final}:crates/rsid-store/src/store/tests.rs")
+        self.assertIn("second.events.len(), 130)", tests)
+        self.assertIn("const REWIND: i32 = 131;", tests)
+
+    def test_real_undeclared_schema_site_still_refuses(self):
+        first_source = self.source("alpha")
+        second_source = self.commit_extra(
+            self.source("beta") and "beta", "crates/rsid-store/src/store/extra.rs",
+            "const SCHEMA: i32 = 130;\n")
+        _first, first_candidate = self.candidate(first_source, self.base)
+        with self.assertRaisesRegex(RENUMBER.Refusal, "undeclared version-bearing"):
+            RENUMBER.inspect(self.repo, self.base, second_source, first_candidate)
+
+    def test_migration_already_at_head_plus_one_is_not_renumbered(self):
+        source = self.commit_extra(
+            self.source("alpha") and "alpha", "Cargo.lock", 'checksum = "x130y"\n')
+        unit = RENUMBER.inspect(self.repo, self.base, source, self.base, allow_noop=True)
+        self.assertTrue(unit["renumber_noop"])
+        self.assertEqual(unit["old_version"], unit["new_version"])
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "tools/rolling-migration-renumber.py"),
+             "--repo", str(self.repo), "--transform", "--base", self.base,
+             "--source", source, "--target", self.base],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["renumber_noop"])
 
 
 if __name__ == "__main__":

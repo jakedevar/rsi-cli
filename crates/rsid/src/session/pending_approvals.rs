@@ -160,7 +160,7 @@ fn remote_preview(
 /// pending set. No target JSON or writer handle leaves this read-only helper.
 /// Missing and replaced observations never establish a tombstone or complete
 /// coverage; the caller separately checks project ownership and Store state.
-pub(super) fn remote_selected_native_approval(
+pub(crate) fn remote_selected_native_approval(
     session: Uuid,
     selected: Uuid,
 ) -> crate::remote_read::Result<crate::remote_read::NativeRuntimeApprovalSnapshot> {
@@ -627,6 +627,32 @@ pub(super) async fn resolve_monitor_approval(
     Ok(())
 }
 
+enum ApprovalAnswerDelivery {
+    Manager(ManagerDecisionDeliveryV2),
+    Remote(crate::store::pending_questions::remote_answers::RemoteAnswerDelivery),
+}
+
+impl ApprovalAnswerDelivery {
+    fn target(&self) -> &Value {
+        match self {
+            Self::Manager(d) => &d.target,
+            Self::Remote(d) => &d.target,
+        }
+    }
+    fn answer(&self) -> &str {
+        match self {
+            Self::Manager(d) => &d.answer,
+            Self::Remote(d) => d.request.answer.as_str(),
+        }
+    }
+    fn session_id(&self) -> Result<Uuid> {
+        match self {
+            Self::Manager(d) => super::manager_coordinator::decision_session(d),
+            Self::Remote(d) => Ok(d.session_id()),
+        }
+    }
+}
+
 impl SessionManager {
     /// Retry only persistence of already-observed source closure, never an
     /// operator response. Registry and each pending set have fixed bounds.
@@ -696,8 +722,22 @@ impl SessionManager {
         }
     }
 
+    pub(super) async fn deliver_remote_appserver_approval(
+        &self,
+        delivery: crate::store::pending_questions::remote_answers::RemoteAnswerDelivery,
+    ) -> Result<()> {
+        self.deliver_native_approval(ApprovalAnswerDelivery::Remote(delivery))
+            .await
+    }
+
     async fn deliver_appserver_approval(&self, delivery: ManagerDecisionDeliveryV2) -> Result<()> {
-        let session = super::manager_coordinator::decision_session(&delivery)?;
+        self.deliver_native_approval(ApprovalAnswerDelivery::Manager(delivery))
+            .await
+    }
+
+    async fn deliver_native_approval(&self, delivery: ApprovalAnswerDelivery) -> Result<()> {
+        let session = delivery.session_id()?;
+        let target = delivery.target();
         let _spawn = super::spawn_single_flight::acquire_spawn_guard(session).await;
         let runtime = WRITERS
             .lock()
@@ -709,13 +749,13 @@ impl SessionManager {
         if !runtime.live.load(Ordering::SeqCst)
             || runtime.capacity_sealed.load(Ordering::SeqCst)
             || !pending
-                .get(&request_key(&delivery.target))
-                .is_some_and(|p| p.target == delivery.target && p.resolution.is_none())
-            || delivery.target["incarnation_id"] != runtime.incarnation.to_string()
+                .get(&request_key(target))
+                .is_some_and(|p| &p.target == target && p.resolution.is_none())
+            || target["incarnation_id"] != runtime.incarnation.to_string()
         {
             return Err(refused("manager_v2_approval_incarnation_changed"));
         }
-        let decision = match delivery.answer.trim() {
+        let decision = match delivery.answer().trim() {
             "approve" => ApprovalDecision::Approve,
             "deny" => ApprovalDecision::Deny,
             _ => {
@@ -724,18 +764,15 @@ impl SessionManager {
                 ));
             }
         };
-        let request_id = &delivery.target["request_id"];
-        let method = delivery.target["method"]
+        let request_id = &target["request_id"];
+        let method = target["method"]
             .as_str()
             .ok_or_else(|| refused("manager_v2_approval_method_missing"))?;
         let prepared = tokio::time::timeout(
             Duration::from_secs(2),
-            runtime.writer.prepare_approval(
-                request_id,
-                method,
-                &delivery.target["params"],
-                decision,
-            ),
+            runtime
+                .writer
+                .prepare_approval(request_id, method, &target["params"], decision),
         )
         .await
         .map_err(|_| refused("manager_v2_approval_writer_capacity"))??;
@@ -755,16 +792,36 @@ impl SessionManager {
             return Err(refused("manager_v2_approval_writer_unavailable"));
         }
         let store = self.store.lock().await;
-        let started = store.manager_v2_set_decision_delivery(
-            &delivery,
-            "running",
-            true,
-            Some("native approval write intent committed before enqueue".into()),
-        )?;
+        let started = match &delivery {
+            ApprovalAnswerDelivery::Manager(delivery) => {
+                ApprovalAnswerDelivery::Manager(store.manager_v2_set_decision_delivery(
+                    delivery,
+                    "running",
+                    true,
+                    Some("native approval write intent committed before enqueue".into()),
+                )?)
+            }
+            ApprovalAnswerDelivery::Remote(delivery) => {
+                ApprovalAnswerDelivery::Remote(store.set_remote_answer_delivery(
+                    delivery,
+                    rsi_common::remote_pending_decisions::RemoteAnswerStateV1::Running,
+                    true,
+                    Some(json!({"code":"native_approval_write_intent"})),
+                )?)
+            }
+        };
         prepared.enqueue();
         // Failure here leaves durable effect_started and the human gate intact;
         // recovery exposes uncertainty and never repeats the enqueue.
-        store.finish_appserver_approval_enqueue(&started)?;
+        match &started {
+            ApprovalAnswerDelivery::Manager(delivery) => {
+                store.finish_appserver_approval_enqueue(delivery)?
+            }
+            ApprovalAnswerDelivery::Remote(delivery) => {
+                store.finish_remote_approval_enqueue(delivery)?
+            }
+        }
+
         // Keep this occurrence until exact provider closure; other requests
         // and the response's unconfirmed consumption remain independently owned.
         Ok(())

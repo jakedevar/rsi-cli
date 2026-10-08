@@ -52,7 +52,7 @@ pub fn open_schedule_form_edit(app: &mut App, job: &ScheduledJob) {
 }
 
 pub async fn handle_schedule_form_key(app: &mut App, key: KeyEvent) -> bool {
-    let (_focused_field, editing_id) = if let OverlayState::ScheduleForm {
+    let (focused_field, editing_id) = if let OverlayState::ScheduleForm {
         focused_field,
         editing_id,
         ..
@@ -62,6 +62,39 @@ pub async fn handle_schedule_form_key(app: &mut App, key: KeyEvent) -> bool {
     } else {
         return false;
     };
+
+    // Standard editing: a real cursor and selection in the focused text field.
+    let accept: fn(char) -> bool = match focused_field {
+        3 => |c| c.is_ascii_digit(),
+        4 => |c| c.is_ascii_digit() || c == '-',
+        5 => |c| c.is_ascii_digit() || c == ':',
+        _ => |_| true,
+    };
+    if app.edit_field_filtered(
+        key,
+        |overlay| match overlay {
+            OverlayState::ScheduleForm {
+                name,
+                message,
+                interval,
+                anchor_date,
+                anchor_time,
+                ..
+            } => match focused_field {
+                0 => Some(name),
+                1 => Some(message),
+                3 => Some(interval),
+                4 => Some(anchor_date),
+                5 => Some(anchor_time),
+                _ => None,
+            },
+            _ => None,
+        },
+        accept,
+    ) != crate::field_edit::FieldKey::Ignored
+    {
+        return true;
+    }
 
     match key.code {
         KeyCode::Tab => {

@@ -1,8 +1,9 @@
 import { ApiError, createApi, limits } from './api.js';
-import { createPoller, createViewState, enterDetail, groupSessions, returnToList } from './state.js';
+import { createDraftStore, createPoller, createViewState, describeDraft, describePendingReceipt, enterDetail, groupSessions, returnToList, submitDraft } from './state.js';
 
 const api = createApi();
 const state = createViewState();
+const drafts = createDraftStore();
 let detailRequestGeneration = 0;
 const MAX_DETAIL_EVENTS = 500;
 let olderLoading = false;
@@ -19,6 +20,8 @@ const elements = {
   detailState: document.querySelector('#detail-state'),
   detailContent: document.querySelector('#detail-content'),
   search: document.querySelector('#search'),
+  announce: document.querySelector('#announce'),
+  footnoteMode: document.querySelector('#footnote-mode'),
 };
 
 const isVisible = () => document.visibilityState === 'visible';
@@ -155,17 +158,134 @@ async function refreshSessions() {
   }
 }
 
-function renderWaiting({ session, decisions, decisionsError }) {
+function announce(message) {
+  elements.announce.textContent = '';
+  elements.announce.textContent = message;
+}
+
+const isAnswerable = (target) => target.kind === 'question' || target.options.length > 0;
+
+function renderAnswerCard(target, draft, fence) {
+  const item = node('li', `decision decision-${target.kind} answer-card`);
+  const head = node('div', 'decision-head');
+  head.append(node('span', `decision-kind decision-kind-${target.kind}`, target.kind === 'question' ? 'Question' : 'Approval'));
+  head.append(node('span', 'decision-title', target.title));
+  item.append(head);
+  if (target.detail) item.append(node('p', 'decision-detail', target.detail));
+  if (target.receipt) {
+    item.append(node('p', 'answer-note', describePendingReceipt(target.receipt).message));
+    return item;
+  }
+  if (!draft) {
+    item.append(node('p', 'answer-note', 'No answer choices were offered for this approval. Answer it on your RSI host.'));
+    return item;
+  }
+  const view = describeDraft(draft);
+  const mark = (element, field) => {
+    element.dataset.draftKey = draft.decisionKey;
+    element.dataset.draftField = field;
+    return element;
+  };
+  const rerender = () => renderDetailPreservingScroll();
+  const group = node('div', 'answer-form');
+  group.setAttribute('role', 'group');
+  group.setAttribute('aria-label', `Answer: ${target.title}`);
+  if (target.options.length) {
+    const choices = node('div', 'answer-options');
+    target.options.forEach((option, index) => {
+      const button = mark(node('button', `option-button${draft.text === option ? ' is-picked' : ''}`, option), `option-${index}`);
+      button.type = 'button';
+      button.disabled = !view.canEdit;
+      button.setAttribute('aria-pressed', draft.text === option ? 'true' : 'false');
+      button.addEventListener('click', () => {
+        drafts.setText(draft, option);
+        rerender();
+      });
+      choices.append(button);
+    });
+    group.append(choices);
+  }
+  if (target.kind === 'question') {
+    const label = node('label', 'answer-label');
+    label.append(node('span', 'answer-label-text', target.options.length ? 'Or write your own answer' : 'Your answer'));
+    const field = mark(node('textarea', 'answer-text'), 'text');
+    field.rows = 3;
+    field.maxLength = 2048;
+    field.value = draft.text;
+    field.readOnly = !view.canEdit;
+    field.autocomplete = 'off';
+    field.addEventListener('input', () => drafts.setText(draft, field.value));
+    label.append(field);
+    group.append(label);
+  }
+  const actions = node('div', 'answer-actions');
+  if (view.canRetry) {
+    const retry = mark(node('button', 'primary-button', 'Retry same answer'), 'retry');
+    retry.type = 'button';
+    retry.addEventListener('click', () => sendDraft(draft));
+    const refresh = mark(node('button', 'text-button', 'Refresh'), 'refresh');
+    refresh.type = 'button';
+    refresh.addEventListener('click', () => detailPoller.kick());
+    actions.append(retry, refresh);
+  } else if (view.canDismiss) {
+    const done = mark(node('button', 'text-button', 'Done'), 'dismiss');
+    done.type = 'button';
+    done.addEventListener('click', () => {
+      drafts.dismiss(draft);
+      rerender();
+    });
+    actions.append(done);
+  } else {
+    const send = mark(node('button', 'primary-button', draft.status === 'sending' ? 'Sending…' : 'Send answer'), 'send');
+    send.type = 'button';
+    send.disabled = !view.canSend || !fence;
+    send.setAttribute('aria-busy', draft.status === 'sending' ? 'true' : 'false');
+    send.addEventListener('click', () => sendDraft(draft));
+    actions.append(send);
+  }
+  group.append(actions);
+  if (view.message) {
+    const status = node('p', `answer-status answer-status-${view.tone}`, view.message);
+    status.setAttribute('role', 'status');
+    group.append(status);
+  }
+  item.append(group);
+  return item;
+}
+
+async function sendDraft(draft) {
+  const fence = state.detail?.targets?.fence ?? null;
+  const sending = submitDraft({ api, store: drafts, draft, fence });
+  renderDetailPreservingScroll();
+  const status = await sending;
+  const failed = draft.error;
+  announce(status === 'receipt' ? 'Answer sent to your RSI host.' : failed ? failed.message : 'This decision changed. Refreshing.');
+  if (state.screen === 'detail' && state.selectedId === draft.sessionId) {
+    renderDetailPreservingScroll();
+    // A receipt, an unknown outcome or a changed decision are all settled by
+    // asking the host again; no optimistic "answered" state is shown.
+    if (status === 'receipt' || status === 'unknown' || !failed) detailPoller.kick();
+  }
+}
+
+function renderWaiting({ session, decisions, decisionsError, targets }) {
   const open = Array.isArray(decisions) ? decisions.filter((decision) => decision.open) : [];
-  if (!decisionsError && !session.attentionIncomplete && open.length === 0) return;
+  const items = targets?.ready ? targets.items : [];
+  const sentDrafts = drafts.forSession(session.id).filter((draft) => draft.status !== 'editing' && !items.some((item) => item.decisionKey === draft.decisionKey));
+  if (!decisionsError && !session.attentionIncomplete && open.length === 0 && items.length === 0 && sentDrafts.length === 0) return;
   const section = node('section', 'waiting-section');
   section.append(node('h2', 'waiting-title', 'Waiting on your RSI host'));
-  if (decisionsError) {
-    section.append(node('p', 'waiting-error', decisionsError));
-  } else if (open.length) {
+  if (decisionsError) section.append(node('p', 'waiting-error', decisionsError));
+  const answerable = new Set(items.map((item) => item.decisionKey));
+  const readOnly = open.filter((decision) => !answerable.has(decision.id));
+  if (items.length || sentDrafts.length || readOnly.length) {
     const list = node('ul', 'decision-list');
     list.setAttribute('aria-label', 'Decisions waiting on the RSI host');
-    for (const decision of open) {
+    for (const target of items) list.append(renderAnswerCard(target, isAnswerable(target) ? drafts.ensure(session.id, target) : null, targets.fence));
+    // An answer already sent stays visible after the decision stops waiting,
+    // so its receipt or unknown outcome is not lost to a poll.
+    for (const draft of sentDrafts) list.append(renderAnswerCard(draft, draft, targets?.fence ?? null));
+    for (const decision of readOnly) {
       const item = node('li', `decision decision-${decision.kind}`);
       const head = node('div', 'decision-head');
       head.append(node('span', `decision-kind decision-kind-${decision.kind}`, decision.kind === 'question' ? 'Question' : 'Approval'));
@@ -176,17 +296,35 @@ function renderWaiting({ session, decisions, decisionsError }) {
     }
     section.append(list);
   }
-  if (open.length) section.append(node('p', 'waiting-note', 'Answer these on your RSI host; this view is read-only.'));
+  if (readOnly.length) section.append(node('p', 'waiting-note', items.length ? 'Decisions without an answer form must be answered on your RSI host.' : 'Answer these on your RSI host; this view is read-only.'));
+  if (targets?.state === 'error') section.append(node('p', 'waiting-incomplete', 'Could not refresh the answer forms; showing the last known ones.'));
   if (session.attentionIncomplete) {
     section.append(node('p', 'waiting-incomplete', 'Some sources could not be checked; the list may be incomplete.'));
   }
   elements.detailContent.append(section);
 }
 
+// The poll rebuilds the page, so the focused draft control and the caret are
+// put back afterwards; the draft text itself lives in the draft store.
 function renderDetail() {
+  const active = document.activeElement;
+  const focus = active?.dataset?.draftField
+    ? { key: active.dataset.draftKey, field: active.dataset.draftField, start: active.selectionStart, end: active.selectionEnd }
+    : null;
+  renderDetailBody();
+  elements.footnoteMode.textContent = state.detail?.targets?.ready ? 'You can answer waiting decisions' : 'Read only';
+  if (!focus) return;
+  const again = [...elements.detailContent.querySelectorAll('[data-draft-field]')]
+    .find((element) => element.dataset.draftKey === focus.key && element.dataset.draftField === focus.field);
+  if (!again || again.disabled) return;
+  again.focus({ preventScroll: true });
+  if (focus.field === 'text' && focus.start !== null) again.setSelectionRange(focus.start, focus.end);
+}
+
+function renderDetailBody() {
   elements.detailContent.replaceChildren();
   if (!state.detail) return;
-  const { session, events, decisions, decisionsError, hasOlder } = state.detail;
+  const { session, events, decisions, decisionsError, targets, hasOlder } = state.detail;
   const header = node('header', 'detail-header');
   const back = node('button', 'back-button');
   back.type = 'button';
@@ -201,7 +339,7 @@ function renderDetail() {
   header.append(metadata);
   elements.detailContent.append(header);
 
-  renderWaiting({ session, decisions, decisionsError });
+  renderWaiting({ session, decisions, decisionsError, targets });
 
   const eventHeading = node('div', 'events-heading');
   const eventCount = events.length === limits.MAX_EVENTS ? `Latest ${limits.MAX_EVENTS} · limited` : `${events.length} events`;
@@ -283,9 +421,16 @@ async function refreshDetail() {
     const detail = await api.getSession(id);
     if (requestGeneration !== detailRequestGeneration || state.screen !== 'detail' || state.selectedId !== id) return;
     const previous = state.detail;
-    state.detail = previous && previous.session.id === detail.session.id
-      ? { ...detail, events: mergeEvents(previous.events, detail.events), hasOlder: previous.hasOlder && detail.hasOlder }
-      : detail;
+    const sameSession = previous && previous.session.id === detail.session.id;
+    // A failed targets read keeps the last good forms so a draft is not pulled
+    // out from under the operator by one bad poll.
+    const targets = detail.targets.state === 'error' && sameSession && previous.targets?.ready
+      ? { ...previous.targets, state: 'error' }
+      : detail.targets;
+    if (targets.state === 'ok') drafts.sync(id, targets.items);
+    state.detail = sameSession
+      ? { ...detail, targets, events: mergeEvents(previous.events, detail.events), hasOlder: previous.hasOlder && detail.hasOlder }
+      : { ...detail, targets };
     state.detailError = '';
     renderDetailPreservingScroll();
     setConnection('connected', `Updated ${formatClock()}`);
@@ -319,6 +464,7 @@ async function openSession(id, row, pushRoute = true) {
   try {
     const detail = await api.getSession(id);
     if (requestGeneration !== detailRequestGeneration || state.screen !== 'detail' || state.selectedId !== id) return;
+    if (detail.targets.state === 'ok') drafts.sync(id, detail.targets.items);
     state.detail = detail;
     state.detailError = '';
   } catch (error) {
@@ -368,6 +514,7 @@ function closeSession(pushHistory) {
   olderLoading = false;
   olderError = '';
   state.detail = null;
+  elements.footnoteMode.textContent = 'Read only';
   showScreen();
   requestAnimationFrame(() => {
     elements.sessionList.scrollTop = state.listScrollTop;

@@ -19762,3 +19762,18 @@ async fn fleet_operator_rpc_returns_typed_bounded_snapshot() {
     assert!(snapshot.agents.len() <= 2048);
     assert_eq!(snapshot.totals.len(), 3);
 }
+
+/// #1626: `project_created` is daemon-global, so a stream subscribed for any
+/// session receives it, and it carries its own bus type.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn project_created_reaches_every_session_stream() {
+    let event = DaemonEvent::ProjectCreated {
+        project_id: Uuid::new_v4(),
+        name: "Created".into(),
+        source: "agent".into(),
+        created_by_session_id: Uuid::new_v4(),
+    };
+    assert_eq!(event_type_str(&event), "project_created");
+    assert!(event_matches_session(&event, Uuid::new_v4()));
+}

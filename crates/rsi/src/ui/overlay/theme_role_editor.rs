@@ -39,15 +39,19 @@ pub fn render_theme_role_editor(
             Style::default().fg(theme::subtext1()),
         )),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("Color  ", Style::default().fg(theme::subtext1())),
-            Span::styled(
+        {
+            let mut spans = vec![Span::styled(
+                "Color  ",
+                Style::default().fg(theme::subtext1()),
+            )];
+            spans.extend(crate::field_edit::draw_inline(
                 input,
                 Style::default()
                     .fg(theme::text())
                     .add_modifier(Modifier::BOLD),
-            ),
-        ]),
+            ));
+            Line::from(spans)
+        },
         Line::from(""),
         Line::from(Span::styled(
             assessment,

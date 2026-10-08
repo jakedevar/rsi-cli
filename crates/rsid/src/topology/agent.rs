@@ -52,7 +52,7 @@ use crate::topology::executor::{Executor, NodeEffects};
 use crate::topology::resolve::resolution_error;
 use crate::topology::store::{
     self as rows, Acceptance, Actor, AttemptRow, ExecutionRequester, ExecutionRow, NewExecution,
-    Recorded,
+    OperatorOwner, Recorded,
 };
 
 /// Plan §5.3: session nodes of one agent-requested execution in flight.
@@ -754,6 +754,20 @@ pub(crate) fn node_launch(node: &NodeDef) -> Option<ManagerLaunchChoiceV2> {
     })
 }
 
+/// The explicit launch an attempt spends: a review node's reviewer triple
+/// (#1641 S1b), otherwise the session node's own settings.
+fn attempt_launch(execution: &ExecutionRow, node: &NodeDef) -> Option<ManagerLaunchChoiceV2> {
+    let steps = crate::topology::steps::WorkflowSteps::from_workflow(&execution.definition).ok()?;
+    if let Some(TopologyStep::Review { reviewer, .. }) = steps.step(&node.id) {
+        return Some(ManagerLaunchChoiceV2 {
+            provider: reviewer.provider,
+            model: reviewer.model.clone(),
+            effort: Some(reviewer.effort.clone()),
+        });
+    }
+    node_launch(node)
+}
+
 /// The equality rule of manager launches (`manager_action_resources`); an
 /// empty grant list fails closed for agents.
 pub(crate) fn launch_granted(
@@ -769,9 +783,7 @@ pub(crate) fn launch_granted(
 
 /// Plan §5.3: a reviewer's vendor family must differ from the author's. An
 /// unknown family on either side cannot prove independence and fails
-/// closed. Review nodes are refused at validation until T3b (plan §3 rule
-/// 9), which wires this check into review-node validation.
-#[cfg_attr(not(test), allow(dead_code))]
+/// closed. `check_definition` applies it to every review node (#1641).
 pub(crate) fn reviewer_family_independent(
     author: &ManagerLaunchChoiceV2,
     reviewer: &ManagerLaunchChoiceV2,
@@ -895,6 +907,9 @@ pub(crate) fn check_definition(
             Some(_) => {}
         }
     }
+    checked
+        .policy
+        .extend(review_diagnostics(&workflow, &steps, allowed));
     checked.policy.extend(fanout_diagnostics(
         &topology.definition,
         &workflow,
@@ -903,6 +918,51 @@ pub(crate) fn check_definition(
     ));
     checked.workflow = Some(workflow);
     checked
+}
+
+/// Plan §5.3 for review nodes: the reviewer triple is an explicit grant like
+/// any session node's, and its vendor family differs from the author's.
+fn review_diagnostics(
+    workflow: &WorkflowDefinition,
+    steps: &crate::topology::steps::WorkflowSteps,
+    allowed: &[ManagerLaunchChoiceV2],
+) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    for node in &workflow.nodes {
+        let Some(TopologyStep::Review { of, reviewer, .. }) = steps.step(&node.id) else {
+            continue;
+        };
+        let launch = ManagerLaunchChoiceV2 {
+            provider: reviewer.provider,
+            model: reviewer.model.clone(),
+            effort: Some(reviewer.effort.clone()),
+        };
+        if allowed.is_empty() {
+            diagnostics.push(format!(
+                "node {}: no allowed_launches are granted by the operator; agent review nodes fail closed",
+                node.id
+            ));
+        } else if !launch_granted(allowed, &launch) {
+            diagnostics.push(clip(format!(
+                "node {}: reviewer {:?}/{}/{} is not in the operator's allowed_launches",
+                node.id, launch.provider, launch.model, reviewer.effort
+            )));
+        }
+        let author = workflow
+            .nodes
+            .iter()
+            .find(|candidate| candidate.id == *of)
+            .and_then(node_launch);
+        if let Some(author) = author
+            && !reviewer_family_independent(&author, &launch)
+        {
+            diagnostics.push(clip(format!(
+                "node {}: reviewer {:?}/{} must be a different vendor family than the author node {of}",
+                node.id, launch.provider, launch.model
+            )));
+        }
+    }
+    diagnostics
 }
 
 /// Plan §5.3 bulk rule: a layer (longest forward path from a source) with
@@ -1061,6 +1121,107 @@ fn ancestor_allowance(
     }
 }
 
+/// #1641 S2: whether the manager or Epic lead that requested `execution`
+/// may still land on its behalf. Re-resolved from rows at every enqueue, so a
+/// revoked grant, a replaced lead, a paused manager or a moved scope stops
+/// the landing (`Some(code)`). An execution no agent owns has nobody to land
+/// for.
+pub(crate) fn landing_gate(
+    store: &Store,
+    execution: &ExecutionRow,
+) -> Result<Option<&'static str>> {
+    // An operator execution carries an owner only when the daemon resolved the
+    // Epic's project manager at accept (`resolve_operator_owner`); the owner
+    // then lands under the same live authority as an agent requester (#1746).
+    let owned = execution.agent_requested() || execution.requested_by_kind == "operator";
+    let (Some(requester), Some(epic)) = (
+        execution.requested_by_session_id.filter(|_| owned),
+        execution.epic_id,
+    ) else {
+        return Ok(Some("owner_required"));
+    };
+    let Ok(caller) = TopologyCaller::resolve_in(store, requester, execution.project_id) else {
+        return Ok(Some("requester_unauthorized"));
+    };
+    if caller.require_epic(store, epic, Reach::Effect).is_err() {
+        return Ok(Some("epic_not_landable"));
+    }
+    Ok(None)
+}
+
+/// #1746: the owner of an operator-started execution's review and land nodes.
+///
+/// The daemon derives it from rows, never from the request: `parent_id` must
+/// be a live Epic of the request's project, and that project's appointed live
+/// project manager (the one the agent path would use) must currently be able to
+/// act on the Epic (Automation capability, Epic in scope, `execute` mode, not
+/// paused). Anything else is a typed `operator_owner_*` refusal the TUI shows.
+pub(crate) fn resolve_operator_owner(
+    store: &Store,
+    project_id: Option<Uuid>,
+    parent_id: Option<Uuid>,
+) -> Result<OperatorOwner> {
+    let live =
+        |status: SessionStatus| !matches!(status, SessionStatus::Archived | SessionStatus::Deleted);
+    let epic = parent_id
+        .map(|id| store.get_session(id))
+        .transpose()?
+        .flatten()
+        .filter(|epic| epic.session_kind == SessionKind::Epic && live(epic.status))
+        .ok_or_else(|| {
+            refusal(
+                "operator_owner_epic_required",
+                "review and land nodes need parent_id to be a live Epic; start from an Issue under an Epic",
+            )
+        })?;
+    let project = epic.project_id.ok_or_else(|| {
+        refusal(
+            "operator_owner_project_required",
+            "the Epic has no project, so no project manager can own the execution",
+        )
+    })?;
+    if project_id != Some(project) {
+        return Err(refusal(
+            "operator_owner_project_mismatch",
+            "pass the Epic's own project as project_id",
+        ));
+    }
+    let no_manager = || {
+        refusal(
+            "operator_owner_no_manager",
+            "this project has no appointed live project manager to own review and land nodes; appoint one first",
+        )
+    };
+    let manager = store
+        .get_harness_manager(project)?
+        .and_then(|config| config.current_session_id)
+        .filter(|manager| {
+            store
+                .get_session(*manager)
+                .ok()
+                .flatten()
+                .is_some_and(|session| live(session.status))
+        })
+        .ok_or_else(no_manager)?;
+    let unauthorized = |_| {
+        refusal(
+            "operator_owner_manager_unauthorized",
+            "the project manager must hold Automation, have this Epic in scope, be in execute mode and not paused",
+        )
+    };
+    let caller = TopologyCaller::resolve_in(store, manager, Some(project)).map_err(unauthorized)?;
+    if !matches!(caller, TopologyCaller::Manager { .. }) {
+        return Err(no_manager());
+    }
+    caller
+        .require_epic(store, epic.id, Reach::Effect)
+        .map_err(unauthorized)?;
+    Ok(OperatorOwner {
+        epic_id: epic.id,
+        manager_session_id: manager,
+    })
+}
+
 pub(crate) fn launch_gate(
     store: &Store,
     execution: &ExecutionRow,
@@ -1077,7 +1238,7 @@ pub(crate) fn launch_gate(
     else {
         return Ok(Some("node_missing"));
     };
-    let Some(launch) = node_launch(node) else {
+    let Some(launch) = attempt_launch(execution, node) else {
         return Ok(Some("launch_not_explicit"));
     };
     // #1235: an execution the global seat requested is governed only by its
@@ -1689,6 +1850,7 @@ fn execute_fingerprint(request: &AgentTopologyExecuteRequestV1) -> String {
             "epic_id": request.epic_id,
             "inputs": request.inputs,
             "base_commit": request.base_commit,
+            "on_call": request.on_call,
         })
         .to_string(),
     )
@@ -1995,7 +2157,29 @@ pub(crate) fn accept_prepared(
             "the Epic's project repository changed while preparing; retry the execution",
         ));
     }
+    crate::topology::oncall::require_covering(store, admitted.project_id, request.on_call.as_ref())
+        .map_err(|_| {
+            refusal(
+                "on_call_not_covering",
+                "name a portfolio node that covers the Epic's project, or omit on_call",
+            )
+        })?;
     let actor = caller.actor();
+    // #1641 S5a: `inputs.issue = <number>` is snapshotted here, under the
+    // accepting lock, from the Epic's project.
+    let inputs = crate::topology::starters::resolve_issue_input(
+        store,
+        admitted.project_id,
+        Some(request.inputs.clone()),
+    )
+    .map_err(|error| match error {
+        DaemonError::InvalidParam(_) => refusal(
+            "issue_not_found",
+            "pass inputs.issue as the display number of an open Issue in the Epic's project",
+        ),
+        other => other,
+    })?
+    .unwrap_or(serde_json::Value::Null);
     let new = NewExecution {
         id: Uuid::new_v4(),
         topology_id: Some(admitted.record.id),
@@ -2006,7 +2190,7 @@ pub(crate) fn accept_prepared(
         parent_session_id: Some(request.epic_id),
         repo_root,
         base_commit,
-        input: (!request.inputs.is_null()).then(|| request.inputs.clone()),
+        input: crate::topology::oncall::embed(inputs, request.on_call.as_ref())?,
         requester: Some(ExecutionRequester {
             actor,
             epic_id: request.epic_id,
@@ -2021,6 +2205,7 @@ pub(crate) fn accept_prepared(
             request_fingerprint: fingerprint,
             topology_revision: Some(admitted.record.revision),
         }),
+        owner: None,
     };
     let base_commit = new.base_commit.clone();
     let id = new.id;

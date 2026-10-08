@@ -329,8 +329,15 @@ pub(crate) async fn reconcile_store_consistency(
         // process leak. Blocking `/proc` walk -> `spawn_blocking`. Any inventory
         // or proof failure preserves the active-like row for a later retry;
         // marking it Failed would discard the only durable ownership evidence.
+        let turns = match store.lock().await.list_active_provider_turn_custody() {
+            Ok(turns) => turns,
+            Err(error) => {
+                tracing::error!(%sid, %error, "Cannot prove detached turn custody; retaining session");
+                continue;
+            }
+        };
         let reaped = match tokio::task::spawn_blocking(move || {
-            crate::session::reap_orphans_for_session(sid)
+            crate::session::reap_orphans_for_session(sid, turns)
         })
         .await
         {

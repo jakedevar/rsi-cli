@@ -1,0 +1,106 @@
+{
+  "nodes": [
+    {
+      "id": "implement",
+      "kind": "Task",
+      "label": "Implement the Issue",
+      "params": {
+        "instructions": "You are a short-lived worker implementing the Issue in the upstream context ('issue': its number, title and body). The Issue states the intent and acceptance criteria; the principle is the ground truth, not the existing code. Follow AGENTS.md and the worker contract in your repository checkout: read the code you change, keep the diff focused, cover what you change with tests that assert the Issue's intent, and verify with scripts/scoped-test --base origin/rolling. Format only the files you changed (scripts/fmt-changed.sh origin/rolling), stage explicit paths, and commit on your sandbox branch. Do not push, do not touch rolling or main. When a product choice or a missing fact blocks you, ask with AskUserQuestion; if you cannot ask, end with a BLOCKED handoff. Finish with a PIPELINE HANDOFF — IMPLEMENTATION: block whose fields are doc_path: inline, status: complete, a short summary, the commit SHA and the tests you ran. For a BLOCKED handoff use status: blocked with blocker, blocker_class (technical_impasse unless it is production, destructive, resource, authority or forbidden_scope), blocker_evidence and blocker_question (the single question that unblocks you).",
+        "provider": "claude",
+        "model": "claude-sonnet-5-5",
+        "effort": "high",
+        "step": {
+          "kind": "session",
+          "expects_commit": true,
+          "pass_content": false
+        }
+      }
+    },
+    {
+      "id": "review",
+      "kind": "Task",
+      "label": "DB-native review",
+      "prereqs": [
+        "implement"
+      ],
+      "params": {
+        "step": {
+          "kind": "review",
+          "of": "implement",
+          "reviewer": {
+            "provider": "codex",
+            "model": "gpt-6.1-sol",
+            "effort": "high"
+          },
+          "max_rounds": 2
+        }
+      }
+    },
+    {
+      "id": "fix",
+      "kind": "Task",
+      "label": "Fix the review findings",
+      "prereqs": [
+        "review"
+      ],
+      "params": {
+        "instructions": "A reviewer asked for changes to the implementation. The upstream context carries the review findings in full. Address every finding in the same sandbox: fix the cause, add or adjust tests that assert the Issue's intent, re-run scripts/scoped-test --base origin/rolling, format only changed files, and commit. Do not widen scope. If a finding needs a product choice, ask with AskUserQuestion or end with a BLOCKED handoff carrying blocker_question. Finish with a PIPELINE HANDOFF — IMPLEMENTATION: block with doc_path: inline, status: complete, a summary of how each finding was addressed, and the commit SHA.",
+        "provider": "claude",
+        "model": "claude-sonnet-5-5",
+        "effort": "high",
+        "when": {
+          "review": "verdict_changes_requested"
+        },
+        "step": {
+          "kind": "session",
+          "expects_commit": true,
+          "pass_content": true
+        }
+      }
+    },
+    {
+      "id": "land",
+      "kind": "Task",
+      "label": "Land through the rolling merge queue",
+      "prereqs": [
+        "review"
+      ],
+      "params": {
+        "when": {
+          "review": "verdict_accepted"
+        },
+        "step": {
+          "kind": "land",
+          "accepted": "review",
+          "test_filters": []
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "implement",
+      "to": "review",
+      "loop_edge": false
+    },
+    {
+      "from": "review",
+      "to": "fix",
+      "loop_edge": false
+    },
+    {
+      "from": "review",
+      "to": "land",
+      "loop_edge": false
+    },
+    {
+      "from": "fix",
+      "to": "review",
+      "loop_edge": true
+    }
+  ],
+  "until": {
+    "type": "max_iterations",
+    "value": 3
+  }
+}

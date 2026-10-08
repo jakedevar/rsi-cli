@@ -980,6 +980,20 @@ fn move_finder_selection(finder: &mut ExplorerFinder, delta: isize) {
 /// Keys while the finder is active. Every printable key (including `j`,
 /// `k`, `q` and Space) types into the query; arrows and Ctrl-J/K/N/P move.
 fn handle_finder_key(app: &mut App, key: KeyEvent) {
+    // Standard editing: a real cursor and selection in the query.
+    match app.edit_field(key, |overlay| match overlay {
+        OverlayState::FileExplorer(state) => Some(&mut state.finder.query),
+        _ => None,
+    }) {
+        crate::field_edit::FieldKey::Edited => {
+            if let Some(state) = explorer_mut(app) {
+                rescore_finder(state);
+            }
+            return;
+        }
+        crate::field_edit::FieldKey::Moved => return,
+        crate::field_edit::FieldKey::Ignored => {}
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let Some(state) = explorer_mut(app) else {

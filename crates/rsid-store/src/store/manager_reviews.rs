@@ -25,6 +25,12 @@ use std::collections::BTreeSet;
 use uuid::Uuid;
 
 mod contributors;
+mod topology;
+pub use topology::{
+    REVIEW_NO_MANAGER_LEDGER, TOPOLOGY_ONCALL_ACCEPTANCE, TopologyExtraRound,
+    TopologyExtraRoundQuery, TopologyOncallAcceptance, TopologyReviewOutcome,
+    TopologyReviewRequest, topology_review_work_key,
+};
 
 const MAX_ASSIGNMENTS_PER_WORK: i64 = 64;
 const MAX_REVIEW_ROUNDS_PER_REVISION: usize = 3;
@@ -37,6 +43,18 @@ const REVIEWER_ESTABLISHMENT_DEADLINE_MINUTES: i64 = 30;
 /// reviewer process may still be running.
 const ORPHAN_REVIEWER_LOOKBACK_MINUTES: i64 = 120;
 
+/// The verdict a receipt effectively carries: an `accepted` receipt with a
+/// blocking finding is not an acceptance (`manager_v2_accepted_source` refuses
+/// it too), so it counts as `changes_requested`. Verdict routing and delta
+/// eligibility both read this.
+pub(super) fn effective_review_verdict(verdict: &str, has_blocking_finding: bool) -> &str {
+    if verdict == "accepted" && has_blocking_finding {
+        "changes_requested"
+    } else {
+        verdict
+    }
+}
+
 fn review_tier_rank(tier: ModelTier) -> u8 {
     match tier {
         ModelTier::Local => 0,
@@ -46,14 +64,18 @@ fn review_tier_rank(tier: ModelTier) -> u8 {
 }
 
 impl Store {
-    fn review_delta_family(
+    /// Validate a delta round and return the previous round's reviewer
+    /// session: the one session whose own contribution the delta exemption
+    /// removes (a finding-focused re-review may reuse its reviewer's family).
+    /// Every other contributor of that family keeps its ban.
+    fn review_delta_reviewer(
         &self,
         project: Uuid,
         work: &WorkRecord,
         source_sha: &str,
         delta_of: Option<Uuid>,
         finding_keys: &[String],
-    ) -> Result<Option<ReviewModelFamily>> {
+    ) -> Result<Option<Uuid>> {
         let Some(prior_id) = delta_of else {
             if !finding_keys.is_empty() {
                 return Err(refused("manager_review_invalid_delta"));
@@ -76,19 +98,25 @@ impl Store {
         {
             return Err(refused("manager_review_invalid_delta"));
         }
-        let receipt: Option<(String, String, String)> = self
+        let receipt: Option<(String, String, String, bool)> = self
             .conn
             .query_row(
-                "SELECT receipt_id,verdict,reviewer_session_id FROM manager_review_receipts
-             WHERE assignment_id=?1 AND source_sha=?2",
+                "SELECT receipt_id,verdict,reviewer_session_id,
+                        EXISTS(SELECT 1 FROM manager_review_findings f
+                                WHERE f.receipt_id=r.receipt_id AND f.blocking)
+                   FROM manager_review_receipts r
+                  WHERE assignment_id=?1 AND source_sha=?2",
                 params![prior_id.to_string(), prior.source_sha],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        let Some((receipt_id, verdict, reviewer)) = receipt else {
+        let Some((receipt_id, verdict, reviewer, blocking)) = receipt else {
             return Err(refused("manager_review_invalid_delta"));
         };
-        if verdict != "changes_requested"
+        // The same effective verdict that routes a topology review's outcome:
+        // an accepted receipt that still carries a blocking finding is a
+        // request for changes. The immutable receipt is never rewritten.
+        if effective_review_verdict(&verdict, blocking) != "changes_requested"
             || prior.reviewer_session_id != Some(parse_uuid(reviewer.clone())?)
         {
             return Err(refused("manager_review_invalid_delta"));
@@ -104,8 +132,7 @@ impl Store {
                 return Err(refused("manager_review_invalid_delta"));
             }
         }
-        let family = self.recorded_review_family(parse_uuid(reviewer)?)?;
-        Ok(Some(family))
+        Ok(Some(parse_uuid(reviewer)?))
     }
 
     /// #967: whether a reviewer launch action has been in flight past the
@@ -354,6 +381,38 @@ struct ReviewAllocationRequest {
     delta_of: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     finding_keys: Vec<String>,
+    /// #1641 S1b: the topology attempt this assignment serves. It makes the
+    /// executor's request idempotent per attempt and is carried unchanged to
+    /// infra-retry successors, so the executor can follow the chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    topology_attempt_id: Option<Uuid>,
+}
+
+/// Inputs of the post-authorization half of a review reservation.
+pub(super) struct ReviewReservation<'a> {
+    pub caller: Uuid,
+    pub config: &'a HarnessManagerConfigV1,
+    pub fence: &'a ManagerFenceV2,
+    pub work: &'a WorkRecord,
+    pub work_row_version: i64,
+    pub observed: &'a super::manager_ledger::LedgerObservation,
+    pub expected_row_version: i64,
+    pub source_commit: &'a String,
+    pub query: &'a String,
+    pub launch: &'a ManagerLaunchChoiceV2,
+    pub delta_of: Option<Uuid>,
+    pub finding_keys: &'a Vec<String>,
+    pub topology: Option<&'a TopologyReservation>,
+}
+
+/// What distinguishes a topology executor's reservation (#1641 S1b).
+pub(super) struct TopologyReservation {
+    /// Recorded on the ledger events: who acted.
+    pub actor: Value,
+    pub attempt_id: Uuid,
+    /// Sessions beyond the recorded author that authored part of the
+    /// reviewed source (earlier fix rounds); their families bar the reviewer.
+    pub contributors: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -1000,6 +1059,48 @@ impl Store {
             }
             self.manager_v2_require_epic(&authority, work.epic_id)?;
         }
+        self.manager_review_reserve_authorized(&ReviewReservation {
+            caller,
+            config,
+            fence: &request.fence,
+            work,
+            work_row_version,
+            observed,
+            expected_row_version: *expected_row_version,
+            source_commit,
+            query,
+            launch,
+            delta_of: *delta_of,
+            finding_keys,
+            topology: None,
+        })
+    }
+
+    /// The post-authorization half of a review reservation, shared by the
+    /// manager's `RequestReview` and the topology executor's review effect
+    /// (#1641 S1b): the same source, tier, family, limit and round checks
+    /// run for both; only who is authorized differs.
+    pub(super) fn manager_review_reserve_authorized(
+        &self,
+        input: &ReviewReservation<'_>,
+    ) -> Result<ManagerMutationReceiptV2> {
+        let ReviewReservation {
+            caller,
+            config,
+            fence,
+            work,
+            work_row_version,
+            observed,
+            expected_row_version,
+            source_commit,
+            query,
+            launch,
+            delta_of,
+            finding_keys,
+            topology,
+        } = *input;
+        let expected_row_version = &expected_row_version;
+        let delta_of = &delta_of;
         // #1493: a delta round may carry a revised commit. The ledger
         // observation already proved it sealed in the author's custody and
         // authored after the base; it replaces the Work's recorded source below
@@ -1026,7 +1127,7 @@ impl Store {
         if work.risk_tier == ManagerWorkRiskTierV2::Tier2 {
             let policy = self
                 .get_harness_manager_policy(config.project_id)?
-                .filter(|policy| policy.row_version == request.fence.policy_version)
+                .filter(|policy| policy.row_version == fence.policy_version)
                 .ok_or_else(|| refused("manager_v2_policy_changed"))?;
             let model = launch.model.rsplit('/').next().unwrap_or(&launch.model);
             let tier =
@@ -1110,6 +1211,15 @@ impl Store {
         {
             return Err(refused("manager_review_closure_specialist_required"));
         }
+        // The previous reviewer's own contribution is the only provenance the
+        // delta exemption removes; fix authors keep their family bans.
+        let exempt_reviewer = self.review_delta_reviewer(
+            config.project_id,
+            work,
+            source_commit,
+            *delta_of,
+            finding_keys,
+        )?;
         let contributors = self.review_contributors(
             config.project_id,
             author,
@@ -1118,28 +1228,17 @@ impl Store {
                 .iter()
                 .copied()
                 .collect::<BTreeSet<Uuid>>(),
+            topology.map_or(&[][..], |topology| topology.contributors.as_slice()),
             &[],
-            &[],
+            exempt_reviewer,
         )?;
-        let mut admissible = contributors.clone();
-        if let Some(family) = self.review_delta_family(
-            config.project_id,
-            work,
-            source_commit,
-            *delta_of,
-            finding_keys,
-        )? {
-            admissible
-                .families
-                .remove(contributors::family_name(family));
-        }
         let override_key =
             self.review_family_override(config, &work.key, work.spec_revision, None)?;
         self.require_review_contributor_family(
             config.project_id,
             &work.key,
             work.spec_revision,
-            &admissible,
+            &contributors,
             override_key.as_deref(),
             review_model_family(launch.provider, Some(launch.model.as_str())),
         )?;
@@ -1187,7 +1286,7 @@ impl Store {
         }
         let allocation = ReviewAllocationRequest {
             requester_session_id: caller,
-            fence: request.fence.clone(),
+            fence: fence.clone(),
             query: query.clone(),
             launch: launch.clone(),
             infra_retry_of: None,
@@ -1197,6 +1296,7 @@ impl Store {
             family_override_key: override_key,
             delta_of: *delta_of,
             finding_keys: finding_keys.clone(),
+            topology_attempt_id: topology.map(|topology| topology.attempt_id),
         };
         let request_json = serde_json::to_value(&allocation)?;
         self.conn.execute(
@@ -1227,7 +1327,13 @@ impl Store {
                 "review_assignment",
                 &assignment_id.to_string(),
                 1,
-                &json!({"assignment_id":assignment_id,"work_key":work.key,"spec_revision":work.spec_revision,"source_commit":source_commit,"previous_source_commit":previous_source,"state":"reserved"}),
+                &{
+                    let mut event = json!({"assignment_id":assignment_id,"work_key":work.key,"spec_revision":work.spec_revision,"source_commit":source_commit,"previous_source_commit":previous_source,"state":"reserved"});
+                    if let Some(topology) = topology {
+                        event["actor"] = topology.actor.clone();
+                    }
+                    event
+                },
             )?,
             key: assignment_id.to_string(),
             row_version: 1,
@@ -2597,6 +2703,7 @@ mod tests {
                 family_override_key: None,
                 delta_of: None,
                 finding_keys: vec![],
+                topology_attempt_id: None,
             },
         }
     }

@@ -34,7 +34,9 @@ You need Rust (rustup) and at least one signed-in agent CLI, such as
 provider at [Ollama](https://ollama.com). Then press `<Space>p` to add a
 project, `<Space>N` to start a session, and `?` for help anywhere. Details are
 under [Install](#install) and [Run](#run). To have a manager working in
-minutes, see [Start here](#start-here).
+minutes, see [Start here](#start-here). Before launching, use the new-session
+modal's [settings backside](#new-session-settings-backside) to choose the model,
+effort, sandbox, or manager role.
 
 ## Start here
 
@@ -43,24 +45,42 @@ always an operator action: you run the command, the agent never appoints itself.
 Full detail: [docs/harness-manager.md](docs/harness-manager.md); the two ways to
 develop are in [docs/development-modes.md](docs/development-modes.md).
 
+**First start.** RSI asks how you edit text. Press `s` for **Standard** (type
+directly; the default if you are new to Vim) or `v` for **Vim**. You can change
+it later in Settings > Editing Mode. Either way the session list has focus
+afterwards, so the `:` commands and `<Space>` chords below work as written. In
+Standard mode an opened session's text box owns every key, including `:` and `j`,
+so run the `:` commands from the list and open a session (`Enter`) only to talk
+to it. Press `Esc` to go back to the list (it first clears a selection or closes
+a suggestion popup, so press it again). `Ctrl-H` also works on terminals with the
+kitty keyboard protocol; others send it as Backspace.
+
 **Seat a project manager on the current repo**
 
-1. `:projects` (or `<Space>p`), pick or add the project for this repo.
-2. `:blank Coordinate this project's work` starts a Standard root session
-   (`Ctrl-N` / `<Space>N` open the same prompt).
-3. With that session focused, run `:manager appoint`, keep the default scope
-   (whole current project) and press `Enter`.
-4. Optional: `:manager policy`, choose the **Execute** preset, press `s`.
-5. Send the session a starter prompt below.
+1. `<Space>p` (or `:projects`) opens the Workspaces picker. For a new repo press
+   `Ctrl-N`, type the project name, `Tab`, type the repo's absolute path, and
+   press `Enter`. The picker then lists the project: type part of its name and
+   press `Enter` to open its tab.
+2. `:blank Coordinate this project's work` starts a Standard root session in that
+   project (`Ctrl-N` / `<Space>N` on the session list open the same prompt). Its
+   row is selected once it exists.
+3. With that row selected, run `:manager appoint`, keep the default scope (whole
+   current project) and press `Enter`. The session moves under **MANAGERS**.
+4. `:manager policy`, press `j` once to select the **Execute** preset, `Enter` to
+   apply it to the draft, then `s` to save. Until Execute is saved the manager
+   has no session quota and can only report status.
+5. Send the manager a starter prompt below: `Enter` on its row opens it, type the
+   prompt, `Enter` sends it.
 
 **Seat a global manager over several projects**
 
-1. Focus a Standard root session (as above).
-2. `:manager global appoint Rsi, Notes` names the projects (comma-separated;
-   no names means every project). Check it with `:manager global`; revoke with
-   `:manager global revoke`.
-3. Send it a prompt. To start a brand-new project from a prompt, use
-   `AgentCreateProject` *(after #1626 lands)*.
+1. Start a root session (`:blank Coordinate every project`) and select its row
+   with `j`/`k`. The seat is the *selected* session, not the newest one.
+2. `:manager global appoint Rsi, Notes` names the projects (comma-separated, so
+   names may contain spaces; no names means every project). Check it with
+   `:manager global`; revoke with `:manager global revoke`.
+3. Send it a prompt. To start a brand-new project from a prompt, see the last
+   starter prompt below.
 
 **Starter prompts** (replace the angle-bracket parts)
 
@@ -71,8 +91,15 @@ develop are in [docs/development-modes.md](docs/development-modes.md).
   > then launch workers on the top five and report evidence for each.
 - > Review and harden <area>: read it, list correctness, error-handling and test
   > gaps as Issues, then fix the highest-value ones with tests.
-- > Create a new project called <name> at <path> and seat a manager on it
-  > (uses `AgentCreateProject`, after #1626 lands).
+- > Create a new project called <name> at <path> and seat a manager on it.
+
+  This works for a project manager in Execute mode and for a global manager
+  (`AgentCreateProject`; the path must exist inside the daemon's workspace
+  roots). The TUI switches to the new project's tab and, for a global manager,
+  asks whether to add it to the grant: press `y`. The global manager then seats
+  a project manager there itself; a project manager only registers the project
+  and you seat its manager with the first list above. Agents cannot delete or
+  archive a project.
 
 Inspect progress with `<Space>i` (Issues workspace), `<Space>gd` (manager
 decisions awaiting you) and `<Space>n` / `:alerts` (attention history).
@@ -218,6 +245,30 @@ First steps:
 3. `Enter` opens a session, `F3` shows exactly what it launched with, `x`
    stops it, `<Space>a` archives it, and `<Space>n` (or `:alerts`) opens notifications.
 4. `?` lists the keys available wherever you are.
+
+### New-session settings (backside)
+
+Open the new-session modal with `<Space>N` or `Ctrl-N`. Write your prompt on
+the front, then press `Ctrl+O` in any mode to flip to the settings backside.
+Alternatively, press `Esc` to leave insert mode (dismiss any suggestions first),
+then press `Tab` in normal mode. Flipping preserves your prompt and editing mode.
+
+| Key on the backside | Action |
+|---|---|
+| `j` / `k` or `Down` / `Up` | Select a setting |
+| `h` / `l` or `Left` / `Right` | Cycle values backward / forward |
+| `Space` or `Enter` | Open the model picker, toggle a setting, or cycle forward |
+| `Ctrl+O`, `Tab`, or `Esc` | Return to the prompt |
+| `?` | Show help for the current side |
+| `Ctrl+Enter` | Launch with the current prompt and settings from either side |
+
+Choose **Model** (provider and model), **Effort**, and **Sandbox** (git-worktree
+isolation, when supported). With a project selected, enable **Manager** to
+appoint the new session at launch; **Scope** and **Policy** then appear. Scope
+can cover the project or a live Group or Epic; policy cycles through **Observe**,
+**Execute** (default), and **Full project control**. Appointing replaces the
+project's current manager. Plain `Enter` on the backside changes a setting;
+use `Ctrl+Enter` to launch.
 
 The [operator manual](docs/agent-harness-operator-manual.md) covers daily use,
 and [docs/keybindings.md](docs/keybindings.md) is the full key reference.

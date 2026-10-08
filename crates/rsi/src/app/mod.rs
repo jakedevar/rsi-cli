@@ -1,5 +1,6 @@
 //! TUI application state.
 
+mod agent_projects;
 pub(crate) mod attention;
 pub(crate) mod bootstrap;
 mod cache;
@@ -655,6 +656,16 @@ pub struct App {
     pub available_models: Vec<(String, String)>,
     /// #1407: the first-run AWS setup prompt was shown this process.
     pub(crate) aws_setup_prompted: bool,
+    /// Issue #1628: the required first-start editing-mode modal, while open.
+    pub editing_mode_prompt: Option<crate::editing_mode_prompt::EditingModePrompt>,
+    /// Cursor and selection of the focused single-line text field under
+    /// Standard editing (#1628).
+    pub field_edit: crate::field_edit::FieldEdit,
+    /// Issue #1628: the first-start rule ran this process.
+    pub(crate) editing_mode_resolved: bool,
+    /// Issue #1628: an existing install detected as Vim; written to the daemon
+    /// by the event loop on its next async step.
+    pub(crate) pending_editing_mode_default: Option<rsi_common::editing_mode::EditingMode>,
     /// #1407: `:aws-setup` opened the Bedrock credential form; verify the
     /// setup once that credential is stored.
     pub(crate) aws_setup_verify_pending: bool,
@@ -799,6 +810,10 @@ pub struct App {
     /// Deferred LcActions enqueued by synchronous key handlers (e.g. settings_keys)
     /// that need async dispatch. Drained by the event loop after the key handler returns.
     pub pending_lc_actions: Vec<crate::modalkit_types::LcAction>,
+
+    /// A `project_created` agent event awaiting its async follow step
+    /// (project refresh, tab switch, grant offer; #1626).
+    pub(crate) pending_agent_project: Option<rsi_common::agent_projects::ProjectCreatedEventV1>,
 
     /// Push notification stream from daemon (second socket connection).
     /// `Some` when daemon supports push and connection is active.
@@ -1325,6 +1340,10 @@ impl App {
             daemon_resources: None,
             available_models: models_for_provider(selected_provider),
             aws_setup_prompted: false,
+            editing_mode_prompt: None,
+            field_edit: crate::field_edit::FieldEdit::default(),
+            editing_mode_resolved: false,
+            pending_editing_mode_default: None,
             aws_setup_verify_pending: false,
             model_effort_capabilities: HashMap::new(),
             local_models: models_for_provider(SessionProvider::Local),
@@ -1381,6 +1400,7 @@ impl App {
             classifier_config_tx,
             classifier_config_rx,
             pending_lc_actions: Vec::new(),
+            pending_agent_project: None,
             notification_stream: None,
             memory_status: None,
             paste_dir: {

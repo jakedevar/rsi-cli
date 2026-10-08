@@ -198,6 +198,9 @@ pub struct VerbRights {
     pub topology_manager: bool,
     pub deploy: bool,
     pub global_manager: bool,
+    /// #1626: an Execute-mode, unpaused project manager or portfolio seat may
+    /// register and edit projects inside its coverage.
+    pub project_admin: bool,
     pub global_reporter: bool,
     /// #1238: the caller holds a manager node seat (area, project or
     /// portfolio), so it may report up and send down.
@@ -279,6 +282,7 @@ pub fn permitted_verb(verb: Verb, rights: &VerbRights) -> bool {
         // #1239: any portfolio node seat delegates to its children.
         | Verb::ManagerAppointChild
         | Verb::ManagerRevokeChild => rights.global_manager,
+        Verb::CreateProject | Verb::UpdateProject => rights.project_admin,
         Verb::ReportToGlobal => rights.global_reporter,
         Verb::ReportUp | Verb::SendDown | Verb::ManagerOverview => rights.tier_seat,
         Verb::TopologyUpsert
@@ -693,6 +697,7 @@ impl Store {
                 .is_some_and(|g| g.policy.capabilities.contains(&Capability::Automation))
                 || global_has(Capability::Automation),
             global_manager: is_global_manager,
+            project_admin: self.agent_project_admin(caller)?,
             global_reporter: is_manager && self.global_reporter(caller)?,
             tier_seat: self.tier_caller_node(caller)?.is_some(),
             portfolio_lead: is_lead

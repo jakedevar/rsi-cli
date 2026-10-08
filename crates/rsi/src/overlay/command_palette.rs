@@ -235,6 +235,26 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) {
             ..
         }
     );
+    // Standard editing: a real cursor and selection in the focused field.
+    let taken = app.edit_field(key, |overlay| match overlay {
+        OverlayState::CommandPalette {
+            query,
+            argument_edit,
+            argument_input,
+            ..
+        } => Some(if *argument_edit {
+            argument_input
+        } else {
+            query
+        }),
+        _ => None,
+    });
+    if taken == crate::field_edit::FieldKey::Edited && !editing {
+        rescore(app);
+    }
+    if taken != crate::field_edit::FieldKey::Ignored {
+        return;
+    }
     match key.code {
         KeyCode::Esc if editing => {
             if let OverlayState::CommandPalette { argument_edit, .. } = &mut app.overlay {

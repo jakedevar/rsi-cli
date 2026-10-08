@@ -42,11 +42,12 @@ pub(super) fn render_telescope(
     }
 
     // Row 0: query input with cursor
-    let query_line = Line::from(vec![
-        Span::styled("/ ", Style::default().fg(theme::blue())),
-        Span::styled(query, Style::default().fg(theme::text())),
-        Span::styled("█", Style::default().fg(theme::text())),
-    ]);
+    let mut query_spans = vec![Span::styled("/ ", Style::default().fg(theme::blue()))];
+    query_spans.extend(crate::field_edit::draw(
+        query,
+        Style::default().fg(theme::text()),
+    ));
+    let query_line = Line::from(query_spans);
     let query_area = Rect::new(inner.x, inner.y, inner.width, 1);
     frame.render_widget(Paragraph::new(query_line), query_area);
 

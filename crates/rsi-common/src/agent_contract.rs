@@ -151,9 +151,16 @@ pub struct StrictPipelineHandoffV2 {
     pub blocker_class: Option<PipelineBlockerClassV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocker_evidence: Option<String>,
+    /// The question a blocked handoff asks (#1641 S3c): present only on
+    /// `blocked` or `human_gate`, at most [`BLOCKER_QUESTION_MAX_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker_question: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<PipelineHandoffWarningV2>,
 }
+
+/// Longest `blocker_question` a strict V2 handoff may carry.
+pub const BLOCKER_QUESTION_MAX_BYTES: usize = 2048;
 
 /// A known legacy field alias accepted by strict V2 and mapped to its
 /// canonical key. Included in the validator result so the producer can repair
@@ -654,6 +661,28 @@ pub fn parse_pipeline_handoff_v2(
         })
         .transpose()?;
     let blocker = meaningful_optional(strict_optional_value(&kv, &["blocker"], "blocker")?);
+    let blocker_question = meaningful_optional(strict_optional_value(
+        &kv,
+        &["blocker_question", "blocker question"],
+        "blocker_question",
+    )?);
+    if let Some(question) = &blocker_question {
+        if question.len() > BLOCKER_QUESTION_MAX_BYTES {
+            return Err(ContractError::InvalidField {
+                field: "blocker_question".into(),
+                message: format!("at most {BLOCKER_QUESTION_MAX_BYTES} bytes"),
+            });
+        }
+        if !matches!(
+            strict_status,
+            PipelineStatusV2::Blocked | PipelineStatusV2::HumanGate
+        ) {
+            return Err(ContractError::InvalidField {
+                field: "blocker_question".into(),
+                message: "only a blocked or human_gate handoff may ask a question".into(),
+            });
+        }
+    }
     let blocker_evidence = meaningful_optional(strict_optional_value(
         &kv,
         &["blocker_evidence", "blocker evidence"],
@@ -712,6 +741,7 @@ pub fn parse_pipeline_handoff_v2(
         strict_status,
         blocker_class,
         blocker_evidence,
+        blocker_question,
         warnings,
     })
 }
@@ -1652,6 +1682,56 @@ mod tests {
         let parsed = parse_pipeline_handoff_v2(partial, "RSI-021").unwrap();
         assert_eq!(parsed.strict_status, PipelineStatusV2::Partial);
         assert_eq!(parsed.blocker_class, None);
+    }
+
+    #[test]
+    fn handoff_parses_blocker_question() {
+        let base = "PIPELINE HANDOFF — IMPLEMENTATION:\n\
+             Implementation document: /tmp/handoff.md\n\
+             Manifest path: /tmp/verification.md\n\
+             Status: blocked\n\
+             Blocker: two designs fit the task\n\
+             Blocker class: technical_impasse\n\
+             Blocker evidence: both pass the existing tests\n";
+        let none = parse_pipeline_handoff_v2(base, "RSI-021").unwrap();
+        assert_eq!(none.blocker_question, None);
+
+        let asked = format!("{base}Blocker question: Keep the old field or rename it?\n");
+        let parsed = parse_pipeline_handoff_v2(&asked, "RSI-021").unwrap();
+        assert_eq!(
+            parsed.blocker_question.as_deref(),
+            Some("Keep the old field or rename it?")
+        );
+
+        let duplicate = format!("{asked}Blocker question: and another?\n");
+        assert!(matches!(
+            parse_pipeline_handoff_v2(&duplicate, "RSI-021"),
+            Err(ContractError::DuplicateField { field }) if field == "blocker_question"
+        ));
+
+        let oversized = format!(
+            "{base}Blocker question: {}\n",
+            "q".repeat(BLOCKER_QUESTION_MAX_BYTES + 1)
+        );
+        assert!(matches!(
+            parse_pipeline_handoff_v2(&oversized, "RSI-021"),
+            Err(ContractError::InvalidField { field, .. }) if field == "blocker_question"
+        ));
+        let at_limit = format!(
+            "{base}Blocker question: {}\n",
+            "q".repeat(BLOCKER_QUESTION_MAX_BYTES)
+        );
+        assert!(parse_pipeline_handoff_v2(&at_limit, "RSI-021").is_ok());
+
+        let complete = "PIPELINE HANDOFF — IMPLEMENTATION:\n\
+             Implementation document: /tmp/handoff.md\n\
+             Manifest path: /tmp/verification.md\n\
+             Status: complete\n\
+             Blocker question: why not?\n";
+        assert!(matches!(
+            parse_pipeline_handoff_v2(complete, "RSI-021"),
+            Err(ContractError::InvalidField { field, .. }) if field == "blocker_question"
+        ));
     }
 
     fn outcome_json(body: &str) -> String {

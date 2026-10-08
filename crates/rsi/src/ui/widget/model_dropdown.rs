@@ -215,12 +215,20 @@ fn search_line(state: &ModelDropdownState, matches: usize, width: u16) -> Line<'
         .add_modifier(Modifier::BOLD);
     let mut left = vec![Span::styled("/ ", prompt_style)];
     let count = if searching {
-        left.push(Span::styled(
-            state.filter_query.clone(),
-            Style::default().fg(theme::text()),
-        ));
-        if state.filter_editing {
-            left.push(Span::styled("▏", Style::default().fg(theme::accent())));
+        if state.filter_editing && crate::field_edit::standard_frame() {
+            left.extend(
+                state
+                    .filter_cursor
+                    .spans(&state.filter_query, Style::default().fg(theme::text())),
+            );
+        } else {
+            left.push(Span::styled(
+                state.filter_query.clone(),
+                Style::default().fg(theme::text()),
+            ));
+            if state.filter_editing {
+                left.push(Span::styled("▏", Style::default().fg(theme::accent())));
+            }
         }
         format!("{matches} of {total}")
     } else {

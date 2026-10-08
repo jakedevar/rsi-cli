@@ -138,6 +138,48 @@ fn indirect_fixture() {
         self.assertIn("rsid=shard:store-01:test(migration_old)", receipt["suggested_filters"])
         self.assertIn("rsid=shard:store-02:test(external_migration)", receipt["suggested_filters"])
 
+    def test_isolated_new_table_selects_only_chain_pins(self):
+        code, summary, receipt = self.additive_rewind_change(
+            'impl Store {\n    fn migrate_v151(&self) {\n'
+            '        tx.execute_batch("CREATE TABLE turns(id TEXT PRIMARY KEY, state TEXT);'
+            " CREATE INDEX turns_state ON turns(state);"
+            " CREATE TRIGGER turns_guard BEFORE UPDATE ON turns WHEN NEW.state='bad'"
+            " BEGIN SELECT RAISE(ABORT,'bad state'); END;\");\n"
+            '        tx.pragma_update(None, "user_version", 151);\n    }\n}\n')
+        self.assertEqual(code, 0, summary)
+        self.assertEqual(set(receipt["suggested_filters"]), {
+            "rsid=shard:store-01:test(every_recovered_migration_step_actually_executes)",
+            "rsid=shard:store-01:test(queue_fixture_rewinds_v150)",
+            "rsid=shard:store-02:test(previous_schema_upgrades_to_the_live_indexes)"})
+
+    def test_new_table_proof_rejects_existing_targets_data_writes_and_unknown_helpers(self):
+        classify = runpy.run_path(str(SCRIPT))["additive_migration"]
+        base = 'impl Store { fn migrate_v151(&self) { tx.execute_batch("%s"); %s } }'
+        new = "CREATE TABLE turns(id TEXT PRIMARY KEY, state TEXT);"
+        self.assertTrue(classify(base % (new, "")))
+        for extra, rust in [
+            ("CREATE INDEX old_idx ON sessions(id);", ""),
+            ("CREATE TRIGGER old_guard BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT,'bad'); END;", ""),
+            ("CREATE TRIGGER writes_old AFTER INSERT ON turns BEGIN UPDATE sessions SET state='x'; END;", ""),
+            ("INSERT INTO turns VALUES('a','live');", ""),
+            ("DROP TABLE turns;", ""),
+            ("CREATE TABLE copied AS SELECT * FROM turns;", ""),
+            ("PRAGMA user_version=151;", ""),
+            ("", "mutate_existing(&tx);"),
+            ("", "(mutate_existing)(&tx);"),
+            ("", "mutate_existing!(&tx);"),
+            ("", 'tx.execute("UPDATE sessions SET state=1", []);'),
+            ("", 'tx.pragma_update(None, "foreign_keys", 0);'),
+        ]:
+            with self.subTest(extra=extra, rust=rust):
+                self.assertFalse(classify(base % (new + extra, rust)))
+        self.assertFalse(classify('fn migrate_v151() { tx.execute_batch(SQL_FROM_HELPER); }'))
+        self.assertFalse(classify(base % ("CREATE TABLE IF NOT EXISTS turns(id TEXT);", "")))
+        self.assertFalse(classify(base % ("CREATE TABLE /* existing */ IF NOT EXISTS turns(id TEXT);", "")))
+        self.assertTrue(classify(base % (
+            "CREATE TABLE turns(id TEXT CHECK(rsi_uuid_is_canonical(id)),"
+            " created_at TEXT CHECK(rsi_rfc3339_nanos_is_canonical(created_at)));", "")))
+
     def test_another_hunk_keeps_the_full_store_test_module(self):
         path, original = self.rewind_fixture()
         self.write(path, original.replace("156;", "157;").replace("unrelated();", "changed();"))

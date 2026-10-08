@@ -25,7 +25,13 @@ pub async fn handle_input_bar_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     };
 
-    let mode = state.input_bar.surface.mode;
+    // Standard editing (#1628) has no Normal mode: the composer is always typing.
+    let standard = app.standard_editing();
+    let mode = if standard {
+        PopupMode::Insert
+    } else {
+        state.input_bar.surface.mode
+    };
     let vim_idle = state.input_bar.surface.vim_state.is_idle();
 
     // Ctrl+Enter submits from any mode (insert or normal)
@@ -65,8 +71,13 @@ pub async fn handle_input_bar_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
 
-    // Ctrl+A opens AI command input (text transformation via local model)
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
+    // Ctrl+A opens AI command input (text transformation via local model).
+    // In Standard mode Ctrl+A is select-all, so the AI command moves to
+    // Ctrl+Alt+A (#1628).
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.code == KeyCode::Char('a')
+        && (!standard || key.modifiers.contains(KeyModifiers::ALT))
+    {
         if app.prompt_processor.is_none() {
             app.notify("AI assistant requires prompt processor (check settings)");
             return true;
@@ -211,7 +222,12 @@ pub async fn handle_input_bar_key(app: &mut App, key: KeyEvent) -> bool {
 
     // Up/Down arrows always scroll the session detail message container,
     // never the input bar — regardless of insert/normal mode.
-    if key.modifiers == KeyModifiers::NONE && matches!(key.code, KeyCode::Up | KeyCode::Down) {
+    // In Standard mode a multi-line draft moves its cursor first and the
+    // surface hands the arrow back at the draft's first/last row.
+    if !standard
+        && key.modifiers == KeyModifiers::NONE
+        && matches!(key.code, KeyCode::Up | KeyCode::Down)
+    {
         return false;
     }
 
@@ -234,7 +250,19 @@ pub async fn handle_input_bar_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
-    handle_session_surface_key(app, session_id, key).await
+    if handle_session_surface_key(app, session_id, key).await {
+        return true;
+    }
+    // Standard editing (#1628): Esc with no selection and no open completion
+    // is handed back by the surface. There is no Normal mode to fall into, and
+    // Ctrl-H needs a kitty-protocol terminal, so Esc is the plain-terminal way
+    // back to the session list.
+    if standard && key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+        app.back_to_list();
+        app.mark_dirty();
+        return true;
+    }
+    false
 }
 
 /// Feed `key` to `session_id`'s input bar editor and act on the result:
@@ -253,12 +281,16 @@ pub(crate) async fn handle_session_surface_key(
         .get(&session_id)
         .map(|s| s.session.working_dir.clone());
 
+    // The surface follows the operator's live editing mode on every key.
+    let standard = app.standard_editing();
+
     // Delegate to shared InputSurface handler
     let config = InputSurfaceConfig {
         pass_through_unhandled: true,
         available_commands: &app.available_commands,
         working_dir: working_dir.as_deref(),
         submit_on_enter: app.settings.submit_on_enter,
+        standard_editing: standard,
     };
 
     // We need to extract the surface, call handle_key, then put it back.

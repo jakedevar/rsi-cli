@@ -55,6 +55,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 mod successor_recovery;
+mod turn_adoption;
 
 const RECURSIVE_DAG_LIVE_SESSION_PERSISTENCE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -2117,6 +2118,9 @@ pub(super) enum ControllerCandidateTestPhase {
     SuccessorUnpublishedAfterSettlement,
     ManagerQuestionBeforeClear,
     ManagerQuestionCleanupRetained,
+    /// #990 review: the continued session's monitor task is spawned; the
+    /// continuation has not yet returned to its caller.
+    ContinuationAfterMonitorSpawn,
     /// #669: after every continuation await, before the final seat fence.
     ManagerSeatBeforeFinalGate,
     /// #1143: manager-action candidate, provider process started, before
@@ -2194,6 +2198,7 @@ pub(super) fn take_capacity_provider_spawn_failure(session_id: Uuid) -> bool {
 /// armed, dropping the guard removes exactly this incarnation from `active`
 /// and reaps its process cohort. The caller settles the durable rows.
 struct UnmonitoredLaunchGuard {
+    store: Arc<tokio::sync::Mutex<Store>>,
     active: Arc<tokio::sync::RwLock<HashMap<Uuid, TrackedSession>>>,
     session_id: Uuid,
     generation: u64,
@@ -2215,6 +2220,7 @@ impl Drop for UnmonitoredLaunchGuard {
             return;
         };
         let active = Arc::clone(&self.active);
+        let store = Arc::clone(&self.store);
         let (session_id, generation) = (self.session_id, self.generation);
         runtime.spawn(async move {
             let removed = {
@@ -2238,8 +2244,10 @@ impl Drop for UnmonitoredLaunchGuard {
                 return;
             }
             tracing::warn!(%session_id, "cancelled manager launch removed an unmonitored candidate");
+            let orphan_store = std::sync::Arc::clone(&store);
             let _ = tokio::task::spawn_blocking(move || {
-                super::reaper::reap_orphans_for_session(session_id)
+                let turns = orphan_store.blocking_lock().list_active_provider_turn_custody()?;
+                super::reaper::reap_orphans_for_session(session_id, turns)
             })
             .await;
         });
@@ -5737,6 +5745,12 @@ impl SessionManager {
             self.deploy_drain_launch_gate(&launch_purpose, config.parent_id.is_some())
                 .await?;
         }
+        for id in [config.rsi_session_id, config.continued_from]
+            .into_iter()
+            .flatten()
+        {
+            self.fence_prior_detached_turn(id).await?;
+        }
         let authenticated_retry = retry_admission.is_some();
         if authenticated_retry && (config.sandbox.is_some() || config.cargo_target_dir.is_some()) {
             return Err(DaemonError::InvalidParam(
@@ -8205,6 +8219,7 @@ impl SessionManager {
         self.active.write().await.insert(session_id, tracked);
         let manager_action_launch = launch_purpose.manager_action().is_some();
         let mut unmonitored_launch_guard = UnmonitoredLaunchGuard {
+            store: Arc::clone(&self.store),
             active: Arc::clone(&self.active),
             session_id,
             generation: spawn_generation,
@@ -9505,6 +9520,9 @@ impl SessionManager {
         self.reconcile_idea_controllers_at_startup(chrono::Utc::now())
             .await?;
 
+        // Claim provider custody before any invocation reconciliation or
+        // recovery dispatch can treat these turns as crashed.
+        let detached_turns = self.claim_detached_turns_on_startup().await?;
         let store = self.store.clone();
         let restart_prepared = tokio::task::spawn_blocking(move || {
             store.blocking_lock().prepare_restart_intents_for_restore()
@@ -9566,6 +9584,35 @@ impl SessionManager {
         let mut crash_reconciled: Vec<Uuid> = Vec::new();
         let mut completed_guard = self.completed.write().await;
         for mut session in sessions {
+            if let Some(turn) = detached_turns.get(&session.id) {
+                drop(completed_guard);
+                let restored = self
+                    .restore_detached_turn(session.clone(), turn.clone())
+                    .await;
+                completed_guard = self.completed.write().await;
+                match restored {
+                    Ok(()) => continue,
+                    Err(error) => {
+                        tracing::warn!(session_id = %session.id,
+                            invocation_id = %turn.invocation_id,
+                            reason = "turn_adoption_restore_failed", %error,
+                            "Detached turn restore failed; falling back to crash recovery");
+                        let store = self.store.lock().await;
+                        if let Err(error) =
+                            store.abandon_provider_turn_custody(turn.invocation_id, turn.boot_id)
+                        {
+                            tracing::warn!(session_id = %session.id, %error,
+                                "Failed to abandon unrestored detached turn custody");
+                        }
+                        // The first reconciliation preserved this claimed turn.
+                        // Release its invocation now that it has no monitor.
+                        if let Err(error) = store.reconcile_running_model_invocations() {
+                            tracing::warn!(session_id = %session.id, %error,
+                                "Failed to reconcile unrestored detached turn invocation");
+                        }
+                    }
+                }
+            }
             // A provider that was live when the daemon died must acquire its
             // durable terminal state before pending-archive cleanup can erase
             // the last manager route.
@@ -10953,16 +11000,11 @@ impl SessionManager {
                 );
                 continue;
             };
-            if !pressure_active_after && idle_secs < config.ttl_secs {
-                refuse_candidate(
-                    &mut report,
-                    &mut reclaim_evidence.refusals,
-                    &candidate,
-                    ReclaimSkipReason::FreshOrInvalidTimestamp,
-                    Some(SandboxReclaimCheck::new("idle_below_ttl")),
-                );
-                continue;
-            }
+            // Inside the TTL and without pressure the target is still
+            // reclaimable when the worktree's HEAD is already on
+            // `origin/rolling` (#1684); the attempt checks that after it has
+            // authenticated the root, and otherwise refuses `idle_below_ttl`.
+            let require_landed = !pressure_active_after && idle_secs < config.ttl_secs;
 
             // The candidate preflight performs Git and descriptor checks with
             // neither Store nor a root stripe held. Each later SQL phase joins
@@ -10994,6 +11036,7 @@ impl SessionManager {
                             candidate_for_reclaim.generation,
                             &candidate_base,
                             !dry_run,
+                            require_landed,
                         )
                     },
                 )
@@ -18326,6 +18369,96 @@ done
         assert!(
             !terminal_cache.exists(),
             "pressure may bypass the warm TTL: {report:?}"
+        );
+    }
+
+    /// #1684: a finished worker whose HEAD is already on `origin/rolling` gives
+    /// up its `target/` at once, with no disk pressure and inside the idle TTL.
+    /// A worker whose HEAD is not landed, and a running one, keep theirs.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn build_cache_reclaim_landed_terminal_worker_ignores_recent_activity() {
+        let _isolation = reclaim_test_isolation();
+        let db_dir = disk_backed_tempdir("reclaim-landed-db");
+        let sandbox_base = disk_backed_tempdir("reclaim-landed-sandbox");
+        let _stats = install_no_pressure_stats_override_for_test(sandbox_base.path());
+        let manager = manager_for_disk_fixture(db_dir.path(), sandbox_base.path());
+        let repo = TempDir::new().expect("repo dir");
+        init_d00_git_repo(repo.path());
+        assert!(
+            Command::new("git")
+                .args(["update-ref", "refs/remotes/origin/rolling", "HEAD"])
+                .current_dir(repo.path())
+                .status()
+                .expect("git update-ref")
+                .success()
+        );
+        let recent = chrono::Utc::now() - chrono::Duration::minutes(1);
+        let (_landed, landed_cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            SessionStatus::Completed,
+            recent,
+        )
+        .await;
+        // A cross-target build leaves `target/<triple>/` beside `debug/`.
+        std::fs::create_dir_all(landed_cache.join("wasm32-unknown-unknown/release"))
+            .expect("create cross-target dirs");
+        let (_running, running_cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            SessionStatus::Running,
+            recent,
+        )
+        .await;
+        let (unlanded, unlanded_cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            SessionStatus::Completed,
+            recent,
+        )
+        .await;
+        let unlanded_root = unlanded.sandbox_root.clone().expect("sandbox root");
+        std::fs::write(unlanded_root.join("work.txt"), "unlanded\n").expect("write work");
+        for args in [
+            &["add", "work.txt"][..],
+            &[
+                "-c",
+                "user.email=a@example.invalid",
+                "-c",
+                "user.name=A",
+                "commit",
+                "-q",
+                "-m",
+                "work",
+            ][..],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&unlanded_root)
+                    .status()
+                    .expect("run git")
+                    .success()
+            );
+        }
+        manager.persistence.barrier().await.unwrap();
+
+        let report = run_build_cache_reclaim_fixture(&manager, false).await;
+        assert!(
+            !landed_cache.exists(),
+            "a landed terminal worker's whole target must go: {report:?}"
+        );
+        assert!(
+            unlanded_cache.exists(),
+            "a worker whose HEAD is not on origin/rolling keeps its target: {report:?}"
+        );
+        assert!(
+            running_cache.exists(),
+            "a running worker's target is never touched: {report:?}"
         );
     }
 

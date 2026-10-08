@@ -73,7 +73,159 @@ pub fn open_question_modal(app: &mut App) {
     };
 }
 
+/// Standard (non-modal) key handling for the question modal (#1628).
+///
+/// There is no Normal mode: the free-text box is always live. While it is
+/// empty and the question has options, Up/Down move the option cursor and
+/// Space or 1-9 pick an option; typing anything else starts a free answer
+/// (which deselects the options). Enter sends, or moves to the next question
+/// when the box is empty and more questions follow; Ctrl+Enter always sends,
+/// Ctrl+D declines and Esc dismisses.
+async fn handle_question_modal_standard(app: &mut App, key: KeyEvent) {
+    let submit_on_enter = app.settings.submit_on_enter;
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let (text_empty, num_options, is_last) = match &app.overlay {
+        OverlayState::QuestionModal {
+            questions,
+            current_question,
+            textarea,
+            ..
+        } => (
+            textarea.lines().iter().all(String::is_empty),
+            questions[*current_question].options.len(),
+            *current_question + 1 >= questions.len(),
+        ),
+        _ => return,
+    };
+    let selecting = text_empty && num_options > 0;
+
+    if key.code == KeyCode::Enter && ctrl {
+        submit_question_response(app).await;
+        return;
+    }
+    if ctrl && matches!(key.code, KeyCode::Char('d' | 'D')) {
+        decline_question_response(app).await;
+        return;
+    }
+    if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
+        if selecting && !is_last {
+            if let OverlayState::QuestionModal {
+                current_question,
+                textarea,
+                ..
+            } = &mut app.overlay
+            {
+                *current_question += 1;
+                *textarea = Box::new(tui_textarea::TextArea::default());
+                textarea.set_cursor_line_style(ratatui::style::Style::default());
+            }
+            return;
+        }
+        if submit_on_enter {
+            submit_question_response(app).await;
+            return;
+        }
+    }
+    if key.code == KeyCode::Esc {
+        let selecting_text = matches!(
+            &app.overlay,
+            OverlayState::QuestionModal { textarea, .. } if textarea.is_selecting()
+        );
+        if selecting_text {
+            if let OverlayState::QuestionModal { textarea, .. } = &mut app.overlay {
+                textarea.cancel_selection();
+            }
+        } else {
+            app.restore_previous_overlay();
+        }
+        return;
+    }
+
+    let OverlayState::QuestionModal {
+        current_question,
+        questions,
+        cursor,
+        selections,
+        textarea,
+        ..
+    } = &mut app.overlay
+    else {
+        return;
+    };
+    let cq = *current_question;
+    if selecting && key.modifiers.is_empty() {
+        match key.code {
+            KeyCode::Up | KeyCode::Down => {
+                let down = key.code == KeyCode::Down;
+                cursor[cq] = if down {
+                    (cursor[cq] + 1) % num_options
+                } else {
+                    (cursor[cq] + num_options - 1) % num_options
+                };
+                // Single-select commits an option as the cursor lands on it.
+                if !questions[cq].multi_select {
+                    selections[cq] = crate::types::QuestionSelection::Single(Some(cursor[cq]));
+                }
+                return;
+            }
+            KeyCode::Backspace if cq > 0 => {
+                *current_question -= 1;
+                return;
+            }
+            KeyCode::Char(c @ ('1'..='9' | ' ')) => {
+                let idx = if c == ' ' {
+                    Some(cursor[cq])
+                } else {
+                    c.to_digit(10)
+                        .map(|digit| (digit - 1) as usize)
+                        .filter(|idx| *idx < num_options)
+                };
+                if let Some(idx) = idx {
+                    cursor[cq] = idx;
+                    match &mut selections[cq] {
+                        crate::types::QuestionSelection::Single(opt) => *opt = Some(idx),
+                        crate::types::QuestionSelection::Multi(opts) => {
+                            if let Some(pos) = opts.iter().position(|&x| x == idx) {
+                                opts.remove(pos);
+                            } else {
+                                opts.push(idx);
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Free text: the shared Standard engine edits the box in place.
+    let mut surface = crate::input_surface::InputSurface::default();
+    std::mem::swap(&mut *surface.textarea, &mut **textarea);
+    let config = crate::input_surface::InputSurfaceConfig {
+        pass_through_unhandled: false,
+        available_commands: &[],
+        working_dir: None,
+        submit_on_enter: false,
+        standard_editing: true,
+    };
+    let _ = crate::input_surface::handle_key(&mut surface, key, &config);
+    std::mem::swap(&mut *surface.textarea, &mut **textarea);
+    if textarea.lines().iter().any(|line| !line.is_empty()) {
+        // Typing a free answer deselects the options.
+        selections[cq] = if questions[cq].multi_select {
+            crate::types::QuestionSelection::Multi(vec![])
+        } else {
+            crate::types::QuestionSelection::Single(None)
+        };
+    }
+}
+
 pub async fn handle_question_modal_key(app: &mut App, key: KeyEvent) {
+    if app.standard_editing() {
+        handle_question_modal_standard(app, key).await;
+        return;
+    }
     let submit_on_enter = app.settings.submit_on_enter;
 
     // Read current popup mode without holding a borrow across the submit await.

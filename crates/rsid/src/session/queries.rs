@@ -222,6 +222,11 @@ fn project_approval_started_at(session: &mut Session, tracked: &TrackedSession) 
         let elapsed = chrono::Duration::from_std(started.elapsed()).unwrap_or_default();
         chrono::Utc::now() - elapsed
     });
+    // The total of ended waits is kept live on the tracked session but written
+    // to `approval_wait_ms` only at terminalization. Topology's node wall clock
+    // reads it to recover waits that began and ended between its observations
+    // (#1704), so project the live total here.
+    session.approval_wait_ms = Some(tracked.approval_wait_total_ms);
 }
 
 fn is_visible_in_session_list(session: &Session) -> bool {

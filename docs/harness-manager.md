@@ -153,6 +153,12 @@ them, and every call is daemon-checked against the active grant.
   command is repeated with `confirm`. In `:manager tree`, `e` on the Global or
   a portfolio row edits the same caps beside the project list (`j`/`k` to a cap
   row, `h`/`l` or `-`/`+` adjust, `H`/`L` step by 10, Enter reviews).
+- `:manager global add-project <project names...>` adds the named projects to
+  the active grant, keeping everything else, fenced on the grant version. When
+  the global seat creates a project (`AgentCreateProject`), the TUI opens
+  `:manager tree` on the same change as a confirm step (`y` adds it, Esc leaves
+  the grant alone); if another overlay is open it points at this command
+  instead. The agent never changes its own grant (#1626).
 - `:manager global configure <JSON>` sends a full `ConfigureGlobalManager`
   request (`session_id`, `project_ids`, `allowed_launches`, `project_policy`,
   `expected_grant_version`, `idempotency_key`).
@@ -1214,6 +1220,12 @@ report. The delegated pass uses the daemon's configured watermarks, TTL and
 pass limits: the params carry no threshold, and daemon settings
 (`UpdateDaemonConfig`) stay operator-only. The pass runs under the trigger
 labels `manager_dry_run`, `manager_actual` and `preview`.
+Below the high watermark a finished worker's `target/` waits for the idle TTL
+(or a landed HEAD, #1684). At or above it the TTL no longer applies: the pass
+examines the newest finished workers first, including ones that finished after
+an earlier pressure pass moved on (#1737), and reclaims each unless a live
+consumer (enabled wake, restart intent, manager seat, queued or running job)
+still needs it.
 
 **Daemon settings (`DaemonSettings`, #1046).** `ProposeDaemonSetting` needs the
 third, separate grant. `DELEGABLE_OPERATOR_METHODS` is partitioned three ways

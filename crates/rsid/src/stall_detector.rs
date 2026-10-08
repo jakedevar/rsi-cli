@@ -157,6 +157,29 @@ pub(crate) fn should_signal_classifier(i: &ClassifierTickInputs<'_>) -> bool {
     true
 }
 
+/// The idle threshold that applies to a session in `status`, or `None` when
+/// the detector leaves it alone. A topology node that waits for its on-call
+/// manager (#1641 S3c) is exempt from every stall action, the classifier
+/// included: the wait is deliberate, the executor pauses its wall clock for
+/// it, and ending it here would fail a node that did nothing wrong. The
+/// execution's own absolute deadline still bounds the run.
+pub(crate) fn stall_threshold(
+    status: SessionStatus,
+    session_id: Uuid,
+    config: &StallConfig,
+) -> Option<u64> {
+    match status {
+        SessionStatus::Running | SessionStatus::Starting => Some(config.running_secs),
+        SessionStatus::WaitingApproval
+            if crate::topology::oncall::awaits_on_call_answer(session_id) =>
+        {
+            None
+        }
+        SessionStatus::WaitingApproval => Some(config.waiting_secs),
+        _ => None,
+    }
+}
+
 fn should_enqueue_stall_retry(
     runtime_config: &crate::config::RuntimeConfig,
     session_kind: SessionKind,
@@ -223,10 +246,10 @@ pub fn spawn_stall_detector(
                 for (session_id, tracked) in active_guard.iter() {
                     active_ids.insert(*session_id);
 
-                    let threshold_secs = match tracked.session.status {
-                        SessionStatus::Running | SessionStatus::Starting => config.running_secs,
-                        SessionStatus::WaitingApproval => config.waiting_secs,
-                        _ => continue,
+                    let Some(threshold_secs) =
+                        stall_threshold(tracked.session.status, *session_id, &config)
+                    else {
+                        continue;
                     };
 
                     let idle_duration = now
@@ -463,6 +486,53 @@ mod tests {
         assert_eq!(config.classifier_idle_secs_codex, 1800);
         assert_eq!(config.classifier_cooldown_secs, 1800);
         assert_eq!(config.classifier_max_per_session, 3);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn topology_node_waiting_on_its_on_call_manager_is_exempt_from_stall_remediation() {
+        use crate::topology::oncall::note_answer_wait;
+        let mut config = cfg();
+        config.standard_action = StallAction::Interrupt;
+        config.unattended_action = StallAction::InterruptAndRetry;
+        let node = Uuid::new_v4();
+        let ordinary = Uuid::new_v4();
+
+        // An ordinary session waiting on a human is still subject to the
+        // waiting threshold, so the timer keeps working for everyone else.
+        assert_eq!(
+            stall_threshold(SessionStatus::WaitingApproval, ordinary, &config),
+            Some(3600)
+        );
+        assert_eq!(
+            stall_threshold(SessionStatus::WaitingApproval, node, &config),
+            Some(3600),
+            "a node that does not wait on the on-call manager is not exempt"
+        );
+
+        // The executor sees the node waiting on its manager: the detector
+        // leaves it alone, for any idle time, while the ordinary one is not.
+        note_answer_wait(node, true);
+        assert_eq!(
+            stall_threshold(SessionStatus::WaitingApproval, node, &config),
+            None
+        );
+        assert_eq!(
+            stall_threshold(SessionStatus::WaitingApproval, ordinary, &config),
+            Some(3600)
+        );
+        // Only the answer wait is exempt: a running node keeps its threshold.
+        assert_eq!(
+            stall_threshold(SessionStatus::Running, node, &config),
+            Some(1800)
+        );
+
+        // The answer arrives and the node is running again: back to normal.
+        note_answer_wait(node, false);
+        assert_eq!(
+            stall_threshold(SessionStatus::WaitingApproval, node, &config),
+            Some(3600)
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]

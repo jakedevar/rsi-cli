@@ -208,7 +208,7 @@ fn close_viewer(app: &mut crate::app::App, session_id: Uuid) {
 
 /// Session whose file viewer receives keys and pastes: the focused detail
 /// pane's session, or the session selected in the focused list.
-fn active_viewer_session(app: &crate::app::App) -> Option<Uuid> {
+pub(crate) fn active_viewer_session(app: &crate::app::App) -> Option<Uuid> {
     let session_id = match app.focused_pane()? {
         Pane::SessionDetail { session_id } => *session_id,
         Pane::SessionList {
@@ -287,6 +287,8 @@ pub fn try_paste_clipboard_file_viewer(app: &mut crate::app::App) -> bool {
 /// Handle a key event when the file viewer is active.
 /// Returns true if the key was consumed (caller should skip normal dispatch).
 pub fn handle_file_viewer_key(app: &mut crate::app::App, key: KeyEvent) -> bool {
+    // The viewer follows the operator's live editing mode on every key (#1628).
+    let standard = app.standard_editing();
     // Relevant when focused pane is SessionDetail or SessionList with a file viewer open
     let (session_id, on_session_list) = match app.focused_pane() {
         Some(Pane::SessionDetail { session_id }) => (*session_id, false),
@@ -323,6 +325,11 @@ pub fn handle_file_viewer_key(app: &mut crate::app::App, key: KeyEvent) -> bool 
     if viewer.search.input_active {
         handle_search_input(viewer, key);
         return true;
+    }
+
+    // --- Standard editing: one non-modal path, no Normal mode (#1628) ---
+    if standard {
+        return handle_standard_viewer_key(app, session_id, key);
     }
 
     // --- Space+key (normal mode): leader sequences ---
@@ -562,6 +569,7 @@ pub fn handle_file_viewer_key(app: &mut crate::app::App, key: KeyEvent) -> bool 
             working_dir: None,
             // This surface edits a document; Enter is always a line break.
             submit_on_enter: false,
+            standard_editing: false,
         };
         let action = input_surface::handle_key(&mut viewer.surface, key, &config);
 
@@ -587,6 +595,105 @@ pub fn handle_file_viewer_key(app: &mut crate::app::App, key: KeyEvent) -> bool 
         }
     }
 
+    true
+}
+
+/// Standard (non-modal) editing in the file viewer (#1628). Every key edits
+/// like an ordinary editor; Ctrl-S saves (handled before), Ctrl-F finds,
+/// F3 / Shift-F3 step through matches, Alt-M toggles the Markdown preview,
+/// PageUp / PageDown scroll and Esc / Ctrl-Q close. Folds and `:` commands
+/// are Vim-mode features.
+fn handle_standard_viewer_key(app: &mut crate::app::App, session_id: Uuid, key: KeyEvent) -> bool {
+    let Some(viewer) = app
+        .sessions
+        .get_mut(&session_id)
+        .and_then(|s| s.file_viewer.as_mut())
+    else {
+        return false;
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    let close = key.code == KeyCode::Char('q') && ctrl
+        || (key.code == KeyCode::Esc
+            && !viewer.surface.textarea.is_selecting()
+            && !viewer.surface.suggestions_visible);
+    if close {
+        close_viewer(app, session_id);
+        return true;
+    }
+
+    // Leave the surface in a state Standard expects even before it edits.
+    crate::input_surface::enter_standard(&mut viewer.surface);
+
+    if ctrl && !alt && key.code == KeyCode::Char('f') {
+        viewer.search.input_active = true;
+        viewer.search.forward = true;
+        viewer.search.input_buffer.clear();
+        return true;
+    }
+    if key.code == KeyCode::F(3) && viewer.search.pattern.is_some() {
+        let forward = if shift {
+            !viewer.search.forward
+        } else {
+            viewer.search.forward
+        };
+        advance_search_match(viewer, forward);
+        return true;
+    }
+    if alt && key.code == KeyCode::Char('m') {
+        if viewer.is_markdown() {
+            viewer.markdown_preview = !viewer.markdown_preview;
+            viewer.markdown_cache = None;
+        }
+        return true;
+    }
+
+    let preview = viewer.markdown_preview && viewer.is_markdown();
+    match key.code {
+        KeyCode::PageDown => {
+            scroll_viewer_by_page(viewer, page_step(viewer, false), true, preview);
+            return true;
+        }
+        KeyCode::PageUp => {
+            scroll_viewer_by_page(viewer, page_step(viewer, false), false, preview);
+            return true;
+        }
+        _ => {}
+    }
+    if preview {
+        // The rendered preview is read-only: arrows scroll it.
+        match key.code {
+            KeyCode::Down => scroll_preview(viewer, 1),
+            KeyCode::Up => scroll_preview(viewer, -1),
+            _ => {}
+        }
+        return true;
+    }
+
+    let content_before = viewer.surface.content();
+    if viewer.auto_pair && !ctrl && !alt && handle_auto_pair(viewer, key).is_some() {
+        if viewer.surface.content() != content_before {
+            viewer.mark_dirty();
+            recompute_folds_from_content(viewer);
+        }
+        return true;
+    }
+
+    let config = InputSurfaceConfig {
+        pass_through_unhandled: false,
+        available_commands: &[],
+        working_dir: None,
+        // This surface edits a document; Enter is always a line break.
+        submit_on_enter: false,
+        standard_editing: true,
+    };
+    let _ = input_surface::handle_key(&mut viewer.surface, key, &config);
+    if viewer.surface.content() != content_before {
+        viewer.mark_dirty();
+        recompute_folds_from_content(viewer);
+    }
     true
 }
 

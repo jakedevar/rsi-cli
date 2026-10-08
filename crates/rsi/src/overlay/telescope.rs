@@ -46,6 +46,18 @@ pub fn open_telescope(app: &mut App) {
 /// arrows and Ctrl-J/K/N/P move the selection, Ctrl-U clears the query.
 pub fn handle_telescope_key(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Standard editing: a real cursor and selection in the query.
+    match app.edit_field(key, |overlay| match overlay {
+        OverlayState::Telescope { query, .. } => Some(query),
+        _ => None,
+    }) {
+        crate::field_edit::FieldKey::Edited => {
+            rescore_telescope(app);
+            return;
+        }
+        crate::field_edit::FieldKey::Moved => return,
+        crate::field_edit::FieldKey::Ignored => {}
+    }
     match key.code {
         KeyCode::Esc => {
             app.overlay = OverlayState::None;

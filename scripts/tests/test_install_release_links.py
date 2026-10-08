@@ -16,6 +16,8 @@ RELEASE_BINS = [
     "rsi-agent-mcp",
     "rsi-build-rustc",
     "rsi-contract-validate",
+    "rsi-turn-shim",
+    "rsi-socket-hold",
 ]
 
 
@@ -82,6 +84,8 @@ class InstallReleaseLinksTest(unittest.TestCase):
             copy = installed / name
             self.assertTrue(copy.is_file() and not copy.is_symlink(), name)
             self.assertTrue(os.access(copy, os.X_OK), name)
+        self.assertEqual((self.bin_dir / "rsi-socket-hold").resolve(), (installed / "rsi-socket-hold").resolve())
+        self.assertEqual((self.bin_dir / "rsi-turn-shim").resolve(), (installed / "rsi-turn-shim").resolve())
         self.assertEqual((self.bin_dir / "rsid").resolve(), (installed / "rsid").resolve())
         self.assertNotEqual(
             (self.bin_dir / "rsid").resolve(), (self.target / "release" / "rsid").resolve()

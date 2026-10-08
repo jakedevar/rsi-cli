@@ -224,6 +224,10 @@ pub struct AgentTopologyListResultV1 {
     pub next_cursor: Option<String>,
 }
 
+/// The execution input key that carries the on-call seat (#1641 S3a). The
+/// executor strips it from node inputs; callers may not supply it.
+pub const ON_CALL_INPUT_KEY: &str = "_rsi_on_call";
+
 /// `AgentTopologyExecute`: run one visible topology under an Epic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -243,6 +247,11 @@ pub struct AgentTopologyExecuteRequestV1 {
     /// daemon checks against the grant, never caller identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<Uuid>,
+    /// #1641 S3a: the on-call manager seat that answers this execution's node
+    /// questions. Omitted means the project's manager (else the covering
+    /// portfolio seat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_call: Option<crate::types::TopologyOnCallSeat>,
 }
 
 impl AgentTopologyExecuteRequestV1 {
@@ -267,6 +276,20 @@ impl AgentTopologyExecuteRequestV1 {
         }
         if !self.inputs.is_null() && !self.inputs.is_object() {
             return Err("topology_invalid_inputs");
+        }
+        // The seat travels in the execution's input under a reserved key.
+        if self
+            .inputs
+            .as_object()
+            .is_some_and(|inputs| inputs.contains_key(ON_CALL_INPUT_KEY))
+        {
+            return Err("topology_invalid_inputs");
+        }
+        if matches!(
+            self.on_call,
+            Some(crate::types::TopologyOnCallSeat::Portfolio { node_id }) if node_id.is_nil()
+        ) {
+            return Err("topology_invalid_on_call");
         }
         if !valid_key(&self.idempotency_key) {
             return Err("topology_invalid_idempotency_key");
@@ -429,6 +452,7 @@ mod tests {
             inputs: serde_json::Value::Null,
             base_commit: None,
             idempotency_key: "run-1".into(),
+            on_call: None,
         };
         assert_eq!(execute.validate(), Ok(()));
         let mut bad = execute.clone();

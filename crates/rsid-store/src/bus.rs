@@ -257,6 +257,18 @@ pub enum DaemonEvent {
         child_id: Uuid,
         kind: SessionKind,
     },
+    /// An agent registered a new project through `AgentCreateProject`
+    /// (#1626). Published for agent creates only: the operator's
+    /// `CreateProject` publishes nothing, so a subscriber can tell an agent
+    /// acting on the operator's behalf from the operator's own action.
+    ProjectCreated {
+        project_id: Uuid,
+        name: String,
+        /// Always `"agent"`; names who created the project.
+        source: String,
+        /// The creating agent session (the token-resolved caller).
+        created_by_session_id: Uuid,
+    },
     /// A lead session emitted a `/halt` directive (or other workflow directive)
     /// inside a `<docregblock>` block. The loop executor subscribes to this
     /// event to implement `UntilCondition::LeadHalt`.
@@ -385,6 +397,7 @@ impl From<DaemonEvent> for rsi_common::rpc::BusEvent {
                 DaemonEvent::CompilePromptFailed { .. } => "compile_prompt_failed".to_string(),
                 DaemonEvent::SandboxOrphanCleaned { .. } => "sandbox_orphan_cleaned".to_string(),
                 DaemonEvent::ChildSpawned { .. } => "child_spawned".to_string(),
+                DaemonEvent::ProjectCreated { .. } => "project_created".to_string(),
                 DaemonEvent::HaltDirective { .. } => "halt_directive".to_string(),
                 DaemonEvent::SessionSpawnDeduped { .. } => "session_spawn_deduped".to_string(),
                 DaemonEvent::ModelInvocationAdmitted { .. } => {

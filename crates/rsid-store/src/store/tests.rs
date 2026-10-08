@@ -35689,7 +35689,7 @@ fn v100_historical_zero_context_window_is_readable_but_never_resolved() {
 /// rewind, so adding a migration without teaching the fixtures how to undo it
 /// fails the migration-chain tests immediately, with a message naming the fix —
 /// instead of silently suppressing chain coverage the way issue #26 did.
-const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 160;
+const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 162;
 const FLEET_INDEX_SCHEMA_VERSION: i32 = 153;
 const FLEET_INDEX_NAMES: [&str; 3] = [
     "idx_fleet_invocations_created",
@@ -35895,6 +35895,16 @@ pub(crate) fn rewind_post_v121_tail_to(connection: &Connection, target: i32) {
         target <= active,
         "cannot rewind forward from V{active} to V{target}"
     );
+    if active >= 162 && target < 162 {
+        connection
+            .execute_batch("DROP TABLE remote_answer_deliveries; PRAGMA user_version=161;")
+            .expect("rewind remote answer journal");
+    }
+    if active >= 161 && target < 161 {
+        connection
+            .execute_batch("DROP TABLE provider_turn_custody; PRAGMA user_version=160;")
+            .expect("rewind provider turn custody");
+    }
     if active >= 160 && target < 160 {
         // The nullable queue delivery column stays for current accessors;
         // its add-if-absent migration safely replays over the fixture.

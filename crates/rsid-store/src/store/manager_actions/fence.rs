@@ -12,6 +12,7 @@
 use super::refused;
 use crate::error::{DaemonError, Result};
 use crate::store::Store;
+use rsi_common::types::{Session, SessionStatus};
 use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
@@ -24,6 +25,10 @@ pub const CONTINUATION_TIP_CHANGED: &str = "continuation_tip_changed";
 pub const CONTINUATION_LEAD_GENERATION_CHANGED: &str = "continuation_lead_generation_changed";
 /// Retryable: the tip owns a live provider (checked under its guard).
 pub const CONTINUATION_TARGET_BUSY: &str = "continuation_target_busy";
+/// Retryable: the tip's conversation advanced past the turn the caller
+/// observed (#1728): another continuation started, so the observation that
+/// justified this one is stale.
+pub const CONTINUATION_TURN_CHANGED: &str = "continuation_turn_changed";
 /// Retryable: the tip row is Starting/Running but has no live owner (#620).
 pub const CONTINUATION_TIP_UNESTABLISHED: &str = "continuation_tip_unestablished";
 /// Terminal: a live manager retirement witness covers the tip.
@@ -34,11 +39,12 @@ pub const CONTINUATION_RETRY_EXHAUSTED: &str = "continuation_retry_exhausted";
 /// holds a scope over the tip (review round 2 `agent_continue_lead_authority_race`).
 pub const CONTINUATION_ACTOR_AUTHORITY_CHANGED: &str = "continuation_actor_authority_changed";
 
-const RETRYABLE: [&str; 5] = [
+const RETRYABLE: [&str; 6] = [
     CONTINUATION_PUBLICATION_PENDING,
     CONTINUATION_TIP_CHANGED,
     CONTINUATION_LEAD_GENERATION_CHANGED,
     CONTINUATION_TARGET_BUSY,
+    CONTINUATION_TURN_CHANGED,
     CONTINUATION_TIP_UNESTABLISHED,
 ];
 
@@ -68,6 +74,23 @@ pub struct ContinuationFenceV1 {
     pub epic: Option<Uuid>,
     pub lead_generation: Option<i64>,
     pub authority: ContinuationAuthorityV1,
+    /// Classification and turn from one restart-cut observation (#1728).
+    /// `None` skips this check for callers other than topology recovery.
+    pub observed_restart_cut: Option<RestartCutFenceV1>,
+}
+
+/// The facts that justified a topology restart resume. Event sequence alone
+/// misses a continuation that admitted an invocation but emitted no events;
+/// invocation and custody generation also fence that case. Classification is
+/// included so journal ownership or a terminal-cause change defers recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestartCutFenceV1 {
+    pub status: SessionStatus,
+    pub stop_reason: Option<String>,
+    pub restart_intent_pending: bool,
+    pub event_sequence: i64,
+    pub invocation_id: Option<Uuid>,
+    pub custody_generation: Option<i64>,
 }
 
 /// The typed fence code carried by `error`, if any. A refusal may append
@@ -157,6 +180,7 @@ impl Store {
             epic: epic.map(|(id, _)| id),
             lead_generation: epic.map(|(_, generation)| generation),
             authority,
+            observed_restart_cut: None,
         }))
     }
 
@@ -181,7 +205,87 @@ impl Store {
         {
             return Err(refused(CONTINUATION_LEAD_GENERATION_CHANGED));
         }
+        if let Some(observed) = fence.observed_restart_cut.as_ref()
+            && self.restart_cut_fence(fence.tip)?.as_ref() != Some(observed)
+        {
+            return Err(refused(CONTINUATION_TURN_CHANGED));
+        }
         Ok(())
+    }
+
+    /// Read the classification, journal owner and cursor in ONE SQLite
+    /// snapshot. The store lock serializes the daemon's writers; the read
+    /// transaction also prevents a second connection from tearing the tuple.
+    pub fn restart_cut_observation(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<(Session, RestartCutFenceV1)>> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Deferred,
+        )?;
+        let observation = match self.get_session(session_id)? {
+            Some(session) => self
+                .restart_cut_fence(session_id)?
+                .map(|fence| (session, fence)),
+            None => None,
+        };
+        tx.commit()?;
+        Ok(observation)
+    }
+
+    /// A single statement also works inside the effect claim's transaction.
+    fn restart_cut_fence(&self, session_id: Uuid) -> Result<Option<RestartCutFenceV1>> {
+        let row = self.conn.query_row(
+            "SELECT s.status, s.stop_reason,
+                    EXISTS(SELECT 1 FROM daemon_restart_intents i
+                           WHERE i.session_id=s.id AND i.invocation_id=s.model_invocation_id
+                             AND i.state IN ('pending','claimed','delivered')),
+                    (SELECT COALESCE(MAX(sequence), -1) FROM conversation_events WHERE session_id=s.id),
+                    s.model_invocation_id, p.custody_generation
+             FROM sessions s LEFT JOIN session_execution_projections p ON p.session_id=s.id
+             WHERE s.id=?1",
+            [session_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?,
+                row.get::<_, bool>(2)?, row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?, row.get::<_, Option<i64>>(5)?)),
+        ).optional()?;
+        row.map(
+            |(
+                status,
+                stop_reason,
+                restart_intent_pending,
+                event_sequence,
+                invocation,
+                custody_generation,
+            )| {
+                Ok(RestartCutFenceV1 {
+                    status: serde_json::from_value(serde_json::Value::String(status))
+                        .map_err(|error| DaemonError::Store(error.to_string()))?,
+                    stop_reason,
+                    restart_intent_pending,
+                    event_sequence,
+                    invocation_id: invocation
+                        .map(|id| {
+                            Uuid::parse_str(&id)
+                                .map_err(|error| DaemonError::Store(error.to_string()))
+                        })
+                        .transpose()?,
+                    custody_generation,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    /// `MAX(sequence)` of the session's conversation events (`-1` when it has
+    /// none): the turn cursor a restart resume carries (#1728).
+    pub fn conversation_max_sequence(&self, session_id: Uuid) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(sequence), -1) FROM conversation_events WHERE session_id=?1",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )?)
     }
 
     /// Effect claim (review round 3 `agent_continue_lead_authority_race_remains`):

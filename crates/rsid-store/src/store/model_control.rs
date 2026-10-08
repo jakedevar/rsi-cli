@@ -1915,14 +1915,14 @@ impl Store {
                     s.total_cache_creation_tokens, s.total_cache_read_tokens, s.work_time_ms, s.cost_usd,
                     mi.error_class = 'manager_question_cleanup_required',
                     (mi.purpose='session.continue.resume' AND mi.trigger_source='continue_session'
-                     AND substr(mi.dedup_key,1,15)='manager.answer:'), mi.estimated_cost_usd
+                     AND (substr(mi.dedup_key,1,15)='manager.answer:' OR substr(mi.dedup_key,1,14)='remote.answer:')), mi.estimated_cost_usd
              FROM model_invocations mi
              LEFT JOIN sessions s ON s.id = mi.session_id
              WHERE mi.admission_status = 'admitted' AND (mi.status = 'running'
                  OR (mi.status = 'cancellation_requested' AND
                      (mi.error_class = 'manager_question_cleanup_required' OR
                       (mi.purpose='session.continue.resume' AND mi.trigger_source='continue_session'
-                       AND substr(mi.dedup_key,1,15)='manager.answer:'))))",
+                       AND (substr(mi.dedup_key,1,15)='manager.answer:' OR substr(mi.dedup_key,1,14)='remote.answer:')))))",
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -1965,6 +1965,19 @@ impl Store {
                     "invalid running model invocation id during reconcile: {e}"
                 ))
             })?;
+            // Startup claims detached custody before crash reconciliation.
+            // Preserve the exact invocation until its restored monitor settles it.
+            if let Some(turn) = self.get_provider_turn_custody(invocation_id)?
+                && turn.boot_id == self.program_run_boot_id()
+                && matches!(
+                    turn.state,
+                    super::provider_turn_custody::ProviderTurnCustodyState::Live
+                        | super::provider_turn_custody::ProviderTurnCustodyState::Adopted
+                )
+                && self.session_model_invocation_id(turn.session_id)? == Some(invocation_id)
+            {
+                continue;
+            }
             if self.is_dispatchable_unexecuted_capacity_admission(invocation_id)? {
                 continue;
             }

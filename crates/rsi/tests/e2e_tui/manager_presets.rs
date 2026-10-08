@@ -358,6 +358,28 @@ async fn run(h: &mut E2eHarness, fixture: &mut Value) -> E2eResult<()> {
             term.screen().await.text(),
         )?;
 
+        // The effective launch allowlist fails closed (#1582): a preset grants
+        // no launches, so the operator adds the one the task will use.
+        let mut launchable = full.policy.clone();
+        launchable.allowed_launches = vec![ManagerLaunchChoiceV2 {
+            provider: SessionProvider::Codex,
+            model: "gpt-6-astra".into(),
+            effort: Some("medium".into()),
+        }];
+        client
+            .configure_harness_manager_policy(ConfigureHarnessManagerPolicyRequestV2 {
+                project_id: project.id,
+                expected_scope_version: config.row_version,
+                expected_policy_version: full.row_version,
+                idempotency_key: "manager-presets-launch-grant".into(),
+                policy: launchable,
+            })
+            .await?;
+        let full = client
+            .get_harness_manager_policy(project.id)
+            .await?
+            .unwrap();
+
         h.phase = "manager-presets-authenticated-task";
         // The fixture provider uses its daemon-minted token only in the RPC
         // transport. This file contains public action parameters, no token.

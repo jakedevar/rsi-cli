@@ -49,9 +49,13 @@ pub fn render_schedule_form(
         } else {
             Style::default().fg(theme::overlay_hint())
         };
-        let cursor = if *focused { "\u{2588}" } else { "" };
-        let text = format!("{:>8}: {value}{cursor}", label);
-        let para = Paragraph::new(Line::from(Span::styled(text, label_style)));
+        let mut spans = vec![Span::styled(format!("{:>8}: ", label), label_style)];
+        if *focused {
+            spans.extend(crate::field_edit::draw(value, label_style));
+        } else {
+            spans.push(Span::styled(value.to_string(), label_style));
+        }
+        let para = Paragraph::new(Line::from(spans));
         frame.render_widget(para, Rect::new(inner.x, y, inner.width, 1));
     }
 
@@ -90,9 +94,13 @@ pub fn render_schedule_form(
         } else {
             label_style
         };
-        let cursor = if focused && !dimmed { "\u{2588}" } else { "" };
-        let text = format!("{:>8}: {interval}{cursor}", "Every N");
-        let para = Paragraph::new(Line::from(Span::styled(text, display_style)));
+        let mut spans = vec![Span::styled(format!("{:>8}: ", "Every N"), display_style)];
+        if focused && !dimmed {
+            spans.extend(crate::field_edit::draw(interval, display_style));
+        } else {
+            spans.push(Span::styled(interval.to_string(), display_style));
+        }
+        let para = Paragraph::new(Line::from(spans));
         frame.render_widget(para, Rect::new(inner.x, y, inner.width, 1));
     }
 
@@ -107,9 +115,13 @@ pub fn render_schedule_form(
         } else {
             Style::default().fg(theme::overlay_hint())
         };
-        let cursor = if focused { "\u{2588}" } else { "" };
-        let text = format!("{:>8}: {anchor_date}{cursor}", "Date");
-        let para = Paragraph::new(Line::from(Span::styled(text, label_style)));
+        let mut spans = vec![Span::styled(format!("{:>8}: ", "Date"), label_style)];
+        if focused {
+            spans.extend(crate::field_edit::draw(anchor_date, label_style));
+        } else {
+            spans.push(Span::styled(anchor_date.to_string(), label_style));
+        }
+        let para = Paragraph::new(Line::from(spans));
         frame.render_widget(para, Rect::new(inner.x, y, inner.width, 1));
     }
 
@@ -124,9 +136,13 @@ pub fn render_schedule_form(
         } else {
             Style::default().fg(theme::overlay_hint())
         };
-        let cursor = if focused { "\u{2588}" } else { "" };
-        let text = format!("{:>8}: {anchor_time}{cursor}", "Time");
-        let para = Paragraph::new(Line::from(Span::styled(text, label_style)));
+        let mut spans = vec![Span::styled(format!("{:>8}: ", "Time"), label_style)];
+        if focused {
+            spans.extend(crate::field_edit::draw(anchor_time, label_style));
+        } else {
+            spans.push(Span::styled(anchor_time.to_string(), label_style));
+        }
+        let para = Paragraph::new(Line::from(spans));
         frame.render_widget(para, Rect::new(inner.x, y, inner.width, 1));
     }
 

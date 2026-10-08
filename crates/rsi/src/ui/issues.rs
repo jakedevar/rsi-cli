@@ -470,6 +470,37 @@ fn render_inspector(frame: &mut Frame, area: Rect, state: &mut IssueWorkspaceSta
     );
 }
 
+/// The text of the issue editor's active field, when that field is typed
+/// into (the same field the key handler edits).
+fn editor_active_text(editor: &crate::types::IssueEditorState, field: usize) -> Option<&str> {
+    if editor.active_field != field {
+        return None;
+    }
+    match editor.mode {
+        IssueEditorMode::Filter => {
+            matches!(field, 1 | 2 | 3 | 5 | 6 | 7).then_some(editor.dependency_text.as_str())
+        }
+        IssueEditorMode::Dependency { .. } => {
+            (field == 1).then_some(editor.dependency_text.as_str())
+        }
+        _ => match field {
+            0 => Some(editor.title.as_str()),
+            1 => Some(editor.body.as_str()),
+            2..=4 => Some(editor.dependency_text.as_str()),
+            _ => None,
+        },
+    }
+}
+
+/// `plain` for a field's value, or in a Standard frame the active field's
+/// text with the cursor and selection marked for [`crate::field_edit::marked_row`].
+fn editor_value(editor: &crate::types::IssueEditorState, field: usize, plain: String) -> String {
+    match editor_active_text(editor, field) {
+        Some(text) if crate::field_edit::standard_frame() => crate::field_edit::mark(text, ""),
+        _ => plain,
+    }
+}
+
 fn render_editor(frame: &mut Frame, area: Rect, editor: &crate::types::IssueEditorState) {
     let marker = |field| {
         if editor.active_field == field {
@@ -483,7 +514,7 @@ fn render_editor(frame: &mut Frame, area: Rect, editor: &crate::types::IssueEdit
             let filters = editor.filter_draft.as_ref();
             let value = |field| {
                 if editor.active_field == field {
-                    editor.dependency_text.clone()
+                    editor_value(editor, field, editor.dependency_text.clone())
                 } else {
                     match (filters, field) {
                         (_, 0) => editor
@@ -583,7 +614,7 @@ fn render_editor(frame: &mut Frame, area: Rect, editor: &crate::types::IssueEdit
                         rsi_common::issue_workspace::IssueDependencyDirectionV1::Blocks => "Blocks",
                     },
                     marker(1),
-                    editor.dependency_text,
+                    editor_value(editor, 1, editor.dependency_text.clone()),
                     marker(2),
                     candidates,
                     editor
@@ -645,22 +676,38 @@ fn render_editor(frame: &mut Frame, area: Rect, editor: &crate::types::IssueEdit
                 format!(
                     "{} Title: {}\n{} Body: {}\n{} Priority: {}\n{} Assignee: {}\n{} Labels: {}\nStatus: {}\n\nTab/Shift-Tab fields{select_hint} · Ctrl-Enter save · Esc cancel{}{}{}",
                     marker(0),
-                    editor.title,
+                    editor_value(editor, 0, editor.title.clone()),
                     marker(1),
-                    editor.body,
+                    editor_value(editor, 1, editor.body.clone()),
                     marker(2),
-                    editor
-                        .priority
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "clear".into()),
+                    editor_value(
+                        editor,
+                        2,
+                        editor
+                            .priority
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "clear".into())
+                    ),
                     marker(3),
-                    editor.assignee.as_deref().unwrap_or("unassigned"),
+                    editor_value(
+                        editor,
+                        3,
+                        editor
+                            .assignee
+                            .as_deref()
+                            .unwrap_or("unassigned")
+                            .to_string()
+                    ),
                     marker(4),
-                    if editor.labels.is_empty() {
-                        "none".to_string()
-                    } else {
-                        editor.labels.join(", ")
-                    },
+                    editor_value(
+                        editor,
+                        4,
+                        if editor.labels.is_empty() {
+                            "none".to_string()
+                        } else {
+                            editor.labels.join(", ")
+                        }
+                    ),
                     editor.status.map(issue_status_label).unwrap_or("—"),
                     if editor.submitted {
                         "\nSaving immutable request…"
@@ -677,8 +724,19 @@ fn render_editor(frame: &mut Frame, area: Rect, editor: &crate::types::IssueEdit
             )
         }
     };
+    let mut in_selection = false;
+    let lines: Vec<Line<'static>> = text
+        .split('\n')
+        .map(|row| {
+            Line::from(crate::field_edit::marked_row(
+                row,
+                &mut in_selection,
+                Style::default(),
+            ))
+        })
+        .collect();
     frame.render_widget(
-        Paragraph::new(text).block(
+        Paragraph::new(lines).block(
             Block::default()
                 .title(format!(" {mode} Issue "))
                 .borders(Borders::ALL),

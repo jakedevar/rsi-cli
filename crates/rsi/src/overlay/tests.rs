@@ -1359,6 +1359,10 @@ async fn test_graph_review_reopens_active_execution_in_executing_mode() {
             row_version: None,
             blocked_attempt_id: None,
             blocked_reason: None,
+            waiting: None,
+            current_nodes: Vec::new(),
+            on_call: None,
+            rulings: Vec::new(),
             updates: Vec::new(),
         },
     );

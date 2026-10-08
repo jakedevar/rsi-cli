@@ -391,6 +391,15 @@ async fn handle_edit_field_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Standard editing: a real cursor and selection in the field being edited.
+    if app.edit_field(key, |overlay| match overlay {
+        OverlayState::GraphReview { edit_buffer, .. } => Some(edit_buffer),
+        _ => None,
+    }) != crate::field_edit::FieldKey::Ignored
+    {
+        return;
+    }
+
     match key.code {
         KeyCode::Esc => {
             if let OverlayState::GraphReview { edit_buffer, .. } = &mut app.overlay {
@@ -1072,6 +1081,215 @@ async fn interrupt_graph_execution(app: &mut App, draft_id: Uuid) {
             app.mark_dirty();
         }
     }
+}
+
+/// The starter the Issues-workspace run key starts (#1641 S5a).
+pub(crate) const DEFAULT_ISSUE_TOPOLOGY: &str = "issue-implement-review-land";
+
+/// Parsed `:topology run <name> [<epic>]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TopologyRunCommand {
+    pub(crate) name: String,
+    pub(crate) epic: Option<String>,
+}
+
+pub(crate) fn parse_topology_run(args: &str) -> Result<TopologyRunCommand, String> {
+    const USAGE: &str = "usage: :topology run <name> [<epic>] (on the focused Issue)";
+    let mut tokens = args.split_whitespace();
+    if tokens.next() != Some("run") {
+        return Err(USAGE.to_owned());
+    }
+    let name = tokens.next().ok_or_else(|| USAGE.to_owned())?.to_owned();
+    let epic = tokens.next().map(str::to_owned);
+    if tokens.next().is_some() {
+        return Err(USAGE.to_owned());
+    }
+    Ok(TopologyRunCommand { name, epic })
+}
+
+fn live_epic(session: &rsi_common::types::Session) -> bool {
+    session.session_kind == rsi_common::types::SessionKind::Epic
+        && !matches!(
+            session.status,
+            rsi_common::types::SessionStatus::Archived | rsi_common::types::SessionStatus::Deleted
+        )
+}
+
+/// The Epic a topology started on an Issue runs under: the one named, else the
+/// focused session's own or enclosing Epic in the Issue's project, else the
+/// project's only live Epic. Anything else asks the operator to name one.
+pub(crate) fn choose_topology_epic(
+    app: &App,
+    project_id: Uuid,
+    named: Option<&str>,
+) -> Result<Uuid, String> {
+    let epics: Vec<&rsi_common::types::Session> = app
+        .sessions
+        .values()
+        .map(|tracked| &tracked.session)
+        .filter(|session| live_epic(session) && session.project_id == Some(project_id))
+        .collect();
+    let label = |session: &rsi_common::types::Session| {
+        format!(
+            "{} ({})",
+            session.title.as_deref().unwrap_or("untitled"),
+            session.id.to_string().get(..8).unwrap_or_default()
+        )
+    };
+    if let Some(named) = named {
+        let needle = named.to_lowercase();
+        let by_id: Vec<_> = epics
+            .iter()
+            .filter(|epic| needle.len() >= 4 && epic.id.to_string().starts_with(&needle))
+            .collect();
+        let by_title: Vec<_> = epics
+            .iter()
+            .filter(|epic| {
+                epic.title
+                    .as_deref()
+                    .is_some_and(|title| title.to_lowercase() == needle)
+            })
+            .collect();
+        return match (by_id.as_slice(), by_title.as_slice()) {
+            ([one], _) | ([], [one]) => Ok(one.id),
+            ([], []) => Err(format!(
+                "no live Epic {named:?} in this Issue's project; Epics: {}",
+                epics
+                    .iter()
+                    .map(|epic| label(epic))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            _ => Err(format!("{named:?} names more than one Epic; use its id")),
+        };
+    }
+    // The Issues pane has no session selection of its own: use the list's.
+    let mut cursor = app.selected_session_id_from_list();
+    for _ in 0..16 {
+        let Some(session) = cursor
+            .and_then(|id| app.sessions.get(&id))
+            .map(|t| &t.session)
+        else {
+            break;
+        };
+        if epics.iter().any(|epic| epic.id == session.id) {
+            return Ok(session.id);
+        }
+        cursor = session.parent_id;
+    }
+    match epics.as_slice() {
+        [only] => Ok(only.id),
+        [] => Err("this Issue's project has no live Epic to run a topology under".to_owned()),
+        many => Err(format!(
+            "name an Epic: :topology run <name> <epic>; Epics: {}",
+            many.iter()
+                .map(|epic| label(epic))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Operator-readable text for an `ExecuteTopology` refusal. The daemon's
+/// `operator_owner_*` codes (#1746) say why review and land nodes have no
+/// owning project manager.
+pub(crate) fn explain_execute_topology_error(error: &str) -> String {
+    let hint = if error.contains("operator_owner_no_manager") {
+        "this project has no appointed live project manager to own review and land nodes; appoint one first"
+    } else if error.contains("operator_owner_manager_unauthorized") {
+        "the project manager must hold Automation, have the Epic in scope, be in execute mode and not paused"
+    } else if error.contains("operator_owner_epic_required") {
+        "review and land nodes need a live Epic; run from an Issue under an Epic"
+    } else if error.contains("operator_owner_project_mismatch")
+        || error.contains("operator_owner_project_required")
+    {
+        "the Epic must belong to the Issue's project"
+    } else {
+        return format!("ExecuteTopology failed: {error}");
+    };
+    format!("ExecuteTopology refused: {hint} ({error})")
+}
+
+/// `:topology run <name> [<epic>]` and the Issues-workspace run key: start a
+/// stored topology on the focused Issue under its Epic, then open the run view.
+pub(crate) async fn run_topology_command(app: &mut App, args: &str) {
+    let command = match parse_topology_run(args) {
+        Ok(command) => command,
+        Err(usage) => {
+            app.notify_error(usage);
+            return;
+        }
+    };
+    let Some(issue) = app.focused_local_issue() else {
+        app.notify_error("Focus an Issue in the Issues workspace first");
+        return;
+    };
+    let epic = match choose_topology_epic(app, issue.project_id, command.epic.as_deref()) {
+        Ok(epic) => epic,
+        Err(reason) => {
+            app.notify_error(reason);
+            return;
+        }
+    };
+    let topology = match app.client.list_topologies(Some(command.name.clone())).await {
+        Ok(found) => found
+            .into_iter()
+            .find(|topology| topology.name == command.name),
+        Err(error) => {
+            app.notify_error(format!("topology lookup failed: {error}"));
+            return;
+        }
+    };
+    let Some(topology) = topology else {
+        app.notify_error(format!("topology not found: {}", command.name));
+        return;
+    };
+    match app
+        .client
+        .execute_topology(
+            topology.id,
+            Some(issue.project_id),
+            serde_json::json!({ "issue": issue.display_number }),
+            Some(epic),
+        )
+        .await
+    {
+        Ok(execution_id) => {
+            app.notify_success(format!(
+                "Started {} on #{} (exec {execution_id})",
+                topology.name, issue.display_number
+            ));
+            open_topology_run_view(app, execution_id, &topology.name, issue.project_id).await;
+        }
+        Err(error) => app.notify_error(explain_execute_topology_error(&error.to_string())),
+    }
+}
+
+/// Open the graph review on the started execution so its run view shows.
+async fn open_topology_run_view(
+    app: &mut App,
+    execution_id: Uuid,
+    topology_name: &str,
+    project_id: Uuid,
+) {
+    let workflow_id = match app.client.list_workflows(Some(project_id)).await {
+        Ok(workflows) => workflows
+            .into_iter()
+            .find(|workflow| workflow.title == topology_name)
+            .map(|workflow| workflow.id),
+        Err(_) => None,
+    };
+    let Some(workflow_id) = workflow_id else {
+        return;
+    };
+    let draft_id = load_saved_workflow_draft(app, workflow_id, Some(project_id)).await;
+    if let Some(draft) = app.graph_draft_mut(&draft_id) {
+        draft.last_execution_id = Some(execution_id);
+    }
+    let _ = app.resync_graph_execution_for_draft(draft_id, false).await;
+    let caps = app.client.get_daemon_capabilities().await.ok();
+    let gv_info_dashboard = caps.map_or(false, |c| c.gv_info_dashboard);
+    app.show_graph_review_draft(draft_id, gv_info_dashboard);
 }
 
 /// Parsed `:topology-resolve [<execution_id>] <action> [<preserved_commit>]`.
@@ -2479,6 +2697,30 @@ mod tests {
                 );
             }
             _ => panic!("expected GraphReview overlay"),
+        }
+    }
+
+    /// #1628 slice 3b: the graph edit buffer gets a cursor in Standard
+    /// editing; Vim mode keeps appending.
+    #[tokio::test]
+    async fn edit_buffer_is_edited_in_place_in_standard_mode_only() {
+        for mode in ["standard", "vim"] {
+            let mut app = test_app();
+            crate::settings::DaemonFeatureEntry::update_from_json(
+                &mut app.daemon_features,
+                &serde_json::json!({ "editing_mode": mode }),
+            );
+            let (_draft_id, before) = open_authored_editing_instructions(&mut app);
+            handle_graph_review_key(&mut app, key(KeyCode::Home)).await;
+            handle_graph_review_key(&mut app, key(KeyCode::Char('X'))).await;
+            let OverlayState::GraphReview { edit_buffer, .. } = &app.overlay else {
+                panic!("expected GraphReview overlay");
+            };
+            if mode == "standard" {
+                assert_eq!(edit_buffer, &format!("X{before}"));
+            } else {
+                assert_eq!(edit_buffer, &format!("{before}X"));
+            }
         }
     }
 }

@@ -56,6 +56,28 @@ pub(super) fn handle_mcp_server_form_key(app: &mut App, key: KeyEvent) {
         OverlayState::McpServerForm { focused_field, .. } => *focused_field,
         _ => return,
     };
+    // Standard editing: a real cursor and selection in the focused text field.
+    if app.edit_field(key, |overlay| match overlay {
+        OverlayState::McpServerForm {
+            id,
+            command,
+            args,
+            secret_env_names,
+            working_dir,
+            ..
+        } => match focused_field {
+            0 => Some(id),
+            1 => Some(command),
+            2 => Some(args),
+            3 => Some(secret_env_names),
+            4 => Some(working_dir),
+            _ => None,
+        },
+        _ => None,
+    }) != crate::field_edit::FieldKey::Ignored
+    {
+        return;
+    }
     match key.code {
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => cycle_field(app, false),
         KeyCode::Tab => cycle_field(app, true),

@@ -623,6 +623,8 @@ impl ProviderLauncher for CachedLauncher<'_> {
             .agy_client
             .as_ref()
             .ok_or(DaemonError::AgyBinaryNotFound)?
+            .clone()
+            .with_runtime_config(self.mgr.runtime_config.clone())
             .launch(config, execution)
     }
 
@@ -854,7 +856,9 @@ impl ProviderLauncher for FreshLauncher {
         config: &LaunchConfig,
         execution: CliExecutionCapability,
     ) -> Result<(AgyProcess, mpsc::Receiver<StreamEvent>)> {
-        AgyClient::new()?.launch(config, execution)
+        AgyClient::new()?
+            .with_runtime_config(self.runtime_config.clone())
+            .launch(config, execution)
     }
 
     fn launch_harness(

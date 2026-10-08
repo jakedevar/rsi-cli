@@ -4,8 +4,8 @@
 
 use crate::error::DaemonError;
 use rsi_common::types::{
-    EdgeWhen, SessionKind, TOPOLOGY_FORBIDDEN_AUTHOR_PARAMS, TopologyDefinition, TopologyStep,
-    legal_children,
+    EdgeWhen, SessionKind, TOPOLOGY_FORBIDDEN_AUTHOR_PARAMS, TOPOLOGY_MAX_REVIEW_ROUNDS,
+    TopologyDefinition, TopologyStep, legal_children,
 };
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -381,7 +381,16 @@ pub fn validate_graph(nodes: &[StepNode<'_>], edges: &[StepEdge<'_>]) -> Result<
             .iter()
             .find(|node| node.id == edge.from)
             .and_then(|node| node.step);
+        let from_review = matches!(source_step, Some(TopologyStep::Review { .. }));
         match edge.when {
+            // A review that asked for changes still succeeds, so an
+            // unconditioned edge would also carry a rejected commit onward.
+            EdgeWhen::Success if from_review => {
+                return Err(format!(
+                    "edge {} -> {}: edges leaving a review node must be verdict_accepted or verdict_changes_requested",
+                    edge.from, edge.to
+                ));
+            }
             EdgeWhen::Success | EdgeWhen::Failure | EdgeWhen::Completed => {}
             EdgeWhen::GateTrue | EdgeWhen::GateFalse => {
                 if !matches!(source_step, Some(TopologyStep::Gate { .. })) {
@@ -391,12 +400,13 @@ pub fn validate_graph(nodes: &[StepNode<'_>], edges: &[StepEdge<'_>]) -> Result<
                     ));
                 }
             }
-            // Rule 9: review/land are refused until the T3b prerequisites.
             EdgeWhen::VerdictAccepted | EdgeWhen::VerdictChangesRequested => {
-                return Err(format!(
-                    "edge {} -> {}: verdict routing needs review nodes, which are not available yet",
-                    edge.from, edge.to
-                ));
+                if !from_review {
+                    return Err(format!(
+                        "edge {} -> {}: verdict edges must leave a review node",
+                        edge.from, edge.to
+                    ));
+                }
             }
         }
         if edge.loop_edge && edge.when != EdgeWhen::Success {
@@ -416,6 +426,23 @@ pub fn validate_graph(nodes: &[StepNode<'_>], edges: &[StepEdge<'_>]) -> Result<
             Some(TopologyStep::Command { op }) => op
                 .validate()
                 .map_err(|error| format!("node {}: {error}", node.id))?,
+            Some(TopologyStep::Review {
+                of,
+                reviewer,
+                max_rounds,
+            }) => validate_review(
+                node.id,
+                of,
+                reviewer,
+                *max_rounds,
+                nodes,
+                edges,
+                &forward_preds,
+            )?,
+            Some(TopologyStep::Land {
+                accepted,
+                test_filters,
+            }) => validate_land(node.id, accepted, test_filters, nodes, edges)?,
             // Rule 2: gate paths reference ancestors only.
             Some(TopologyStep::Gate { condition }) => {
                 let referenced = condition
@@ -433,6 +460,105 @@ pub fn validate_graph(nodes: &[StepNode<'_>], edges: &[StepEdge<'_>]) -> Result<
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Rules 3 and 6 for a review node (#1641): `of` is a commit-producing
+/// session that runs before the review (a forward ancestor, or the fix node
+/// whose loop edge re-enters it), the reviewer launch is explicit, and the
+/// round bound stays within the store's per-revision cap.
+fn validate_review(
+    id: &str,
+    of: &str,
+    reviewer: &rsi_common::types::ReviewerLaunch,
+    max_rounds: u8,
+    nodes: &[StepNode<'_>],
+    edges: &[StepEdge<'_>],
+    forward_preds: &HashMap<&str, Vec<&str>>,
+) -> Result<(), String> {
+    if !(1..=TOPOLOGY_MAX_REVIEW_ROUNDS).contains(&max_rounds) {
+        return Err(format!(
+            "node {id}: max_rounds must be between 1 and {TOPOLOGY_MAX_REVIEW_ROUNDS}"
+        ));
+    }
+    if reviewer.model.trim().is_empty() || reviewer.effort.trim().is_empty() {
+        return Err(format!(
+            "node {id}: a review node needs an explicit reviewer provider, model and effort"
+        ));
+    }
+    let Some(author) = nodes.iter().find(|node| node.id == of) else {
+        return Err(format!("node {id}: review.of names unknown node {of}"));
+    };
+    if !matches!(
+        author.step,
+        Some(TopologyStep::Session {
+            expects_commit: true,
+            ..
+        })
+    ) {
+        return Err(format!(
+            "node {id}: review.of {of} must be a session node with expects_commit"
+        ));
+    }
+    let reaches = ancestors(id, forward_preds).contains(of)
+        || edges
+            .iter()
+            .any(|edge| edge.loop_edge && edge.from == of && edge.to == id);
+    if !reaches {
+        return Err(format!(
+            "node {id}: review.of {of} must be an ancestor or the fix node of this review's loop"
+        ));
+    }
+    Ok(())
+}
+
+/// Rule 4 for a land node (#1641 S2): `accepted` names a review node, the
+/// queue filters are well formed, and the only input of the land node is the
+/// review's `verdict_accepted` edge (a land that also had another input, or a
+/// loop edge, could publish a commit nobody accepted or publish twice).
+fn validate_land(
+    id: &str,
+    accepted: &str,
+    test_filters: &[String],
+    nodes: &[StepNode<'_>],
+    edges: &[StepEdge<'_>],
+) -> Result<(), String> {
+    if test_filters.len() > rsi_common::rolling_queue::ROLLING_QUEUE_MAX_TEST_FILTERS
+        || test_filters
+            .iter()
+            .any(|filter| !rsi_common::rolling_queue::valid_test_filter(filter))
+    {
+        return Err(format!(
+            "node {id}: land.test_filters must be PACKAGE=FILTER pairs (at most {})",
+            rsi_common::rolling_queue::ROLLING_QUEUE_MAX_TEST_FILTERS
+        ));
+    }
+    let Some(review) = nodes.iter().find(|node| node.id == accepted) else {
+        return Err(format!(
+            "node {id}: land.accepted names unknown node {accepted}"
+        ));
+    };
+    if !matches!(review.step, Some(TopologyStep::Review { .. })) {
+        return Err(format!(
+            "node {id}: land.accepted {accepted} must be a review node"
+        ));
+    }
+    let inputs: Vec<&StepEdge<'_>> = edges.iter().filter(|edge| edge.to == id).collect();
+    let only_accepted = matches!(
+        inputs.as_slice(),
+        [edge] if edge.from == accepted
+            && !edge.loop_edge
+            && edge.when == EdgeWhen::VerdictAccepted
+    );
+    if !only_accepted {
+        return Err(format!(
+            "node {id}: a land node's only input must be the verdict_accepted edge from review \
+             node {accepted}"
+        ));
+    }
+    if edges.iter().any(|edge| edge.loop_edge && edge.from == id) {
+        return Err(format!("node {id}: a land node cannot sit on a loop edge"));
     }
     Ok(())
 }

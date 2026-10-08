@@ -107,14 +107,14 @@ else:
                                 capture_output=True, text=True, env=env)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         lines = self.log.read_text().splitlines()
-        self.assertIn("cargo-e2e build -p rsid --bin rsid", lines)
+        self.assertIn("cargo-e2e build -p rsid -p rsi-common -p rsi-turn-shim --bin rsid --bin rsi-agent-mcp --bin rsi-rpc --bin rsi-turn-shim", lines)
         self.assertIn("RSI_E2E=1", lines)
 
     def test_e2e_dry_run_reports_the_rsid_prebuild_for_e2e_filters(self):
         code, output = self.invoke(dry_run=True, explicit=["rsi=test:e2e_tui:test(=tests::one)"])
         self.assertEqual(code, 0, output)
         self.assertIn("e2e prebuild (RSI_E2E=1): ", output)
-        self.assertIn("build -p rsid --bin rsid", output)
+        self.assertIn("build -p rsid -p rsi-common -p rsi-turn-shim --bin rsid --bin rsi-agent-mcp", output)
 
     def test_non_e2e_dry_run_has_no_rsid_prebuild(self):
         code, output = self.invoke(dry_run=True, explicit=["rsi=test:flow"])
@@ -706,6 +706,37 @@ if Path(sys.argv[index + 1]).stem == 'rsid':
         self.assertEqual(RUNNER["build_command"]("rsi", selections, ["cargo-stub"]),
                          ["cargo-stub", "test", "-p", "rsi", "--bin", "tool", "--test", "integration",
                           "--no-run", "--message-format=json"])
+
+
+class ScopedTestReceipt(unittest.TestCase):
+    """#1638: the daemon's scoped-test job reads the last-line JSON receipt."""
+
+    def run_script(self, *args):
+        done = subprocess.run([sys.executable, str(SCRIPT), *args], cwd=SCRIPT.parents[1],
+                              text=True, capture_output=True)
+        lines = done.stdout.splitlines()
+        self.assertTrue(lines and lines[-1].startswith("SCOPED_TEST_RECEIPT "), done.stdout + done.stderr)
+        return done.returncode, json.loads(lines[-1].split(" ", 1)[1])
+
+    def test_a_dry_run_ends_with_the_typed_receipt(self):
+        code, receipt = self.run_script("--dry-run", "--base", "HEAD", "--filter", "rsid=shard:other-01:test(x)")
+        self.assertEqual(code, 0)
+        self.assertEqual((receipt["ok"], receipt["exit_code"], receipt["schema"]), (True, 0, 1))
+        self.assertEqual(receipt["base"], "HEAD")
+        self.assertEqual(receipt["filters"], ["rsid=shard:other-01:test(x)"])
+        self.assertRegex(receipt["head"], r"^[0-9a-f]{40}$")
+        self.assertTrue(receipt["log_dir"].startswith("/tmp/") or Path(receipt["log_dir"]).is_dir())
+
+    def test_a_failed_run_still_ends_with_a_red_receipt(self):
+        code, receipt = self.run_script("--base", "no-such-ref-for-receipt-test")
+        self.assertNotEqual(code, 0)
+        self.assertEqual((receipt["ok"], receipt["exit_code"]), (False, code))
+        self.assertEqual(receipt["base"], "no-such-ref-for-receipt-test")
+
+    def test_the_package_executor_prints_no_receipt(self):
+        done = subprocess.run([sys.executable, str(SCRIPT), "--execute-plan", "/nonexistent"],
+                              text=True, capture_output=True)
+        self.assertNotIn("SCOPED_TEST_RECEIPT", done.stdout)
 
 
 if __name__ == "__main__":

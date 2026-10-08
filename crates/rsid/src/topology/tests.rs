@@ -7,7 +7,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -28,8 +28,14 @@ use crate::sandbox::SandboxAllocator;
 use crate::store::Store;
 use crate::topology::catalog::{CommandOutcome, CommandPoll};
 use crate::topology::custody::TopologyForkSource;
-use crate::topology::executor::{Executor, LaunchRequest, NodeEffects, SessionObservation, Step};
+use crate::topology::executor::{
+    AnswerContinuation, Executor, LaunchRequest, NodeEffects, SessionObservation, Step,
+};
+use crate::topology::land::{LandEnqueue, LandRequest, LandStatus};
 use crate::topology::recovery::recover_after_restart;
+use crate::topology::review::{
+    ExtraRound, ExtraRoundRequest, OncallAcceptance, ReviewRequest, ReviewStatus,
+};
 use crate::topology::store::{self as rows, AttemptRow, AttemptStatus, NewAttempt, NewExecution};
 
 // ─── fixture ────────────────────────────────────────────────────────────────
@@ -58,6 +64,17 @@ struct FakeSession {
     status: SessionStatus,
     sandbox: PathBuf,
     content: String,
+    waiting_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// #1641 S4a: the provider can resume this session (default: it cannot,
+    /// so a restart cut keeps the plan §3.4 preserve/retry).
+    resumable: bool,
+    /// The restart journal still owns the session.
+    restart_intent_pending: bool,
+    stop_reason: Option<String>,
+    waited_ms: Option<u64>,
+    /// #1728: the conversation turn cursor (`MAX(sequence)`); a continuation
+    /// of the session advances it.
+    turn: i64,
 }
 
 /// The world outside the daemon: provider sessions and their sandboxes.
@@ -73,6 +90,37 @@ struct World {
     command_starts: Vec<Uuid>,
     /// Stale process groups killed by a later incarnation.
     killed_groups: Vec<i32>,
+    /// The review service lives outside the daemon and survives a restart:
+    /// the scripted verdict of each next assignment (#1641),
+    review_script: VecDeque<ReviewScript>,
+    /// `(assignment id, request)` of every review request, in order,
+    review_requests: Vec<(Uuid, ReviewRequest)>,
+    /// and the verdicts already handed out, so a repeated poll agrees.
+    review_verdicts: HashMap<Uuid, ReviewStatus>,
+    /// The merge queue lives outside the daemon and survives a restart:
+    /// `(entry id, request)` of every enqueue, in order,
+    land_requests: Vec<(Uuid, LandRequest)>,
+    /// the state each entry is in (absent: still pending),
+    land_states: HashMap<Uuid, LandStatus>,
+    /// and a scripted answer that replaces the next enqueues (a refusal).
+    land_override: Option<LandEnqueue>,
+    /// `(session id, prompt)` of every continuation of a finished node
+    /// session (#1641 S3c).
+    continues: Vec<(Uuid, String)>,
+    /// While set, the next continuation is refused.
+    refuse_continue: bool,
+    /// An operator continuation of the node session got there first (#1728).
+    competing_continue: bool,
+    /// What the review ledger answers to "may one more round run?" (#1715);
+    /// `None`: the node's own reviewer.
+    extra_round: Option<ExtraRound>,
+    /// Every "may one more round run?" question asked.
+    extra_round_asks: Vec<ExtraRoundRequest>,
+    /// Every on-call acceptance the executor recorded on the review ledger (#1740).
+    oncall_acceptances: Vec<OncallAcceptance>,
+    /// #1728: a competing continuation of the session starts between the
+    /// executor's observation and the resume's guarded check.
+    racing_continue: bool,
 }
 
 /// One catalog-op run of the current incarnation.
@@ -102,12 +150,143 @@ pub(super) struct Fake {
     pub(super) record_hold: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// #1417: while set, the host-load admission holds every launch.
     hold_launches: AtomicBool,
-    /// Every `launch_held` question the executor asked: `(agent_requested,
+    /// #1641 S4b: while set, `launch` is refused with the sandbox capacity
+    /// code (-32029) carrying this `data.code`, before any session exists.
+    capacity_refusal: StdMutex<Option<&'static str>>,
+    /// #1641 S4b: while set, a command node's build slot is held with this kind.
+    build_slot_hold: StdMutex<Option<&'static str>>,
+    /// Every `launch_held` question the executor asked: `(unattended,
     /// attempt id)`.
     launch_asks: StdMutex<Vec<(bool, Uuid)>>,
+    /// Refuse this many review requests before accepting one.
+    review_request_failures: std::sync::atomic::AtomicU32,
+    /// While set, every review request is refused with this message.
+    review_refusal: StdMutex<Option<String>>,
+    /// One-shot suspension inside an answer delivery, after the executor
+    /// decided to send it and before the continuation's fence: `(entered, go)`.
+    pub(super) answer_hold: StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    /// While set, an answer delivery fails after its provider effect started
+    /// (the claim is recorded, the answer was sent).
+    pub(super) fail_answer_after_effect: AtomicBool,
+    /// Every operator attention message the executor sent: `(level, text)`.
+    notices: StdMutex<Vec<(String, String)>>,
+}
+
+/// What the fake review service decides for the next polled assignment.
+#[derive(Clone, Debug)]
+pub(super) enum ReviewScript {
+    Accept,
+    Changes(Vec<&'static str>),
+    Unsettled(&'static str),
 }
 
 impl NodeEffects for Fake {
+    async fn review_extra_round(&self, request: ExtraRoundRequest) -> ExtraRound {
+        let mut world = self.world.lock().unwrap();
+        world.extra_round_asks.push(request);
+        world.extra_round.clone().unwrap_or(ExtraRound::Same)
+    }
+
+    async fn record_oncall_acceptance(&self, acceptance: OncallAcceptance) -> Result<()> {
+        self.world
+            .lock()
+            .unwrap()
+            .oncall_acceptances
+            .push(acceptance);
+        Ok(())
+    }
+
+    async fn request_review(&self, request: ReviewRequest) -> Result<Uuid> {
+        if self
+            .review_request_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(DaemonError::PolicyDenied("review service refused".into()));
+        }
+        if let Some(message) = self.review_refusal.lock().unwrap().clone() {
+            return Err(DaemonError::PolicyDenied(message));
+        }
+        // Idempotent per attempt, like the production effect must be.
+        let assignment = Uuid::new_v5(&Uuid::NAMESPACE_OID, request.attempt_id.as_bytes());
+        let mut world = self.world.lock().unwrap();
+        if !world
+            .review_requests
+            .iter()
+            .any(|(id, _)| *id == assignment)
+        {
+            world.review_requests.push((assignment, request));
+        }
+        Ok(assignment)
+    }
+
+    async fn review_status(&self, assignment_id: Uuid) -> ReviewStatus {
+        let mut world = self.world.lock().unwrap();
+        if let Some(settled) = world.review_verdicts.get(&assignment_id) {
+            return settled.clone();
+        }
+        let Some(script) = world.review_script.pop_front() else {
+            return ReviewStatus::Pending;
+        };
+        let source_commit = world
+            .review_requests
+            .iter()
+            .find(|(id, _)| *id == assignment_id)
+            .map(|(_, request)| request.source_commit.clone())
+            .expect("a polled assignment was requested");
+        let status = match script {
+            ReviewScript::Accept => ReviewStatus::Accepted {
+                findings: Vec::new(),
+                reviewed_commit: source_commit,
+            },
+            ReviewScript::Changes(findings) => ReviewStatus::ChangesRequested {
+                findings: findings.into_iter().map(str::to_owned).collect(),
+            },
+            ReviewScript::Unsettled(reason) => ReviewStatus::Unsettled(reason.to_owned()),
+        };
+        world.review_verdicts.insert(assignment_id, status.clone());
+        status
+    }
+
+    async fn find_land_entry(&self, request: &LandRequest) -> Option<Uuid> {
+        let world = self.world.lock().unwrap();
+        world
+            .land_requests
+            .iter()
+            .find(|(_, other)| other.dedup_key == request.dedup_key)
+            .map(|(entry, _)| *entry)
+    }
+
+    async fn enqueue_land(&self, request: LandRequest) -> Result<LandEnqueue> {
+        let mut world = self.world.lock().unwrap();
+        if let Some(answer) = world.land_override.clone() {
+            return Ok(answer);
+        }
+        // Idempotent per replay key, like the queue's UNIQUE identity.
+        if let Some((entry, _)) = world
+            .land_requests
+            .iter()
+            .find(|(_, other)| other.dedup_key == request.dedup_key)
+        {
+            return Ok(LandEnqueue::Queued(*entry));
+        }
+        let entry = Uuid::new_v5(&Uuid::NAMESPACE_OID, request.dedup_key.as_bytes());
+        world.land_requests.push((entry, request));
+        Ok(LandEnqueue::Queued(entry))
+    }
+
+    async fn land_status(&self, entry_id: Uuid) -> LandStatus {
+        self.world
+            .lock()
+            .unwrap()
+            .land_states
+            .get(&entry_id)
+            .cloned()
+            .unwrap_or(LandStatus::Pending)
+    }
+
     async fn before_resolution_record(&self, _execution_id: Uuid) {
         let hold = self.record_hold.lock().unwrap().take();
         if let Some((entered, go)) = hold {
@@ -129,6 +308,13 @@ impl NodeEffects for Fake {
     }
 
     async fn launch(&self, request: LaunchRequest) -> Result<Uuid> {
+        if let Some(code) = *self.capacity_refusal.lock().unwrap() {
+            return Err(DaemonError::StructuredRpc {
+                rpc_code: -32029,
+                message: "sandbox_capacity_refused".into(),
+                data: serde_json::json!({"kind": "sandbox_capacity", "code": code}),
+            });
+        }
         let key = request
             .config
             .model_invocation_dedup_key
@@ -158,6 +344,12 @@ impl NodeEffects for Fake {
                 status: SessionStatus::Running,
                 sandbox: allocation.root,
                 content: String::new(),
+                waiting_since: None,
+                resumable: false,
+                restart_intent_pending: false,
+                stop_reason: None,
+                waited_ms: None,
+                turn: 0,
             },
         );
         Ok(request.session_id)
@@ -171,6 +363,19 @@ impl NodeEffects for Fake {
             .map(|session| SessionObservation {
                 status: session.status,
                 sandbox_root: Some(session.sandbox.clone()),
+                waiting_since: session.waiting_since,
+                resumable: session.resumable,
+                restart_intent_pending: session.restart_intent_pending,
+                stop_reason: session.stop_reason.clone(),
+                waited_ms: session.waited_ms,
+                restart_cut_fence: Some(crate::store::manager_actions::fence::RestartCutFenceV1 {
+                    status: session.status,
+                    stop_reason: session.stop_reason.clone(),
+                    restart_intent_pending: session.restart_intent_pending,
+                    event_sequence: session.turn,
+                    invocation_id: None,
+                    custody_generation: None,
+                }),
             })
     }
 
@@ -277,15 +482,106 @@ impl NodeEffects for Fake {
 
     fn launch_held(
         &self,
-        agent_requested: bool,
+        unattended: bool,
         _since: chrono::DateTime<chrono::Utc>,
         attempt: &AttemptRow,
     ) -> bool {
         self.launch_asks
             .lock()
             .unwrap()
-            .push((agent_requested, attempt.id));
-        self.hold_launches.load(Ordering::SeqCst)
+            .push((unattended, attempt.id));
+        self.hold_launches.load(Ordering::SeqCst) && unattended
+    }
+
+    fn build_slot_held(&self, _attempt: &AttemptRow) -> Option<&'static str> {
+        *self.build_slot_hold.lock().unwrap()
+    }
+
+    fn notify_operator(&self, level: &str, message: String) {
+        self.notices.lock().unwrap().push((level.into(), message));
+    }
+
+    async fn continue_with_answer(&self, request: AnswerContinuation) -> Result<()> {
+        let hold = self.answer_hold.lock().unwrap().take();
+        if let Some((entered, go)) = hold {
+            entered.notify_one();
+            go.notified().await;
+        }
+        if self.world.lock().unwrap().refuse_continue {
+            return Err(DaemonError::InvalidParam("provider refused".into()));
+        }
+        // The daemon's continuation: the exact binding is rechecked and the
+        // delivery durably claimed before the provider effect.
+        {
+            let store = self.store.lock().await;
+            rows::claim_answer_delivery(&store, &request.binding, request.session_id)?;
+        }
+        {
+            let mut world = self.world.lock().unwrap();
+            let session = world
+                .sessions
+                .get_mut(&request.session_id)
+                .ok_or_else(|| DaemonError::InvalidParam("no such session".into()))?;
+            session.status = SessionStatus::Running;
+            world.continues.push((request.session_id, request.prompt));
+        }
+        if self.fail_answer_after_effect.load(Ordering::SeqCst) {
+            return Err(DaemonError::Process("daemon lost the provider".into()));
+        }
+        Ok(())
+    }
+
+    async fn continue_session(&self, session_id: Uuid, prompt: String) -> Result<()> {
+        let mut world = self.world.lock().unwrap();
+        if world.refuse_continue {
+            return Err(DaemonError::InvalidParam("provider refused".into()));
+        }
+        let session = world
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| DaemonError::InvalidParam("no such session".into()))?;
+        session.status = SessionStatus::Running;
+        world.continues.push((session_id, prompt));
+        Ok(())
+    }
+
+    async fn resume_cut_session(
+        &self,
+        session_id: Uuid,
+        prompt: String,
+        observed_restart_cut: Option<crate::store::manager_actions::fence::RestartCutFenceV1>,
+    ) -> Result<()> {
+        {
+            let mut world = self.world.lock().unwrap();
+            if world.racing_continue
+                && let Some(session) = world.sessions.get_mut(&session_id)
+            {
+                // The operator's continuation starts after the observation.
+                session.turn += 1;
+                session.status = SessionStatus::Running;
+            }
+            let turn = world.sessions.get(&session_id).map(|session| session.turn);
+            let observed_event_sequence = observed_restart_cut.map(|fence| fence.event_sequence);
+            if observed_event_sequence.is_some()
+                && turn.is_some()
+                && observed_event_sequence != turn
+            {
+                return Err(DaemonError::InvalidParam(
+                    "continuation_turn_changed".into(),
+                ));
+            }
+        }
+        if self.world.lock().unwrap().competing_continue {
+            // The competing continuation owns the session and runs it.
+            let mut world = self.world.lock().unwrap();
+            if let Some(session) = world.sessions.get_mut(&session_id) {
+                session.status = SessionStatus::Running;
+            }
+            return Err(DaemonError::InvalidParam(format!(
+                "continuation_target_busy:{session_id}"
+            )));
+        }
+        self.continue_session(session_id, prompt).await
     }
 }
 
@@ -340,13 +636,13 @@ impl Harness {
     }
 
     /// Drop every daemon-side handle and reopen: a new daemon incarnation.
-    fn restart(&mut self) {
+    pub(super) fn restart(&mut self) {
         let fresh = boot(&self.db, &self.sandboxes, &self.world);
         let old = std::mem::replace(&mut self.executor, fresh);
         drop(old);
     }
 
-    async fn start(&self, workflow: WorkflowDefinition) -> Uuid {
+    pub(super) async fn start(&self, workflow: WorkflowDefinition) -> Uuid {
         let custody_plan = crate::session::graph_runner::plan_workflow_custody(&workflow).unwrap();
         let new = NewExecution {
             id: Uuid::new_v4(),
@@ -360,6 +656,7 @@ impl Harness {
             base_commit: self.base.clone(),
             input: None,
             requester: None,
+            owner: None,
         };
         let store = self.executor.store.lock().await;
         rows::insert_execution(&store, &new).unwrap();
@@ -410,6 +707,74 @@ impl Harness {
             .clone()
     }
 
+    /// The daemon's own record of when the session began waiting (#1704).
+    pub(super) fn set_waiting_since(&self, session_id: Uuid, since: chrono::DateTime<chrono::Utc>) {
+        self.world
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .waiting_since = Some(since);
+    }
+
+    /// #1641 S4a: the session's provider can resume it.
+    pub(super) fn set_resumable(&self, session_id: Uuid) {
+        self.world
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .resumable = true;
+    }
+
+    /// #1641 S4a: the restart journal owns the (cut-off) session.
+    pub(super) fn set_restart_intent_pending(&self, session_id: Uuid) {
+        self.world
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .restart_intent_pending = true;
+    }
+
+    pub(super) fn clear_restart_intent_pending(&self, session_id: Uuid) {
+        self.world
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .restart_intent_pending = false;
+    }
+
+    pub(super) fn interrupts(&self) -> Vec<Uuid> {
+        self.world.lock().unwrap().interrupts.clone()
+    }
+
+    pub(super) fn set_stop_reason(&self, session_id: Uuid, reason: &str) {
+        self.world
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .stop_reason = Some(reason.to_owned());
+    }
+
+    /// The session's own cumulative total of ended waits (#1704).
+    pub(super) fn set_waited_ms(&self, session_id: Uuid, waited_ms: u64) {
+        self.world
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .waited_ms = Some(waited_ms);
+    }
+
     pub(super) fn set_status(&self, session_id: Uuid, status: SessionStatus) {
         self.world
             .lock()
@@ -434,8 +799,78 @@ impl Harness {
         git(&sandbox, &["rev-parse", "HEAD"])
     }
 
+    /// The node's agent stops on a BLOCKED handoff. `question` is its
+    /// `blocker_question`; `class` its typed blocker class.
+    pub(super) fn complete_blocked(&self, session_id: Uuid, class: &str, question: Option<&str>) {
+        let mut world = self.world.lock().unwrap();
+        let session = world.sessions.get_mut(&session_id).unwrap();
+        session.status = SessionStatus::Completed;
+        let mut content = format!(
+            "PIPELINE HANDOFF — RESEARCH:\ndoc_path: /tmp/blocked.md\nstatus: blocked\n\
+             blocker: cannot choose alone\nblocker_class: {class}\n\
+             blocker_evidence: two designs fit\n"
+        );
+        if let Some(question) = question {
+            content.push_str(&format!("blocker_question: {question}\n"));
+        }
+        session.content = content;
+    }
+
+    /// `(session id, prompt)` of every continuation so far.
+    pub(super) fn continues(&self) -> Vec<(Uuid, String)> {
+        self.world.lock().unwrap().continues.clone()
+    }
+
+    pub(super) fn refuse_continues(&self, refuse: bool) {
+        self.world.lock().unwrap().refuse_continue = refuse;
+    }
+
+    pub(super) fn race_continues(&self, race: bool) {
+        self.world.lock().unwrap().racing_continue = race;
+    }
+
+    pub(super) fn compete_continues(&self, compete: bool) {
+        self.world.lock().unwrap().competing_continue = compete;
+    }
+
+    /// The review service decides these verdicts for the next assignments.
+    pub(super) fn script_reviews(&self, script: impl IntoIterator<Item = ReviewScript>) {
+        self.world.lock().unwrap().review_script.extend(script);
+    }
+
+    fn land_requests(&self) -> Vec<(Uuid, LandRequest)> {
+        self.world.lock().unwrap().land_requests.clone()
+    }
+
+    fn set_land_state(&self, entry: Uuid, status: LandStatus) {
+        self.world.lock().unwrap().land_states.insert(entry, status);
+    }
+
+    /// Operator attention messages sent so far.
+    pub(super) fn operator_notices(&self) -> Vec<(String, String)> {
+        self.executor.effects.notices.lock().unwrap().clone()
+    }
+
+    pub(super) fn review_requests(&self) -> Vec<(Uuid, ReviewRequest)> {
+        self.world.lock().unwrap().review_requests.clone()
+    }
+
+    /// The review ledger answers "may one more round run?" with `round` (#1715).
+    pub(super) fn script_extra_round(&self, round: ExtraRound) {
+        self.world.lock().unwrap().extra_round = Some(round);
+    }
+
+    /// Every "may one more round run?" question the executor asked.
+    pub(super) fn oncall_acceptances(&self) -> Vec<OncallAcceptance> {
+        self.world.lock().unwrap().oncall_acceptances.clone()
+    }
+
+    pub(super) fn extra_round_asks(&self) -> Vec<ExtraRoundRequest> {
+        self.world.lock().unwrap().extra_round_asks.clone()
+    }
+
     /// The running catalog op of `attempt_id` exits with `exit_code`.
-    fn finish_command(&self, attempt_id: Uuid, exit_code: i32) {
+    pub(super) fn finish_command(&self, attempt_id: Uuid, exit_code: i32) {
         self.executor
             .effects
             .runs
@@ -461,7 +896,7 @@ impl Harness {
     }
 
     /// Run the executor, completing every running node, until it settles.
-    async fn run_to_end(&self, execution_id: Uuid) -> Step {
+    pub(super) async fn run_to_end(&self, execution_id: Uuid) -> Step {
         for _ in 0..64 {
             let step = self.executor.advance(execution_id).await.unwrap();
             if step != Step::Wait {
@@ -534,7 +969,14 @@ fn boot(db: &Path, sandboxes: &Path, world: &Arc<StdMutex<World>>) -> Executor<F
         build_cap: std::sync::atomic::AtomicU32::new(2),
         record_hold: StdMutex::new(None),
         hold_launches: AtomicBool::new(false),
+        capacity_refusal: StdMutex::new(None),
+        build_slot_hold: StdMutex::new(None),
         launch_asks: StdMutex::new(Vec::new()),
+        review_request_failures: std::sync::atomic::AtomicU32::new(0),
+        review_refusal: StdMutex::new(None),
+        answer_hold: StdMutex::new(None),
+        fail_answer_after_effect: AtomicBool::new(false),
+        notices: StdMutex::new(Vec::new()),
     };
     Executor::new(store, Arc::new(fake), boot_id, Arc::default())
 }
@@ -563,6 +1005,17 @@ fn workflow(nodes: &[&str], edges: &[(&str, &str)]) -> WorkflowDefinition {
 /// Attach typed steps and edge routing to a workflow snapshot, exactly as
 /// the bridge stamps them.
 fn with_steps(
+    workflow: WorkflowDefinition,
+    steps: &[(&str, serde_json::Value)],
+    routing: &[(&str, &str, &str)],
+) -> WorkflowDefinition {
+    let workflow = stamp_steps(workflow, steps, routing);
+    crate::topology::steps::validate_workflow(&workflow).expect("valid steps");
+    workflow
+}
+
+/// `with_steps` without the validity assertion, for refusal tests.
+fn stamp_steps(
     mut workflow: WorkflowDefinition,
     steps: &[(&str, serde_json::Value)],
     routing: &[(&str, &str, &str)],
@@ -583,7 +1036,6 @@ fn with_steps(
         crate::topology::steps::EDGE_WHEN_METADATA_KEY.into(),
         GraphValue::String(serde_json::Value::Array(routing).to_string()),
     );
-    crate::topology::steps::validate_workflow(&workflow).expect("valid steps");
     workflow
 }
 
@@ -704,6 +1156,33 @@ async fn t3a_a1_blocked_handoff_blocks_execution_with_evidence() {
             .unwrap()
             .contains("operator decision required")
     );
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Blocked
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn blocked_handoff_question_without_a_manager_ledger_blocks_as_before() {
+    // #1641 S3c: an operator-started execution has no project-manager ledger
+    // to file a question on, so the old behaviour stands: the attempt blocks.
+    let harness = Harness::new();
+    let execution = harness.start(workflow(&["A"], &[])).await;
+    harness.executor.advance(execution).await.unwrap();
+    let attempt = harness.attempt(execution, "A", 0, 1).await;
+    harness.complete_blocked(attempt.session_id, "technical_impasse", Some("Which one?"));
+    assert_eq!(
+        harness.executor.advance(execution).await.unwrap(),
+        Step::Done
+    );
+    let blocked = harness.attempt(execution, "A", 0, 1).await;
+    assert_eq!(blocked.status, AttemptStatus::Blocked);
+    assert_eq!(
+        blocked.failure_class.as_deref(),
+        Some(rows::failure::HANDOFF_BLOCKED)
+    );
+    assert!(harness.continues().is_empty());
     assert_eq!(
         harness.status(execution).await,
         rows::ExecutionStatus::Blocked
@@ -1280,6 +1759,376 @@ async fn t2_a1_restart_failed_session_is_interrupted_not_failed() {
     );
 }
 
+/// #1641 S4a: a node session the restart cut off (a crash leaves it `Failed`,
+/// an unjournaled graceful stop `Interrupted` with the restart cause) is
+/// continued as the same session once for this boot, with its uncommitted
+/// work in place. It is neither preserved nor retried.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn restart_interrupted_node_is_continued_not_preserved() {
+    let mut harness = Harness::new();
+    let crashed = harness.start(workflow(&["A"], &[])).await;
+    let drained = harness.start(workflow(&["A"], &[])).await;
+    let operator = harness.start(workflow(&["A"], &[])).await;
+    for execution in [crashed, drained, operator] {
+        assert_eq!(
+            harness.executor.advance(execution).await.unwrap(),
+            Step::Wait
+        );
+    }
+    let first_crashed = harness.attempt(crashed, "A", 0, 1).await;
+    let first_drained = harness.attempt(drained, "A", 0, 1).await;
+    let first_operator = harness.attempt(operator, "A", 0, 1).await;
+    for attempt in [&first_crashed, &first_drained, &first_operator] {
+        let sandbox = harness.sandbox(attempt.session_id);
+        std::fs::write(sandbox.join("partial.txt"), "unsaved work\n").unwrap();
+        harness.set_resumable(attempt.session_id);
+    }
+    harness.restart();
+    harness.set_status(first_crashed.session_id, SessionStatus::Failed);
+    harness.set_status(first_drained.session_id, SessionStatus::Interrupted);
+    harness.set_stop_reason(first_drained.session_id, "interrupted:deploy_drain");
+    // An operator interrupt is the operator's decision, not a restart cut.
+    harness.set_status(first_operator.session_id, SessionStatus::Interrupted);
+    harness.set_stop_reason(first_operator.session_id, "interrupted:operator");
+    recover_after_restart(&harness.executor, 8, std::time::Duration::from_secs(30))
+        .await
+        .unwrap();
+
+    for (execution, first) in [(crashed, &first_crashed), (drained, &first_drained)] {
+        let kept = harness.attempt(execution, "A", 0, 1).await;
+        assert_eq!(kept.status, AttemptStatus::Running);
+        assert_eq!(kept.session_id, first.session_id);
+        assert_eq!(kept.failure_class, None);
+        assert!(kept.preserved_commit.is_none());
+        assert_eq!(kept.boot_id, Some(harness.executor.boot_id));
+        assert_eq!(
+            harness.status(execution).await,
+            rows::ExecutionStatus::Running
+        );
+        assert_eq!(
+            event_count(&harness, execution, "node_resumed_after_restart").await,
+            1
+        );
+        assert_eq!(
+            event_count(&harness, execution, "node_resume_refused").await,
+            0
+        );
+        assert_eq!(
+            harness
+                .launches()
+                .iter()
+                .filter(|launch| launch.1 == first.session_id)
+                .count(),
+            1
+        );
+    }
+    let continues = harness.continues();
+    assert_eq!(continues.len(), 2, "one continuation per cut node");
+    assert!(
+        continues
+            .iter()
+            .all(|(_, prompt)| prompt.contains("Continue the task from its durable state"))
+    );
+    // The operator's interrupt keeps the plan §3.4 outcome.
+    assert_eq!(
+        harness.attempt(operator, "A", 0, 1).await.status,
+        AttemptStatus::Blocked
+    );
+
+    // A second tick in the same boot does not resume it again.
+    harness.executor.advance(crashed).await.unwrap();
+    assert_eq!(harness.continues().len(), 2);
+    // The continued session finishes with the uncommitted work it kept.
+    let head = harness.commit_and_complete(first_crashed.session_id, "A");
+    assert_eq!(harness.executor.advance(crashed).await.unwrap(), Step::Done);
+    assert_eq!(
+        harness.status(crashed).await,
+        rows::ExecutionStatus::Succeeded
+    );
+    assert_eq!(
+        harness
+            .attempt(crashed, "A", 0, 1)
+            .await
+            .result_commit
+            .as_deref(),
+        Some(head.as_str())
+    );
+}
+
+/// A continued session that dies again in the same boot is an ordinary node
+/// failure: at most one auto-resume per attempt per boot.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn resumed_node_that_fails_again_is_not_resumed_twice() {
+    let mut harness = Harness::new();
+    let execution = harness.start(workflow(&["A"], &[])).await;
+    harness.executor.advance(execution).await.unwrap();
+    let first = harness.attempt(execution, "A", 0, 1).await;
+    harness.set_resumable(first.session_id);
+    harness.restart();
+    harness.set_status(first.session_id, SessionStatus::Failed);
+    recover_after_restart(&harness.executor, 8, std::time::Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(harness.continues().len(), 1);
+    harness.set_status(first.session_id, SessionStatus::Failed);
+    harness.executor.advance(execution).await.unwrap();
+    assert_eq!(harness.continues().len(), 1);
+    let failed = harness.attempt(execution, "A", 0, 1).await;
+    assert_eq!(failed.status, AttemptStatus::Failed);
+    assert_eq!(
+        failed.failure_class.as_deref(),
+        Some(rows::failure::SESSION_FAILED)
+    );
+}
+
+/// #1641 S4a: a session the restart journal still owns (a deploy drain cut
+/// its turn and the startup pass has not continued it yet) is live. The
+/// executor neither settles it nor continues it itself.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn restart_intent_pending_node_is_not_settled() {
+    let mut harness = Harness::new();
+    let execution = harness.start(workflow(&["A"], &[])).await;
+    harness.executor.advance(execution).await.unwrap();
+    let first = harness.attempt(execution, "A", 0, 1).await;
+    let sandbox = harness.sandbox(first.session_id);
+    std::fs::write(sandbox.join("partial.txt"), "unsaved work\n").unwrap();
+    harness.set_resumable(first.session_id);
+    harness.restart();
+    harness.set_status(first.session_id, SessionStatus::Interrupted);
+    harness.set_stop_reason(first.session_id, "interrupted:deploy_drain");
+    harness.set_restart_intent_pending(first.session_id);
+    recover_after_restart(&harness.executor, 8, std::time::Duration::from_secs(30))
+        .await
+        .unwrap();
+    let held = harness.attempt(execution, "A", 0, 1).await;
+    assert_eq!(held.status, AttemptStatus::Running);
+    assert_eq!(held.failure_class, None);
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Running
+    );
+    assert!(
+        harness.continues().is_empty(),
+        "the journal owns the continuation"
+    );
+    assert!(harness.interrupts().is_empty());
+    assert_eq!(
+        event_count(&harness, execution, "node_resumed_after_restart").await,
+        0
+    );
+
+    // The startup pass continues the session; the attempt follows it.
+    harness.set_status(first.session_id, SessionStatus::Running);
+    harness.clear_restart_intent_pending(first.session_id);
+    harness.executor.advance(execution).await.unwrap();
+    assert_eq!(
+        harness.attempt(execution, "A", 0, 1).await.status,
+        AttemptStatus::Running
+    );
+    harness.commit_and_complete(first.session_id, "A");
+    assert_eq!(
+        harness.executor.advance(execution).await.unwrap(),
+        Step::Done
+    );
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Succeeded
+    );
+}
+
+/// #1722: cancelling an execution whose node session the restart journal
+/// still holds settles it instead of waiting on the journal forever.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn cancelling_settles_a_journal_held_node() {
+    let mut harness = Harness::new();
+    let execution = harness.start(workflow(&["A"], &[])).await;
+    harness.executor.advance(execution).await.unwrap();
+    let first = harness.attempt(execution, "A", 0, 1).await;
+    harness.set_resumable(first.session_id);
+    harness.restart();
+    harness.set_status(first.session_id, SessionStatus::Interrupted);
+    harness.set_stop_reason(first.session_id, "interrupted:deploy_drain");
+    harness.set_restart_intent_pending(first.session_id);
+    harness.executor.request_interrupt(execution).await.unwrap();
+    for _ in 0..4 {
+        if harness.executor.advance(execution).await.unwrap() == Step::Done {
+            break;
+        }
+    }
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Cancelled
+    );
+    assert_eq!(
+        harness.attempt(execution, "A", 0, 1).await.status,
+        AttemptStatus::Cancelled
+    );
+    assert!(harness.continues().is_empty());
+}
+
+/// #1641 S4a: only a refused continuation falls back to plan §3.4. The refusal
+/// is recorded once and the boot does not ask again.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn resume_refused_falls_back_to_preserve() {
+    let mut harness = Harness::new();
+    let execution = harness.start(workflow(&["A"], &[])).await;
+    harness.executor.advance(execution).await.unwrap();
+    let first = harness.attempt(execution, "A", 0, 1).await;
+    let sandbox = harness.sandbox(first.session_id);
+    std::fs::write(sandbox.join("partial.txt"), "unsaved work\n").unwrap();
+    harness.set_resumable(first.session_id);
+    harness.refuse_continues(true);
+    harness.restart();
+    harness.set_status(first.session_id, SessionStatus::Failed);
+    recover_after_restart(&harness.executor, 8, std::time::Duration::from_secs(30))
+        .await
+        .unwrap();
+    let blocked = harness.attempt(execution, "A", 0, 1).await;
+    assert_eq!(blocked.status, AttemptStatus::Blocked);
+    assert_eq!(
+        blocked.failure_class.as_deref(),
+        Some(rows::failure::PRESERVED_WORK)
+    );
+    assert!(blocked.preserved_commit.is_some());
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Blocked
+    );
+    assert!(harness.continues().is_empty());
+    assert_eq!(
+        event_count(&harness, execution, "node_resume_refused").await,
+        1
+    );
+    assert_eq!(
+        event_count(&harness, execution, "node_resumed_after_restart").await,
+        0
+    );
+}
+
+/// #1728: an operator continuation of the same session got there first, so
+/// the executor's fenced resume is refused busy. The session runs under the
+/// operator's continuation: the executor neither preserves nor retries it and
+/// does not start a second one.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn competing_continuation_defers_the_restart_resume() {
+    let mut harness = Harness::new();
+    let execution = harness.start(workflow(&["A"], &[])).await;
+    harness.executor.advance(execution).await.unwrap();
+    let first = harness.attempt(execution, "A", 0, 1).await;
+    let sandbox = harness.sandbox(first.session_id);
+    std::fs::write(sandbox.join("partial.txt"), "unsaved work\n").unwrap();
+    harness.set_resumable(first.session_id);
+    harness.compete_continues(true);
+    harness.restart();
+    harness.set_status(first.session_id, SessionStatus::Failed);
+    recover_after_restart(&harness.executor, 8, std::time::Duration::from_secs(30))
+        .await
+        .unwrap();
+    let held = harness.attempt(execution, "A", 0, 1).await;
+    assert_eq!(held.status, AttemptStatus::Running);
+    assert_eq!(held.failure_class, None);
+    assert!(held.preserved_commit.is_none());
+    assert!(harness.continues().is_empty(), "exactly one continuation");
+    assert_eq!(
+        event_count(&harness, execution, "node_resume_refused").await,
+        0
+    );
+    assert_eq!(
+        event_count(&harness, execution, "node_resumed_after_restart").await,
+        0
+    );
+    // The operator's continuation finishes the node; the attempt follows it.
+    harness.commit_and_complete(first.session_id, "A");
+    assert_eq!(
+        harness.executor.advance(execution).await.unwrap(),
+        Step::Done
+    );
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Succeeded
+    );
+}
+
+/// #1728: an operator continuation of the same session starts after the
+/// executor classified it restart-cut and before the resume's guarded check.
+/// The resume carries the observed turn cursor, so it is refused: no second
+/// invocation, nothing preserved from the stale observation, no recorded
+/// refusal; the next observation follows the live session.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn stale_restart_resume_is_refused_after_a_competing_turn() {
+    let mut harness = Harness::new();
+    let execution = harness.start(workflow(&["A"], &[])).await;
+    harness.executor.advance(execution).await.unwrap();
+    let first = harness.attempt(execution, "A", 0, 1).await;
+    let sandbox = harness.sandbox(first.session_id);
+    std::fs::write(sandbox.join("partial.txt"), "unsaved work\n").unwrap();
+    harness.set_resumable(first.session_id);
+    harness.race_continues(true);
+    harness.restart();
+    harness.set_status(first.session_id, SessionStatus::Failed);
+    recover_after_restart(&harness.executor, 8, std::time::Duration::from_secs(30))
+        .await
+        .unwrap();
+    let held = harness.attempt(execution, "A", 0, 1).await;
+    assert_eq!(held.status, AttemptStatus::Running);
+    assert_eq!(held.failure_class, None);
+    assert!(held.preserved_commit.is_none());
+    assert!(
+        harness.continues().is_empty(),
+        "the stale resume launched nothing"
+    );
+    assert_eq!(
+        event_count(&harness, execution, "node_resume_refused").await,
+        0
+    );
+    assert_eq!(
+        event_count(&harness, execution, "node_resumed_after_restart").await,
+        0
+    );
+    // The competing turn finishes the node; the attempt follows it.
+    harness.race_continues(false);
+    harness.commit_and_complete(first.session_id, "A");
+    assert_eq!(
+        harness.executor.advance(execution).await.unwrap(),
+        Step::Done
+    );
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Succeeded
+    );
+}
+
+/// A provider that cannot resume keeps the plan §3.4 outcome without asking.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn non_resumable_restart_cut_keeps_preserve_or_retry() {
+    let mut harness = Harness::new();
+    let execution = harness.start(workflow(&["A"], &[])).await;
+    harness.executor.advance(execution).await.unwrap();
+    let first = harness.attempt(execution, "A", 0, 1).await;
+    harness.restart();
+    harness.set_status(first.session_id, SessionStatus::Failed);
+    recover_after_restart(&harness.executor, 8, std::time::Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert!(harness.continues().is_empty());
+    assert_eq!(
+        harness.attempt(execution, "A", 0, 1).await.status,
+        AttemptStatus::Interrupted
+    );
+    assert_eq!(
+        event_count(&harness, execution, "node_resume_refused").await,
+        0
+    );
+}
+
 /// T2-A2: an attempt reserved but never launched relaunches after a restart
 /// with exactly the reserved dedup key and pre-minted session id.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -1303,53 +2152,6 @@ async fn t2_a2_reserved_attempt_relaunches_with_same_dedup_key() {
     let running = harness.attempt(execution, "A", 0, 1).await;
     assert_eq!(running.status, AttemptStatus::Running);
     assert_eq!(running.boot_id, Some(harness.executor.boot_id));
-}
-
-/// #1417: a launch the host-load admission holds leaves the attempt `Reserved`
-/// (nothing written, nothing launched) and is asked again on every advance; once
-/// the hold clears the same attempt launches with its reserved dedup key.
-#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
-#[tokio::test]
-async fn t2_a2_host_load_hold_keeps_a_reserved_attempt_unlaunched_until_released() {
-    let harness = Harness::new();
-    let effects = Arc::clone(&harness.executor.effects);
-    effects.hold_launches.store(true, Ordering::SeqCst);
-    let execution = harness.start(workflow(&["A"], &[])).await;
-
-    for _ in 0..3 {
-        assert_eq!(
-            harness.executor.advance(execution).await.unwrap(),
-            Step::Wait,
-            "a held launch waits for the next tick"
-        );
-        let attempts = harness.attempts(execution).await;
-        assert_eq!(attempts.len(), 1, "held, not retried or re-reserved");
-        assert_eq!(attempts[0].status, AttemptStatus::Reserved);
-        assert!(harness.launches().is_empty(), "nothing launched while held");
-    }
-    let reserved = harness.attempt(execution, "A", 0, 1).await;
-    {
-        let asks = effects.launch_asks.lock().unwrap();
-        assert!(asks.len() >= 3, "asked again on every advance: {asks:?}");
-        assert!(
-            asks.iter().all(|(agent, id)| !agent && *id == reserved.id),
-            "an operator execution is asked as not agent-requested: {asks:?}"
-        );
-    }
-
-    effects.hold_launches.store(false, Ordering::SeqCst);
-    assert_eq!(
-        harness.executor.advance(execution).await.unwrap(),
-        Step::Wait
-    );
-    let launches = harness.launches();
-    assert_eq!(launches.len(), 1);
-    assert_eq!(launches[0].0, reserved.dedup_key);
-    assert_eq!(launches[0].1, reserved.session_id);
-    assert_eq!(
-        harness.attempt(execution, "A", 0, 1).await.status,
-        AttemptStatus::Running
-    );
 }
 
 /// T2-A3: recovery run twice (and a relaunch race) launches once; an
@@ -1446,6 +2248,148 @@ async fn host_load_does_not_hold_recovery_of_an_unadmitted_launching_attempt() {
             .is_empty(),
         "recovery bypasses new-work admission"
     );
+}
+
+/// #1641 S4b: a launch the sandbox capacity gate refuses (-32029) is a delay,
+/// never a failure. The node stays `Reserved` (one attempt, no failure, no
+/// session), one `admission_hold{kind}` event is written per transition (not
+/// per tick), and the next tick launches it once the pressure clears.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn disk_floor_refusal_holds_node_reserved_then_launches() {
+    let harness = Harness::new();
+    let effects = Arc::clone(&harness.executor.effects);
+    *effects.capacity_refusal.lock().unwrap() = Some("free_space_limit");
+    let execution = harness.start(workflow(&["A"], &[])).await;
+
+    for _ in 0..3 {
+        assert_eq!(
+            harness.executor.advance(execution).await.unwrap(),
+            Step::Wait
+        );
+        let attempts = harness.attempts(execution).await;
+        assert_eq!(attempts.len(), 1, "held, never failed or re-reserved");
+        assert_eq!(attempts[0].status, AttemptStatus::Reserved);
+        assert_eq!(attempts[0].failure_class, None);
+        assert!(harness.launches().is_empty());
+    }
+    assert_eq!(
+        event_count(&harness, execution, "admission_hold").await,
+        1,
+        "one hold event per transition, not per tick"
+    );
+
+    // The pressure changes kind: a new transition, a second event.
+    *effects.capacity_refusal.lock().unwrap() = Some("source_root_limit");
+    harness.executor.advance(execution).await.unwrap();
+    harness.executor.advance(execution).await.unwrap();
+    assert_eq!(event_count(&harness, execution, "admission_hold").await, 2);
+    let kinds: Vec<String> = {
+        let store = harness.executor.store.lock().await;
+        let mut statement = store
+            .conn
+            .prepare(
+                "SELECT json_extract(payload_json,'$.detail.kind') FROM topology_events \
+                 WHERE execution_id=?1 AND kind='admission_hold' ORDER BY execution_seq",
+            )
+            .unwrap();
+        statement
+            .query_map([execution.to_string()], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(kinds, ["disk_floor", "source_root_limit"]);
+
+    *effects.capacity_refusal.lock().unwrap() = None;
+    assert_eq!(
+        harness.executor.advance(execution).await.unwrap(),
+        Step::Wait
+    );
+    let reserved = harness.attempt(execution, "A", 0, 1).await;
+    assert_eq!(reserved.status, AttemptStatus::Running);
+    let launches = harness.launches();
+    assert_eq!(launches.len(), 1);
+    assert_eq!(launches[0].0, reserved.dedup_key);
+    assert_eq!(event_count(&harness, execution, "admission_hold").await, 2);
+}
+
+/// #1641 S4b: an operator execution's first launch starts when asked, but its
+/// later nodes wait for the host like any other execution's.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn operator_execution_later_nodes_respect_host_load_hold() {
+    let harness = Harness::new();
+    let effects = Arc::clone(&harness.executor.effects);
+    effects.hold_launches.store(true, Ordering::SeqCst);
+    let execution = harness.start(workflow(&["A", "B"], &[("A", "B")])).await;
+
+    assert_eq!(
+        harness.executor.advance(execution).await.unwrap(),
+        Step::Wait
+    );
+    assert_eq!(
+        harness.attempt(execution, "A", 0, 1).await.status,
+        AttemptStatus::Running,
+        "the operator's first node is immediate even on a loaded host"
+    );
+    let a = harness.attempt(execution, "A", 0, 1).await;
+    harness.commit_and_complete(a.session_id, "A-0-1");
+    for _ in 0..3 {
+        harness.executor.advance(execution).await.unwrap();
+        let attempts = harness.attempts(execution).await;
+        let b = attempts.iter().find(|attempt| attempt.node_id == "B");
+        assert_eq!(
+            b.map(|attempt| attempt.status),
+            Some(AttemptStatus::Reserved),
+            "the later node waits for the host: {attempts:?}"
+        );
+    }
+    assert_eq!(harness.launches().len(), 1, "only A launched while held");
+    assert!(
+        effects
+            .launch_asks
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(unattended, _)| *unattended),
+        "the later node is asked as unattended"
+    );
+
+    effects.hold_launches.store(false, Ordering::SeqCst);
+    harness.executor.advance(execution).await.unwrap();
+    assert_eq!(harness.launches().len(), 2);
+    assert_eq!(
+        harness.attempt(execution, "B", 0, 1).await.status,
+        AttemptStatus::Running
+    );
+}
+
+/// #1641 S4b: a command node whose governor build slot is held stays
+/// `Reserved` with one `admission_hold{disk_floor}` event, and starts once the
+/// slot is granted.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn command_node_build_slot_hold_keeps_it_reserved_then_runs() {
+    let harness = Harness::new();
+    let effects = Arc::clone(&harness.executor.effects);
+    *effects.build_slot_hold.lock().unwrap() = Some("disk_floor");
+    let execution = harness
+        .start(with_steps(
+            workflow(&["T"], &[]),
+            &[("T", command_step("rsid"))],
+            &[],
+        ))
+        .await;
+    for _ in 0..3 {
+        harness.executor.advance(execution).await.unwrap();
+        let attempt = harness.attempt(execution, "T", 0, 1).await;
+        assert_eq!(attempt.status, AttemptStatus::Reserved);
+        assert_eq!(attempt.sandbox_root, None, "no sandbox while held");
+    }
+    assert_eq!(event_count(&harness, execution, "admission_hold").await, 1);
+    *effects.build_slot_hold.lock().unwrap() = None;
+    running_command(&harness, execution, "T").await;
 }
 
 /// Round 1 (`concurrent_test_does_not_race`): two advancers on separate
@@ -3087,4 +4031,864 @@ async fn t3a_typed_topology_uses_plan_attempt_cap() {
     let legacy = harness.start(retrying(&nodes, 2)).await;
     assert_eq!(run_with_failures(&harness, legacy, None).await, Step::Done);
     assert_eq!(harness.attempts(legacy).await.len(), 66);
+}
+
+// ─── #1641 S1a: review nodes ────────────────────────────────────────────────
+
+fn review_step(of: &str, max_rounds: u8) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "review",
+        "of": of,
+        "reviewer": {"provider": "codex", "model": "gpt-6-luna", "effort": "medium"},
+        "max_rounds": max_rounds,
+    })
+}
+
+const REVIEW_ROUTING: [(&str, &str, &str); 2] = [
+    ("Review", "Fix", "verdict_changes_requested"),
+    ("Review", "Land", "verdict_accepted"),
+];
+
+/// implement → review; review ⇒ fix (changes) → review (loop); review ⇒ land.
+fn review_loop(max_rounds: u8, until: u32) -> WorkflowDefinition {
+    let looped = with_loops(
+        workflow(
+            &["Impl", "Review", "Fix", "Land"],
+            &[("Impl", "Review"), ("Review", "Fix"), ("Review", "Land")],
+        ),
+        &[("Fix", "Review")],
+        &[&["Fix", "Review"]],
+        &UntilCondition::MaxIterations(until),
+    );
+    with_steps(
+        looped,
+        &[
+            (
+                "Impl",
+                serde_json::json!({"kind": "session", "expects_commit": true}),
+            ),
+            ("Review", review_step("Impl", max_rounds)),
+            (
+                "Fix",
+                serde_json::json!({"kind": "session", "expects_commit": true, "pass_content": true}),
+            ),
+        ],
+        &REVIEW_ROUTING,
+    )
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn review_node_waits_without_a_session_then_accepted_routes_to_land_and_skips_fix() {
+    let harness = Harness::new();
+    let execution = harness.start(review_loop(2, 3)).await;
+    // Implement runs and completes; the review has no verdict yet.
+    assert_eq!(
+        harness.executor.advance(execution).await.unwrap(),
+        Step::Wait
+    );
+    let implement = harness.attempt(execution, "Impl", 0, 1).await;
+    let commit = harness.commit_and_complete(implement.session_id, "impl");
+    assert_eq!(
+        harness.executor.advance(execution).await.unwrap(),
+        Step::Wait
+    );
+    let review = harness.attempt(execution, "Review", 0, 1).await;
+    assert_eq!(review.status, AttemptStatus::Waiting);
+    assert_eq!(review.node_kind, "review");
+    assert_eq!(review.base_commit, commit);
+    let requests = harness.review_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(review.review_assignment_id, Some(requests[0].0));
+    assert_eq!(requests[0].1.of_node, "Impl");
+    assert_eq!(requests[0].1.round, 1);
+    assert_eq!(requests[0].1.source_commit, commit);
+    // Waiting is stable across ticks and launches nothing of its own.
+    assert_eq!(
+        harness.executor.advance(execution).await.unwrap(),
+        Step::Wait
+    );
+    assert_eq!(harness.launches().len(), 1);
+    assert_eq!(harness.review_requests().len(), 1);
+
+    harness.script_reviews([ReviewScript::Accept]);
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+    let review = harness.attempt(execution, "Review", 0, 1).await;
+    assert_eq!(review.status, AttemptStatus::Succeeded);
+    assert_eq!(review.result_commit.as_deref(), Some(commit.as_str()));
+    let output = review.output.unwrap();
+    assert_eq!(output["fields"]["verdict"], "accepted");
+    assert_eq!(output["fields"]["round"], 1.0);
+    assert_eq!(
+        harness.attempt(execution, "Fix", 0, 1).await.status,
+        AttemptStatus::Skipped
+    );
+    let land = harness.attempt(execution, "Land", 0, 1).await;
+    assert_eq!(land.status, AttemptStatus::Succeeded);
+    assert_eq!(land.base_commit, commit);
+    // Only the implement and land sessions ever launched.
+    assert_eq!(harness.launches().len(), 2);
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Succeeded
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn review_changes_requested_passes_findings_to_fix_and_loops() {
+    let harness = Harness::new();
+    let execution = harness.start(review_loop(3, 3)).await;
+    harness.script_reviews([
+        ReviewScript::Changes(vec!["handle the empty case", "name the constant"]),
+        ReviewScript::Accept,
+    ]);
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+
+    let first = harness.attempt(execution, "Review", 0, 1).await;
+    assert_eq!(first.status, AttemptStatus::Succeeded);
+    assert_eq!(
+        first.output.as_ref().unwrap()["fields"]["verdict"],
+        "changes_requested"
+    );
+    let fix = harness.attempt(execution, "Fix", 0, 1).await;
+    assert_eq!(fix.status, AttemptStatus::Succeeded);
+    assert!(fix.query().contains("1. handle the empty case"));
+    assert!(fix.query().contains("2. name the constant"));
+    // The fix forks from the commit that was reviewed.
+    assert_eq!(
+        Some(fix.base_commit.as_str()),
+        first.result_commit.as_deref()
+    );
+
+    // The second round reviews the fix's commit and accepts it.
+    let second = harness.attempt(execution, "Review", 1, 1).await;
+    assert_eq!(second.base_commit, fix.result_commit.clone().unwrap());
+    assert_eq!(second.output.as_ref().unwrap()["fields"]["round"], 2.0);
+    assert_eq!(
+        second.output.as_ref().unwrap()["fields"]["verdict"],
+        "accepted"
+    );
+    assert_eq!(
+        harness.attempt(execution, "Fix", 1, 1).await.status,
+        AttemptStatus::Skipped
+    );
+    // The accepted review ends the loop: no third round is reserved.
+    assert!(
+        harness
+            .attempts(execution)
+            .await
+            .iter()
+            .all(|attempt| attempt.iteration < 2)
+    );
+    let land = harness.attempt(execution, "Land", 0, 1).await;
+    assert_eq!(land.status, AttemptStatus::Succeeded);
+    assert_eq!(land.base_commit, second.result_commit.unwrap());
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Succeeded
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn review_rounds_exhausted_blocks_with_typed_reason() {
+    let harness = Harness::new();
+    let execution = harness.start(review_loop(2, 5)).await;
+    harness.script_reviews([
+        ReviewScript::Changes(vec!["first"]),
+        ReviewScript::Changes(vec!["still wrong"]),
+    ]);
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+    let last = harness.attempt(execution, "Review", 1, 1).await;
+    assert_eq!(last.status, AttemptStatus::Blocked);
+    assert_eq!(
+        last.failure_class.as_deref(),
+        Some(rows::failure::REVIEW_ROUNDS_EXHAUSTED)
+    );
+    assert!(last.error.unwrap().contains("still wrong"));
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Blocked
+    );
+    let reason = {
+        let store = harness.executor.store.lock().await;
+        rows::load_execution(&store, execution)
+            .unwrap()
+            .unwrap()
+            .blocked_reason
+            .unwrap()
+    };
+    assert_eq!(reason["kind"], "review_rounds_exhausted");
+    assert_eq!(reason["node_id"], "Review");
+    // Nothing landed.
+    assert!(
+        harness
+            .attempts(execution)
+            .await
+            .iter()
+            .all(|attempt| attempt.node_id != "Land")
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn review_rounds_stop_at_the_loop_bound_even_below_max_rounds() {
+    // Three rounds are allowed but the loop itself stops after two.
+    let harness = Harness::new();
+    let execution = harness.start(review_loop(3, 2)).await;
+    harness.script_reviews([
+        ReviewScript::Changes(vec!["a"]),
+        ReviewScript::Changes(vec!["b"]),
+    ]);
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+    let last = harness.attempt(execution, "Review", 1, 1).await;
+    assert_eq!(last.status, AttemptStatus::Blocked);
+    assert_eq!(
+        last.failure_class.as_deref(),
+        Some(rows::failure::REVIEW_ROUNDS_EXHAUSTED)
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn review_unsettled_retries_once_then_blocks() {
+    // No usable verdict twice: one new assignment, then blocked.
+    let harness = Harness::new();
+    let execution = harness.start(review_loop(2, 3)).await;
+    harness.script_reviews([
+        ReviewScript::Unsettled("superseded"),
+        ReviewScript::Unsettled("superseded again"),
+    ]);
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+    let first = harness.attempt(execution, "Review", 0, 1).await;
+    let second = harness.attempt(execution, "Review", 0, 2).await;
+    assert_eq!(first.status, AttemptStatus::Failed);
+    assert_eq!(second.status, AttemptStatus::Blocked);
+    for attempt in [&first, &second] {
+        assert_eq!(
+            attempt.failure_class.as_deref(),
+            Some(rows::failure::REVIEW_UNSETTLED)
+        );
+    }
+    assert_ne!(first.review_assignment_id, second.review_assignment_id);
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Blocked
+    );
+
+    // A usable verdict on the replacement assignment completes the review.
+    let harness = Harness::new();
+    let execution = harness.start(review_loop(2, 3)).await;
+    harness.script_reviews([ReviewScript::Unsettled("superseded"), ReviewScript::Accept]);
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+    assert_eq!(
+        harness.attempt(execution, "Review", 0, 2).await.status,
+        AttemptStatus::Succeeded
+    );
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Succeeded
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn refused_review_request_is_unsettled_and_retried_once() {
+    let harness = Harness::new();
+    harness
+        .executor
+        .effects
+        .review_request_failures
+        .store(1, Ordering::SeqCst);
+    let execution = harness.start(review_loop(2, 3)).await;
+    harness.script_reviews([ReviewScript::Accept]);
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+    let refused = harness.attempt(execution, "Review", 0, 1).await;
+    assert_eq!(refused.status, AttemptStatus::Failed);
+    assert_eq!(
+        refused.failure_class.as_deref(),
+        Some(rows::failure::REVIEW_UNSETTLED)
+    );
+    assert!(refused.error.unwrap().contains("review service refused"));
+    assert_eq!(
+        harness.attempt(execution, "Review", 0, 2).await.status,
+        AttemptStatus::Succeeded
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn waiting_review_survives_a_restart_and_re_derives_its_route() {
+    let mut harness = Harness::new();
+    let execution = harness.start(review_loop(2, 3)).await;
+    harness.executor.advance(execution).await.unwrap();
+    let implement = harness.attempt(execution, "Impl", 0, 1).await;
+    harness.commit_and_complete(implement.session_id, "impl");
+    harness.executor.advance(execution).await.unwrap();
+    assert_eq!(
+        harness.attempt(execution, "Review", 0, 1).await.status,
+        AttemptStatus::Waiting
+    );
+    harness.restart();
+    // The restarted incarnation still drives the waiting execution and does
+    // not open a second assignment.
+    let ids = {
+        let store = harness.executor.store.lock().await;
+        rows::drivable_execution_ids(&store, 10).unwrap()
+    };
+    assert_eq!(ids, vec![execution]);
+    harness.script_reviews([ReviewScript::Accept]);
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+    assert_eq!(harness.review_requests().len(), 1);
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Succeeded
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn cancelling_abandons_a_waiting_review() {
+    let harness = Harness::new();
+    let execution = harness.start(review_loop(2, 3)).await;
+    harness.executor.advance(execution).await.unwrap();
+    let implement = harness.attempt(execution, "Impl", 0, 1).await;
+    harness.commit_and_complete(implement.session_id, "impl");
+    harness.executor.advance(execution).await.unwrap();
+    harness.executor.request_interrupt(execution).await.unwrap();
+    assert_eq!(
+        harness.executor.advance(execution).await.unwrap(),
+        Step::Done
+    );
+    assert_eq!(
+        harness.attempt(execution, "Review", 0, 1).await.status,
+        AttemptStatus::Cancelled
+    );
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Cancelled
+    );
+}
+
+// ─── review validation ──────────────────────────────────────────────────────
+
+fn refusal(workflow: WorkflowDefinition) -> String {
+    crate::topology::steps::validate_workflow(&workflow).expect_err("definition is refused")
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn verdict_edge_from_non_review_node_is_refused() {
+    let session = stamp_steps(
+        workflow(&["A", "B"], &[("A", "B")]),
+        &[("A", serde_json::json!({"kind": "session"}))],
+        &[("A", "B", "verdict_accepted")],
+    );
+    assert!(refusal(session).contains("verdict edges must leave a review node"));
+    // Legacy untyped nodes cannot route a verdict either.
+    let legacy = stamp_steps(
+        workflow(&["A", "B"], &[("A", "B")]),
+        &[],
+        &[("A", "B", "verdict_changes_requested")],
+    );
+    assert!(refusal(legacy).contains("verdict edges must leave a review node"));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn review_node_validation_rules() {
+    let committer = serde_json::json!({"kind": "session", "expects_commit": true});
+    let build = |of: serde_json::Value, rounds: u8, when: &str| {
+        let mut step = review_step("A", rounds);
+        step["of"] = of;
+        stamp_steps(
+            workflow(&["A", "R", "L"], &[("A", "R"), ("R", "L")]),
+            &[("A", committer.clone()), ("R", step)],
+            &[("R", "L", when)],
+        )
+    };
+    // The accepted shape validates.
+    crate::topology::steps::validate_workflow(&build("A".into(), 3, "verdict_accepted")).unwrap();
+    assert!(
+        refusal(build("A".into(), 4, "verdict_accepted"))
+            .contains("max_rounds must be between 1 and 3")
+    );
+    assert!(
+        refusal(build("A".into(), 0, "verdict_accepted"))
+            .contains("max_rounds must be between 1 and 3")
+    );
+    assert!(refusal(build("Z".into(), 2, "verdict_accepted")).contains("names unknown node Z"));
+    // `of` must be a commit-producing session that runs before the review.
+    assert!(
+        refusal(build("L".into(), 2, "verdict_accepted"))
+            .contains("must be a session node with expects_commit")
+    );
+    // An unconditioned edge would carry a rejected commit onward.
+    assert!(
+        refusal(build("A".into(), 2, "success"))
+            .contains("must be verdict_accepted or verdict_changes_requested")
+    );
+    // A session without expects_commit has no commit to review.
+    let plain = stamp_steps(
+        workflow(&["A", "R"], &[("A", "R")]),
+        &[
+            ("A", serde_json::json!({"kind": "session"})),
+            ("R", review_step("A", 2)),
+        ],
+        &[],
+    );
+    assert!(refusal(plain).contains("must be a session node with expects_commit"));
+    // Unknown reviewer fields are hard errors, like every other step field.
+    let strict: std::result::Result<rsi_common::types::TopologyStep, _> =
+        serde_json::from_value(serde_json::json!({
+            "kind": "review", "of": "A",
+            "reviewer": {"provider": "codex", "model": "m", "effort": "high", "argv": []},
+        }));
+    assert!(strict.is_err());
+    // `max_rounds` defaults to 2.
+    let defaulted: rsi_common::types::TopologyStep = serde_json::from_value(serde_json::json!({
+        "kind": "review", "of": "A",
+        "reviewer": {"provider": "codex", "model": "m", "effort": "high"},
+    }))
+    .unwrap();
+    assert!(matches!(
+        defaulted,
+        rsi_common::types::TopologyStep::Review { max_rounds: 2, .. }
+    ));
+}
+
+// ─── #1641 S1b: what the review service is told ─────────────────────────────
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn review_request_names_the_author_pin_and_previous_round() {
+    let harness = Harness::new();
+    let execution = harness.start(review_loop(3, 3)).await;
+    harness.script_reviews([
+        ReviewScript::Changes(vec!["handle the empty case"]),
+        ReviewScript::Accept,
+    ]);
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+
+    let implement = harness.attempt(execution, "Impl", 0, 1).await;
+    let fix = harness.attempt(execution, "Fix", 0, 1).await;
+    let requests = harness.review_requests();
+    assert_eq!(requests.len(), 2);
+
+    // Round one reviews the author's own pinned commit.
+    let (first_id, first) = &requests[0];
+    assert_eq!(first.round, 1);
+    assert_eq!(first.author_session_id, implement.session_id);
+    assert!(first.extra_contributors.is_empty());
+    assert_eq!(first.previous_assignment, None);
+    assert_eq!(
+        first.pin_ref,
+        crate::topology::custody::node_pin_ref(execution, "Impl", 0)
+    );
+    assert_eq!(
+        first.source_commit,
+        implement.result_commit.clone().unwrap()
+    );
+    assert!(
+        first.query.contains("produced by node `Impl`"),
+        "{}",
+        first.query
+    );
+    assert!(
+        first.query.contains(&first.source_commit),
+        "{}",
+        first.query
+    );
+
+    // Round two reviews the fix node's commit: the author stays the first
+    // reviewed commit's author, the fix session is a further contributor, and
+    // the previous round's assignment is the delta to resolve.
+    let (_, second) = &requests[1];
+    assert_eq!(second.round, 2);
+    assert_eq!(second.author_session_id, implement.session_id);
+    assert_eq!(second.extra_contributors, vec![fix.session_id]);
+    assert_eq!(second.previous_assignment, Some(*first_id));
+    assert_eq!(
+        second.pin_ref,
+        crate::topology::custody::node_pin_ref(execution, "Fix", 0)
+    );
+    assert_eq!(second.source_commit, fix.result_commit.clone().unwrap());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn review_without_a_manager_ledger_blocks_at_once_with_its_typed_class() {
+    let harness = Harness::new();
+    *harness.executor.effects.review_refusal.lock().unwrap() =
+        Some("review_no_manager_ledger: the project has no live manager".into());
+    let execution = harness.start(review_loop(2, 3)).await;
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+    let review = harness.attempt(execution, "Review", 0, 1).await;
+    assert_eq!(review.status, AttemptStatus::Blocked);
+    assert_eq!(
+        review.failure_class.as_deref(),
+        Some(rows::failure::REVIEW_NO_MANAGER_LEDGER)
+    );
+    assert!(review.error.unwrap().contains("no live manager"));
+    // No second assignment is tried: retrying the same request cannot help.
+    assert!(
+        harness
+            .attempts(execution)
+            .await
+            .iter()
+            .all(|attempt| attempt.node_id != "Review" || attempt.attempt_no == 1)
+    );
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Blocked
+    );
+}
+
+// ─── #1641 S2: land nodes ───────────────────────────────────────────────────
+
+/// implement → review ⇒ land (a real land step, not a session).
+fn land_flow() -> WorkflowDefinition {
+    with_steps(
+        workflow(
+            &["Impl", "Review", "Land"],
+            &[("Impl", "Review"), ("Review", "Land")],
+        ),
+        &[
+            (
+                "Impl",
+                serde_json::json!({"kind": "session", "expects_commit": true}),
+            ),
+            ("Review", review_step("Impl", 2)),
+            (
+                "Land",
+                serde_json::json!({"kind": "land", "accepted": "Review", "test_filters": ["rsid=topology"]}),
+            ),
+        ],
+        &[("Review", "Land", "verdict_accepted")],
+    )
+}
+
+/// Run `land_flow` until the land attempt is waiting on the queue.
+async fn land_waiting(harness: &Harness) -> (Uuid, AttemptRow) {
+    let execution = harness.start(land_flow()).await;
+    harness.script_reviews([ReviewScript::Accept]);
+    for _ in 0..8 {
+        harness.executor.advance(execution).await.unwrap();
+        for attempt in harness.attempts(execution).await {
+            if attempt.status == AttemptStatus::Running {
+                harness.commit_and_complete(attempt.session_id, "impl");
+            }
+        }
+        let land = harness.attempts(execution).await;
+        if let Some(land) = land.iter().find(|a| a.node_id == "Land")
+            && land.status == AttemptStatus::Waiting
+        {
+            return (execution, land.clone());
+        }
+    }
+    panic!("the land node never reached the queue");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn land_enqueues_once_and_mirrors_published() {
+    let harness = Harness::new();
+    let (execution, land) = land_waiting(&harness).await;
+    let accepted = harness.attempt(execution, "Review", 0, 1).await;
+    assert_eq!(land.node_kind, "land");
+    assert_eq!(land.base_commit, accepted.result_commit.clone().unwrap());
+    let requests = harness.land_requests();
+    assert_eq!(requests.len(), 1);
+    let (entry, request) = &requests[0];
+    assert_eq!(land.land_entry_id, Some(*entry));
+    // The queue is asked for the accepted commit, the accepting assignment,
+    // the reviewed author, and the attempt's own replay key.
+    assert_eq!(request.source_commit, land.base_commit);
+    assert_eq!(
+        request.review_assignment_id,
+        accepted.review_assignment_id.unwrap()
+    );
+    assert_eq!(request.review_node, "Review");
+    assert_eq!(
+        request.author_session_id,
+        harness.attempt(execution, "Impl", 0, 1).await.session_id
+    );
+    assert_eq!(request.dedup_key, land.dedup_key);
+    assert_eq!(request.test_filters, vec!["rsid=topology".to_owned()]);
+    assert_eq!(request.repo_root, harness.repo);
+
+    // Waiting is stable across ticks, with no second enqueue and no launch.
+    assert_eq!(
+        harness.executor.advance(execution).await.unwrap(),
+        Step::Wait
+    );
+    assert_eq!(harness.land_requests().len(), 1);
+    assert_eq!(harness.launches().len(), 1);
+
+    // A gating entry is still pending; the published entry settles the node.
+    harness.set_land_state(*entry, LandStatus::Pending);
+    assert_eq!(
+        harness.executor.advance(execution).await.unwrap(),
+        Step::Wait
+    );
+    harness.set_land_state(
+        *entry,
+        LandStatus::Published {
+            landed_sha: Some("f".repeat(40)),
+        },
+    );
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+    let land = harness.attempt(execution, "Land", 0, 1).await;
+    assert_eq!(land.status, AttemptStatus::Succeeded);
+    let output = land.output.unwrap();
+    assert_eq!(output["fields"]["state"], "published");
+    assert_eq!(output["fields"]["landed_sha"], "f".repeat(40));
+    assert_eq!(output["fields"]["entry_id"], entry.to_string());
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Succeeded
+    );
+    assert_eq!(harness.land_requests().len(), 1);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn land_after_restart_mirrors_existing_entry_without_resubmitting() {
+    let mut harness = Harness::new();
+    let (execution, land) = land_waiting(&harness).await;
+    let entry = land.land_entry_id.unwrap();
+    harness.restart();
+    let ids = {
+        let store = harness.executor.store.lock().await;
+        rows::drivable_execution_ids(&store, 10).unwrap()
+    };
+    assert_eq!(ids, vec![execution]);
+    harness.set_land_state(
+        entry,
+        LandStatus::Published {
+            landed_sha: Some("e".repeat(40)),
+        },
+    );
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+    assert_eq!(harness.land_requests().len(), 1);
+    assert_eq!(
+        harness.attempt(execution, "Land", 0, 1).await.status,
+        AttemptStatus::Succeeded
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn land_adopts_an_entry_enqueued_before_a_crash_without_a_second_enqueue() {
+    let mut harness = Harness::new();
+    let execution = harness.start(land_flow()).await;
+    harness.script_reviews([ReviewScript::Accept]);
+    // Drive until the land attempt is reserved, then simulate the crash
+    // window: the queue holds the entry, the attempt row does not know it.
+    for _ in 0..8 {
+        harness.executor.advance(execution).await.unwrap();
+        for attempt in harness.attempts(execution).await {
+            if attempt.status == AttemptStatus::Running {
+                harness.commit_and_complete(attempt.session_id, "impl");
+            }
+        }
+        if harness.land_requests().len() == 1 {
+            break;
+        }
+    }
+    let (entry, _) = harness.land_requests()[0].clone();
+    {
+        let store = harness.executor.store.lock().await;
+        store
+            .conn
+            .execute(
+                "UPDATE topology_node_attempts SET status='reserved',integrate_action_id=NULL \
+                 WHERE execution_id=?1 AND node_id='Land'",
+                [execution.to_string()],
+            )
+            .unwrap();
+    }
+    harness.restart();
+    harness.executor.advance(execution).await.unwrap();
+    let land = harness.attempt(execution, "Land", 0, 1).await;
+    assert_eq!(land.status, AttemptStatus::Waiting);
+    assert_eq!(land.land_entry_id, Some(entry));
+    assert_eq!(harness.land_requests().len(), 1);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn land_refused_entry_fails_without_retry() {
+    for state in ["refused", "failed", "superseded"] {
+        let harness = Harness::new();
+        let (execution, land) = land_waiting(&harness).await;
+        harness.set_land_state(
+            land.land_entry_id.unwrap(),
+            LandStatus::Refused {
+                state: state.into(),
+                reason: "queue_batch_merge_conflict".into(),
+            },
+        );
+        assert_eq!(harness.run_to_end(execution).await, Step::Done);
+        let land = harness.attempt(execution, "Land", 0, 1).await;
+        assert_eq!(land.status, AttemptStatus::Failed, "{state}");
+        assert_eq!(
+            land.failure_class.as_deref(),
+            Some(rows::failure::LAND_REFUSED)
+        );
+        assert!(land.error.unwrap().contains("queue_batch_merge_conflict"));
+        // Never retried: one attempt, one enqueue, a failed execution.
+        assert!(
+            harness
+                .attempts(execution)
+                .await
+                .iter()
+                .all(|a| a.node_id != "Land" || a.attempt_no == 1)
+        );
+        assert_eq!(harness.land_requests().len(), 1);
+        assert_eq!(
+            harness.status(execution).await,
+            rows::ExecutionStatus::Failed
+        );
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn land_refuses_when_acceptance_changed() {
+    let harness = Harness::new();
+    harness.world.lock().unwrap().land_override = Some(LandEnqueue::AdmissionLost(
+        "the review no longer admits this commit as accepted".into(),
+    ));
+    let execution = harness.start(land_flow()).await;
+    harness.script_reviews([ReviewScript::Accept]);
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+    let land = harness.attempt(execution, "Land", 0, 1).await;
+    assert_eq!(land.status, AttemptStatus::Blocked);
+    assert_eq!(
+        land.failure_class.as_deref(),
+        Some(rows::failure::LAND_ADMISSION_LOST)
+    );
+    assert!(land.error.unwrap().contains("no longer admits"));
+    assert_eq!(land.land_entry_id, None);
+    assert!(harness.land_requests().is_empty());
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Blocked
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn land_cancelled_before_the_entry_exists_cancels_the_attempt() {
+    let harness = Harness::new();
+    harness.world.lock().unwrap().land_override = Some(LandEnqueue::Cancelled);
+    let execution = harness.start(land_flow()).await;
+    harness.script_reviews([ReviewScript::Accept]);
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+    let land = harness.attempt(execution, "Land", 0, 1).await;
+    assert_eq!(land.status, AttemptStatus::Cancelled);
+    assert_eq!(
+        land.failure_class.as_deref(),
+        Some(rows::failure::CANCELLED)
+    );
+    assert_eq!(land.land_entry_id, None);
+    assert!(harness.land_requests().is_empty());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn land_with_a_disabled_queue_blocks_visibly_and_a_queue_refusal_fails() {
+    let harness = Harness::new();
+    harness.world.lock().unwrap().land_override = Some(LandEnqueue::QueueDisabled);
+    let execution = harness.start(land_flow()).await;
+    harness.script_reviews([ReviewScript::Accept]);
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+    let land = harness.attempt(execution, "Land", 0, 1).await;
+    assert_eq!(land.status, AttemptStatus::Blocked);
+    assert_eq!(
+        land.failure_class.as_deref(),
+        Some(rows::failure::QUEUE_DISABLED)
+    );
+    assert!(harness.land_requests().is_empty());
+
+    let harness = Harness::new();
+    harness.world.lock().unwrap().land_override =
+        Some(LandEnqueue::Refused("queue_duplicate_source".into()));
+    let execution = harness.start(land_flow()).await;
+    harness.script_reviews([ReviewScript::Accept]);
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+    let land = harness.attempt(execution, "Land", 0, 1).await;
+    assert_eq!(land.status, AttemptStatus::Failed);
+    assert_eq!(
+        land.failure_class.as_deref(),
+        Some(rows::failure::LAND_REFUSED)
+    );
+    assert!(land.error.unwrap().contains("queue_duplicate_source"));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn land_node_validation_rules() {
+    let committer = serde_json::json!({"kind": "session", "expects_commit": true});
+    let land = |accepted: &str, filters: serde_json::Value| serde_json::json!({"kind": "land", "accepted": accepted, "test_filters": filters});
+    let build = |step: serde_json::Value, when: &str| {
+        stamp_steps(
+            workflow(&["A", "R", "L"], &[("A", "R"), ("R", "L")]),
+            &[
+                ("A", committer.clone()),
+                ("R", review_step("A", 2)),
+                ("L", step),
+            ],
+            &[("R", "L", when)],
+        )
+    };
+    crate::topology::steps::validate_workflow(&build(
+        land("R", serde_json::json!([])),
+        "verdict_accepted",
+    ))
+    .unwrap();
+    // `accepted` must name a review node.
+    assert!(
+        refusal(build(land("A", serde_json::json!([])), "verdict_accepted"))
+            .contains("must be a review node")
+    );
+    assert!(
+        refusal(build(land("Z", serde_json::json!([])), "verdict_accepted"))
+            .contains("names unknown node Z")
+    );
+    // The only input is the review's verdict_accepted edge.
+    assert!(
+        refusal(build(
+            land("R", serde_json::json!([])),
+            "verdict_changes_requested"
+        ))
+        .contains("only input must be the verdict_accepted edge")
+    );
+    let two_inputs = stamp_steps(
+        workflow(&["A", "R", "L"], &[("A", "R"), ("R", "L"), ("A", "L")]),
+        &[
+            ("A", committer.clone()),
+            ("R", review_step("A", 2)),
+            ("L", land("R", serde_json::json!([]))),
+        ],
+        &[("R", "L", "verdict_accepted")],
+    );
+    assert!(refusal(two_inputs).contains("only input must be the verdict_accepted edge"));
+    // Queue filters are validated with the queue's own PACKAGE=FILTER rule.
+    for bad in ["nofilter", "=x", "rsid=", "-p=x"] {
+        assert!(
+            refusal(build(
+                land("R", serde_json::json!([bad])),
+                "verdict_accepted"
+            ))
+            .contains("PACKAGE=FILTER"),
+            "{bad}"
+        );
+    }
+    // The step decodes strictly.
+    let strict: std::result::Result<rsi_common::types::TopologyStep, _> =
+        serde_json::from_value(serde_json::json!({"kind": "land", "accepted": "R", "argv": []}));
+    assert!(strict.is_err());
 }

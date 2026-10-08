@@ -44,6 +44,7 @@ pub fn open_provider_form(app: &mut App, entry: Option<&crate::settings::CustomP
 /// Handle key events inside the ProviderForm overlay.
 pub(super) fn handle_provider_form_key(app: &mut App, key: KeyEvent) {
     let submit_on_enter = app.settings.submit_on_enter;
+    let standard_editing = app.standard_editing();
     let (editing_id, focused_mode) = match &app.overlay {
         OverlayState::ProviderForm {
             focused_field,
@@ -94,6 +95,7 @@ pub(super) fn handle_provider_form_key(app: &mut App, key: KeyEvent) {
                     available_commands: &[],
                     working_dir: None,
                     submit_on_enter,
+                    standard_editing,
                 },
             );
 

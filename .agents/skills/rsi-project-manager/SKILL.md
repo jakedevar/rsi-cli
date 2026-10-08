@@ -1,6 +1,6 @@
 ---
 name: rsi-project-manager
-description: Operating playbook for the operator-appointed rsi harness manager — verify the seat, run the integrator loop (fresh short-lived workers, merge, compile, touched-module tests, fast-forward push to rolling), keep the laptop satellite and the AWS cloud busy, deploy, wake discipline, and hand the seat on. Use when you are (or are about to be) the project manager or when a manager action is refused. Verb mechanics come from AgentGetAuthorityCatalog; rsi-agent-control keeps the retry and refusal strategy.
+description: Operating playbook for the operator-appointed rsi harness manager — verify the seat, run the integrator loop (fresh short-lived workers, merge, compile, touched-module tests, fast-forward push to rolling), keep the laptop satellite busy (no AWS), deploy, wake discipline, and hand the seat on. Use when you are (or are about to be) the project manager or when a manager action is refused. Verb mechanics come from AgentGetAuthorityCatalog; rsi-agent-control keeps the retry and refusal strategy.
 ---
 
 # rsi project manager
@@ -47,14 +47,19 @@ artifact is the handoff you write at baton pass.
   fast third"; "the rules of this harness are completely made up ... if that
   means stopping every session and just making the changes and pushing them
   ... so be it ... you know better than I what's the right answer."
-- 2026-09-28/29 capacity: "make full use of the satellite"; get the cloud "up and
-  running asap". Keep the laptop and AWS busy.
+- 2026-09-28/29 capacity: "make full use of the satellite". Keep the laptop busy.
+- 2026-10-08, no AWS (standing): about $2 a run is too expensive for a
+  software factory. Builds, gates and QA run only on local hardware (the hub
+  and the arch-laptop satellite). Never launch cloud-gate or cloud-sweep runs;
+  #1010 and #1037 are cancelled. Build cost is answered by the local shared
+  build (#1741).
 - 2026-09-29 00:55Z: "never ask me again to manage the satellite instance." The
   hub manager owns satellite health.
 - 2026-09-29 23:40Z: "build fast and break things": merge everything waiting and
   fix forward; an unstable `rolling` is acceptable, "all I want is to see it
-  working" (hub, laptop and cloud). The #945 delivery rule is approved: at most
-  once, an uncertain result is shown, never auto-replayed.
+  working" (hub and laptop; the cloud is retired, 2026-10-08). The #945
+  delivery rule is approved: at most once, an uncertain result is shown, never
+  auto-replayed.
 - 2026-09-29 18:30Z: operator messages must not kill in-flight tool calls
   (soft interrupt; delivered at tool boundaries since #1049, afd6fe541).
 - 2026-10-06 ~07:10Z, technical decisions: "don't ask me what the right
@@ -125,8 +130,8 @@ it. Do not repeat that:
   starts at the `rolling` tip, commits on its own sandbox branch, and ends with
   a `RESULT <sha> ...` line. No persistent leads: on 2026-09-29 four leads had
   grown to about 800K context ($70-86 each), and three died when resumed after a
-  restart. The cap limits long-lived contexts, not machines: the satellite and
-  the cloud run workers, QA sweeps and heavy test runs as well.
+  restart. The cap limits long-lived contexts, not machines: the satellite runs
+  workers, QA sweeps and heavy test runs as well.
 - **Launch a worker.** Prepare then commit a `create_session` control (parent =
   the Epic that owns the Issue; `kind`, `launch` provider/model/effort, `query` =
   the worker prompt) and read the action until `session_established`. A worker
@@ -154,7 +159,7 @@ it. Do not repeat that:
   3. Run the tests for the modules the change touched, with
      `env -u RSI_PROCESS_OWNERSHIP_NAMESPACE` (otherwise some tests hang), and
      skip the very slow `h1_v83` startup tests (the QA sweep covers them). Hand
-     long full-suite runs to the cloud or the satellite. Choose them with
+     long full-suite runs to the satellite. Choose them with
      `rsi-test-impact --repo . --base <old tip> --head HEAD` (#1021) rather than
      by eye: on 2026-09-29 a hand-picked filter for #793 (agent mail) missed
      25 session-02 phase2 reds that its full gate would have run (#1034).
@@ -229,30 +234,12 @@ it. Do not repeat that:
   `systemd-run --user --scope --collect --slice=user.slice -- ~/rsi/scripts/rsid-supervisor.sh ~/rsi/target/release/rsid`
   (`~/.rsi/.env` on the satellite carries the provider keys).
 
-## Cloud (AWS)
+## Cloud (AWS): retired
 
-- Goal: the AWS remote gate as the routine executor for heavy test runs, with a
-  warm shared build cache (#1010). Also #965 (the shard fingerprint hashes
-  rustup stderr).
-- `scripts/cloud-gate.sh -- <rsi-rolling-land args>` applies, gates and destroys
-  an ephemeral c7i.8xlarge (about $1.78/h; a full gate is about 60 min). Keep a
-  host fully busy while it is up and destroy it when the queue is empty.
-- Spend: the operator's grant is $100 from 2026-09-27, tracked in
-  `~/.rsi/cloud/spend.md`. Log every window there, and stop and report at $90
-  cumulative. AWS Budgets: `rsi-cloud-us-west-1-monthly` ($100) and `-daily`
-  ($15). The default AWS profile is `rsi-cloud-terraform`. Beyond the grant,
-  ask the operator once with the exact amount.
-- Run every rolling-tip QA sweep as a daemon job, not by hand: call
-  `AgentSubmitJob {kind:"cloud_sweep", params:{sha:<the rolling tip, 40 hex>}}`
-  and end your turn. The daemon runs the sweep in its own unit (from its embedded
-  scripts, with the spend guard) and wakes you once with `verdict` GREEN, RED or
-  INCOMPLETE, `results_dir`, `new_failures` and `known_failures`. Do not start
-  `scripts/cloud-sweep.sh` through `systemd-run` yourself and do not keep a poll
-  wake for it; a refusal (`cloud_spend_refused`) arrives the same way. GREEN
-  means land the QA pointer; RED means file the NEW failures; INCOMPLETE means
-  read `results_dir` or the job log and resubmit.
-- Stop a running gate with SIGTERM to `cloud-gate.sh` and its lander child, so
-  its EXIT trap destroys the host. Never SIGKILL it.
+- Standing operator directive (2026-10-08): no AWS. Do not run
+  `scripts/cloud-gate.sh`, `scripts/cloud-sweep.sh` or `AgentSubmitJob`
+  `cloud_gate`/`cloud_sweep` jobs. Heavy runs and QA sweeps go to the hub's
+  daemon jobs and the arch-laptop satellite.
 
 ## QA and the canary
 

@@ -1,5 +1,6 @@
 //! Operator-local Remote read RPC dispatch. The public gateway remains closed;
 //! it must establish its own configured project scope before forwarding reads.
+use super::decision_targets::{parse_request, spawn_decision_targets_read};
 use super::{
     ReadError, RemoteCursorSigner, RemoteReadCompleted, RemoteReadLimiter, spawn_decisions_read,
     spawn_history_read, spawn_info_read, spawn_projects_read, spawn_selected_session_read,
@@ -45,6 +46,7 @@ pub fn is_operator_read_method(method: &str) -> bool {
             | "RemoteGetSessionV1"
             | "RemoteGetHistoryPageV1"
             | "RemoteGetDecisionsV1"
+            | "RemoteGetDecisionTargetsV1"
     )
 }
 
@@ -67,6 +69,22 @@ pub async fn send_operator_read<W: AsyncWrite + Unpin>(
     if rpc.session_token.is_some() || !is_operator_read_method(&rpc.method) {
         return send_error(writer, id, ReadError::InvalidSource).await;
     }
+    let limiter = operator_limiter();
+    // This operator read is deliberately outside the six V1 observation
+    // methods, so it is admitted before the closed `ReadRequestV1` parse.
+    if rpc.method == "RemoteGetDecisionTargetsV1" {
+        return match parse_request(rpc) {
+            Ok(request) => {
+                settle(
+                    spawn_decision_targets_read(limiter, Arc::clone(manager.store()), request),
+                    id,
+                    writer,
+                )
+                .await
+            }
+            Err(error) => send_error(writer, id, error).await,
+        };
+    }
     let request = serde_json::from_value::<ReadRequestV1>(serde_json::json!({
         "method": rpc.method,
         "params": rpc.params,
@@ -81,7 +99,6 @@ pub async fn send_operator_read<W: AsyncWrite + Unpin>(
         Ok(request) if rpc.jsonrpc == "2.0" => request,
         _ => return send_error(writer, id, ReadError::InvalidSource).await,
     };
-    let limiter = operator_limiter();
     match &request {
         ReadRequestV1::RemoteGetInfoV1(_) => {
             settle(spawn_info_read(limiter, &request, daemon_epoch), id, writer).await

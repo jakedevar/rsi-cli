@@ -113,6 +113,10 @@ impl App {
                 row_version: None,
                 blocked_attempt_id: None,
                 blocked_reason: None,
+                waiting: None,
+                current_nodes: Vec::new(),
+                on_call: None,
+                rulings: Vec::new(),
                 updates: Vec::new(),
             },
         );
@@ -154,6 +158,10 @@ impl App {
                 row_version: None,
                 blocked_attempt_id: None,
                 blocked_reason: None,
+                waiting: None,
+                current_nodes: Vec::new(),
+                on_call: None,
+                rulings: Vec::new(),
                 updates: Vec::new(),
             });
 

@@ -4,10 +4,13 @@
 
 use crate::kill_guard::{command_word, simple_commands};
 
-pub(super) const REFUSAL: &str = "rsi refused an unscoped test run (#1339): \
-derive touched-module filters with `scripts/check-touched-shards --base origin/rolling`, \
-then use its suggested filters or `scripts/run-rsid-test-shards.sh shard SHARD --filterset 'test(MODULE)'`. \
-Supply a nonempty test-name filter for rsid/rsid-store library tests and copied test binaries. \
+pub(super) const REFUSAL: &str = "rsi refused an unscoped or broad test run (#1339, #1656): \
+a bare-word or module-prefix libtest filter (`topology::`, `review`) is a substring match that can select \
+hundreds of rsid/rsid-store tests, and the hook cannot count them without a build. \
+Use `scripts/scoped-test --base origin/rolling` (derives filters from `scripts/check-touched-shards`), \
+or name each test by its full path and pass `--exact` \
+(`cargo test -p rsid --lib -- --exact store::tests::NAME`; nextest: `-E 'test(=NAME)'`), \
+or `scripts/run-rsid-test-shards.sh shard SHARD --filterset 'test(MODULE)'`. \
 Only the QA lane may opt out with explicit `RSI_FULL_SUITE=1`.";
 
 pub(super) fn refusal(command: &str, full_suite: bool) -> Option<&'static str> {
@@ -155,7 +158,7 @@ fn inspect(program: &str, args: &[String], full_suite: bool, depth: usize) -> bo
         return cargo_unscoped(args);
     }
     if program.starts_with("rsid-") || program.starts_with("rsid_store-") {
-        return !listing_or_help(args) && !has_filter(args, false);
+        return !listing_or_help(args) && !exact_filters(args);
     }
     false
 }
@@ -179,6 +182,9 @@ fn cargo_unscoped(args: &[String]) -> bool {
             break;
         }
     }
+    if args.get(command).map(String::as_str) == Some("nextest") {
+        return nextest_unscoped(&args[command + 1..]);
+    }
     if args.get(command).map(String::as_str) != Some("test") {
         return false;
     }
@@ -196,16 +202,98 @@ fn cargo_unscoped(args: &[String]) -> bool {
     {
         return false;
     }
-    let protected_package = cargo.iter().enumerate().any(|(index, arg)| {
+    let protected_package = is_protected_package(cargo);
+    // The positional TESTNAME may sit on either side of `--`; `--exact` is a
+    // libtest flag and turns every filter into a full test path (#1656).
+    protected_package
+        && !((has_filter(cargo, true) || has_filter(libtest, false))
+            && libtest.iter().any(|arg| arg == "--exact"))
+}
+
+fn is_protected_package(args: &[String]) -> bool {
+    args.iter().enumerate().any(|(index, arg)| {
         let package = if matches!(arg.as_str(), "-p" | "--package") {
-            cargo.get(index + 1).map(String::as_str)
+            args.get(index + 1).map(String::as_str)
         } else {
             arg.strip_prefix("--package=")
                 .or_else(|| arg.strip_prefix("-p"))
         };
         matches!(package, Some("rsid" | "rsid-store"))
+    })
+}
+
+/// `cargo nextest run`: substring filters and `package()`-only filtersets are
+/// as broad as a bare libtest filter. Accept exact `test(=NAME)` filtersets or
+/// positional filters together with `--exact`.
+fn nextest_unscoped(args: &[String]) -> bool {
+    let mut index = 0;
+    while args.get(index).is_some_and(|arg| arg.starts_with('-')) {
+        index += 1;
+    }
+    if args.get(index).map(String::as_str) != Some("run") {
+        return false;
+    }
+    let args = &args[index + 1..];
+    if !is_protected_package(args) || args.iter().any(|arg| arg == "--no-run" || arg == "--help") {
+        return false;
+    }
+    let mut filterset_exact = false;
+    let mut broad_filterset = false;
+    for (index, arg) in args.iter().enumerate() {
+        let expr = if matches!(arg.as_str(), "-E" | "--filterset") {
+            args.get(index + 1).map(String::as_str)
+        } else {
+            arg.strip_prefix("--filterset=")
+        };
+        if let Some(expr) = expr {
+            let tests = expr.matches("test(").count();
+            let exact = expr.matches("test(=").count();
+            if tests > 0 && tests == exact {
+                filterset_exact = true;
+            } else {
+                broad_filterset = true;
+            }
+        }
+    }
+    if broad_filterset {
+        return true;
+    }
+    if filterset_exact {
+        return false;
+    }
+    let positional = args.iter().enumerate().any(|(index, arg)| {
+        !arg.starts_with('-')
+            && !index
+                .checked_sub(1)
+                .and_then(|prev| args.get(prev))
+                .is_some_and(|prev| {
+                    matches!(
+                        prev.as_str(),
+                        "-p" | "--package"
+                            | "-P"
+                            | "--profile"
+                            | "-j"
+                            | "--test-threads"
+                            | "--features"
+                            | "-F"
+                            | "--manifest-path"
+                            | "--target-dir"
+                            | "--color"
+                            | "--message-format"
+                            | "--config"
+                            | "--cargo-profile"
+                            | "-Z"
+                            | "--retries"
+                    )
+                })
     });
-    protected_package && !has_filter(cargo, true) && !has_filter(libtest, false)
+    !(positional && args.iter().any(|arg| arg == "--exact"))
+}
+
+/// True when a copied test binary names at least one filter and passes
+/// `--exact`, so every filter is a full test path, not a substring (#1656).
+fn exact_filters(args: &[String]) -> bool {
+    has_filter(args, false) && args.iter().any(|arg| arg == "--exact")
 }
 
 /// Option values (threads, skip patterns, features, paths, etc.) are not
@@ -310,6 +398,19 @@ mod tests {
             "cargo test --package=rsid-store --lib -- --test-threads 1 --skip slow",
             "cargo test -prsid --features feature --lib '' -- --format json",
             "cargo +stable test --lib --package rsid -- --exact",
+            // #1656: bare-word and module-prefix filters are broad substring matches.
+            "cargo test -p rsid --lib topology:: review",
+            "cargo test -p rsid --lib -- topology:: review",
+            "cargo test -p rsid-store --lib review",
+            "cargo test -p rsid --lib -- store::tests --test-threads 1",
+            "scripts/rsi-spill -- cargo test -p rsid --lib topology::",
+            "target/debug/deps/rsid-01234 store::tests --test-threads 1",
+            "/tmp/rsid-copy store::tests",
+            "cargo nextest run -p rsid --lib topology::",
+            "cargo nextest run -p rsid",
+            "cargo nextest run -p rsid-store -E 'package(rsid-store)'",
+            "cargo nextest run -p rsid -E 'test(topology)'",
+            "cargo nextest run -p rsid -E 'test(=a) | test(b)'",
             "cargo test -p rsid --lib > /tmp/test.log",
             "env -u RSI_PROCESS_OWNERSHIP_NAMESPACE cargo test -p rsid --lib | tee log",
             "~/.rsi/bin/cargo-slot env -u RSI_PROCESS_OWNERSHIP_NAMESPACE cargo test -p rsid --lib",
@@ -340,17 +441,25 @@ mod tests {
     #[test]
     fn hook_allows_scoped_runs_integration_targets_and_inspection() {
         for command in [
-            "cargo test -p rsid --lib -- store::tests",
-            "cargo test -p rsid-store store::tests --lib",
+            "cargo test -p rsid --lib -- --exact store::tests::one",
+            "cargo test -p rsid-store --lib store::tests::one -- --exact --test-threads 1",
+            "cargo test -p rsid --lib store::tests::one other::tests::two -- --exact",
+            "scripts/scoped-test --base origin/rolling",
+            "scripts/scoped-test --base origin/rolling --dry-run",
+            "rsi-rolling-land --repo . --remote origin --accepted abc --test-filter rsid=shard:store-01:test(NAME)",
+            "cargo nextest run -p rsid -E 'test(=store::tests::one)'",
+            "cargo nextest run -p rsid --lib store::tests::one -- --exact",
+            "cargo nextest run -p rsid --no-run",
+            "cargo nextest list -p rsid",
             "cargo test -p rsid --test rpc_integration",
             "cargo test -p rsid --lib --no-run",
             "cargo test -p rsid --lib -- --list",
             "cargo test -p rsi-common --lib",
             "cargo run -p rsid --lib -- test",
             "cargo metadata --manifest-path /tmp/rsid-store-test/Cargo.toml",
-            "target/debug/deps/rsid-01234 store::tests --test-threads 1",
+            "target/debug/deps/rsid-01234 store::tests::one --exact --test-threads 1",
             "/tmp/rsid_store-copy --list",
-            "/tmp/rsid-copy store::tests",
+            "/tmp/rsid-copy store::tests::one --exact",
             "scripts/run-rsid-test-shards.sh shard other-01",
             "scripts/run-rsid-test-shards.sh list",
             "scripts/run-rsid-test-shards.sh warmup",

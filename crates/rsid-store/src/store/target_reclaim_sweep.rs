@@ -1649,6 +1649,20 @@ const RECENT_SWEEP_STATE_KEY: &str = "target_reclaim_recent_cursor";
 struct RecentSweepState {
     cycle: u64,
     after: TerminalReclaimSweepKey,
+    /// The newest eligible terminal row the descent had seen when it last
+    /// started from the top. A row newer than this finished after the descent
+    /// began and sits above `after`, so the descent restarts from the top
+    /// instead of leaving it unseen until the next fair cycle.
+    #[serde(default)]
+    head: Option<TerminalReclaimSweepKey>,
+}
+
+/// SQL ordering of sweep keys: `updated_at` text, then the lowercase id.
+fn sweep_key_newer(candidate: &TerminalReclaimSweepKey, than: &TerminalReclaimSweepKey) -> bool {
+    (
+        candidate.updated_at.as_str(),
+        candidate.session_id.to_string(),
+    ) > (than.updated_at.as_str(), than.session_id.to_string())
 }
 
 impl Store {
@@ -1856,15 +1870,30 @@ fn select_page(
     // Their own durable descending cursor prevents refused keys from spending
     // the same slots on every pass. It resets with the next fair cycle.
     let mut absent_sessions = std::collections::HashSet::new();
+    let mut recent_head = None;
     let (recent_keys, recent_last, recent_scanned) = if recent_first {
         let recent_state = store
             .get_daemon_setting(RECENT_SWEEP_STATE_KEY)?
             .map(|raw| serde_json::from_str::<RecentSweepState>(&raw))
             .transpose()
-            .map_err(|error| DaemonError::Store(error.to_string()))?;
+            .map_err(|error| DaemonError::Store(error.to_string()))?
+            .filter(|recent| recent.cycle == cycle_after);
+        // A worker that finished after the descent passed its position is
+        // newer than every key the cursor will ever reach. Restart from the
+        // top when the newest eligible row is newer than the recorded head, so
+        // pressure reclaim sees a fresh finisher on its next pass (#1737).
+        let newest = select_recent_terminal_keys(connection, None, 1)?
+            .into_iter()
+            .next();
+        let arrivals = match (&newest, recent_state.as_ref().and_then(|r| r.head.as_ref())) {
+            (Some(newest), Some(head)) => sweep_key_newer(newest, head),
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        recent_head = newest;
         let after = recent_state
             .as_ref()
-            .filter(|recent| recent.cycle == cycle_after)
+            .filter(|_| !arrivals)
             .map(|recent| &recent.after);
         let want = (limit / 2).min(RECENT_FIRST_LIMIT);
         if skip_absent {
@@ -1978,6 +2007,7 @@ fn select_page(
         recent_state: recent_last.map(|after| RecentSweepState {
             cycle: cycle_after,
             after,
+            head: recent_head,
         }),
     })
 }
@@ -2715,6 +2745,32 @@ mod tests {
         }
         let wrapped = store.reserve_terminal_reclaim_page_with(2, true).unwrap();
         assert!(wrapped.evidence.wrapped);
+    }
+
+    /// #1737: the recent lane's descending cursor sat below a worker that
+    /// finished after the descent began, so a fresh finisher stayed unseen
+    /// under disk pressure until the next fair cycle. It is examined first.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn pressure_page_sees_a_worker_that_finished_after_the_recent_cursor_passed() {
+        let fixture = FixtureDirectory::create("target-reclaim-recent-arrival");
+        let mut store = Store::open_in_memory().unwrap();
+        let ids = (0..6)
+            .map(|ordinal| seed_candidate(&mut store, fixture.path(), ordinal))
+            .collect::<Vec<_>>();
+        let first = store.reserve_terminal_reclaim_page_with(2, true).unwrap();
+        assert_eq!(first.candidates[0].session_id, ids[5]);
+        let second = store.reserve_terminal_reclaim_page_with(2, true).unwrap();
+        assert_eq!(second.candidates[0].session_id, ids[4]);
+
+        let late = seed_candidate(&mut store, fixture.path(), 7);
+        let preview = store.preview_terminal_reclaim_page_with(2, true).unwrap();
+        assert_eq!(preview.candidates[0].session_id, late);
+        let third = store.reserve_terminal_reclaim_page_with(2, true).unwrap();
+        assert_eq!(third.candidates[0].session_id, late);
+        // The descent resumes below the arrival rather than looping on it.
+        let fourth = store.reserve_terminal_reclaim_page_with(2, true).unwrap();
+        assert_ne!(fourth.candidates[0].session_id, late);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]

@@ -108,6 +108,21 @@ pub(crate) fn filtered_indices(app: &App) -> Vec<usize> {
 
 /// Handle keys in the parent picker overlay.
 pub(super) async fn handle_parent_picker_key(app: &mut App, key: KeyEvent) {
+    // Standard editing: every printable key types into the query, with a
+    // real cursor and selection.
+    match app.edit_field(key, |overlay| match overlay {
+        OverlayState::ParentPicker { query, .. } => Some(query),
+        _ => None,
+    }) {
+        crate::field_edit::FieldKey::Edited => {
+            if let OverlayState::ParentPicker { selected, .. } = &mut app.overlay {
+                *selected = 0;
+            }
+            return;
+        }
+        crate::field_edit::FieldKey::Moved => return,
+        crate::field_edit::FieldKey::Ignored => {}
+    }
     let visible = filtered_indices(app);
     let visible_count = visible.len();
 

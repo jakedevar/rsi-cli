@@ -2575,3 +2575,133 @@ fn models_for_provider_claude_returns_the_canonical_catalog() {
         .collect();
     assert_eq!(models, expected);
 }
+
+// --- #1746: `:topology run` on the focused Issue ---
+
+fn epic_in(project: uuid::Uuid, title: &str) -> Session {
+    let mut epic = make_session_with_status(rsi_common::types::SessionStatus::Running);
+    epic.session_kind = rsi_common::types::SessionKind::Epic;
+    epic.project_id = Some(project);
+    epic.title = Some(title.to_string());
+    epic
+}
+
+fn app_with_epics(project: uuid::Uuid, titles: &[&str]) -> (App, Vec<uuid::Uuid>) {
+    let mut app = test_app();
+    let mut ids = Vec::new();
+    for title in titles {
+        let epic = epic_in(project, title);
+        ids.push(epic.id);
+        app.sessions.insert(epic.id, SessionState::new(epic));
+    }
+    (app, ids)
+}
+
+#[test]
+fn topology_run_command_parses_name_and_optional_epic() {
+    use crate::overlay::graph::{TopologyRunCommand, parse_topology_run};
+    assert_eq!(
+        parse_topology_run("run issue-implement-review-land").unwrap(),
+        TopologyRunCommand {
+            name: "issue-implement-review-land".into(),
+            epic: None,
+        }
+    );
+    assert_eq!(
+        parse_topology_run("run flow Platform").unwrap(),
+        TopologyRunCommand {
+            name: "flow".into(),
+            epic: Some("Platform".into()),
+        }
+    );
+    for bad in ["", "run", "start flow", "run a b c"] {
+        assert!(
+            parse_topology_run(bad)
+                .unwrap_err()
+                .contains("usage: :topology run"),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn topology_run_epic_is_the_projects_only_epic_or_the_named_one() {
+    use crate::overlay::graph::choose_topology_epic;
+    let project = uuid::Uuid::new_v4();
+
+    let (app, ids) = app_with_epics(project, &["Platform"]);
+    assert_eq!(choose_topology_epic(&app, project, None), Ok(ids[0]));
+
+    // Another project's Epic never counts.
+    assert!(choose_topology_epic(&app, uuid::Uuid::new_v4(), None).is_err());
+
+    let (app, ids) = app_with_epics(project, &["Platform", "Billing"]);
+    let ambiguous = choose_topology_epic(&app, project, None).unwrap_err();
+    assert!(ambiguous.contains("name an Epic"), "{ambiguous}");
+    assert!(ambiguous.contains("Platform") && ambiguous.contains("Billing"));
+    assert_eq!(
+        choose_topology_epic(&app, project, Some("billing")),
+        Ok(ids[1])
+    );
+    let by_id = ids[0].to_string()[..8].to_string();
+    assert_eq!(
+        choose_topology_epic(&app, project, Some(&by_id)),
+        Ok(ids[0])
+    );
+    assert!(
+        choose_topology_epic(&app, project, Some("nope"))
+            .unwrap_err()
+            .contains("no live Epic")
+    );
+}
+
+#[test]
+fn topology_run_epic_prefers_the_focused_epic() {
+    use crate::overlay::graph::choose_topology_epic;
+    let project = uuid::Uuid::new_v4();
+    let (mut app, ids) = app_with_epics(project, &["Platform", "Billing"]);
+    // A worker under the second Epic focuses that Epic.
+    let mut worker = make_session_with_status(rsi_common::types::SessionStatus::Running);
+    worker.parent_id = Some(ids[1]);
+    worker.project_id = Some(project);
+    let worker_id = worker.id;
+    app.sessions.insert(worker_id, SessionState::new(worker));
+    if let Some(Pane::SessionList {
+        selected_session, ..
+    }) = app.active_tab_mut().layout.find_pane_mut(PaneId(0))
+    {
+        *selected_session = Some(worker_id);
+    }
+    assert_eq!(choose_topology_epic(&app, project, None), Ok(ids[1]));
+}
+
+#[test]
+fn topology_run_explains_the_owner_refusals() {
+    use crate::overlay::graph::explain_execute_topology_error;
+    let none = explain_execute_topology_error("operator_owner_no_manager");
+    assert!(none.contains("appoint one first"), "{none}");
+    let unauthorized = explain_execute_topology_error("operator_owner_manager_unauthorized");
+    assert!(unauthorized.contains("execute mode"), "{unauthorized}");
+    assert_eq!(
+        explain_execute_topology_error("boom"),
+        "ExecuteTopology failed: boom"
+    );
+}
+
+#[tokio::test]
+async fn topology_run_without_a_focused_issue_says_so() {
+    let mut app = test_app();
+    crate::overlay::graph::run_topology_command(&mut app, "run issue-implement-review-land").await;
+    let last = app.notifications.back().expect("a notification");
+    assert_eq!(last.kind, crate::types::NotificationKind::OperationFailed);
+    assert_eq!(last.message, "Focus an Issue in the Issues workspace first");
+
+    crate::overlay::graph::run_topology_command(&mut app, "run").await;
+    assert!(
+        app.notifications
+            .back()
+            .unwrap()
+            .message
+            .contains("usage: :topology run")
+    );
+}

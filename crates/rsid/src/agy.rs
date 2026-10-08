@@ -8,51 +8,17 @@ use crate::process_control::{
 };
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::mpsc;
 
 /// Wraps a running Antigravity CLI (`agy`) process.
-pub struct AgyProcess {
-    child: Child,
-}
-
-impl AgyProcess {
-    /// Send SIGINT to gracefully interrupt the session.
-    pub fn interrupt(&self) -> Result<()> {
-        if let Some(pid) = self.child.id() {
-            nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGINT,
-            )
-            .map_err(|e| DaemonError::Process(format!("Failed to send SIGINT: {}", e)))?;
-        }
-        Ok(())
-    }
-
-    /// Force kill the process.
-    pub async fn kill(&mut self) -> Result<()> {
-        crate::process_scope::kill_worker_child(&mut self.child).await
-    }
-
-    /// Wait for the process to exit.
-    pub async fn wait(&mut self) -> Result<std::process::ExitStatus> {
-        Ok(self.child.wait().await?)
-    }
-
-    /// OS pid of the provider child, `None` once it was reaped.
-    pub fn pid(&self) -> Option<u32> {
-        self.child.id()
-    }
-
-    /// Check if the process is still running.
-    pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
-        Ok(self.child.try_wait()?)
-    }
-}
+pub type AgyProcess = crate::claude::CliTurnProcess;
 
 /// Client for interacting with the Antigravity CLI.
+#[derive(Clone)]
 pub struct AgyClient {
     binary_path: PathBuf,
+    runtime_config: Option<std::sync::Arc<crate::config::RuntimeConfig>>,
 }
 
 fn format_model_name(id: &str) -> String {
@@ -105,7 +71,7 @@ fn format_model_name(id: &str) -> String {
 /// is one message. Interior newlines/blank lines are preserved (markdown lists
 /// and headings stay intact); leading/trailing whitespace is trimmed. Returns
 /// None when there is no meaningful output.
-fn assistant_event_from_output(output: &str) -> Option<StreamEvent> {
+pub(crate) fn assistant_event_from_output(output: &str) -> Option<StreamEvent> {
     let mut thinking_lines = Vec::new();
     let mut text_lines = Vec::new();
 
@@ -163,7 +129,29 @@ impl AgyClient {
             crate::provider_cli::resolve_any(&["agy", "antigravity", "antigravity-cli"])
                 .ok_or(DaemonError::AgyBinaryNotFound)?;
         tracing::info!(path = %binary_path.display(), "Found Antigravity binary");
-        Ok(Self { binary_path })
+        Ok(Self {
+            binary_path,
+            runtime_config: None,
+        })
+    }
+
+    pub(crate) fn with_runtime_config(
+        mut self,
+        runtime: std::sync::Arc<crate::config::RuntimeConfig>,
+    ) -> Self {
+        self.runtime_config = Some(runtime);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_path_for_test(
+        binary_path: PathBuf,
+        runtime: std::sync::Arc<crate::config::RuntimeConfig>,
+    ) -> Self {
+        Self {
+            binary_path,
+            runtime_config: Some(runtime),
+        }
     }
 
     /// Check if the Antigravity binary is available without creating a client.
@@ -281,6 +269,15 @@ impl AgyClient {
         config: &LaunchConfig,
         execution: CliExecutionCapability,
     ) -> Result<(AgyProcess, mpsc::Receiver<StreamEvent>)> {
+        self.launch_inner(config, execution, None)
+    }
+
+    pub(crate) fn launch_inner(
+        &self,
+        config: &LaunchConfig,
+        execution: CliExecutionCapability,
+        shim_override: Option<&Path>,
+    ) -> Result<(AgyProcess, mpsc::Receiver<StreamEvent>)> {
         if config
             .effort
             .as_deref()
@@ -333,7 +330,6 @@ impl AgyClient {
         }
 
         crate::claude::stamp_execution_environment(&mut cmd, config, invocation_id)?;
-        cmd = crate::process_scope::ScopedWorkerCommand::wrap_unspawned(&cmd, invocation_id)?;
 
         // agy never prints its conversation id (GitHub issue
         // google-antigravity/antigravity-cli#7); on exit it writes
@@ -355,6 +351,27 @@ impl AgyClient {
             None
         };
 
+        if let Some(shim) = crate::claude::turn_spool::available_shim(
+            config,
+            self.runtime_config.as_deref(),
+            shim_override,
+        ) {
+            return crate::claude::turn_spool::launch(
+                &cmd,
+                config,
+                execution,
+                RuntimeExecutionRoute::AntigravityCli,
+                &shim,
+                crate::claude::turn_spool::TurnOutput::Antigravity {
+                    conversation_cache_path,
+                    working_dir: capture_working_dir,
+                    pre_snapshot,
+                    capture: do_file_capture,
+                },
+                None,
+            );
+        }
+        cmd = crate::process_scope::ScopedWorkerCommand::wrap_unspawned(&cmd, invocation_id)?;
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::null());
@@ -487,7 +504,7 @@ impl AgyClient {
             let _ = event_tx.send(success_event).await;
         });
 
-        Ok((AgyProcess { child }, event_rx))
+        Ok((AgyProcess::direct(child), event_rx))
     }
 }
 
@@ -513,7 +530,10 @@ fn agy_conversation_cache_path() -> PathBuf {
 
 /// Read the conversation UUID agy last associated with `working_dir` from its
 /// on-disk cache. Returns `None` when the file or key is absent or unreadable.
-fn read_last_conversation_for_dir(cache_path: &Path, working_dir: &Path) -> Option<String> {
+pub(crate) fn read_last_conversation_for_dir(
+    cache_path: &Path,
+    working_dir: &Path,
+) -> Option<String> {
     let bytes = std::fs::read(cache_path).ok()?;
     let map: std::collections::HashMap<String, String> = serde_json::from_slice(&bytes).ok()?;
     let key = working_dir.to_str()?;
@@ -711,6 +731,7 @@ printf '%s\n' "$1"
     async fn test_discover_models_returns_entries() {
         // Verify static list shape without needing the binary
         let client = AgyClient {
+            runtime_config: None,
             binary_path: PathBuf::new(),
         };
         let models = client.discover_models().await;
@@ -739,7 +760,10 @@ worker prompt body\n\
         let workdir = tmp.path().join("work");
         fs::create_dir_all(&workdir).expect("create workdir");
         let (binary_path, args_path, env_capture_path) = install_fake_agy(tmp.path());
-        let client = AgyClient { binary_path };
+        let client = AgyClient {
+            binary_path,
+            runtime_config: None,
+        };
 
         let mut config = test_launch_config(&directive.query);
         config.working_dir = Some(workdir.clone());
@@ -778,7 +802,10 @@ worker prompt body\n\
     async fn antigravity_resume_launch_passes_model_and_effort() {
         let tmp = TempDir::new().expect("tempdir");
         let (binary_path, args_path, _) = install_fake_agy(tmp.path());
-        let client = AgyClient { binary_path };
+        let client = AgyClient {
+            binary_path,
+            runtime_config: None,
+        };
 
         let mut config = test_launch_config("next turn");
         config.model = Some("gemini-3.6-flash-high".to_string());
@@ -809,7 +836,10 @@ worker prompt body\n\
         let workdir = tmp.path().join("work");
         std::fs::create_dir_all(&workdir).expect("create workdir");
         let (binary_path, args_path, output_path) = install_prompt_parsing_agy(tmp.path());
-        let client = AgyClient { binary_path };
+        let client = AgyClient {
+            binary_path,
+            runtime_config: None,
+        };
 
         for prompt in ["---\ndate: test\n---\n# Handoff", "-x", "--help"] {
             let mut config = test_launch_config(prompt);
@@ -840,7 +870,10 @@ worker prompt body\n\
     fn antigravity_launch_rejects_unsupported_effort() {
         let tmp = TempDir::new().expect("tempdir");
         let (binary_path, _, _) = install_fake_agy(tmp.path());
-        let client = AgyClient { binary_path };
+        let client = AgyClient {
+            binary_path,
+            runtime_config: None,
+        };
         let mut config = test_launch_config("next turn");
         config.effort = Some("ultra".to_string());
 
@@ -875,7 +908,10 @@ worker prompt body\n\
             .tempdir_in(&fixture_base)
             .unwrap();
         let (binary_path, _, _) = install_fake_agy(tmp.path());
-        let client = AgyClient { binary_path };
+        let client = AgyClient {
+            binary_path,
+            runtime_config: None,
+        };
         let session_id = uuid::Uuid::new_v4();
         let mut config = test_launch_config("scratch");
         config.working_dir = Some(root.path().to_path_buf());

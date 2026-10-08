@@ -118,6 +118,46 @@ def changed(repo: Path, base: str, source: str) -> set[str]:
     return paths
 
 
+# Dependency manifests and lockfiles carry no schema site; their checksums and
+# version strings contain arbitrary digit runs (#1655).
+NON_SCHEMA_FILES = ("Cargo.lock", "Cargo.toml")
+
+
+def is_non_schema_file(name: str) -> bool:
+    return os.path.basename(name) in NON_SCHEMA_FILES
+
+
+def introduced_ranges(repo: Path, base: str, source: str, filename: str,
+                      data: bytes) -> list[tuple[int, int]]:
+    """Byte ranges of ``data`` (the file at ``source``) on lines the source added.
+
+    A line that already existed unchanged at ``base`` cannot be a site of the
+    provisional migration (the base head is below it), so it is not a schema
+    site however it happens to spell the number (#1655).  A file new at
+    ``base`` is introduced in full.
+    """
+    old = show(repo, base, filename)
+    lines = data.splitlines(keepends=True)
+    if old is None:
+        return [(0, len(data))] if data else []
+    remaining: dict[bytes, int] = {}
+    for line in old.splitlines(keepends=True):
+        remaining[line] = remaining.get(line, 0) + 1
+    ranges = []
+    offset = 0
+    for line in lines:
+        if remaining.get(line, 0) > 0:
+            remaining[line] -= 1
+        else:
+            ranges.append((offset, offset + len(line)))
+        offset += len(line)
+    return ranges
+
+
+def in_ranges(ranges: list[tuple[int, int]], start: int, end: int) -> bool:
+    return any(lo <= start and end <= hi for lo, hi in ranges)
+
+
 def layout_of(manifest: dict) -> str:
     """``dir`` for one file per version, ``file`` for the legacy inline layout."""
     return "dir" if "migration_dir" in manifest else "file"
@@ -156,7 +196,8 @@ def revision_inventory(repo: Path, revision: str) -> dict:
         raise Refusal(f"invalid migration inventory at {revision}: {error}") from error
 
 
-def inspect(repo: Path, base: str, source: str, target: str) -> dict | None:
+def inspect(repo: Path, base: str, source: str, target: str,
+            allow_noop: bool = False) -> dict | None:
     for item in (base, source, target):
         oid(item)
         run(repo, "cat-file", "-e", f"{item}^{{commit}}")
@@ -188,6 +229,10 @@ def inspect(repo: Path, base: str, source: str, target: str) -> dict | None:
         raise Refusal("target schema head is behind the accepted base")
     if target_manifest["latest_schema_version"] >= 2_147_483_647:
         raise Refusal("no representable next i32 schema version")
+    if allow_noop and target_manifest["latest_schema_version"] + 1 == old:
+        # Already rolling head + 1: nothing to renumber, so nothing to inventory.
+        return {"base": base, "source": source, "target": target,
+                "old_version": old, "new_version": old, "renumber_noop": True}
     declarations = sorted(name for name in changed(repo, base, source)
                           if name.startswith(DECLARATIONS) and name.endswith(".json"))
     if len(declarations) != 1:
@@ -263,8 +308,10 @@ def inspect(repo: Path, base: str, source: str, target: str) -> dict | None:
                                  "scope": site["scope"],
                                  "source_blob": sha(original),
                                  "before_offset": start})
+        introduced = introduced_ranges(repo, base, source, source_path, original)
         for match in version_pattern.finditer(original):
-            if not all(covered[match.start():match.end()]):
+            if (not all(covered[match.start():match.end()]) and
+                    in_ranges(introduced, match.start(), match.end())):
                 raise Refusal(f"undeclared version-bearing site: {source_path}:{match.start()}")
         if destination != source_path and show(repo, source, destination) is not None:
             raise Refusal(f"destination already exists in source: {destination}")
@@ -273,7 +320,13 @@ def inspect(repo: Path, base: str, source: str, target: str) -> dict | None:
         if show(repo, base, source_path) is None and show(repo, target, destination) is not None:
             raise Refusal(f"new source file collides with target: {destination}")
     for filename in all_changed - declared_paths - {MANIFEST, declaration_path}:
-        if version_pattern.search(filename.encode()) or version_pattern.search(show(repo, source, filename) or b""):
+        if is_non_schema_file(filename):
+            continue
+        content = show(repo, source, filename) or b""
+        introduced = introduced_ranges(repo, base, source, filename, content)
+        if (version_pattern.search(filename.encode()) or
+                any(in_ranges(introduced, m.start(), m.end())
+                    for m in version_pattern.finditer(content))):
             raise Refusal(f"undeclared version-bearing file or site: {filename}")
     if layout_of(source_manifest) == "dir":
         unit_file = f"{MIGRATION_DIR}/v{old:03d}.rs"
@@ -783,8 +836,11 @@ def main() -> int:
         else:
             if not args.base or not args.source or not args.target:
                 raise Refusal("--base, --source and --target are required")
-            unit = inspect(args.repo, args.base, args.source, args.target)
-            if args.transform:
+            unit = inspect(args.repo, args.base, args.source, args.target,
+                           allow_noop=args.transform)
+            if args.transform and unit is not None and unit.get("renumber_noop"):
+                pass
+            elif args.transform:
                 if unit is None:
                     raise Refusal("provisional declaration has no appended migration")
                 unit.update(transform(args.repo, unit))

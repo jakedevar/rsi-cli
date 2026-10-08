@@ -3639,3 +3639,47 @@ async fn report_to_hub_refuses_a_revoked_manager_appointment() {
         .unwrap();
     assert_eq!(queued.reports.len(), 1);
 }
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::significant_drop_tightening)]
+async fn topology_land_is_admitted_before_the_queue_is_consulted() {
+    use crate::topology::land::{LandEnqueue, LandRequest};
+
+    let pilot = pilot().await;
+    let request = LandRequest {
+        execution_id: Uuid::new_v4(),
+        attempt_id: Uuid::new_v4(),
+        node_id: "Land".into(),
+        dedup_key: "attempt-1".into(),
+        project_id: None,
+        epic_id: Some(pilot.epics[0]),
+        repo_root: std::env::temp_dir(),
+        source_commit: "a".repeat(40),
+        review_node: "Review".into(),
+        review_assignment_id: Uuid::new_v4(),
+        author_session_id: pilot.leads[0],
+        test_filters: Vec::new(),
+    };
+    // No execution owns this landing: the answer is an admission loss even
+    // with the queue disabled, and nothing is queued.
+    for enabled in [true, false] {
+        let answer = pilot
+            .manager
+            .agent_control()
+            .enqueue_for_topology(&request, enabled)
+            .await
+            .unwrap();
+        assert!(
+            matches!(answer, LandEnqueue::AdmissionLost(_)),
+            "{answer:?}"
+        );
+    }
+    let store = pilot.manager.store.lock().await;
+    assert!(
+        store
+            .list_rolling_queue_entries(None, 10)
+            .unwrap()
+            .is_empty()
+    );
+}

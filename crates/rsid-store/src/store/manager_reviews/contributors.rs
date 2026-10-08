@@ -41,7 +41,7 @@ impl Store {
     /// Add the recorded custody cohort of one session. A shared custody root
     /// is deliberately conservative: all its members could have touched the
     /// sealed bytes, even if an old rotation edge is no longer readable.
-    fn review_lineage(&self, id: Uuid) -> Result<BTreeSet<Uuid>> {
+    pub(super) fn review_lineage(&self, id: Uuid) -> Result<BTreeSet<Uuid>> {
         let custody: Option<Option<String>> = self
             .conn
             .query_row(
@@ -82,6 +82,11 @@ impl Store {
     /// contributes, and `unrelated` names descendants the daemon proved at
     /// request time to be path-disjoint from the sealed range. Spawn rows have
     /// no cross-table order witness, so every recorded spawn edge is walked.
+    ///
+    /// `exempt` is the previous round's reviewer session of a delta review:
+    /// that one session contributes nothing (its own family may be reused by a
+    /// finding-focused re-review). Any other session of the same family, such
+    /// as a fix author, still bars it.
     pub(super) fn review_contributors(
         &self,
         project: Uuid,
@@ -89,10 +94,11 @@ impl Store {
         unrelated: &BTreeSet<Uuid>,
         stored_ids: &[Uuid],
         stored_families: &[String],
+        exempt: Option<Uuid>,
     ) -> Result<ContributorSet> {
         let mut set = ContributorSet::default();
         let lineage = self.review_lineage(author)?;
-        for member in &lineage {
+        for member in lineage.iter().filter(|member| Some(**member) != exempt) {
             let family = self
                 .recorded_review_family(*member)
                 .map_err(|_| unbounded())?;
@@ -116,8 +122,9 @@ impl Store {
             // #984: a reviewer never contributes. A proven-unrelated descendant
             // contributes nothing either. Both are still traversed so their own
             // children are judged individually. The author lineage always counts.
-            let barred = !lineage.contains(&id)
-                && (unrelated.contains(&id) || self.is_project_reviewer(project, id)?);
+            let barred = Some(id) == exempt
+                || (!lineage.contains(&id)
+                    && (unrelated.contains(&id) || self.is_project_reviewer(project, id)?));
             if !barred {
                 set.sessions.insert(id);
                 if set.sessions.len() > MAX_CONTRIBUTORS {
@@ -138,7 +145,7 @@ impl Store {
                 }
             }
         }
-        for id in stored_ids {
+        for id in stored_ids.iter().filter(|id| Some(**id) != exempt) {
             set.sessions.insert(*id);
             if set.sessions.len() > MAX_CONTRIBUTORS {
                 return Err(unbounded());
@@ -264,6 +271,7 @@ impl Store {
     pub(super) fn review_contributors_for_assignment(
         &self,
         assignment: &ReviewAssignment,
+        exempt: Option<Uuid>,
     ) -> Result<ContributorSet> {
         let mut root = assignment.clone();
         let mut stored_ids = root.request.contributor_session_ids.clone();
@@ -322,6 +330,7 @@ impl Store {
             &stored_unrelated,
             &stored_ids,
             &stored_families,
+            exempt,
         )
     }
 
@@ -329,23 +338,21 @@ impl Store {
         &self,
         assignment: &ReviewAssignment,
     ) -> Result<ContributorSet> {
-        let mut set = self.review_contributors_for_assignment(assignment)?;
+        let mut exempt = None;
         if assignment.request.delta_of.is_some() {
             let config = self
                 .get_harness_manager(assignment.project_id)?
                 .ok_or_else(unbounded)?;
             let (_, work) = self.manager_v2_work(&config, &assignment.work_key)?;
-            if let Some(family) = self.review_delta_family(
+            exempt = self.review_delta_reviewer(
                 assignment.project_id,
                 &work,
                 &assignment.source_sha,
                 assignment.request.delta_of,
                 &assignment.request.finding_keys,
-            )? {
-                set.families.remove(family_name(family));
-            }
+            )?;
         }
-        Ok(set)
+        self.review_contributors_for_assignment(assignment, exempt)
     }
 
     /// A decision is usable only when its current version was written by the
@@ -654,6 +661,7 @@ mod tests {
             family_override_key: None,
             delta_of: None,
             finding_keys: vec![],
+            topology_attempt_id: None,
         };
         let mut value = serde_json::to_value(request).unwrap();
         if legacy {
@@ -766,7 +774,7 @@ mod tests {
 
     fn contributors(f: &Fixture) -> ContributorSet {
         f.store
-            .review_contributors(f.project, f.author, &BTreeSet::new(), &[], &[])
+            .review_contributors(f.project, f.author, &BTreeSet::new(), &[], &[], None)
             .unwrap()
     }
 
@@ -851,7 +859,7 @@ mod tests {
         let unrelated = BTreeSet::from([child]);
         let set = f
             .store
-            .review_contributors(f.project, f.author, &unrelated, &[], &[])
+            .review_contributors(f.project, f.author, &unrelated, &[], &[], None)
             .unwrap();
         assert!(!set.sessions.contains(&child));
         assert!(check(&f, &set, ReviewModelFamily::Anthropic).is_ok());
@@ -868,7 +876,7 @@ mod tests {
         let unrelated = BTreeSet::from([child]);
         let set = f
             .store
-            .review_contributors(f.project, f.author, &unrelated, &[], &[])
+            .review_contributors(f.project, f.author, &unrelated, &[], &[], None)
             .unwrap();
         assert!(!set.sessions.contains(&child));
         assert!(set.sessions.contains(&grandchild));
@@ -882,7 +890,7 @@ mod tests {
         let unrelated = BTreeSet::from([f.author]);
         let set = f
             .store
-            .review_contributors(f.project, f.author, &unrelated, &[], &[])
+            .review_contributors(f.project, f.author, &unrelated, &[], &[], None)
             .unwrap();
         assert!(set.sessions.contains(&f.author));
         assert!(check(&f, &set, ReviewModelFamily::OpenAI).is_err());
@@ -1029,7 +1037,10 @@ mod tests {
         assert!(rowid(root_id) < rowid(later_id));
 
         let root = f.store.manager_review_assignment(root_id).unwrap();
-        let set = f.store.review_contributors_for_assignment(&root).unwrap();
+        let set = f
+            .store
+            .review_contributors_for_assignment(&root, None)
+            .unwrap();
         assert!(!set.sessions.contains(&prior));
         assert!(!set.sessions.contains(&later));
         assert_eq!(set.sessions, BTreeSet::from([f.author]));
@@ -1092,7 +1103,7 @@ mod tests {
         }
         assert!(
             f.store
-                .review_contributors(f.project, f.author, &BTreeSet::new(), &[], &[])
+                .review_contributors(f.project, f.author, &BTreeSet::new(), &[], &[], None)
                 .unwrap_err()
                 .to_string()
                 .contains("contributors_unbounded")
